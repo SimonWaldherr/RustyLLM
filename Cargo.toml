@@ -1,0 +1,15 @@
+[package]
+name = "rusty-llm"
+version = "0.1.0"
+edition = "2026"
+description = "Dependency-free LLM inference engine — NEON (Apple Silicon) + AVX2 (x86)"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "rusty-llm"
+path = "src/main.rs"
