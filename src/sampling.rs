@@ -7,7 +7,13 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_1337 } else { seed } }
+        Self {
+            state: if seed == 0 {
+                0xDEAD_BEEF_CAFE_1337
+            } else {
+                seed
+            },
+        }
     }
 
     /// Returns uniform f32 in [0, 1)
@@ -19,6 +25,7 @@ impl Rng {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct SamplerConfig {
     pub temperature: f32,
     pub top_p: f32,
@@ -37,7 +44,12 @@ impl Default for SamplerConfig {
     }
 }
 
-pub fn sample(logits: &mut [f32], config: &SamplerConfig, rng: &mut Rng, recent_tokens: &[u32]) -> u32 {
+pub fn sample(
+    logits: &mut [f32],
+    config: &SamplerConfig,
+    rng: &mut Rng,
+    recent_tokens: &[u32],
+) -> u32 {
     let n = logits.len();
 
     for v in logits.iter_mut() {
@@ -61,7 +73,8 @@ pub fn sample(logits: &mut [f32], config: &SamplerConfig, rng: &mut Rng, recent_
 
     // Greedy
     if config.temperature < 1e-6 {
-        return logits.iter()
+        return logits
+            .iter()
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i as u32)
@@ -130,7 +143,9 @@ pub fn sample(logits: &mut [f32], config: &SamplerConfig, rng: &mut Rng, recent_
         // Renormalize
         if new_sum > 0.0 {
             let inv = 1.0 / new_sum;
-            for v in logits.iter_mut() { *v *= inv; }
+            for v in logits.iter_mut() {
+                *v *= inv;
+            }
         }
     }
 

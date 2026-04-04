@@ -31,10 +31,20 @@ pub enum GGMLType {
 impl From<u32> for GGMLType {
     fn from(v: u32) -> Self {
         match v {
-            0 => Self::F32, 1 => Self::F16, 2 => Self::Q4_0, 3 => Self::Q4_1,
-            6 => Self::Q5_0, 7 => Self::Q5_1, 8 => Self::Q8_0, 9 => Self::Q8_1,
-            10 => Self::Q2_K, 11 => Self::Q3_K, 12 => Self::Q4_K,
-            13 => Self::Q5_K, 14 => Self::Q6_K, 15 => Self::Q8_K,
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            9 => Self::Q8_1,
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
+            12 => Self::Q4_K,
+            13 => Self::Q5_K,
+            14 => Self::Q6_K,
+            15 => Self::Q8_K,
             39 => Self::MXFP4,
             _ => Self::Unknown,
         }
@@ -47,9 +57,9 @@ impl GGMLType {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
-            Self::Q4_0 | Self::Q4_1 => 18,   // 2 (f16 scale) + 16 (32 nibbles)
-            Self::Q8_0 | Self::Q8_1 => 34,   // 2 (f16 scale) + 32 (i8 quants)
-            Self::Q5_0 | Self::Q5_1 => 34,   // treat like Q8 layout for now
+            Self::Q4_0 | Self::Q4_1 => 18, // 2 (f16 scale) + 16 (32 nibbles)
+            Self::Q8_0 | Self::Q8_1 => 34, // 2 (f16 scale) + 32 (i8 quants)
+            Self::Q5_0 | Self::Q5_1 => 34, // treat like Q8 layout for now
             _ => panic!("Unsupported: {:?}", self),
         }
     }
@@ -82,9 +92,17 @@ impl GGMLType {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum MetaValue {
-    U8(u8), I8(i8), U16(u16), I16(i16),
-    U32(u32), I32(i32), U64(u64), I64(i64),
-    F32(f32), F64(f64), Bool(bool),
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
     Str(String),
     Array(Vec<MetaValue>),
 }
@@ -92,40 +110,51 @@ pub enum MetaValue {
 impl MetaValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
-            Self::U32(v) => Some(*v), Self::I32(v) => Some(*v as u32),
-            Self::U64(v) => Some(*v as u32), Self::I64(v) => Some(*v as u32),
-            Self::U8(v) => Some(*v as u32), Self::U16(v) => Some(*v as u32),
+            Self::U32(v) => Some(*v),
+            Self::I32(v) => Some(*v as u32),
+            Self::U64(v) => Some(*v as u32),
+            Self::I64(v) => Some(*v as u32),
+            Self::U8(v) => Some(*v as u32),
+            Self::U16(v) => Some(*v as u32),
             _ => None,
         }
     }
 
     pub fn as_f32(&self) -> Option<f32> {
         match self {
-            Self::F32(v) => Some(*v), Self::F64(v) => Some(*v as f32),
+            Self::F32(v) => Some(*v),
+            Self::F64(v) => Some(*v as f32),
             _ => None,
         }
     }
 
     pub fn as_str(&self) -> Option<&str> {
-        match self { Self::Str(s) => Some(s), _ => None }
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn as_string_array(&self) -> Option<Vec<String>> {
         match self {
-            Self::Array(arr) => {
-                Some(arr.iter().filter_map(|v| {
-                    if let Self::Str(s) = v { Some(s.clone()) } else { None }
-                }).collect())
-            }
+            Self::Array(arr) => Some(
+                arr.iter()
+                    .filter_map(|v| {
+                        if let Self::Str(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            ),
             _ => None,
         }
     }
 
     pub fn as_f32_array(&self) -> Option<Vec<f32>> {
         match self {
-            Self::Array(arr) => {
-                Some(arr.iter().filter_map(|v| v.as_f32()).collect())
-            }
+            Self::Array(arr) => Some(arr.iter().filter_map(|v| v.as_f32()).collect()),
             _ => None,
         }
     }
@@ -136,7 +165,7 @@ pub struct TensorInfo {
     pub name: String,
     pub dims: Vec<u64>,
     pub dtype: GGMLType,
-    pub offset: u64,  // offset from tensor data start
+    pub offset: u64, // offset from tensor data start
 }
 
 impl TensorInfo {
@@ -152,7 +181,9 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
 
     fn read_u8(&mut self) -> u8 {
         let v = self.data[self.pos];
@@ -200,7 +231,9 @@ impl<'a> Cursor<'a> {
         self.pos += len;
         s
     }
-    fn read_bool(&mut self) -> bool { self.read_u8() != 0 }
+    fn read_bool(&mut self) -> bool {
+        self.read_u8() != 0
+    }
 
     fn read_value(&mut self, vtype: u32) -> MetaValue {
         match vtype {
@@ -217,7 +250,9 @@ impl<'a> Cursor<'a> {
                 let elem_type = self.read_u32();
                 let count = self.read_u64() as usize;
                 let mut arr = Vec::with_capacity(count);
-                for _ in 0..count { arr.push(self.read_value(elem_type)); }
+                for _ in 0..count {
+                    arr.push(self.read_value(elem_type));
+                }
                 MetaValue::Array(arr)
             }
             10 => MetaValue::U64(self.read_u64()),
@@ -232,7 +267,7 @@ impl<'a> Cursor<'a> {
 pub struct GGUFFile {
     pub metadata: HashMap<String, MetaValue>,
     pub tensors: Vec<TensorInfo>,
-    pub data_offset: usize,  // byte offset where tensor data begins
+    pub data_offset: usize, // byte offset where tensor data begins
 }
 
 impl GGUFFile {
@@ -245,7 +280,12 @@ impl GGUFFile {
         }
         let magic_bytes = &data[0..4];
         if magic_bytes != b"GGUF" {
-            let v = u32::from_le_bytes([magic_bytes[0], magic_bytes[1], magic_bytes[2], magic_bytes[3]]);
+            let v = u32::from_le_bytes([
+                magic_bytes[0],
+                magic_bytes[1],
+                magic_bytes[2],
+                magic_bytes[3],
+            ]);
             return Err(format!("Invalid GGUF magic: 0x{:08X}", v));
         }
         // advance cursor past magic
@@ -255,7 +295,10 @@ impl GGUFFile {
         let n_tensors = c.read_u64() as usize;
         let n_kv = c.read_u64() as usize;
 
-        eprintln!("GGUF v{} — {} tensors, {} metadata entries", version, n_tensors, n_kv);
+        eprintln!(
+            "GGUF v{} — {} tensors, {} metadata entries",
+            version, n_tensors, n_kv
+        );
 
         // Parse metadata
         let mut metadata = HashMap::with_capacity(n_kv);
@@ -272,10 +315,17 @@ impl GGUFFile {
             let name = c.read_string();
             let n_dims = c.read_u32();
             let mut dims = Vec::with_capacity(n_dims as usize);
-            for _ in 0..n_dims { dims.push(c.read_u64()); }
+            for _ in 0..n_dims {
+                dims.push(c.read_u64());
+            }
             let dtype = GGMLType::from(c.read_u32());
             let offset = c.read_u64();
-            tensors.push(TensorInfo { name, dims, dtype, offset });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                dtype,
+                offset,
+            });
         }
 
         // Tensor data is aligned to 32 bytes after the header
@@ -285,15 +335,25 @@ impl GGUFFile {
             .unwrap_or(32) as usize;
         let data_offset = (c.pos + alignment - 1) / alignment * alignment;
 
-        Ok(Self { metadata, tensors, data_offset })
+        Ok(Self {
+            metadata,
+            tensors,
+            data_offset,
+        })
     }
 
     pub fn get_u32(&self, key: &str, default: u32) -> u32 {
-        self.metadata.get(key).and_then(|v| v.as_u32()).unwrap_or(default)
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_u32())
+            .unwrap_or(default)
     }
 
     pub fn get_f32(&self, key: &str, default: f32) -> f32 {
-        self.metadata.get(key).and_then(|v| v.as_f32()).unwrap_or(default)
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_f32())
+            .unwrap_or(default)
     }
 
     pub fn get_str(&self, key: &str) -> Option<&str> {

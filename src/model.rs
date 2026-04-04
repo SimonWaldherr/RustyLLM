@@ -4,9 +4,11 @@
 // The SIMD kernels do fused dequant+dot, avoiding intermediate f32 buffers.
 // Only normalization weights and embeddings are stored as f32.
 
-use std::collections::HashMap;
-use crate::gguf::{GGUFFile, GGMLType};
+use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
+use std::collections::HashMap;
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -82,11 +84,56 @@ impl Config {
 
 // ─── Weight storage: either f32 Vec or raw quantized bytes (zero-copy) ───────
 
+
+// ─── Weight storage: either f32 Vec or raw quantized bytes (zero-copy) ───────
+
+pub enum RawTensorData {
+    Owned(Vec<u8>),
+    View { ptr: *const u8, len: usize },
+}
+
+impl Clone for RawTensorData {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Owned(data) => Self::Owned(data.clone()),
+            Self::View { ptr, len } => Self::View {
+                ptr: *ptr,
+                len: *len,
+            },
+        }
+    }
+}
+
+// SAFETY: Raw tensor data is immutable after model load. `View` points into an
+// mmap kept alive by the owning `Runner`, so cross-thread reads are safe.
+unsafe impl Send for RawTensorData {}
+unsafe impl Sync for RawTensorData {}
+
+impl RawTensorData {
+    fn owned(data: &[u8]) -> Self {
+        Self::Owned(data.to_vec())
+    }
+
+    fn view(data: &[u8]) -> Self {
+        Self::View {
+            ptr: data.as_ptr(),
+            len: data.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(data) => data,
+            Self::View { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum Weight {
     F32(Vec<f32>),
     Quantized {
-        data: Vec<u8>,   // owned copy (from mmap slice)
+        data: RawTensorData,
         dtype: GGMLType,
         rows: usize,
         cols: usize,
@@ -102,13 +149,48 @@ impl Weight {
                 let rows = data.len() / cols;
                 simd::matvec_f32(data, x, rows, cols)
             }
-            Weight::Quantized { data, dtype, rows, cols } => {
+            Weight::Quantized {
+                data,
+                dtype,
+                rows,
+                cols,
+            } => {
+                let data = data.as_slice();
                 match dtype {
                     GGMLType::Q8_0 => simd::matvec_q8_0(data, x, *rows, *cols),
                     GGMLType::Q4_0 => simd::matvec_q4_0(data, x, *rows, *cols),
                     GGMLType::Q4_K => simd::matvec_q4_k(data, x, *rows, *cols),
                     GGMLType::Q6_K => simd::matvec_q6_k(data, x, *rows, *cols),
                     GGMLType::MXFP4 => simd::matvec_mxfp4(data, x, *rows, *cols),
+                    _ => panic!("Unsupported quantized matvec: {:?}", dtype),
+                }
+            }
+        }
+    }
+
+    /// Matrix-vector multiply, writing into a pre-allocated output buffer.
+    pub fn matvec_into(&self, x: &[f32], out: &mut Vec<f32>) {
+        match self {
+            Weight::F32(data) => {
+                let cols = x.len();
+                let rows = data.len() / cols;
+                out.resize(rows, 0.0);
+                simd::matvec_f32_into(data, x, rows, cols, out);
+            }
+            Weight::Quantized {
+                data,
+                dtype,
+                rows,
+                cols,
+            } => {
+                let data = data.as_slice();
+                out.resize(*rows, 0.0);
+                match dtype {
+                    GGMLType::Q8_0 => simd::matvec_q8_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q4_0 => simd::matvec_q4_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q4_K => simd::matvec_q4_k_into(data, x, *rows, *cols, out),
+                    GGMLType::Q6_K => simd::matvec_q6_k_into(data, x, *rows, *cols, out),
+                    GGMLType::MXFP4 => simd::matvec_mxfp4_into(data, x, *rows, *cols, out),
                     _ => panic!("Unsupported quantized matvec: {:?}", dtype),
                 }
             }
@@ -122,7 +204,13 @@ impl Weight {
                 let start = row * cols;
                 data[start..start + cols].to_vec()
             }
-            Weight::Quantized { data, dtype, rows, cols: qcols } => {
+            Weight::Quantized {
+                data,
+                dtype,
+                rows,
+                cols: qcols,
+            } => {
+                let data = data.as_slice();
                 assert_eq!(*qcols, cols, "row(): column mismatch");
                 assert!(row < *rows, "row(): row out of bounds");
                 match dtype {
@@ -165,9 +253,9 @@ pub struct LayerWeights {
     pub bv: Vec<f32>,
     pub wo: Weight,
     pub ffn_norm: Vec<f32>,
-    pub w1: Weight,  // gate
-    pub w2: Weight,  // down
-    pub w3: Weight,  // up
+    pub w1: Weight, // gate
+    pub w2: Weight, // down
+    pub w3: Weight, // up
 }
 
 pub struct ModelWeights {
@@ -178,7 +266,7 @@ pub struct ModelWeights {
 }
 
 pub struct ExpertWeight {
-    pub data: Vec<u8>,
+    pub data: RawTensorData,
     pub dtype: GGMLType,
     pub experts: usize,
     pub rows: usize,
@@ -188,12 +276,13 @@ pub struct ExpertWeight {
 impl ExpertWeight {
     pub fn matvec_expert(&self, expert: usize, x: &[f32]) -> Vec<f32> {
         assert!(expert < self.experts, "expert index out of bounds");
+        let data = self.data.as_slice();
         match self.dtype {
             GGMLType::MXFP4 => {
                 let row_bytes = (self.cols / 32) * 17;
                 let expert_bytes = self.rows * row_bytes;
                 let start = expert * expert_bytes;
-                simd::matvec_mxfp4(&self.data[start..start + expert_bytes], x, self.rows, self.cols)
+                simd::matvec_mxfp4(&data[start..start + expert_bytes], x, self.rows, self.cols)
             }
             _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
         }
@@ -232,15 +321,54 @@ pub struct GptOssWeights {
 // ─── KV Cache ────────────────────────────────────────────────────────────────
 
 pub struct KVCache {
-    pub k: Vec<Vec<f32>>,  // [layer][pos * kv_dim .. (pos+1) * kv_dim]
+    pub k: Vec<Vec<f32>>, // [layer][pos * per_pos_k_dim ..]
     pub v: Vec<Vec<f32>>,
+    pub per_pos_k_dim: usize,
+    pub per_pos_v_dim: usize,
+    pub max_len: usize,
 }
 
 impl KVCache {
-    pub fn new(n_layers: usize, kv_dim: usize, max_len: usize) -> Self {
+    pub fn new(n_layers: usize, per_pos_k_dim: usize, per_pos_v_dim: usize, max_len: usize) -> Self {
         Self {
-            k: vec![vec![0.0; max_len * kv_dim]; n_layers],
-            v: vec![vec![0.0; max_len * kv_dim]; n_layers],
+            k: vec![vec![0.0; max_len * per_pos_k_dim]; n_layers],
+            v: vec![vec![0.0; max_len * per_pos_v_dim]; n_layers],
+            per_pos_k_dim,
+            per_pos_v_dim,
+            max_len,
+        }
+    }
+}
+
+// ─── Per-token decode scratch buffers (reused across tokens) ─────────────────
+
+/// Pre-allocated working memory for a single forward pass.
+/// Eliminates per-token heap allocations in the hot decode loop.
+pub struct DecodeBuffer {
+    pub xn: Vec<f32>,       // rms-normed residual (dim)
+    pub xn2: Vec<f32>,      // second rms norm (dim)
+    pub q: Vec<f32>,        // query (n_heads * head_dim)
+    pub k: Vec<f32>,        // key   (n_kv_heads * head_dim)
+    pub v: Vec<f32>,        // value (n_kv_heads * value_dim)
+    pub attn_out: Vec<f32>, // attention output (n_heads * value_dim)
+    pub hidden: Vec<f32>,   // FFN hidden (hidden_dim)
+}
+
+impl DecodeBuffer {
+    pub fn new(
+        config: &Config,
+        max_head_dim: usize,
+        max_n_kv_heads: usize,
+        max_value_dim: usize,
+    ) -> Self {
+        Self {
+            xn: vec![0.0; config.dim],
+            xn2: vec![0.0; config.dim],
+            q: vec![0.0; config.n_heads * max_head_dim],
+            k: vec![0.0; max_n_kv_heads * max_head_dim],
+            v: vec![0.0; max_n_kv_heads * max_value_dim],
+            attn_out: vec![0.0; config.n_heads * max_value_dim],
+            hidden: vec![0.0; config.hidden_dim],
         }
     }
 }
@@ -258,17 +386,30 @@ fn load_weight(
     tensors: &HashMap<String, &crate::gguf::TensorInfo>,
     inferred_sizes: &HashMap<String, usize>,
     force_f32: bool,
+    borrow_quantized: bool,
 ) -> Weight {
-    let info = tensors.get(name).unwrap_or_else(|| panic!("Missing tensor: {}", name));
+    let info = tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("Missing tensor: {}", name));
     let numel = info.numel();
     let mut byte_size = info
         .dtype
         .data_size(numel)
         .or_else(|| inferred_sizes.get(name).copied())
-        .unwrap_or_else(|| panic!("Unsupported tensor type/size for {}: {:?}", name, info.dtype));
+        .unwrap_or_else(|| {
+            panic!(
+                "Unsupported tensor type/size for {}: {:?}",
+                name, info.dtype
+            )
+        });
     let offset = data_offset + info.offset as usize;
 
-    if offset.checked_add(byte_size).map(|end| end <= mmap_data.len()).unwrap_or(false) == false {
+    if offset
+        .checked_add(byte_size)
+        .map(|end| end <= mmap_data.len())
+        .unwrap_or(false)
+        == false
+    {
         if let Some(&inferred) = inferred_sizes.get(name) {
             byte_size = inferred;
         } else {
@@ -312,27 +453,36 @@ fn load_weight(
         raw_slice
     };
 
+    // Treat Q5 variants as needing dequantization into f32 for now
+    // (SIMD kernels for Q5 aren't implemented yet).
+    let effective_force_f32 = force_f32 || matches!(info.dtype, GGMLType::Q5_0 | GGMLType::Q5_1);
+
     match info.dtype {
         GGMLType::F32 => {
             let mut data = vec![0.0f32; numel];
             for i in 0..numel {
                 data[i] = f32::from_le_bytes([
-                    raw_view[i * 4], raw_view[i * 4 + 1], raw_view[i * 4 + 2], raw_view[i * 4 + 3],
+                    raw_view[i * 4],
+                    raw_view[i * 4 + 1],
+                    raw_view[i * 4 + 2],
+                    raw_view[i * 4 + 3],
                 ]);
             }
             Weight::F32(data)
         }
-        GGMLType::F16 if force_f32 => {
+        GGMLType::F16 if effective_force_f32 => {
             let mut data = vec![0.0f32; numel];
             for i in 0..numel {
-                data[i] = simd::f16_to_f32(u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]));
+                data[i] =
+                    simd::f16_to_f32(u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]));
             }
             Weight::F32(data)
         }
         GGMLType::F16 => {
             let mut data = vec![0.0f32; numel];
             for i in 0..numel {
-                data[i] = simd::f16_to_f32(u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]));
+                data[i] =
+                    simd::f16_to_f32(u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]));
             }
             Weight::F32(data)
         }
@@ -345,9 +495,13 @@ fn load_weight(
         | GGMLType::Q4_1
         | GGMLType::Q5_0
         | GGMLType::Q5_1 => {
-            if force_f32 {
+            if effective_force_f32 {
                 if matches!(info.dtype, GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::MXFP4) {
-                    panic!("{} force_f32 dequantization not implemented for {}", format!("{:?}", info.dtype), name);
+                    panic!(
+                        "{} force_f32 dequantization not implemented for {}",
+                        format!("{:?}", info.dtype),
+                        name
+                    );
                 }
                 // Dequantize into f32 vector
                 let mut data_f = vec![0.0f32; numel];
@@ -359,7 +513,10 @@ fn load_weight(
                     let n_blocks = numel / 32;
                     for b in 0..n_blocks {
                         let base = b * block_size;
-                        let scale = simd::f16_to_f32(u16::from_le_bytes([raw_view[base], raw_view[base + 1]]));
+                        let scale = simd::f16_to_f32(u16::from_le_bytes([
+                            raw_view[base],
+                            raw_view[base + 1],
+                        ]));
                         for i in 0..32 {
                             data_f[b * 32 + i] = scale * (raw_view[base + 2 + i] as i8) as f32;
                         }
@@ -370,7 +527,10 @@ fn load_weight(
                     let n_blocks = numel / 32;
                     for b in 0..n_blocks {
                         let base = b * block_size;
-                        let scale = simd::f16_to_f32(u16::from_le_bytes([raw_view[base], raw_view[base + 1]]));
+                        let scale = simd::f16_to_f32(u16::from_le_bytes([
+                            raw_view[base],
+                            raw_view[base + 1],
+                        ]));
                         for i in 0..16 {
                             let byte = raw_view[base + 2 + i];
                             let lo = ((byte & 0x0F) as i32 - 8) as f32;
@@ -383,10 +543,18 @@ fn load_weight(
                 Weight::F32(data_f)
             } else {
                 // Keep quantized — use fused SIMD dot products
-                let rows = if info.dims.len() >= 2 { info.dims[1] as usize } else { 1 };
+                let rows = if info.dims.len() >= 2 {
+                    info.dims[1] as usize
+                } else {
+                    1
+                };
                 let cols = info.dims[0] as usize;
                 Weight::Quantized {
-                    data: raw_view.to_vec(),
+                    data: if borrow_quantized && available >= byte_size {
+                        RawTensorData::view(raw_slice)
+                    } else {
+                        RawTensorData::owned(raw_view)
+                    },
                     dtype: info.dtype,
                     rows,
                     cols,
@@ -405,7 +573,15 @@ fn load_f32_vec(
     tensors: &HashMap<String, &crate::gguf::TensorInfo>,
     inferred_sizes: &HashMap<String, usize>,
 ) -> Vec<f32> {
-    match load_weight(mmap_data, data_offset, name, tensors, inferred_sizes, true) {
+    match load_weight(
+        mmap_data,
+        data_offset,
+        name,
+        tensors,
+        inferred_sizes,
+        true,
+        false,
+    ) {
         Weight::F32(v) => v,
         _ => panic!("Expected f32 for {}", name),
     }
@@ -432,19 +608,35 @@ fn load_expert_weight(
     name: &str,
     tensors: &HashMap<String, &crate::gguf::TensorInfo>,
     inferred_sizes: &HashMap<String, usize>,
+    borrow_quantized: bool,
 ) -> ExpertWeight {
-    let info = tensors.get(name).unwrap_or_else(|| panic!("Missing tensor: {}", name));
-    assert!(info.dims.len() == 3, "Expected 3D expert tensor for {}", name);
+    let info = tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("Missing tensor: {}", name));
+    assert!(
+        info.dims.len() == 3,
+        "Expected 3D expert tensor for {}",
+        name
+    );
     let numel = info.numel();
     let byte_size = info
         .dtype
         .data_size(numel)
         .or_else(|| inferred_sizes.get(name).copied())
-        .unwrap_or_else(|| panic!("Unsupported expert tensor type/size for {}: {:?}", name, info.dtype));
+        .unwrap_or_else(|| {
+            panic!(
+                "Unsupported expert tensor type/size for {}: {:?}",
+                name, info.dtype
+            )
+        });
     let offset = data_offset + info.offset as usize;
     let raw = &mmap_data[offset..offset + byte_size];
     ExpertWeight {
-        data: raw.to_vec(),
+        data: if borrow_quantized {
+            RawTensorData::view(raw)
+        } else {
+            RawTensorData::owned(raw)
+        },
         dtype: info.dtype,
         experts: info.dims[2] as usize,
         rows: info.dims[1] as usize,
@@ -452,11 +644,22 @@ fn load_expert_weight(
     }
 }
 
-pub fn load_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, ModelWeights) {
-    let config = Config::from_gguf(gguf);
-    eprintln!("Config: dim={}, layers={}, heads={}/{}, hidden={}, vocab={}, ctx={}",
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads,
-        config.hidden_dim, config.vocab_size, config.max_seq_len);
+pub fn load_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, ModelWeights) {
+    let mut config = Config::from_gguf(gguf);
+    eprintln!(
+        "Config: dim={}, layers={}, heads={}/{}, hidden={}, vocab={}, ctx={}",
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.hidden_dim,
+        config.vocab_size,
+        config.max_seq_len
+    );
 
     // Index tensors by name
     let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> =
@@ -473,61 +676,234 @@ pub fn load_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, ModelWeights) {
     if !gguf.tensors.is_empty() {
         let mmap_len = mmap_data.len();
         // Build sorted list of (offset, idx)
-        let mut offs: Vec<(u64, usize)> = gguf.tensors.iter().enumerate().map(|(i, t)| (t.offset as u64, i)).collect();
+        let mut offs: Vec<(u64, usize)> = gguf
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.offset as u64, i))
+            .collect();
         offs.sort_unstable_by_key(|o| o.0);
 
         for w in 0..offs.len() {
             let (off, _idx) = offs[w];
-            let next_off = if w + 1 < offs.len() { offs[w + 1].0 } else { (mmap_len as u64).saturating_sub(data_offset as u64) };
-            let byte_size = if next_off > off { (next_off - off) as usize } else { 0 };
-            // Map tensor name to inferred byte_size
+            let next_off = if w + 1 < offs.len() {
+                offs[w + 1].0
+            } else {
+                (mmap_len as u64).saturating_sub(data_offset as u64)
+            };
+            let byte_size = if next_off > off {
+                (next_off - off) as usize
+            } else {
+                0
+            };
+            // Some quantized layouts do not match a simple dtype*numel formula,
+            // so neighboring offsets are the most reliable fallback.
             let idx = _idx as usize;
             let name = &gguf.tensors[idx].name;
             inferred_sizes.insert(name.clone(), byte_size);
             let end = data_offset as usize + off as usize + byte_size;
-            if end > max_required_end { max_required_end = end; }
+            if end > max_required_end {
+                max_required_end = end;
+            }
         }
     }
     // Embeddings can be quantized; keep native format and dequantize selected rows on demand.
-    let token_embd = load_weight(mmap_data, data_offset, "token_embd.weight", &tensor_idx, &inferred_sizes, false);
-    let output_norm = load_f32_vec(mmap_data, data_offset, "output_norm.weight", &tensor_idx, &inferred_sizes);
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output_norm = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "output_norm.weight",
+        &tensor_idx,
+        &inferred_sizes,
+    );
 
     // Output projection (may be tied)
     let output = if tensor_idx.contains_key("output.weight") {
-        load_weight(mmap_data, data_offset, "output.weight", &tensor_idx, &inferred_sizes, false)
+        load_weight(
+            mmap_data,
+            data_offset,
+            "output.weight",
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        )
     } else {
         eprintln!("Note: output tied to embeddings");
         token_embd.clone()
     };
 
+    // Infer attention head/value dimensions from tensor shapes when GGUF
+    // metadata appears inconsistent. We examine available blk.* attn_q/attn_v
+    // tensors and prefer derived shapes over possibly-misleading metadata.
+    {
+        let mut head_dim_cand: Option<usize> = None;
+        let mut value_dim_cand: Option<usize> = None;
+        for l in 0..config.n_layers {
+            let qn = format!("blk.{}.attn_q.weight", l);
+            if let Some(info) = tensor_idx.get(&qn) {
+                if info.dims.len() >= 2 {
+                    let rows = info.dims[1] as usize;
+                    let cols = info.dims[0] as usize;
+                    if cols == config.dim && rows % config.n_heads == 0 {
+                        head_dim_cand = Some(rows / config.n_heads);
+                    }
+                }
+            }
+            let vn = format!("blk.{}.attn_v.weight", l);
+            if let Some(info) = tensor_idx.get(&vn) {
+                if info.dims.len() >= 2 {
+                    let rows = info.dims[1] as usize;
+                    let cols = info.dims[0] as usize;
+                    if cols == config.dim && rows % config.n_kv_heads == 0 {
+                        value_dim_cand = Some(rows / config.n_kv_heads);
+                    }
+                }
+            }
+            if head_dim_cand.is_some() && value_dim_cand.is_some() {
+                break;
+            }
+        }
+        if let Some(hd) = head_dim_cand {
+            if hd != config.head_dim {
+                eprintln!(
+                    "[INFO] Overriding config.head_dim {} -> {} based on attn_q tensor shapes",
+                    config.head_dim, hd
+                );
+                config.head_dim = hd;
+            }
+        }
+        if let Some(vd) = value_dim_cand {
+            if vd != config.value_dim {
+                eprintln!(
+                    "[INFO] Overriding config.value_dim {} -> {} based on attn_v tensor shapes",
+                    config.value_dim, vd
+                );
+                config.value_dim = vd;
+            }
+        }
+        // Recompute derived kv sizes
+        config.kv_dim = config.value_dim * config.n_kv_heads;
+        config.kv_mul = config.n_heads / config.n_kv_heads;
+        eprintln!(
+            "Adjusted config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
+            config.head_dim, config.value_dim, config.kv_dim, config.kv_mul
+        );
+    }
+
     // Layers
     let mut layers = Vec::with_capacity(config.n_layers);
     for l in 0..config.n_layers {
         let layer = LayerWeights {
-            attn_norm: load_f32_vec(mmap_data, data_offset,
-                &format!("blk.{}.attn_norm.weight", l), &tensor_idx, &inferred_sizes),
-            wq: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.attn_q.weight", l), &tensor_idx, &inferred_sizes, false),
-            bq: load_optional_f32_vec(mmap_data, data_offset,
-                &format!("blk.{}.attn_q.bias", l), &tensor_idx, &inferred_sizes, config.dim),
-            wk: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.attn_k.weight", l), &tensor_idx, &inferred_sizes, false),
-            bk: load_optional_f32_vec(mmap_data, data_offset,
-                &format!("blk.{}.attn_k.bias", l), &tensor_idx, &inferred_sizes, config.kv_dim),
-            wv: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.attn_v.weight", l), &tensor_idx, &inferred_sizes, false),
-            bv: load_optional_f32_vec(mmap_data, data_offset,
-                &format!("blk.{}.attn_v.bias", l), &tensor_idx, &inferred_sizes, config.kv_dim),
-            wo: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.attn_output.weight", l), &tensor_idx, &inferred_sizes, false),
-            ffn_norm: load_f32_vec(mmap_data, data_offset,
-                &format!("blk.{}.ffn_norm.weight", l), &tensor_idx, &inferred_sizes),
-            w1: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.ffn_gate.weight", l), &tensor_idx, &inferred_sizes, false),
-            w2: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.ffn_down.weight", l), &tensor_idx, &inferred_sizes, false),
-            w3: load_weight(mmap_data, data_offset,
-                &format!("blk.{}.ffn_up.weight", l), &tensor_idx, &inferred_sizes, false),
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wq: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bq: load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                config.dim,
+            ),
+            wk: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bk: load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                config.kv_dim,
+            ),
+            wv: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bv: load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                config.kv_dim,
+            ),
+            wo: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_output.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            ffn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            w1: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_gate.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            w2: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_down.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            w3: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_up.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
         };
         layers.push(layer);
         if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {
@@ -535,15 +911,31 @@ pub fn load_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, ModelWeights) {
         }
     }
 
-    let weights = ModelWeights { token_embd, output_norm, output, layers };
+    let weights = ModelWeights {
+        token_embd,
+        output_norm,
+        output,
+        layers,
+    };
     (config, weights)
 }
 
-pub fn load_gpt_oss_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, GptOssWeights) {
+pub fn load_gpt_oss_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, GptOssWeights) {
     let config = Config::from_gguf(gguf);
-    eprintln!("Config: dim={}, layers={}, heads={}/{}, hidden={}, vocab={}, ctx={}",
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads,
-        config.hidden_dim, config.vocab_size, config.max_seq_len);
+    eprintln!(
+        "Config: dim={}, layers={}, heads={}/{}, hidden={}, vocab={}, ctx={}",
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.hidden_dim,
+        config.vocab_size,
+        config.max_seq_len
+    );
 
     let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> =
         gguf.tensors.iter().map(|t| (t.name.clone(), t)).collect();
@@ -552,42 +944,210 @@ pub fn load_gpt_oss_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, GptOssW
     let mut inferred_sizes: HashMap<String, usize> = HashMap::new();
     if !gguf.tensors.is_empty() {
         let mmap_len = mmap_data.len();
-        let mut offs: Vec<(u64, usize)> = gguf.tensors.iter().enumerate().map(|(i, t)| (t.offset as u64, i)).collect();
+        let mut offs: Vec<(u64, usize)> = gguf
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.offset as u64, i))
+            .collect();
         offs.sort_unstable_by_key(|o| o.0);
         for w in 0..offs.len() {
             let (off, idx) = offs[w];
-            let next_off = if w + 1 < offs.len() { offs[w + 1].0 } else { (mmap_len as u64).saturating_sub(data_offset as u64) };
-            let byte_size = if next_off > off { (next_off - off) as usize } else { 0 };
+            let next_off = if w + 1 < offs.len() {
+                offs[w + 1].0
+            } else {
+                (mmap_len as u64).saturating_sub(data_offset as u64)
+            };
+            let byte_size = if next_off > off {
+                (next_off - off) as usize
+            } else {
+                0
+            };
             inferred_sizes.insert(gguf.tensors[idx].name.clone(), byte_size);
         }
     }
 
-    let token_embd = load_weight(mmap_data, data_offset, "token_embd.weight", &tensor_idx, &inferred_sizes, false);
-    let output_norm = load_f32_vec(mmap_data, data_offset, "output_norm.weight", &tensor_idx, &inferred_sizes);
-    let output = load_weight(mmap_data, data_offset, "output.weight", &tensor_idx, &inferred_sizes, false);
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output_norm = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "output_norm.weight",
+        &tensor_idx,
+        &inferred_sizes,
+    );
+    let output = load_weight(
+        mmap_data,
+        data_offset,
+        "output.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
 
     let mut layers = Vec::with_capacity(config.n_layers);
     for l in 0..config.n_layers {
         let layer = GptOssLayerWeights {
-            attn_norm: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_norm.weight", l), &tensor_idx, &inferred_sizes),
-            wq: load_weight(mmap_data, data_offset, &format!("blk.{}.attn_q.weight", l), &tensor_idx, &inferred_sizes, false),
-            bq: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_q.bias", l), &tensor_idx, &inferred_sizes),
-            wk: load_weight(mmap_data, data_offset, &format!("blk.{}.attn_k.weight", l), &tensor_idx, &inferred_sizes, false),
-            bk: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_k.bias", l), &tensor_idx, &inferred_sizes),
-            wv: load_weight(mmap_data, data_offset, &format!("blk.{}.attn_v.weight", l), &tensor_idx, &inferred_sizes, false),
-            bv: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_v.bias", l), &tensor_idx, &inferred_sizes),
-            wo: load_weight(mmap_data, data_offset, &format!("blk.{}.attn_output.weight", l), &tensor_idx, &inferred_sizes, false),
-            bo: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_output.bias", l), &tensor_idx, &inferred_sizes),
-            sinks: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.attn_sinks.weight", l), &tensor_idx, &inferred_sizes),
-            post_attn_norm: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.post_attention_norm.weight", l), &tensor_idx, &inferred_sizes),
-            gate_inp: load_weight(mmap_data, data_offset, &format!("blk.{}.ffn_gate_inp.weight", l), &tensor_idx, &inferred_sizes, false),
-            gate_inp_bias: load_f32_vec(mmap_data, data_offset, &format!("blk.{}.ffn_gate_inp.bias", l), &tensor_idx, &inferred_sizes),
-            gate_exps: load_expert_weight(mmap_data, data_offset, &format!("blk.{}.ffn_gate_exps.weight", l), &tensor_idx, &inferred_sizes),
-            gate_exps_bias: load_weight(mmap_data, data_offset, &format!("blk.{}.ffn_gate_exps.bias", l), &tensor_idx, &inferred_sizes, true),
-            up_exps: load_expert_weight(mmap_data, data_offset, &format!("blk.{}.ffn_up_exps.weight", l), &tensor_idx, &inferred_sizes),
-            up_exps_bias: load_weight(mmap_data, data_offset, &format!("blk.{}.ffn_up_exps.bias", l), &tensor_idx, &inferred_sizes, true),
-            down_exps: load_expert_weight(mmap_data, data_offset, &format!("blk.{}.ffn_down_exps.weight", l), &tensor_idx, &inferred_sizes),
-            down_exps_bias: load_weight(mmap_data, data_offset, &format!("blk.{}.ffn_down_exps.bias", l), &tensor_idx, &inferred_sizes, true),
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wq: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bq: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wk: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bk: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wv: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bv: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wo: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_output.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            bo: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_output.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            sinks: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_sinks.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            post_attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.post_attention_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            gate_inp: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_gate_inp.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            gate_inp_bias: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_gate_inp.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            gate_exps: load_expert_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_gate_exps.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                borrow_quantized,
+            ),
+            gate_exps_bias: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_gate_exps.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                true,
+                false,
+            ),
+            up_exps: load_expert_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_up_exps.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                borrow_quantized,
+            ),
+            up_exps_bias: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_up_exps.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                true,
+                false,
+            ),
+            down_exps: load_expert_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_down_exps.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                borrow_quantized,
+            ),
+            down_exps_bias: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_down_exps.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                true,
+                false,
+            ),
         };
         layers.push(layer);
         if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {
@@ -595,7 +1155,12 @@ pub fn load_gpt_oss_model(mmap_data: &[u8], gguf: &GGUFFile) -> (Config, GptOssW
         }
     }
 
-    let weights = GptOssWeights { token_embd, output_norm, output, layers };
+    let weights = GptOssWeights {
+        token_embd,
+        output_norm,
+        output,
+        layers,
+    };
     (config, weights)
 }
 
@@ -607,7 +1172,22 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
     let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
     let scale = 1.0 / (ss + eps).sqrt();
-    x.iter().zip(weight).map(|(xi, wi)| xi * scale * wi).collect()
+    x.iter()
+        .zip(weight)
+        .map(|(xi, wi)| xi * scale * wi)
+        .collect()
+}
+
+/// RMS Normalization writing into a pre-allocated output buffer.
+#[inline]
+fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
+    let n = x.len();
+    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let scale = 1.0 / (ss + eps).sqrt();
+    out.resize(n, 0.0);
+    for i in 0..n {
+        out[i] = x[i] * scale * weight[i];
+    }
 }
 
 /// Apply RoPE to q/k vectors
@@ -615,30 +1195,124 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta: f32) {
     for h in 0..n_heads {
         let off = h * head_dim;
-        for i in (0..head_dim).step_by(2) {
+        let last = head_dim - (head_dim % 2);
+        for i in (0..last).step_by(2) {
+            let idx0 = off + i;
+            let idx1 = off + i + 1;
+            if idx1 >= vec.len() {
+                break;
+            }
             let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
             let angle = pos as f32 * freq;
             let (sin_a, cos_a) = angle.sin_cos();
-            let v0 = vec[off + i];
-            let v1 = vec[off + i + 1];
-            vec[off + i] = v0 * cos_a - v1 * sin_a;
-            vec[off + i + 1] = v0 * sin_a + v1 * cos_a;
+            let v0 = vec[idx0];
+            let v1 = vec[idx1];
+            vec[idx0] = v0 * cos_a - v1 * sin_a;
+            vec[idx1] = v0 * sin_a + v1 * cos_a;
         }
     }
 }
 
-/// Softmax in-place
 #[inline]
-fn softmax(x: &mut [f32]) {
-    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
+fn online_attention_with_sink(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    sink_score: f32,
+    out: &mut [f32],
+) {
+    let mut max_score = sink_score;
+    let mut denom = 1.0f32;
+
+    for t in start_t..=end_t {
+        let k_off = t * key_stride;
+        let score = simd::dot_f32(query, &keys[k_off..k_off + key_head_dim]) * scale;
+        let v_off = t * value_stride;
+        let value_row = &values[v_off..v_off + value_head_dim];
+
+        if score > max_score {
+            let old_scale = if max_score.is_finite() {
+                (max_score - score).exp()
+            } else {
+                0.0
+            };
+            for d in 0..value_head_dim {
+                out[d] = out[d] * old_scale + value_row[d];
+            }
+            denom = denom * old_scale + 1.0;
+            max_score = score;
+        } else {
+            let weight = (score - max_score).exp();
+            for d in 0..value_head_dim {
+                out[d] += weight * value_row[d];
+            }
+            denom += weight;
+        }
     }
-    let inv_sum = 1.0 / sum;
-    for v in x.iter_mut() {
-        *v *= inv_sum;
+
+    if denom > 0.0 {
+        let inv = 1.0 / denom;
+        for value in out.iter_mut() {
+            *value *= inv;
+        }
+    }
+}
+
+#[inline]
+fn online_attention(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let mut max_score = f32::NEG_INFINITY;
+    let mut denom = 0.0f32;
+
+    for t in start_t..=end_t {
+        let k_off = t * key_stride;
+        let score = simd::dot_f32(query, &keys[k_off..k_off + key_head_dim]) * scale;
+        let v_off = t * value_stride;
+        let value_row = &values[v_off..v_off + value_head_dim];
+
+        if score > max_score {
+            let old_scale = if max_score.is_finite() {
+                (max_score - score).exp()
+            } else {
+                0.0
+            };
+            for d in 0..value_head_dim {
+                out[d] = out[d] * old_scale + value_row[d];
+            }
+            denom = denom * old_scale + 1.0;
+            max_score = score;
+        } else {
+            let weight = (score - max_score).exp();
+            for d in 0..value_head_dim {
+                out[d] += weight * value_row[d];
+            }
+            denom += weight;
+        }
+    }
+
+    if denom > 0.0 {
+        let inv = 1.0 / denom;
+        for value in out.iter_mut() {
+            *value *= inv;
+        }
     }
 }
 
@@ -661,10 +1335,12 @@ fn apply_rope_gpt_oss(q: &mut [f32], k: &mut [f32], pos: usize, config: &Config)
     let mut high = 0.0f32;
     if config.rope_scaling_factor > 1.0 {
         low = d_half
-            * ((config.rope_original_context_length as f32 / (32.0 * 2.0 * std::f32::consts::PI)).ln()
+            * ((config.rope_original_context_length as f32 / (32.0 * 2.0 * std::f32::consts::PI))
+                .ln()
                 / config.rope_theta.ln());
         high = d_half
-            * ((config.rope_original_context_length as f32 / (1.0 * 2.0 * std::f32::consts::PI)).ln()
+            * ((config.rope_original_context_length as f32 / (1.0 * 2.0 * std::f32::consts::PI))
+                .ln()
                 / config.rope_theta.ln());
     }
 
@@ -706,7 +1382,10 @@ fn apply_rope_gpt_oss(q: &mut [f32], k: &mut [f32], pos: usize, config: &Config)
 }
 
 fn softmax_selected(values: &[(usize, f32)]) -> Vec<f32> {
-    let max = values.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+    let max = values
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = values.iter().map(|(_, v)| (*v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.into_iter().map(|v| v / sum).collect()
@@ -728,16 +1407,25 @@ pub fn forward_gpt_oss(
         let mut q = layer.wq.matvec(&xn);
         let mut k = layer.wk.matvec(&xn);
         let v = layer.wv.matvec(&xn);
-        for i in 0..q.len() { q[i] += layer.bq[i]; }
-        for i in 0..k.len() { k[i] += layer.bk[i]; }
+        for i in 0..q.len() {
+            q[i] += layer.bq[i];
+        }
+        for i in 0..k.len() {
+            k[i] += layer.bk[i];
+        }
         let mut v = v;
-        for i in 0..v.len() { v[i] += layer.bv[i]; }
+        for i in 0..v.len() {
+            v[i] += layer.bv[i];
+        }
 
         apply_rope_gpt_oss(&mut q, &mut k, pos, config);
 
-        let kv_start = pos * config.kv_dim;
-        cache.k[l][kv_start..kv_start + config.n_kv_heads * config.head_dim].copy_from_slice(&k);
-        cache.v[l][kv_start..kv_start + config.n_kv_heads * config.value_dim].copy_from_slice(&v);
+        let kv_k_dim = cache.per_pos_k_dim;
+        let kv_v_dim = cache.per_pos_v_dim;
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        cache.k[l][kv_k_start..kv_k_start + k.len()].copy_from_slice(&k);
+        cache.v[l][kv_v_start..kv_v_start + v.len()].copy_from_slice(&v);
 
         let mut attn_out = vec![0.0f32; config.n_heads * config.value_dim];
         let scale = 1.0 / (config.head_dim as f32).sqrt();
@@ -750,51 +1438,44 @@ pub fn forward_gpt_oss(
         for h in 0..config.n_heads {
             let kv_h = h / config.kv_mul;
             let q_off = h * config.head_dim;
-
-            let mut max_score = layer.sinks[h];
-            let mut scores = Vec::with_capacity(pos - attn_window + 1);
-            for t in attn_window..=pos {
-                let k_off = t * config.kv_dim + kv_h * config.head_dim;
-                let score = simd::dot_f32(
-                    &q[q_off..q_off + config.head_dim],
-                    &cache.k[l][k_off..k_off + config.head_dim],
-                ) * scale;
-                if score > max_score { max_score = score; }
-                scores.push((t, score));
-            }
-
-            let sink_exp = (layer.sinks[h] - max_score).exp();
-            let mut denom = sink_exp;
-            let mut probs = Vec::with_capacity(scores.len());
-            for &(t, s) in &scores {
-                let p = (s - max_score).exp();
-                denom += p;
-                probs.push((t, p));
-            }
-            let inv = 1.0 / denom;
             let out_off = h * config.value_dim;
-            for (t, p) in probs {
-                let v_off = t * config.kv_dim + kv_h * config.value_dim;
-                let p = p * inv;
-                for d in 0..config.value_dim {
-                    attn_out[out_off + d] += p * cache.v[l][v_off + d];
-                }
-            }
+            online_attention_with_sink(
+                &q[q_off..q_off + config.head_dim],
+                &cache.k[l][kv_h * config.head_dim..],
+                &cache.v[l][kv_h * config.value_dim..],
+                kv_k_dim,
+                kv_v_dim,
+                config.head_dim,
+                config.value_dim,
+                attn_window,
+                pos,
+                scale,
+                layer.sinks[h],
+                &mut attn_out[out_off..out_off + config.value_dim],
+            );
         }
 
         let mut attn_proj = layer.wo.matvec(&attn_out);
-        for i in 0..attn_proj.len() { attn_proj[i] += layer.bo[i]; }
-        for i in 0..config.dim { x[i] += attn_proj[i]; }
+        for i in 0..attn_proj.len() {
+            attn_proj[i] += layer.bo[i];
+        }
+        for i in 0..config.dim {
+            x[i] += attn_proj[i];
+        }
 
         let xn2 = rms_norm(&x, &layer.post_attn_norm, config.rms_norm_eps);
         let mut gate_logits = layer.gate_inp.matvec(&xn2);
-        for i in 0..gate_logits.len() { gate_logits[i] += layer.gate_inp_bias[i]; }
+        for i in 0..gate_logits.len() {
+            gate_logits[i] += layer.gate_inp_bias[i];
+        }
 
         let mut top: Vec<(usize, f32)> = gate_logits.iter().copied().enumerate().collect();
         top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         top.truncate(config.expert_used_count);
         let expert_probs = softmax_selected(&top);
 
+        // Evaluate only the routed experts, then accumulate their weighted
+        // contributions back into the residual stream.
         let mut moe_sum = vec![0.0f32; config.dim];
         for ((expert_idx, _), expert_prob) in top.into_iter().zip(expert_probs.into_iter()) {
             let gate_bias = layer.gate_exps_bias.row(expert_idx, config.hidden_dim);
@@ -816,7 +1497,9 @@ pub fn forward_gpt_oss(
             }
         }
 
-        for i in 0..config.dim { x[i] += moe_sum[i]; }
+        for i in 0..config.dim {
+            x[i] += moe_sum[i];
+        }
     }
 
     let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
@@ -828,12 +1511,13 @@ pub fn forward(
     config: &Config,
     weights: &ModelWeights,
     cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
     let dim = config.dim;
     let head_dim = config.head_dim;
-    let kv_dim = config.kv_dim;
+    let _kv_dim = config.kv_dim;
     let kv_mul = config.kv_mul;
 
     // Token embedding
@@ -843,73 +1527,894 @@ pub fn forward(
         let layer = &weights.layers[l];
 
         // ── Attention ──
-        let xn = rms_norm(&x, &layer.attn_norm, config.rms_norm_eps);
+        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        let mut q = layer.wq.matvec(&xn);
-        let mut k = layer.wk.matvec(&xn);
-        let mut v = layer.wv.matvec(&xn);
+        layer.wq.matvec_into(&buf.xn, &mut buf.q);
+        layer.wk.matvec_into(&buf.xn, &mut buf.k);
+        layer.wv.matvec_into(&buf.xn, &mut buf.v);
 
-        for i in 0..q.len() { q[i] += layer.bq[i]; }
-        for i in 0..k.len() { k[i] += layer.bk[i]; }
-        for i in 0..v.len() { v[i] += layer.bv[i]; }
+        for i in 0..buf.q.len() {
+            buf.q[i] += layer.bq[i];
+        }
+        for i in 0..buf.k.len() {
+            buf.k[i] += layer.bk[i];
+        }
+        for i in 0..buf.v.len() {
+            buf.v[i] += layer.bv[i];
+        }
 
-        apply_rope(&mut q, pos, head_dim, config.n_heads, config.rope_theta);
-        apply_rope(&mut k, pos, head_dim, config.n_kv_heads, config.rope_theta);
+        apply_rope(&mut buf.q, pos, head_dim, config.n_heads, config.rope_theta);
+        apply_rope(
+            &mut buf.k,
+            pos,
+            head_dim,
+            config.n_kv_heads,
+            config.rope_theta,
+        );
 
-        // Store KV
-        let kv_start = pos * kv_dim;
-        cache.k[l][kv_start..kv_start + kv_dim].copy_from_slice(&k);
-        cache.v[l][kv_start..kv_start + kv_dim].copy_from_slice(&v);
+        // Store KV (keys and values may have different per-head dims)
+        let kv_k_dim = cache.per_pos_k_dim;
+        let kv_v_dim = cache.per_pos_v_dim;
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        // debug log removed
+        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
+        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
         // Multi-head attention with GQA
-        let mut attn_out = vec![0.0f32; dim];
         let scale = 1.0 / (head_dim as f32).sqrt();
+        // Models with sliding-window attention should ignore cache entries that
+        // fall outside the active local context.
+        let attn_window = if config.sliding_window > 0 {
+            pos.saturating_sub(config.sliding_window)
+        } else {
+            0
+        };
+
+        // Zero output buffer before accumulating attention results.
+        for v in buf.attn_out.iter_mut() {
+            *v = 0.0;
+        }
 
         for h in 0..config.n_heads {
             let kv_h = h / kv_mul;
             let q_off = h * head_dim;
-
-            // Attention scores
-            let mut scores = vec![0.0f32; pos + 1];
-            for t in 0..=pos {
-                let k_off = t * kv_dim + kv_h * head_dim;
-                scores[t] = simd::dot_f32(
-                    &q[q_off..q_off + head_dim],
-                    &cache.k[l][k_off..k_off + head_dim],
-                ) * scale;
-            }
-
-            softmax(&mut scores);
-
-            // Weighted value sum
-            let out_off = h * head_dim;
-            for t in 0..=pos {
-                let v_off = t * kv_dim + kv_h * head_dim;
-                let s = scores[t];
-                for d in 0..head_dim {
-                    attn_out[out_off + d] += s * cache.v[l][v_off + d];
-                }
-            }
+            let out_off = h * config.value_dim;
+            online_attention(
+                &buf.q[q_off..q_off + head_dim],
+                &cache.k[l][kv_h * config.head_dim..],
+                &cache.v[l][kv_h * config.value_dim..],
+                kv_k_dim,
+                kv_v_dim,
+                head_dim,
+                config.value_dim,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[out_off..out_off + config.value_dim],
+            );
         }
 
         // Output projection + residual
-        let attn_proj = layer.wo.matvec(&attn_out);
-        for i in 0..dim { x[i] += attn_proj[i]; }
+        let attn_proj = layer.wo.matvec(&buf.attn_out);
+        for i in 0..dim {
+            x[i] += attn_proj[i];
+        }
 
         // ── FFN (SwiGLU) ──
-        let xn2 = rms_norm(&x, &layer.ffn_norm, config.rms_norm_eps);
-        let gate = layer.w1.matvec(&xn2);
-        let up = layer.w3.matvec(&xn2);
+        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        let hidden: Vec<f32> = gate.iter().zip(up.iter())
-            .map(|(g, u)| silu(*g) * u)
-            .collect();
+        let gate = layer.w1.matvec(&buf.xn2);
+        let up = layer.w3.matvec(&buf.xn2);
 
-        let ffn_out = layer.w2.matvec(&hidden);
-        for i in 0..dim { x[i] += ffn_out[i]; }
+        buf.hidden.resize(config.hidden_dim, 0.0);
+        for i in 0..config.hidden_dim {
+            buf.hidden[i] = silu(gate[i]) * up[i];
+        }
+
+        let ffn_out = layer.w2.matvec(&buf.hidden);
+        for i in 0..dim {
+            x[i] += ffn_out[i];
+        }
     }
 
     // Final norm → logits
     let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
     weights.output.matvec(&x)
+}
+
+/// Forward pass for Gemma-4 models (initial implementation mirroring the
+/// standard LLaMA-style forward). Bias terms are currently ignored when
+/// missing; the loader warns about absent tensors.
+pub fn forward_gemma4(
+    config: &Config,
+    weights: &Gemma4Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> Vec<f32> {
+    let dim = config.dim;
+    // Per-layer head/value/k_v layout is stored in each Gemma4 layer.
+    // `buf` and `cache` are sized using layer maxima; here we use the
+    // per-layer descriptors to read/write the correct slices and strides.
+
+    // Token embedding
+    let mut x = weights.token_embd.row(token as usize, dim);
+
+    for l in 0..config.n_layers {
+        let layer = &weights.layers[l];
+
+
+        
+        // Standard attention path (or K=V reuse when attn_v is missing)
+        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+
+        layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+        layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+        
+        // If has_attn_v is false, V = K (K=V reuse)
+        let head_dim_l = layer.head_dim;
+        let n_kv_heads_l = layer.n_kv_heads;
+        let value_dim_l = layer.value_dim;
+        
+        if layer.has_attn_v {
+            layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+        } else {
+            // K=V reuse: copy only the relevant portion of k into v
+            let kv_size = n_kv_heads_l * head_dim_l;
+            buf.v[..kv_size].copy_from_slice(&buf.k[..kv_size]);
+        }
+
+        // Apply RoPE using per-head dims
+        apply_rope(&mut buf.q, pos, head_dim_l, config.n_heads, config.rope_theta);
+        apply_rope(&mut buf.k, pos, head_dim_l, n_kv_heads_l, config.rope_theta);
+
+        // Store KV into per-pos slots (cache uses fixed per-pos stride)
+        // Important: only write the relevant portion based on per-layer dims
+        let kv_k_size = n_kv_heads_l * head_dim_l;
+        let kv_v_size = n_kv_heads_l * value_dim_l;
+        
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
+        cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+
+        // Multi-head attention with GQA
+        let scale = 1.0 / (head_dim_l as f32).sqrt();
+        let attn_window = if config.sliding_window > 0 {
+            pos.saturating_sub(config.sliding_window)
+        } else {
+            0
+        };
+
+        for v in buf.attn_out.iter_mut() {
+            *v = 0.0;
+        }
+
+        let kv_mul_l = config.n_heads / n_kv_heads_l;
+        for h in 0..config.n_heads {
+            let kv_h = h / kv_mul_l;
+            let q_off = h * head_dim_l;
+            let out_off = h * value_dim_l;
+            online_attention(
+                &buf.q[q_off..q_off + head_dim_l],
+                &cache.k[l][kv_h * head_dim_l..],
+                &cache.v[l][kv_h * value_dim_l..],
+                cache.per_pos_k_dim,
+                cache.per_pos_v_dim,
+                head_dim_l,
+                value_dim_l,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[out_off..out_off + value_dim_l],
+            );
+        }
+
+        // Output projection + residual
+        let attn_proj = layer.attn_output.matvec(&buf.attn_out);
+        for i in 0..dim {
+            x[i] += attn_proj[i];
+        }
+
+        // ── FFN (SwiGLU-like) ──
+        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+
+        let gate = layer.ffn_gate.matvec(&buf.xn2);
+        let up = layer.ffn_up.matvec(&buf.xn2);
+
+        buf.hidden.resize(config.hidden_dim, 0.0);
+        for i in 0..config.hidden_dim {
+            buf.hidden[i] = silu(gate[i]) * up[i];
+        }
+
+        let ffn_out = layer.ffn_down.matvec(&buf.hidden);
+        for i in 0..dim {
+            x[i] += ffn_out[i];
+        }
+
+    }
+
+    // Final norm → logits
+    let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
+    weights.output.matvec(&x)
+}
+
+#[derive(Clone)]
+pub struct Gemma4LayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub attn_q: Weight,
+    pub attn_k: Weight,
+    pub attn_v: Weight,
+    pub attn_output: Weight,
+    pub ffn_norm: Vec<f32>,
+    pub ffn_down: Weight,
+    pub ffn_up: Weight,
+    pub ffn_gate: Weight,
+    pub head_dim: usize,
+    pub n_kv_heads: usize,
+    pub value_dim: usize,
+    pub has_attn_v: bool,  // True if layer has separate V projection; false = use K as V
+    // TODO: Add biases, global attn, etc. falls benötigt
+}
+
+#[derive(Clone)]
+pub struct Gemma4Weights {
+    pub token_embd: Weight,
+    pub output_norm: Vec<f32>,
+    pub output: Weight,
+    pub layers: Vec<Gemma4LayerWeights>,
+}
+
+/// Loader für Gemma-4 Modelle (Stub, lädt nur Grundstruktur)
+pub fn load_gemma4_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, Gemma4Weights) {
+    let mut config = Config::from_gguf(gguf);
+    eprintln!(
+        "Config: dim={}, layers={}, heads={}/{}, hidden={}, vocab={}, ctx={}",
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.hidden_dim,
+        config.vocab_size,
+        config.max_seq_len
+    );
+
+    let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> =
+        gguf.tensors.iter().map(|t| (t.name.clone(), t)).collect();
+    let data_offset = gguf.data_offset;
+    let mut inferred_sizes: HashMap<String, usize> = HashMap::new();
+    if !gguf.tensors.is_empty() {
+        let mmap_len = mmap_data.len();
+        let mut offs: Vec<(u64, usize)> = gguf
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.offset as u64, i))
+            .collect();
+        offs.sort_unstable_by_key(|o| o.0);
+        for w in 0..offs.len() {
+            let (off, _idx) = offs[w];
+            let next_off = if w + 1 < offs.len() {
+                offs[w + 1].0
+            } else {
+                (mmap_len as u64).saturating_sub(data_offset as u64)
+            };
+            let byte_size = if next_off > off {
+                (next_off - off) as usize
+            } else {
+                0
+            };
+            let idx = _idx as usize;
+            let name = &gguf.tensors[idx].name;
+            inferred_sizes.insert(name.clone(), byte_size);
+        }
+    }
+
+    // Infer head/value dims from available tensors (some Gemma-4 GGUFs
+    // have unreliable metadata). Prefer inferred shapes when possible.
+    {
+        for l in 0..config.n_layers {
+            let q_name = format!("blk.{}.attn_q.weight", l);
+            if let Some(info) = tensor_idx.get(&q_name) {
+                eprintln!("Layer {} attn_q shape: {:?}", l, info.dims);
+            }
+        }
+        let mut head_dim_cand: Option<usize> = None;
+        let mut value_dim_cand: Option<usize> = None;
+        let mut kv_heads_cand: Option<usize> = None;
+        for l in 0..config.n_layers {
+            let qn = format!("blk.{}.attn_q.weight", l);
+            let vn = format!("blk.{}.attn_v.weight", l);
+            if head_dim_cand.is_none() {
+                if let Some(info) = tensor_idx.get(&qn) {
+                    if info.dims.len() >= 2 {
+                        let rows = info.dims[1] as usize;
+                        let cols = info.dims[0] as usize;
+                        if cols == config.dim && config.n_heads > 0 {
+                            head_dim_cand = Some(rows / config.n_heads);
+                        }
+                    }
+                }
+            }
+            if value_dim_cand.is_none() || kv_heads_cand.is_none() {
+                if let Some(info) = tensor_idx.get(&vn) {
+                    if info.dims.len() >= 2 {
+                        let rows = info.dims[1] as usize;
+                        let cols = info.dims[0] as usize;
+                        if cols == config.dim && head_dim_cand.is_some() {
+                            let hd = head_dim_cand.unwrap();
+                            if rows % hd == 0 {
+                                kv_heads_cand = Some(rows / hd);
+                                value_dim_cand = Some(hd); // assume value_dim matches head_dim
+                            }
+                        }
+                    }
+                }
+            }
+            if head_dim_cand.is_some() && value_dim_cand.is_some() && kv_heads_cand.is_some() {
+                break;
+            }
+        }
+        if let Some(hd) = head_dim_cand {
+            if hd != config.head_dim {
+                eprintln!(
+                    "[INFO] Overriding config.head_dim {} -> {} based on attn_q tensor shapes",
+                    config.head_dim, hd
+                );
+                config.head_dim = hd;
+            }
+        }
+        if let Some(vd) = value_dim_cand {
+            if vd != config.value_dim {
+                eprintln!(
+                    "[INFO] Overriding config.value_dim {} -> {} based on attn_v tensor shapes",
+                    config.value_dim, vd
+                );
+                config.value_dim = vd;
+            }
+        }
+        if let Some(kvh) = kv_heads_cand {
+            if kvh != config.n_kv_heads {
+                eprintln!(
+                    "[INFO] Overriding config.n_kv_heads {} -> {} based on attn_v tensor shapes",
+                    config.n_kv_heads, kvh
+                );
+                config.n_kv_heads = kvh;
+            }
+        }
+        config.kv_dim = config.value_dim * config.n_kv_heads;
+        config.kv_mul = config.n_heads / config.n_kv_heads;
+        eprintln!(
+            "Adjusted Gemma4 config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
+            config.head_dim,
+            config.value_dim,
+            config.kv_dim,
+            config.kv_mul
+        );
+    }
+
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output_norm = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "output_norm.weight",
+        &tensor_idx,
+        &inferred_sizes,
+    );
+    let output = if tensor_idx.contains_key("output.weight") {
+        load_weight(
+            mmap_data,
+            data_offset,
+            "output.weight",
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        )
+    } else {
+        eprintln!("Note: output tied to embeddings");
+        token_embd.clone()
+    };
+
+    // Infer head/value dims from available tensors
+    {
+        let mut head_dim_cand: Option<usize> = None;
+        let mut value_dim_cand: Option<usize> = None;
+        for l in 0..config.n_layers {
+            let qn = format!("blk.{}.attn_q.weight", l);
+            if let Some(info) = tensor_idx.get(&qn) {
+                if info.dims.len() >= 2 {
+                    let rows = info.dims[1] as usize;
+                    let cols = info.dims[0] as usize;
+                    if cols == config.dim && rows % config.n_heads == 0 {
+                        head_dim_cand = Some(rows / config.n_heads);
+                    }
+                }
+            }
+            let vn = format!("blk.{}.attn_v.weight", l);
+            if let Some(info) = tensor_idx.get(&vn) {
+                if info.dims.len() >= 2 {
+                    let rows = info.dims[1] as usize;
+                    let cols = info.dims[0] as usize;
+                    if cols == config.dim && rows % config.n_kv_heads == 0 {
+                        value_dim_cand = Some(rows / config.n_kv_heads);
+                    }
+                }
+            }
+            if head_dim_cand.is_some() && value_dim_cand.is_some() {
+                break;
+            }
+        }
+        if let Some(hd) = head_dim_cand {
+            if hd != config.head_dim {
+                eprintln!(
+                    "[INFO] Overriding config.head_dim {} -> {} based on attn_q tensor shapes",
+                    config.head_dim, hd
+                );
+                config.head_dim = hd;
+            }
+        }
+        if let Some(vd) = value_dim_cand {
+            if vd != config.value_dim {
+                eprintln!(
+                    "[INFO] Overriding config.value_dim {} -> {} based on attn_v tensor shapes",
+                    config.value_dim, vd
+                );
+                config.value_dim = vd;
+            }
+        }
+        config.kv_dim = config.value_dim * config.n_kv_heads;
+        config.kv_mul = config.n_heads / config.n_kv_heads;
+        eprintln!(
+            "Adjusted Gemma4 config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
+            config.head_dim,
+            config.value_dim,
+            config.kv_dim,
+            config.kv_mul
+        );
+    }
+
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for l in 0..config.n_layers {
+        // Helper: find an alternative tensor for this block that matches
+        // the provided substrings (simple substring match, not regex).
+        fn find_alternative(
+            tensor_idx: &HashMap<String, &crate::gguf::TensorInfo>,
+            layer: usize,
+            subs: &[&str],
+        ) -> Option<String> {
+            let prefix = format!("blk.{}.", layer);
+            for k in tensor_idx.keys() {
+                if !k.starts_with(&prefix) || !k.ends_with(".weight") {
+                    continue;
+                }
+                let mut ok = true;
+                for s in subs.iter() {
+                    if !k.contains(s) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Some(k.clone());
+                }
+            }
+            None
+        }
+
+        // Helper: validate a loaded weight's shape and panic with a clear
+        // message if it doesn't match the expectation.
+        fn validate_shape(
+            name: &str,
+            layer: usize,
+            w: &Weight,
+            exp_rows: usize,
+            exp_cols: usize,
+            config: &Config,
+        ) {
+            match w {
+                Weight::F32(v) => {
+                    let actual = v.len();
+                    let expected = exp_rows.checked_mul(exp_cols).unwrap_or(0);
+                    if actual != expected {
+                        eprintln!(
+                            "[ERROR] {} (layer {}): f32 elements {} != expected {} ({}x{}). config: dim={}, head_dim={}, n_heads={}, n_kv_heads={}, value_dim={}, kv_dim={}",
+                            name,
+                            layer,
+                            actual,
+                            expected,
+                            exp_rows,
+                            exp_cols,
+                            config.dim,
+                            config.head_dim,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.value_dim,
+                            config.kv_dim
+                        );
+                        panic!("Shape mismatch for {} (layer {})", name, layer);
+                    }
+                }
+                Weight::Quantized { rows, cols, .. } => {
+                    if *rows != exp_rows || *cols != exp_cols {
+                        eprintln!(
+                            "[ERROR] {} (layer {}): quantized shape {}x{} != expected {}x{}. config: dim={}, head_dim={}, n_heads={}, n_kv_heads={}, value_dim={}, kv_dim={}",
+                            name,
+                            layer,
+                            rows,
+                            cols,
+                            exp_rows,
+                            exp_cols,
+                            config.dim,
+                            config.head_dim,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.value_dim,
+                            config.kv_dim
+                        );
+                        panic!("Shape mismatch for {} (layer {})", name, layer);
+                    }
+                }
+            }
+        }
+
+        let dim = config.dim;
+
+        // Determine per-layer head/value layout heuristically from available
+        // tensors. Many Gemma-4 GGUFs interleave layers with different
+        // head/value sizes, so compute per-layer values rather than relying
+        // solely on the global `config`.
+        let mut head_dim_l = config.head_dim;
+        let mut n_kv_heads_l = config.n_kv_heads;
+        let mut value_dim_l = config.value_dim;
+
+        // Try Q tensor first (preferred source of head_dim)
+        let q_name = format!("blk.{}.attn_q.weight", l);
+        let k_name = format!("blk.{}.attn_k.weight", l);
+        let v_name = format!("blk.{}.attn_v.weight", l);
+        if let Some(info) = tensor_idx.get(&q_name) {
+            if info.dims.len() >= 2 {
+                let rows = info.dims[1] as usize;
+                let cols = info.dims[0] as usize;
+                if cols == dim && config.n_heads > 0 && rows % config.n_heads == 0 {
+                    head_dim_l = rows / config.n_heads;
+                }
+            }
+        }
+
+        // K tensor can reveal n_kv_heads when its rows are n_kv_heads * head_dim
+        if let Some(info) = tensor_idx.get(&k_name) {
+            if info.dims.len() >= 2 {
+                let rows = info.dims[1] as usize;
+                let cols = info.dims[0] as usize;
+                if cols == dim && head_dim_l > 0 && rows % head_dim_l == 0 {
+                    n_kv_heads_l = rows / head_dim_l;
+                }
+            }
+        }
+
+        // V tensor reveals value_dim (rows = n_kv_heads * value_dim) — derive
+        if let Some(info) = tensor_idx.get(&v_name) {
+            if info.dims.len() >= 2 {
+                let rows = info.dims[1] as usize;
+                let cols = info.dims[0] as usize;
+                if cols == dim {
+                    if n_kv_heads_l > 0 && rows % n_kv_heads_l == 0 {
+                        value_dim_l = rows / n_kv_heads_l;
+                    } else if head_dim_l > 0 && rows % head_dim_l == 0 {
+                        // some GGUFs use value_dim == head_dim
+                        value_dim_l = head_dim_l;
+                        n_kv_heads_l = rows / head_dim_l;
+                    }
+                }
+            }
+        } else {
+            // V tensor is missing: use K=V reuse. 
+            // value_dim_l should match K's geometry: k_rows = n_kv_heads * head_dim
+            // So value_dim_l = head_dim_l (since V will use the same projection as K)
+            value_dim_l = head_dim_l;
+            eprintln!(
+                "[INFO] Layer {}: attn_v missing, using K=V reuse. value_dim set to head_dim = {}",
+                l, head_dim_l
+            );
+        }
+
+        let q_rows = config.n_heads * head_dim_l;
+        let k_rows = n_kv_heads_l * head_dim_l;
+        let v_rows = n_kv_heads_l * value_dim_l;
+        let out_rows = config.dim;
+
+        let out_name = format!("blk.{}.attn_output.weight", l);
+        let ffn_gate_name = format!("blk.{}.ffn_gate.weight", l);
+        let ffn_up_name = format!("blk.{}.ffn_up.weight", l);
+        let ffn_down_name = format!("blk.{}.ffn_down.weight", l);
+
+        // Load or fallback Q
+        let attn_q = if tensor_idx.contains_key(&q_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &q_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&q_name, l, &w, q_rows, dim, &config);
+            w
+        } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "q"]) {
+            eprintln!(
+                "[INFO] Using alternative tensor {} for {} (layer {})",
+                alt, q_name, l
+            );
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &alt,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&alt, l, &w, q_rows, dim, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                q_name, l, q_rows, dim
+            );
+            Weight::F32(vec![0.0; q_rows * dim])
+        };
+
+        // Load or fallback K
+        let attn_k = if tensor_idx.contains_key(&k_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &k_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&k_name, l, &w, k_rows, dim, &config);
+            w
+        } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "k"]) {
+            eprintln!(
+                "[INFO] Using alternative tensor {} for {} (layer {})",
+                alt, k_name, l
+            );
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &alt,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&alt, l, &w, k_rows, dim, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                k_name, l, k_rows, dim
+            );
+            Weight::F32(vec![0.0; k_rows * dim])
+        };
+
+        // Load or fallback V
+        // Special handling: if V tensor is missing, use K as V (K=V reuse for full-attention layers)
+        let has_attn_v = tensor_idx.contains_key(&v_name);
+        let attn_v = if has_attn_v {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &v_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&v_name, l, &w, v_rows, dim, &config);
+            w
+        } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "v"]) {
+            eprintln!(
+                "[INFO] Using alternative tensor {} for {} (layer {})",
+                alt, v_name, l
+            );
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &alt,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&alt, l, &w, v_rows, dim, &config);
+            w
+        } else {
+            // K=V reuse: missing attn_v means use K tensor as V
+            // This is common in full-attention/sliding-window layers
+            eprintln!(
+                "[INFO] Missing tensor: {} (layer {}) — using K as V (K=V reuse)",
+                v_name, l
+            );
+            attn_k.clone()
+        };
+
+        // Load or fallback output projection
+        let attn_output = if tensor_idx.contains_key(&out_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &out_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            // attn_output: rows = dim, cols = n_heads * value_dim
+            validate_shape(&out_name, l, &w, out_rows, config.n_heads * value_dim_l, &config);
+            w
+        } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "output"]) {
+            eprintln!(
+                "[INFO] Using alternative tensor {} for {} (layer {})",
+                alt, out_name, l
+            );
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &alt,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&alt, l, &w, out_rows, config.n_heads * value_dim_l, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                out_name,
+                l,
+                out_rows,
+                config.n_heads * value_dim_l
+            );
+            Weight::F32(vec![0.0; out_rows * config.n_heads * value_dim_l])
+        };
+
+        // FFN weights: gate/up/down
+        let ffn_gate = if tensor_idx.contains_key(&ffn_gate_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &ffn_gate_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&ffn_gate_name, l, &w, config.hidden_dim, dim, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                ffn_gate_name, l, config.hidden_dim, dim
+            );
+            Weight::F32(vec![0.0; config.hidden_dim * dim])
+        };
+
+        let ffn_up = if tensor_idx.contains_key(&ffn_up_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &ffn_up_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&ffn_up_name, l, &w, config.hidden_dim, dim, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                ffn_up_name, l, config.hidden_dim, dim
+            );
+            Weight::F32(vec![0.0; config.hidden_dim * dim])
+        };
+
+        let ffn_down = if tensor_idx.contains_key(&ffn_down_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &ffn_down_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&ffn_down_name, l, &w, dim, config.hidden_dim, &config);
+            w
+        } else {
+            eprintln!(
+                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
+                ffn_down_name, l, dim, config.hidden_dim
+            );
+            Weight::F32(vec![0.0; dim * config.hidden_dim])
+        };
+
+        let has_attn_v = tensor_idx.contains_key(&v_name);
+        let layer = Gemma4LayerWeights {
+            attn_norm: if tensor_idx.contains_key(&format!("blk.{}.attn_norm.weight", l)) {
+                load_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_norm.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                )
+            } else {
+                eprintln!(
+                    "[WARN] Missing tensor: blk.{}.attn_norm.weight (layer {})",
+                    l, l
+                );
+                vec![0.0; dim]
+            },
+            attn_q,
+            attn_k,
+            attn_v,
+            attn_output,
+            ffn_norm: if tensor_idx.contains_key(&format!("blk.{}.ffn_norm.weight", l)) {
+                load_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_norm.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                )
+            } else {
+                eprintln!(
+                    "[WARN] Missing tensor: blk.{}.ffn_norm.weight (layer {})",
+                    l, l
+                );
+                vec![0.0; dim]
+            },
+            ffn_down,
+            ffn_up,
+            ffn_gate,
+            head_dim: head_dim_l,
+            n_kv_heads: n_kv_heads_l,
+            value_dim: value_dim_l,
+            has_attn_v,
+        };
+        layers.push(layer);
+        if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {
+            eprintln!("  Loaded Gemma4 layer {}/{}", l + 1, config.n_layers);
+        }
+    }
+
+    let weights = Gemma4Weights {
+        token_embd,
+        output_norm,
+        output,
+        layers,
+    };
+    (config, weights)
 }

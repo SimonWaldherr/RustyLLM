@@ -3,8 +3,8 @@
 // Supports SentencePiece-style BPE with merge scores, byte fallback,
 // and special token handling (BOS/EOS).
 
-use std::collections::HashMap;
 use crate::gguf::MetaValue;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TokenizerMode {
@@ -63,6 +63,8 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
+        // GGUF tokenizer metadata is not fully standardized across model
+        // families, so mode selection uses a few conservative hints.
         let mode = if model.eq_ignore_ascii_case("gpt2")
             || pre.to_ascii_lowercase().contains("qwen")
             || pre.to_ascii_lowercase().contains("gpt")
@@ -166,6 +168,8 @@ impl Tokenizer {
     }
 
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
+        // SentencePiece models encode word starts with U+2581, so we inject a
+        // leading space before splitting to preserve first-token behavior.
         let processed = format!(" {}", text);
         let processed = processed.replace(' ', "\u{2581}");
         let current_tokens = self.encode_from_pieces(processed.chars().map(|ch| ch.to_string()));
@@ -214,6 +218,8 @@ impl Tokenizer {
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
         for piece in pretokenize_gpt2(text) {
+            // GPT-2 style BPE operates on a reversible byte-level alphabet
+            // before merge ranks are applied.
             let mut encoded = String::with_capacity(piece.len());
             for &byte in piece.as_bytes() {
                 if let Some(&ch) = self.byte_encoder.get(&byte) {
@@ -290,6 +296,9 @@ fn pretokenize_gpt2(text: &str) -> Vec<String> {
     let mut pieces = Vec::new();
     let mut i = 0usize;
 
+    // This is a lightweight approximation of GPT-2's regex pre-tokenizer:
+    // group leading whitespace with the following token and split runs of
+    // letters, digits, and punctuation separately.
     while i < chars.len() {
         let start = i;
         let mut had_space = false;
@@ -316,7 +325,11 @@ fn pretokenize_gpt2(text: &str) -> Vec<String> {
                 j += 1;
             }
         } else {
-            while j < chars.len() && !chars[j].is_whitespace() && !chars[j].is_alphabetic() && !chars[j].is_numeric() {
+            while j < chars.len()
+                && !chars[j].is_whitespace()
+                && !chars[j].is_alphabetic()
+                && !chars[j].is_numeric()
+            {
                 j += 1;
             }
         }
@@ -330,6 +343,8 @@ fn pretokenize_gpt2(text: &str) -> Vec<String> {
 }
 
 fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
+    // Mirrors GPT-2's bytes_to_unicode table so arbitrary byte sequences can
+    // flow through BPE merges without losing reversibility.
     let mut bs: Vec<u32> = (b'!'..=b'~').map(|b| b as u32).collect();
     bs.extend((0xA1u8..=0xAC).map(|b| b as u32));
     bs.extend((0xAEu8..=0xFF).map(|b| b as u32));

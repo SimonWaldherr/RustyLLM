@@ -32,24 +32,17 @@ impl MmapFile {
         let fd = file.as_raw_fd();
 
         // mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, 0)
-        let ptr = unsafe {
-            libc_mmap(
-                std::ptr::null_mut(),
-                len,
-                PROT_READ,
-                MAP_PRIVATE,
-                fd,
-                0,
-            )
-        };
+        let ptr = unsafe { libc_mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, fd, 0) };
 
         if ptr == MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
 
-        // Hint: sequential access pattern (helps macOS VM prefetcher)
+        // Hint sequential access, then request eager page-fault to reduce
+        // per-weight load latency during model loading.
         unsafe {
             libc_madvise(ptr, len, MADV_SEQUENTIAL);
+            libc_madvise(ptr, len, MADV_WILLNEED);
         }
 
         Ok(Self {
@@ -69,7 +62,6 @@ impl MmapFile {
     pub fn len(&self) -> usize {
         self.len
     }
-
 }
 
 impl Drop for MmapFile {
@@ -86,11 +78,12 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FAILED: *mut std::ffi::c_void = !0usize as *mut std::ffi::c_void;
 
-// MADV_SEQUENTIAL is 2 on both Linux and macOS
+// MADV_SEQUENTIAL = 2, MADV_WILLNEED = 3 on both Linux and macOS
 const MADV_SEQUENTIAL: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
 
 // These use the libc ABI directly — same on macOS and Linux
-extern "C" {
+unsafe extern "C" {
     fn mmap(
         addr: *mut std::ffi::c_void,
         len: usize,
