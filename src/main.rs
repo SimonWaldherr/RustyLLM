@@ -8,7 +8,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 fn print_usage(name: &str) {
-    eprintln!("rusty-llm v0.2.0");
+    eprintln!("rusty-llm v0.3.0");
     eprintln!();
     eprintln!("Usage: {} <model.gguf> [options]", name);
     eprintln!();
@@ -26,6 +26,8 @@ fn print_usage(name: &str) {
     eprintln!("  --seed <N>            RNG seed (default: time-based)");
     eprintln!("  --threads <N>         Override thread count");
     eprintln!("  --system-prompt <T>   Override the default system prompt");
+    eprintln!("  --stop <text>         Stop generation when this string appears");
+    eprintln!("  --embed               Embed prompt and print the vector (RAG mode)");
     eprintln!("  --list-tensors        Print GGUF tensor inventory and exit");
 }
 
@@ -47,6 +49,7 @@ fn main() {
     let mut serve_addr: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut embed_mode = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -101,6 +104,13 @@ fn main() {
             "--system-prompt" => {
                 i += 1;
                 options.system_prompt = args[i].clone();
+            }
+            "--stop" => {
+                i += 1;
+                options.stop_sequences.push(args[i].clone());
+            }
+            "--embed" => {
+                embed_mode = true;
             }
             "--list-tensors" => {
                 list_tensors = true;
@@ -167,6 +177,22 @@ fn main() {
         return;
     }
 
+    // Embedding mode: run prefill, print the L2-normalised embedding vector.
+    if embed_mode {
+        if prompt.is_empty() {
+            eprintln!("--embed requires --prompt <text>");
+            std::process::exit(1);
+        }
+        let result = runner.embed(&prompt).unwrap_or_else(|err| {
+            eprintln!("Embed error: {}", err);
+            std::process::exit(1);
+        });
+        eprintln!("Embedding dim: {}, tokens: {}", result.embedding.len(), result.token_count);
+        let floats: Vec<String> = result.embedding.iter().map(|v| format!("{:.6}", v)).collect();
+        println!("[{}]", floats.join(", "));
+        return;
+    }
+
     // Server mode takes over the process after the model is loaded.
     if let Some(addr) = serve_addr {
         let protocol = if tls_cert.is_some() && tls_key.is_some() {
@@ -176,7 +202,7 @@ fn main() {
         };
         eprintln!("{} endpoint listening on {}", protocol, addr);
         eprintln!(
-            "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions."
+            "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
         );
         let serve_options = ServeOptions {
             addr,

@@ -2418,3 +2418,320 @@ pub fn load_gemma4_model(
     };
     (config, weights)
 }
+
+// ─── Embedding forward passes (return normalized hidden state, not logits) ───
+//
+// These are identical to the generation forwards but skip the final output
+// projection so the caller gets the residual stream after the last RMSNorm.
+// Used by Runner::embed for text embedding / RAG retrieval.
+
+/// Forward for standard (LLaMA-style) models; returns the normalized hidden
+/// state of dimension `config.dim` instead of vocabulary logits.
+pub fn forward_hidden(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> Vec<f32> {
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let kv_mul = config.kv_mul;
+
+    let mut x = weights.token_embd.row(token as usize, dim);
+
+    for l in 0..config.n_layers {
+        let layer = &weights.layers[l];
+
+        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+
+        layer.wq.matvec_into(&buf.xn, &mut buf.q);
+        layer.wk.matvec_into(&buf.xn, &mut buf.k);
+        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+
+        for i in 0..buf.q.len() {
+            buf.q[i] += layer.bq[i];
+        }
+        for i in 0..buf.k.len() {
+            buf.k[i] += layer.bk[i];
+        }
+        for i in 0..buf.v.len() {
+            buf.v[i] += layer.bv[i];
+        }
+
+        apply_rope(&mut buf.q, pos, head_dim, config.n_heads, config.rope_theta);
+        apply_rope(&mut buf.k, pos, head_dim, config.n_kv_heads, config.rope_theta);
+
+        let kv_k_dim = cache.per_pos_k_dim;
+        let kv_v_dim = cache.per_pos_v_dim;
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
+        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let attn_window = if config.sliding_window > 0 {
+            pos.saturating_sub(config.sliding_window)
+        } else {
+            0
+        };
+
+        for v in buf.attn_out.iter_mut() {
+            *v = 0.0;
+        }
+
+        for h in 0..config.n_heads {
+            let kv_h = h / kv_mul;
+            let q_off = h * head_dim;
+            let out_off = h * config.value_dim;
+            online_attention(
+                &buf.q[q_off..q_off + head_dim],
+                &cache.k[l][kv_h * config.head_dim..],
+                &cache.v[l][kv_h * config.value_dim..],
+                kv_k_dim,
+                kv_v_dim,
+                head_dim,
+                config.value_dim,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[out_off..out_off + config.value_dim],
+            );
+        }
+
+        let attn_proj = layer.wo.matvec(&buf.attn_out);
+        for i in 0..dim {
+            x[i] += attn_proj[i];
+        }
+
+        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+
+        let gate = layer.w1.matvec(&buf.xn2);
+        let up = layer.w3.matvec(&buf.xn2);
+
+        buf.hidden.resize(config.hidden_dim, 0.0);
+        for i in 0..config.hidden_dim {
+            buf.hidden[i] = silu(gate[i]) * up[i];
+        }
+
+        let ffn_out = layer.w2.matvec(&buf.hidden);
+        for i in 0..dim {
+            x[i] += ffn_out[i];
+        }
+    }
+
+    // Apply final norm but skip the output projection — return the hidden state.
+    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+}
+
+/// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
+pub fn forward_hidden_gpt_oss(
+    config: &Config,
+    weights: &GptOssWeights,
+    cache: &mut KVCache,
+    token: u32,
+    pos: usize,
+) -> Vec<f32> {
+    let mut x = weights.token_embd.row(token as usize, config.dim);
+
+    for l in 0..config.n_layers {
+        let layer = &weights.layers[l];
+
+        let xn = rms_norm(&x, &layer.attn_norm, config.rms_norm_eps);
+        let mut q = layer.wq.matvec(&xn);
+        let mut k = layer.wk.matvec(&xn);
+        let v = layer.wv.matvec(&xn);
+        for i in 0..q.len() {
+            q[i] += layer.bq[i];
+        }
+        for i in 0..k.len() {
+            k[i] += layer.bk[i];
+        }
+        let mut v = v;
+        for i in 0..v.len() {
+            v[i] += layer.bv[i];
+        }
+
+        apply_rope_gpt_oss(&mut q, &mut k, pos, config);
+
+        let kv_k_dim = cache.per_pos_k_dim;
+        let kv_v_dim = cache.per_pos_v_dim;
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        cache.k[l][kv_k_start..kv_k_start + k.len()].copy_from_slice(&k);
+        cache.v[l][kv_v_start..kv_v_start + v.len()].copy_from_slice(&v);
+
+        let mut attn_out = vec![0.0f32; config.n_heads * config.value_dim];
+        let scale = 1.0 / (config.head_dim as f32).sqrt();
+        let attn_window = if l % 2 == 0 && config.sliding_window > 0 {
+            pos.saturating_sub(config.sliding_window)
+        } else {
+            0
+        };
+
+        for h in 0..config.n_heads {
+            let kv_h = h / config.kv_mul;
+            let q_off = h * config.head_dim;
+            let out_off = h * config.value_dim;
+            online_attention_with_sink(
+                &q[q_off..q_off + config.head_dim],
+                &cache.k[l][kv_h * config.head_dim..],
+                &cache.v[l][kv_h * config.value_dim..],
+                kv_k_dim,
+                kv_v_dim,
+                config.head_dim,
+                config.value_dim,
+                attn_window,
+                pos,
+                scale,
+                layer.sinks[h],
+                &mut attn_out[out_off..out_off + config.value_dim],
+            );
+        }
+
+        let mut attn_proj = layer.wo.matvec(&attn_out);
+        for i in 0..attn_proj.len() {
+            attn_proj[i] += layer.bo[i];
+        }
+        for i in 0..config.dim {
+            x[i] += attn_proj[i];
+        }
+
+        let xn2 = rms_norm(&x, &layer.post_attn_norm, config.rms_norm_eps);
+        let mut gate_logits = layer.gate_inp.matvec(&xn2);
+        for i in 0..gate_logits.len() {
+            gate_logits[i] += layer.gate_inp_bias[i];
+        }
+
+        let mut top: Vec<(usize, f32)> = gate_logits.iter().copied().enumerate().collect();
+        top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        top.truncate(config.expert_used_count);
+        let expert_probs = softmax_selected(&top);
+
+        let mut moe_sum = vec![0.0f32; config.dim];
+        for ((expert_idx, _), expert_prob) in top.into_iter().zip(expert_probs.into_iter()) {
+            let gate_bias = layer.gate_exps_bias.row(expert_idx, config.hidden_dim);
+            let up_bias = layer.up_exps_bias.row(expert_idx, config.hidden_dim);
+            let down_bias = layer.down_exps_bias.row(expert_idx, config.dim);
+
+            let mut gate = layer.gate_exps.matvec_expert(expert_idx, &xn2);
+            let mut up = layer.up_exps.matvec_expert(expert_idx, &xn2);
+            for i in 0..config.hidden_dim {
+                gate[i] += gate_bias[i];
+                up[i] += up_bias[i];
+                gate[i] = swiglu_gpt_oss(gate[i], up[i]);
+            }
+
+            let mut down = layer.down_exps.matvec_expert(expert_idx, &gate);
+            for i in 0..config.dim {
+                down[i] = (down[i] + down_bias[i]) * expert_prob;
+                moe_sum[i] += down[i];
+            }
+        }
+
+        for i in 0..config.dim {
+            x[i] += moe_sum[i];
+        }
+    }
+
+    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+}
+
+/// Forward for Gemma-4 models; returns the normalized hidden state.
+pub fn forward_hidden_gemma4(
+    config: &Config,
+    weights: &Gemma4Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> Vec<f32> {
+    let dim = config.dim;
+
+    let mut x = weights.token_embd.row(token as usize, dim);
+
+    for l in 0..config.n_layers {
+        let layer = &weights.layers[l];
+
+        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+
+        layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+        layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+
+        let head_dim_l = layer.head_dim;
+        let n_kv_heads_l = layer.n_kv_heads;
+        let value_dim_l = layer.value_dim;
+
+        if layer.has_attn_v {
+            layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+        } else {
+            let kv_size = n_kv_heads_l * head_dim_l;
+            buf.v[..kv_size].copy_from_slice(&buf.k[..kv_size]);
+        }
+
+        apply_rope(&mut buf.q, pos, head_dim_l, config.n_heads, config.rope_theta);
+        apply_rope(&mut buf.k, pos, head_dim_l, n_kv_heads_l, config.rope_theta);
+
+        let kv_k_size = n_kv_heads_l * head_dim_l;
+        let kv_v_size = n_kv_heads_l * value_dim_l;
+
+        let kv_k_start = pos * cache.per_pos_k_dim;
+        let kv_v_start = pos * cache.per_pos_v_dim;
+        cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
+        cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+
+        let scale = 1.0 / (head_dim_l as f32).sqrt();
+        let attn_window = if config.sliding_window > 0 {
+            pos.saturating_sub(config.sliding_window)
+        } else {
+            0
+        };
+
+        for v in buf.attn_out.iter_mut() {
+            *v = 0.0;
+        }
+
+        let kv_mul_l = config.n_heads / n_kv_heads_l;
+        for h in 0..config.n_heads {
+            let kv_h = h / kv_mul_l;
+            let q_off = h * head_dim_l;
+            let out_off = h * value_dim_l;
+            online_attention(
+                &buf.q[q_off..q_off + head_dim_l],
+                &cache.k[l][kv_h * head_dim_l..],
+                &cache.v[l][kv_h * value_dim_l..],
+                cache.per_pos_k_dim,
+                cache.per_pos_v_dim,
+                head_dim_l,
+                value_dim_l,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[out_off..out_off + value_dim_l],
+            );
+        }
+
+        let attn_proj = layer.attn_output.matvec(&buf.attn_out);
+        for i in 0..dim {
+            x[i] += attn_proj[i];
+        }
+
+        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+
+        let gate = layer.ffn_gate.matvec(&buf.xn2);
+        let up = layer.ffn_up.matvec(&buf.xn2);
+
+        buf.hidden.resize(config.hidden_dim, 0.0);
+        for i in 0..config.hidden_dim {
+            buf.hidden[i] = silu(gate[i]) * up[i];
+        }
+
+        let ffn_out = layer.ffn_down.matvec(&buf.hidden);
+        for i in 0..dim {
+            x[i] += ffn_out[i];
+        }
+    }
+
+    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+}
