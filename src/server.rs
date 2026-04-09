@@ -24,6 +24,91 @@ impl ServeOptions {
     }
 }
 
+// ─── Multimodal content types ─────────────────────────────────────────────────
+
+/// A single part of a multimodal message content array.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Deserialize)]
+struct ImageUrl {
+    url: String,
+    #[allow(dead_code)]
+    detail: Option<String>,
+}
+
+/// The `content` field of an API message can be either a plain string or an
+/// array of content parts (OpenAI multimodal format).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ApiMessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl ApiMessageContent {
+    /// Extract just the text, describing images with a placeholder.
+    fn into_text(self) -> String {
+        match self {
+            ApiMessageContent::Text(s) => s,
+            ApiMessageContent::Parts(parts) => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(&text);
+                        }
+                        ContentPart::ImageUrl { image_url } => {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            // Describe the image with its URL for context; a
+                            // vision encoder would process it in a full
+                            // multimodal pipeline.
+                            let url = &image_url.url;
+                            if url.starts_with("data:image/") {
+                                out.push_str("[image: base64 data]");
+                            } else {
+                                out.push_str(&format!("[image: {}]", url));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+// ─── Stop sequence helper ─────────────────────────────────────────────────────
+
+/// Accept `"stop"` as either a single string or an array of strings, matching
+/// the OpenAI API contract.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StopSpec {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopSpec {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StopSpec::One(s) => vec![s],
+            StopSpec::Many(v) => v,
+        }
+    }
+}
+
+// ─── Request types ────────────────────────────────────────────────────────────
+
 #[derive(Deserialize)]
 struct GenerateRequest {
     prompt: Option<String>,
@@ -35,12 +120,13 @@ struct GenerateRequest {
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
     system_prompt: Option<String>,
+    stop: Option<StopSpec>,
 }
 
 #[derive(Deserialize)]
 struct ApiMessage {
     role: String,
-    content: String,
+    content: ApiMessageContent,
 }
 
 #[derive(Deserialize)]
@@ -48,13 +134,17 @@ struct OpenAiCompletionsRequest {
     model: Option<String>,
     prompt: OpenAiPrompt,
     max_tokens: Option<usize>,
+    /// Alias for max_tokens (OpenAI spec ≥ 2024-10).
+    max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
+    #[allow(dead_code)]
     stream: Option<bool>,
     system_prompt: Option<String>,
+    stop: Option<StopSpec>,
 }
 
 #[derive(Deserialize)]
@@ -69,14 +159,38 @@ struct OpenAiChatCompletionsRequest {
     model: Option<String>,
     messages: Vec<ApiMessage>,
     max_tokens: Option<usize>,
+    /// Alias for max_tokens (OpenAI spec ≥ 2024-10).
+    max_completion_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
+    #[allow(dead_code)]
     stream: Option<bool>,
     system_prompt: Option<String>,
+    stop: Option<StopSpec>,
 }
+
+/// OpenAI-compatible `/v1/embeddings` request.
+#[derive(Deserialize)]
+struct EmbeddingsRequest {
+    model: Option<String>,
+    input: EmbeddingsInput,
+    /// Ignored — always returns float embeddings.
+    #[serde(default)]
+    #[allow(dead_code)]
+    encoding_format: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingsInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+// ─── Response types ───────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct GenerateResponse<'a> {
@@ -225,8 +339,182 @@ where
     T: Read + Write,
 {
     let request = read_http_request(&mut stream).map_err(|err| err.to_string())?;
+
+    // Streaming requests need direct access to the underlying write stream;
+    // route them before falling through to the standard (status, body) path.
+    if is_streaming_request(&request) {
+        return route_streaming_request(&request, &mut stream, &runner, options)
+            .map_err(|err| err.to_string());
+    }
+
     let (status, body) = route_request(&request, &runner, options);
     write_http_response(&mut stream, status, &body).map_err(|err| err.to_string())
+}
+
+/// Returns true when the request body asks for SSE streaming.
+fn is_streaming_request(request: &HttpRequest) -> bool {
+    let method = request.method.as_str();
+    let path = request.path.as_str();
+    if method != "POST" {
+        return false;
+    }
+    if path != "/v1/chat/completions" && path != "/v1/completions" {
+        return false;
+    }
+    // Quick JSON field scan — avoid full deserialisation just for the flag.
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) {
+        return v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+    }
+    false
+}
+
+/// Write the streaming SSE response directly to `stream`.
+fn route_streaming_request<W: Write>(
+    request: &HttpRequest,
+    stream: &mut W,
+    runner: &Runner,
+    options: &ServeOptions,
+) -> io::Result<()> {
+    let model_ids = advertised_model_ids(runner);
+    let created = unix_timestamp();
+    let comp_id = format!(
+        "{}rustyllm-{}",
+        if request.path == "/v1/chat/completions" {
+            "chatcmpl-"
+        } else {
+            "cmpl-"
+        },
+        created
+    );
+    let is_chat = request.path == "/v1/chat/completions";
+    let model_name = model_ids.first().cloned().unwrap_or_else(|| runner.architecture().to_string());
+
+    let (messages, generation) = if is_chat {
+        match serde_json::from_slice::<OpenAiChatCompletionsRequest>(&request.body) {
+            Ok(payload) => {
+                let messages = match parse_api_messages(payload.messages) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        write_http_response(stream, 400, &json_error(&err))?;
+                        return Ok(());
+                    }
+                };
+                let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
+                let gen = apply_generation_overrides(
+                    &options.defaults,
+                    max_tok,
+                    payload.temperature,
+                    payload.top_p,
+                    payload.top_k,
+                    payload.repeat_penalty,
+                    payload.seed,
+                    payload.system_prompt,
+                    payload.stop.map(|s| s.into_vec()),
+                );
+                (messages, gen)
+            }
+            Err(err) => {
+                write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+                return Ok(());
+            }
+        }
+    } else {
+        match serde_json::from_slice::<OpenAiCompletionsRequest>(&request.body) {
+            Ok(payload) => {
+                let prompt = match payload.prompt {
+                    OpenAiPrompt::Single(p) => p,
+                    OpenAiPrompt::Batch(mut v) => {
+                        if v.is_empty() {
+                            write_http_response(
+                                stream,
+                                400,
+                                &json_error("Prompt array must not be empty."),
+                            )?;
+                            return Ok(());
+                        }
+                        v.remove(0)
+                    }
+                };
+                let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
+                let gen = apply_generation_overrides(
+                    &options.defaults,
+                    max_tok,
+                    payload.temperature,
+                    payload.top_p,
+                    payload.top_k,
+                    payload.repeat_penalty,
+                    payload.seed,
+                    payload.system_prompt,
+                    payload.stop.map(|s| s.into_vec()),
+                );
+                (vec![ChatMessage::user(prompt)], gen)
+            }
+            Err(err) => {
+                write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Write SSE response headers — no Content-Length since length is unknown.
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    )?;
+
+    // Stream each token as a Server-Sent Event chunk.
+    let result = runner.generate_chat_stream(&messages, &generation, |text| {
+        let chunk = if is_chat {
+            serde_json::json!({
+                "id": comp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": null
+                }]
+            })
+        } else {
+            serde_json::json!({
+                "id": comp_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "text": text,
+                    "finish_reason": null
+                }]
+            })
+        };
+        let line = format!("data: {}\n\n", chunk);
+        let _ = stream.write_all(line.as_bytes());
+    });
+
+    // Send final chunk with finish_reason and [DONE].
+    let finish_reason = if result.is_ok() { "stop" } else { "error" };
+    let final_chunk = if is_chat {
+        serde_json::json!({
+            "id": comp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+        })
+    } else {
+        serde_json::json!({
+            "id": comp_id,
+            "object": "text_completion",
+            "created": created,
+            "model": model_name,
+            "choices": [{"index": 0, "text": "", "finish_reason": finish_reason}]
+        })
+    };
+    write!(stream, "data: {}\n\n", final_chunk)?;
+    write!(stream, "data: [DONE]\n\n")?;
+    stream.flush()
 }
 
 fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions) -> (u16, String) {
@@ -264,6 +552,7 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                     payload.repeat_penalty,
                     payload.seed,
                     payload.system_prompt,
+                    payload.stop.map(|s| s.into_vec()),
                 );
 
                 let result = if let Some(messages) = payload.messages {
@@ -300,13 +589,7 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
         ("POST", "/v1/completions") => {
             match serde_json::from_slice::<OpenAiCompletionsRequest>(&request.body) {
                 Ok(payload) => {
-                    if payload.stream.unwrap_or(false) {
-                        return (400, json_error("Streaming is not supported."));
-                    }
-                    let model = match resolve_model(payload.model.as_deref(), &model_ids) {
-                        Ok(model) => model,
-                        Err(err) => return (400, json_error(&err)),
-                    };
+                    let model = resolve_model(payload.model.as_deref(), &model_ids);
                     let prompt = match payload.prompt {
                         OpenAiPrompt::Single(prompt) => prompt,
                         OpenAiPrompt::Batch(mut prompts) => {
@@ -316,15 +599,17 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                             prompts.remove(0)
                         }
                     };
+                    let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
                     let generation = apply_generation_overrides(
                         &options.defaults,
-                        payload.max_tokens,
+                        max_tok,
                         payload.temperature,
                         payload.top_p,
                         payload.top_k,
                         payload.repeat_penalty,
                         payload.seed,
                         payload.system_prompt,
+                        payload.stop.map(|s| s.into_vec()),
                     );
                     match runner.generate(&prompt, &generation) {
                         Ok(result) => {
@@ -363,26 +648,22 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
         ("POST", "/v1/chat/completions") => {
             match serde_json::from_slice::<OpenAiChatCompletionsRequest>(&request.body) {
                 Ok(payload) => {
-                    if payload.stream.unwrap_or(false) {
-                        return (400, json_error("Streaming is not supported."));
-                    }
-                    let model = match resolve_model(payload.model.as_deref(), &model_ids) {
-                        Ok(model) => model,
-                        Err(err) => return (400, json_error(&err)),
-                    };
+                    let model = resolve_model(payload.model.as_deref(), &model_ids);
                     let messages = match parse_api_messages(payload.messages) {
                         Ok(messages) => messages,
                         Err(err) => return (400, json_error(&err)),
                     };
+                    let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
                     let generation = apply_generation_overrides(
                         &options.defaults,
-                        payload.max_tokens,
+                        max_tok,
                         payload.temperature,
                         payload.top_p,
                         payload.top_k,
                         payload.repeat_penalty,
                         payload.seed,
                         payload.system_prompt,
+                        payload.stop.map(|s| s.into_vec()),
                     );
                     match runner.generate_chat(&messages, &generation) {
                         Ok(result) => {
@@ -421,6 +702,53 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                 Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
             }
         }
+        ("POST", "/v1/embeddings") => {
+            match serde_json::from_slice::<EmbeddingsRequest>(&request.body) {
+                Ok(payload) => {
+                    let model = resolve_model(payload.model.as_deref(), &model_ids);
+                    let inputs: Vec<String> = match payload.input {
+                        EmbeddingsInput::Single(s) => vec![s],
+                        EmbeddingsInput::Batch(v) => v,
+                    };
+                    if inputs.is_empty() {
+                        return (400, json_error("input must not be empty."));
+                    }
+
+                    let mut data: Vec<serde_json::Value> = Vec::new();
+                    for (i, text) in inputs.iter().enumerate() {
+                        match runner.embed(text) {
+                            Ok(result) => {
+                                data.push(serde_json::json!({
+                                    "object": "embedding",
+                                    "embedding": result.embedding,
+                                    "index": i,
+                                }));
+                            }
+                            Err(err) => return (400, json_error(&err)),
+                        }
+                    }
+
+                    let total_tokens: usize = inputs.iter().map(|t| {
+                        runner.tokenizer().encode(t).len()
+                    }).sum();
+
+                    let response = serde_json::json!({
+                        "object": "list",
+                        "data": data,
+                        "model": model,
+                        "usage": {
+                            "prompt_tokens": total_tokens,
+                            "total_tokens": total_tokens,
+                        }
+                    });
+                    match serde_json::to_string(&response) {
+                        Ok(body) => (200, body),
+                        Err(err) => (500, json_error(&format!("Serialize error: {}", err))),
+                    }
+                }
+                Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+            }
+        }
         _ => (404, json_error("Not found")),
     }
 }
@@ -434,6 +762,7 @@ fn apply_generation_overrides(
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
     system_prompt: Option<String>,
+    stop_sequences: Option<Vec<String>>,
 ) -> GenerationOptions {
     let mut generation = defaults.clone();
     if let Some(max_tokens) = max_tokens {
@@ -457,32 +786,51 @@ fn apply_generation_overrides(
     if let Some(system_prompt) = system_prompt {
         generation.system_prompt = system_prompt;
     }
+    if let Some(stop) = stop_sequences {
+        generation.stop_sequences = stop;
+    }
     generation
 }
 
 fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, String> {
     messages
         .into_iter()
-        .map(|message| match message.role.as_str() {
-            "system" => Ok(ChatMessage {
-                role: ChatRole::System,
-                content: message.content,
-            }),
-            "user" => Ok(ChatMessage::user(message.content)),
-            "assistant" => Ok(ChatMessage::assistant(message.content)),
-            other => Err(format!("Unsupported role: {}", other)),
+        .map(|message| {
+            let content = message.content.into_text();
+            match message.role.as_str() {
+                "system" => Ok(ChatMessage {
+                    role: ChatRole::System,
+                    content,
+                }),
+                "user" => Ok(ChatMessage::user(content)),
+                "assistant" => Ok(ChatMessage::assistant(content)),
+                other => Err(format!("Unsupported role: {}", other)),
+            }
         })
         .collect()
 }
 
-fn resolve_model(requested: Option<&str>, model_ids: &[String]) -> Result<String, String> {
-    let Some(default_model) = model_ids.first() else {
-        return Err(String::from("No model available."));
-    };
-    match requested {
-        None => Ok(default_model.clone()),
-        Some(model) if model_ids.iter().any(|candidate| candidate == model) => Ok(model.to_string()),
-        Some(model) => Err(format!("Unknown model '{}'.", model)),
+/// Resolve the requested model ID to a canonical name.
+///
+/// For single-model deployments (the most common case) we accept any model ID
+/// the caller provides — it is silently mapped to the loaded model.  This
+/// avoids breaking RAG pipelines that hard-code an arbitrary model name.
+fn resolve_model(requested: Option<&str>, model_ids: &[String]) -> String {
+    match model_ids.first() {
+        None => String::from("unknown"),
+        Some(default) => match requested {
+            None => default.clone(),
+            Some(model) if model_ids.iter().any(|c| c == model) => model.to_string(),
+            // Unknown model name — fall back to the loaded model and warn so
+            // operators can detect misconfigured clients.
+            Some(model) => {
+                eprintln!(
+                    "Warning: requested model '{}' not found; using '{}' instead.",
+                    model, default
+                );
+                default.clone()
+            }
+        },
     }
 }
 
@@ -506,13 +854,23 @@ fn model_aliases_for_arch(arch: &str) -> &'static [&'static str] {
     match arch {
         "llama" | "llama2" | "llama3" => &["llama", "llama2", "llama3"],
         "mistral" | "mixtral" | "ministral" => &["mistral", "mixtral", "ministral"],
-        "qwen2" => &["qwen2", "qwen2.5", "qwen3"],
+        "qwen2" | "qwen3" => &["qwen2", "qwen2.5", "qwen3"],
         "gpt-oss" => &["gpt-oss"],
         "gemma" | "gemma2" | "gemma4" => &["gemma", "gemma2", "gemma4"],
         "deepseek" | "deepseek-v2" | "deepseek2" => &["deepseek", "deepseek-v2", "deepseek2"],
         "nemotron" => &["nemotron"],
         "hermes" => &["hermes"],
-        "phi" | "phi2" | "phi3" => &["phi", "phi2", "phi3"],
+        "phi" | "phi2" | "phi3" | "phi4" => &["phi", "phi2", "phi3", "phi4"],
+        "falcon" | "falcon3" => &["falcon", "falcon3"],
+        "stablelm" => &["stablelm"],
+        "starcoder2" => &["starcoder2"],
+        "command-r" | "cohere" => &["command-r", "cohere"],
+        "internlm2" => &["internlm2"],
+        "olmo" | "olmo2" => &["olmo", "olmo2"],
+        "exaone" => &["exaone"],
+        "solar" => &["solar"],
+        "yi" => &["yi"],
+        "arctic" => &["arctic"],
         "nomic-bert" | "nomic-embed" | "text-embedding-nomic-embed-text" => {
             &["nomic-bert", "nomic-embed", "text-embedding-nomic-embed-text"]
         }

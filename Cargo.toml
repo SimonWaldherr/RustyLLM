@@ -1,6 +1,6 @@
 [package]
 name = "rusty-llm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "LLM inference engine — NEON (Apple Silicon) + AVX2 (x86)"
 
