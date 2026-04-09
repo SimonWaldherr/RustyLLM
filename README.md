@@ -5,7 +5,7 @@ RustyLLM is a small Rust inference runner for GGUF language models. It focuses o
 ## Features
 
 - Loads GGUF models directly from disk with zero-copy memory mapping on native targets.
-- Supports `llama`, `qwen2`, and `gpt-oss` architectures.
+- Supports GGUF architectures including `llama`/`llama2`/`llama3`, `mistral`/`mixtral`/`ministral`, `qwen2`, `gpt-oss`, `gemma`/`gemma2`/`gemma4`, `deepseek` variants, `nemotron`, `hermes`, `phi` variants, and `nomic` embeddings.
 - Handles SentencePiece and GPT-2 style tokenizers from GGUF metadata.
 - Runs quantized inference paths for `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K`, and `MXFP4` tensors.
 - Uses native SIMD backends on Apple Silicon and AVX2/FMA-capable x86_64 systems, with scalar fallback elsewhere.
@@ -74,6 +74,9 @@ Available routes:
 
 - `GET /health`
 - `POST /generate`
+- `GET /v1/models` (OpenAI-compatible)
+- `POST /v1/completions` (OpenAI-compatible)
+- `POST /v1/chat/completions` (OpenAI-compatible)
 
 Prompt request example:
 
@@ -115,6 +118,22 @@ Response shape:
   "decode_ms": 180,
   "total_ms": 223
 }
+```
+
+OpenAI chat completion example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "llama3",
+    "messages": [
+      {"role": "system", "content": "You are concise."},
+      {"role": "user", "content": "What is GGUF?"}
+    ],
+    "max_tokens": 64,
+    "temperature": 0.7
+  }'
 ```
 
 ## Library Usage

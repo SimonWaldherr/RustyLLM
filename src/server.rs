@@ -2,11 +2,13 @@ use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub struct ServeOptions {
@@ -41,6 +43,41 @@ struct ApiMessage {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct OpenAiCompletionsRequest {
+    model: Option<String>,
+    prompt: OpenAiPrompt,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+    stream: Option<bool>,
+    system_prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OpenAiPrompt {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct OpenAiChatCompletionsRequest {
+    model: Option<String>,
+    messages: Vec<ApiMessage>,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+    stream: Option<bool>,
+    system_prompt: Option<String>,
+}
+
 #[derive(Serialize)]
 struct GenerateResponse<'a> {
     text: &'a str,
@@ -49,6 +86,67 @@ struct GenerateResponse<'a> {
     prefill_ms: u128,
     decode_ms: u128,
     total_ms: u128,
+}
+
+#[derive(Serialize)]
+struct OpenAiModelListResponse {
+    object: &'static str,
+    data: Vec<OpenAiModelInfo>,
+}
+
+#[derive(Serialize)]
+struct OpenAiModelInfo {
+    id: String,
+    object: &'static str,
+    created: u64,
+    owned_by: &'static str,
+}
+
+#[derive(Serialize)]
+struct OpenAiUsage {
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatChoice {
+    index: usize,
+    message: OpenAiChatMessage,
+    finish_reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<OpenAiChatChoice>,
+    usage: OpenAiUsage,
+}
+
+#[derive(Serialize)]
+struct OpenAiCompletionChoice {
+    text: String,
+    index: usize,
+    finish_reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct OpenAiCompletionResponse {
+    id: String,
+    object: &'static str,
+    created: u64,
+    model: String,
+    choices: Vec<OpenAiCompletionChoice>,
+    usage: OpenAiUsage,
 }
 
 pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
@@ -132,47 +230,44 @@ where
 }
 
 fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions) -> (u16, String) {
+    let model_ids = advertised_model_ids(runner);
     match (request.method.as_str(), request.path.as_str()) {
+        ("OPTIONS", _) => (200, String::from("{}")),
         ("GET", "/health") => (200, String::from("{\"status\":\"ok\"}")),
+        ("GET", "/v1/models") => {
+            let created = unix_timestamp();
+            let response = OpenAiModelListResponse {
+                object: "list",
+                data: model_ids
+                    .into_iter()
+                    .map(|id| OpenAiModelInfo {
+                        id,
+                        object: "model",
+                        created,
+                        owned_by: "rusty-llm",
+                    })
+                    .collect(),
+            };
+            match serde_json::to_string(&response) {
+                Ok(body) => (200, body),
+                Err(err) => (500, json_error(&format!("Serialize error: {}", err))),
+            }
+        }
         ("POST", "/generate") => match serde_json::from_slice::<GenerateRequest>(&request.body) {
             Ok(payload) => {
-                let mut generation = options.defaults.clone();
-                if let Some(max_tokens) = payload.max_tokens {
-                    generation.max_tokens = max_tokens;
-                }
-                if let Some(temp) = payload.temp {
-                    generation.sampler.temperature = temp;
-                }
-                if let Some(top_p) = payload.top_p {
-                    generation.sampler.top_p = top_p;
-                }
-                if let Some(top_k) = payload.top_k {
-                    generation.sampler.top_k = top_k;
-                }
-                if let Some(repeat_penalty) = payload.repeat_penalty {
-                    generation.sampler.repeat_penalty = repeat_penalty;
-                }
-                if let Some(seed) = payload.seed {
-                    generation.seed = seed;
-                }
-                if let Some(system_prompt) = payload.system_prompt {
-                    generation.system_prompt = system_prompt;
-                }
+                let generation = apply_generation_overrides(
+                    &options.defaults,
+                    payload.max_tokens,
+                    payload.temp,
+                    payload.top_p,
+                    payload.top_k,
+                    payload.repeat_penalty,
+                    payload.seed,
+                    payload.system_prompt,
+                );
 
                 let result = if let Some(messages) = payload.messages {
-                    let messages: Result<Vec<ChatMessage>, String> = messages
-                        .into_iter()
-                        .map(|message| match message.role.as_str() {
-                            "system" => Ok(ChatMessage {
-                                role: ChatRole::System,
-                                content: message.content,
-                            }),
-                            "user" => Ok(ChatMessage::user(message.content)),
-                            "assistant" => Ok(ChatMessage::assistant(message.content)),
-                            other => Err(format!("Unsupported role: {}", other)),
-                        })
-                        .collect();
-                    match messages {
+                    match parse_api_messages(messages) {
                         Ok(messages) => runner.generate_chat(&messages, &generation),
                         Err(err) => Err(err),
                     }
@@ -202,8 +297,234 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
             }
             Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
         },
+        ("POST", "/v1/completions") => {
+            match serde_json::from_slice::<OpenAiCompletionsRequest>(&request.body) {
+                Ok(payload) => {
+                    if payload.stream.unwrap_or(false) {
+                        return (400, json_error("Streaming is not supported."));
+                    }
+                    let model = match resolve_model(payload.model.as_deref(), &model_ids) {
+                        Ok(model) => model.to_string(),
+                        Err(err) => return (400, json_error(&err)),
+                    };
+                    let prompt = match payload.prompt {
+                        OpenAiPrompt::Single(prompt) => prompt,
+                        OpenAiPrompt::Batch(mut prompts) => {
+                            if prompts.is_empty() {
+                                return (400, json_error("Prompt array must not be empty."));
+                            }
+                            prompts.remove(0)
+                        }
+                    };
+                    let generation = apply_generation_overrides(
+                        &options.defaults,
+                        payload.max_tokens,
+                        payload.temperature,
+                        payload.top_p,
+                        payload.top_k,
+                        payload.repeat_penalty,
+                        payload.seed,
+                        payload.system_prompt,
+                    );
+                    match runner.generate(&prompt, &generation) {
+                        Ok(result) => {
+                            let created = unix_timestamp();
+                            let usage = OpenAiUsage {
+                                prompt_tokens: result.stats.prompt_tokens,
+                                completion_tokens: result.stats.generated_tokens,
+                                total_tokens: result.stats.prompt_tokens
+                                    + result.stats.generated_tokens,
+                            };
+                            let response = OpenAiCompletionResponse {
+                                id: format!("cmpl-rustyllm-{}", created),
+                                object: "text_completion",
+                                created,
+                                model,
+                                choices: vec![OpenAiCompletionChoice {
+                                    text: result.text,
+                                    index: 0,
+                                    finish_reason: "stop",
+                                }],
+                                usage,
+                            };
+                            match serde_json::to_string(&response) {
+                                Ok(body) => (200, body),
+                                Err(err) => {
+                                    (500, json_error(&format!("Serialize error: {}", err)))
+                                }
+                            }
+                        }
+                        Err(err) => (400, json_error(&err)),
+                    }
+                }
+                Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+            }
+        }
+        ("POST", "/v1/chat/completions") => {
+            match serde_json::from_slice::<OpenAiChatCompletionsRequest>(&request.body) {
+                Ok(payload) => {
+                    if payload.stream.unwrap_or(false) {
+                        return (400, json_error("Streaming is not supported."));
+                    }
+                    let model = match resolve_model(payload.model.as_deref(), &model_ids) {
+                        Ok(model) => model.to_string(),
+                        Err(err) => return (400, json_error(&err)),
+                    };
+                    let messages = match parse_api_messages(payload.messages) {
+                        Ok(messages) => messages,
+                        Err(err) => return (400, json_error(&err)),
+                    };
+                    let generation = apply_generation_overrides(
+                        &options.defaults,
+                        payload.max_tokens,
+                        payload.temperature,
+                        payload.top_p,
+                        payload.top_k,
+                        payload.repeat_penalty,
+                        payload.seed,
+                        payload.system_prompt,
+                    );
+                    match runner.generate_chat(&messages, &generation) {
+                        Ok(result) => {
+                            let created = unix_timestamp();
+                            let usage = OpenAiUsage {
+                                prompt_tokens: result.stats.prompt_tokens,
+                                completion_tokens: result.stats.generated_tokens,
+                                total_tokens: result.stats.prompt_tokens
+                                    + result.stats.generated_tokens,
+                            };
+                            let response = OpenAiChatCompletionResponse {
+                                id: format!("chatcmpl-rustyllm-{}", created),
+                                object: "chat.completion",
+                                created,
+                                model,
+                                choices: vec![OpenAiChatChoice {
+                                    index: 0,
+                                    message: OpenAiChatMessage {
+                                        role: "assistant",
+                                        content: result.text,
+                                    },
+                                    finish_reason: "stop",
+                                }],
+                                usage,
+                            };
+                            match serde_json::to_string(&response) {
+                                Ok(body) => (200, body),
+                                Err(err) => {
+                                    (500, json_error(&format!("Serialize error: {}", err)))
+                                }
+                            }
+                        }
+                        Err(err) => (400, json_error(&err)),
+                    }
+                }
+                Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+            }
+        }
         _ => (404, json_error("Not found")),
     }
+}
+
+fn apply_generation_overrides(
+    defaults: &GenerationOptions,
+    max_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+    system_prompt: Option<String>,
+) -> GenerationOptions {
+    let mut generation = defaults.clone();
+    if let Some(max_tokens) = max_tokens {
+        generation.max_tokens = max_tokens;
+    }
+    if let Some(temperature) = temperature {
+        generation.sampler.temperature = temperature;
+    }
+    if let Some(top_p) = top_p {
+        generation.sampler.top_p = top_p;
+    }
+    if let Some(top_k) = top_k {
+        generation.sampler.top_k = top_k;
+    }
+    if let Some(repeat_penalty) = repeat_penalty {
+        generation.sampler.repeat_penalty = repeat_penalty;
+    }
+    if let Some(seed) = seed {
+        generation.seed = seed;
+    }
+    if let Some(system_prompt) = system_prompt {
+        generation.system_prompt = system_prompt;
+    }
+    generation
+}
+
+fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, String> {
+    messages
+        .into_iter()
+        .map(|message| match message.role.as_str() {
+            "system" => Ok(ChatMessage {
+                role: ChatRole::System,
+                content: message.content,
+            }),
+            "user" => Ok(ChatMessage::user(message.content)),
+            "assistant" => Ok(ChatMessage::assistant(message.content)),
+            other => Err(format!("Unsupported role: {}", other)),
+        })
+        .collect()
+}
+
+fn resolve_model<'a>(requested: Option<&str>, model_ids: &'a [String]) -> Result<&'a str, String> {
+    let Some(default_model) = model_ids.first() else {
+        return Err(String::from("No model available."));
+    };
+    match requested {
+        None => Ok(default_model.as_str()),
+        Some(model) if model_ids.iter().any(|candidate| candidate == model) => Ok(model),
+        Some(model) => Err(format!("Unknown model '{}'.", model)),
+    }
+}
+
+fn advertised_model_ids(runner: &Runner) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(model_name) = runner.model_name() {
+        let trimmed = model_name.trim();
+        if !trimmed.is_empty() {
+            ids.push(trimmed.to_string());
+        }
+    }
+    ids.push(runner.architecture().to_string());
+    ids.extend(model_aliases_for_arch(runner.architecture()).iter().map(|id| id.to_string()));
+
+    let mut seen = HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+fn model_aliases_for_arch(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "llama" | "llama2" | "llama3" => &["llama", "llama2", "llama3"],
+        "mistral" | "mixtral" | "ministral" => &["mistral", "mixtral", "ministral"],
+        "qwen2" => &["qwen2", "qwen2.5", "qwen3"],
+        "gpt-oss" => &["gpt-oss"],
+        "gemma" | "gemma2" | "gemma4" => &["gemma", "gemma2", "gemma4"],
+        "deepseek" | "deepseek-v2" | "deepseek2" => &["deepseek", "deepseek-v2", "deepseek2"],
+        "nemotron" => &["nemotron"],
+        "hermes" => &["hermes"],
+        "phi" | "phi2" | "phi3" => &["phi", "phi2", "phi3"],
+        "nomic-bert" | "nomic-embed" | "text-embedding-nomic-embed-text" => {
+            &["nomic-bert", "nomic-embed", "text-embedding-nomic-embed-text"]
+        }
+        _ => &[],
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn json_error(message: &str) -> String {

@@ -175,7 +175,9 @@ fn main() {
             "HTTP"
         };
         eprintln!("{} endpoint listening on {}", protocol, addr);
-        eprintln!("POST /generate and GET /health are available.");
+        eprintln!(
+            "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions."
+        );
         let serve_options = ServeOptions {
             addr,
             defaults: options.clone(),
