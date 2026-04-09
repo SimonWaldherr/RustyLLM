@@ -304,7 +304,7 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                         return (400, json_error("Streaming is not supported."));
                     }
                     let model = match resolve_model(payload.model.as_deref(), &model_ids) {
-                        Ok(model) => model.to_string(),
+                        Ok(model) => model,
                         Err(err) => return (400, json_error(&err)),
                     };
                     let prompt = match payload.prompt {
@@ -367,7 +367,7 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                         return (400, json_error("Streaming is not supported."));
                     }
                     let model = match resolve_model(payload.model.as_deref(), &model_ids) {
-                        Ok(model) => model.to_string(),
+                        Ok(model) => model,
                         Err(err) => return (400, json_error(&err)),
                     };
                     let messages = match parse_api_messages(payload.messages) {
@@ -475,13 +475,13 @@ fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, Str
         .collect()
 }
 
-fn resolve_model<'a>(requested: Option<&str>, model_ids: &'a [String]) -> Result<&'a str, String> {
+fn resolve_model(requested: Option<&str>, model_ids: &[String]) -> Result<String, String> {
     let Some(default_model) = model_ids.first() else {
         return Err(String::from("No model available."));
     };
     match requested {
-        None => Ok(default_model.as_str()),
-        Some(model) if model_ids.iter().any(|candidate| candidate == model) => Ok(model),
+        None => Ok(default_model.clone()),
+        Some(model) if model_ids.iter().any(|candidate| candidate == model) => Ok(model.to_string()),
         Some(model) => Err(format!("Unknown model '{}'.", model)),
     }
 }
