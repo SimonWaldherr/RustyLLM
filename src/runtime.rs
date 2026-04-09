@@ -379,6 +379,15 @@ impl Runner {
         let mut pos = tokens.len();
         let mut recent: VecDeque<u32> = tokens.iter().copied().collect();
 
+        // Pre-compute the longest stop sequence length so we only scan a small
+        // trailing window of `output` on each token instead of the full string.
+        let max_stop_len = options
+            .stop_sequences
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+
         'decode: for _ in 0..options.max_tokens {
             let token = sampling::sample(
                 &mut logits,
@@ -394,12 +403,18 @@ impl Runner {
             let text = self.tok.decode_token(token);
             output.push_str(&text);
 
-            // Check stop sequences on the accumulated output.  When a match is
-            // found, trim everything from the stop string onwards and stop.
-            if !options.stop_sequences.is_empty() {
+            // Check stop sequences only within a trailing window equal to the
+            // longest stop sequence length plus the current token length.  This
+            // keeps the scan O(max_stop_len) per token instead of O(output_len).
+            if max_stop_len > 0 {
+                let window_start = output
+                    .len()
+                    .saturating_sub(max_stop_len + text.len());
+                let window = &output[window_start..];
                 for stop in &options.stop_sequences {
-                    if let Some(idx) = output.find(stop.as_str()) {
-                        output.truncate(idx);
+                    if let Some(rel_idx) = window.find(stop.as_str()) {
+                        // Map the relative index back to an absolute offset.
+                        output.truncate(window_start + rel_idx);
                         break 'decode;
                     }
                 }

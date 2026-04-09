@@ -821,8 +821,15 @@ fn resolve_model(requested: Option<&str>, model_ids: &[String]) -> String {
         Some(default) => match requested {
             None => default.clone(),
             Some(model) if model_ids.iter().any(|c| c == model) => model.to_string(),
-            // Unknown model name — fall back to the loaded model silently.
-            Some(_) => default.clone(),
+            // Unknown model name — fall back to the loaded model and warn so
+            // operators can detect misconfigured clients.
+            Some(model) => {
+                eprintln!(
+                    "Warning: requested model '{}' not found; using '{}' instead.",
+                    model, default
+                );
+                default.clone()
+            }
         },
     }
 }
