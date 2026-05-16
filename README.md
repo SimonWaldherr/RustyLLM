@@ -112,6 +112,22 @@ rusty-llm ./models/model.gguf --repl
 rusty-llm ./models/model.gguf --list-tensors
 ```
 
+Embedding demo (cosine similarity check with three texts):
+
+```bash
+cargo run --release --bin embedding_demo -- \
+  "$HOME/.cache/lm-studio/models/lmstudio-community/Ministral-3-14B-Reasoning-2512-GGUF/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf" \
+  "Albert Einstein was a physicist." \
+  "Einstein developed the theory of relativity." \
+  "A banana is a tropical fruit."
+```
+
+Embedding-focused tests:
+
+```bash
+cargo test runtime::tests
+```
+
 ## HTTP API
 
 Start the server:

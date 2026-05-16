@@ -106,6 +106,57 @@ pub struct LoadInfo {
     pub load_time: Duration,
 }
 
+#[inline]
+fn mean_pool_in_place(values: &mut [f32], sample_count: usize) {
+    if sample_count == 0 {
+        return;
+    }
+    let scale = 1.0 / sample_count as f32;
+    for value in values.iter_mut() {
+        *value *= scale;
+    }
+}
+
+#[inline]
+fn l2_normalize_in_place(values: &mut [f32]) {
+    let norm: f32 = values.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        let inv = 1.0 / norm;
+        for value in values.iter_mut() {
+            *value *= inv;
+        }
+    }
+}
+
+/// Compute cosine similarity between two embeddings.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, String> {
+    if a.len() != b.len() {
+        return Err(format!(
+            "cosine_similarity: dimension mismatch ({} vs {})",
+            a.len(),
+            b.len()
+        ));
+    }
+    if a.is_empty() {
+        return Err(String::from("cosine_similarity: empty vectors"));
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom <= 1e-12 {
+        return Err(String::from(
+            "cosine_similarity: zero-norm vector encountered",
+        ));
+    }
+    Ok(dot / denom)
+}
+
 enum LoadedWeights {
     Standard(ModelWeights),
     GptOss(GptOssWeights),
@@ -577,19 +628,10 @@ impl Runner {
             }
         }
 
-        // Mean pool across all token positions.
-        let scale = 1.0 / token_count as f32;
-        for v in sum.iter_mut() {
-            *v *= scale;
-        }
-
-        // L2 normalise so cosine similarity == dot product.
-        let norm: f32 = sum.iter().map(|&v| v * v).sum::<f32>().sqrt();
-        if norm > 1e-8 {
-            for v in sum.iter_mut() {
-                *v /= norm;
-            }
-        }
+        // Mean pool across all token positions, then L2 normalise so cosine
+        // similarity is equivalent to a dot product.
+        mean_pool_in_place(&mut sum, token_count);
+        l2_normalize_in_place(&mut sum);
 
         Ok(EmbeddingResult {
             embedding: sum,
@@ -756,6 +798,53 @@ impl Runner {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cosine_similarity, l2_normalize_in_place, mean_pool_in_place};
+
+    #[test]
+    fn mean_pool_scales_by_sample_count() {
+        let mut v = vec![6.0f32, -3.0, 9.0];
+        mean_pool_in_place(&mut v, 3);
+        assert_eq!(v, vec![2.0, -1.0, 3.0]);
+    }
+
+    #[test]
+    fn l2_normalize_produces_unit_vector() {
+        let mut v = vec![3.0f32, 4.0];
+        l2_normalize_in_place(&mut v);
+        let norm = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!((v[0] - 0.6).abs() < 1e-6);
+        assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_normalize_keeps_zero_vector_stable() {
+        let mut v = vec![0.0f32, 0.0, 0.0];
+        l2_normalize_in_place(&mut v);
+        assert_eq!(v, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn cosine_similarity_for_identical_and_orthogonal_vectors() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![1.0f32, 2.0, 3.0];
+        let c = vec![1.0f32, -2.0, 1.0];
+        let sim_ab = cosine_similarity(&a, &b).unwrap();
+        let sim_ac = cosine_similarity(&a, &c).unwrap();
+        assert!((sim_ab - 1.0).abs() < 1e-6);
+        assert!(sim_ac.abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_rejects_invalid_inputs() {
+        assert!(cosine_similarity(&[], &[]).is_err());
+        assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
+        assert!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]).is_err());
     }
 }
 

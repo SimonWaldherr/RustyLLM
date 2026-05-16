@@ -15,5 +15,5 @@ pub mod tokenizer;
 
 pub use runtime::{
     ChatMessage, ChatRole, EmbeddingResult, GenerationOptions, GenerationResult, GenerationStats,
-    LoadInfo, Runner,
+    LoadInfo, Runner, cosine_similarity,
 };
