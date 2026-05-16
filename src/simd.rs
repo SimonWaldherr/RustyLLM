@@ -219,14 +219,13 @@ impl MatvecJob {
 struct WorkerState {
     job: Option<MatvecJob>,
     job_id: u64,
-    completed: usize,
+    completed: AtomicUsize,
 }
 
 #[cfg(not(target_family = "wasm"))]
 struct WorkerPool {
     state: Mutex<WorkerState>,
     work_available: Condvar,
-    job_done: Condvar,
     max_workers: usize,
 }
 
@@ -237,10 +236,9 @@ impl WorkerPool {
             state: Mutex::new(WorkerState {
                 job: None,
                 job_id: 0,
-                completed: 0,
+                completed: AtomicUsize::new(0),
             }),
             work_available: Condvar::new(),
-            job_done: Condvar::new(),
             max_workers,
         });
 
@@ -267,25 +265,41 @@ impl WorkerPool {
             return;
         }
 
+        // Fast spin-wait if previous job is finishing (usually very quick)
+        loop {
+            let mut state = self.state.lock().expect("worker pool mutex poisoned");
+            if state.job.is_none() {
+                state.job_id = state.job_id.wrapping_add(1);
+                state.completed.store(0, Ordering::Release);
+                state.job = Some(job);
+                self.work_available.notify_all();
+                break;
+            }
+            drop(state);
+            std::hint::spin_loop();
+        }
+
+        // Wait for workers to finish current job using spin-loop
+        // This is a micro-job, so sleeping via Condvar is too slow for LLM latencies.
+        let mut spins = 0;
+        loop {
+            let state = self.state.lock().expect("worker pool mutex poisoned");
+            if state.completed.load(Ordering::Acquire) == job.workers {
+                break;
+            }
+            drop(state);
+            
+            if spins < 10000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                thread::yield_now();
+            }
+        }
+        
+        // Final cleanup
         let mut state = self.state.lock().expect("worker pool mutex poisoned");
-        while state.job.is_some() {
-            state = self
-                .job_done
-                .wait(state)
-                .expect("worker pool mutex poisoned");
-        }
-
-        state.job_id = state.job_id.wrapping_add(1);
-        state.completed = 0;
-        state.job = Some(job);
-        self.work_available.notify_all();
-
-        while state.job.is_some() {
-            state = self
-                .job_done
-                .wait(state)
-                .expect("worker pool mutex poisoned");
-        }
+        state.job = None;
     }
 }
 
@@ -309,12 +323,8 @@ fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
             unsafe {
                 job.run_worker(worker_idx);
             }
-            let mut state = pool.state.lock().expect("worker pool mutex poisoned");
-            state.completed += 1;
-            if state.completed == job.workers {
-                state.job = None;
-                pool.job_done.notify_all();
-            }
+            let state = pool.state.lock().expect("worker pool mutex poisoned");
+            state.completed.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -542,6 +552,11 @@ pub fn dot_q4_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[inline]
 pub fn dot_q6_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 256 == 0);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { return dot_q6_k_f32_neon(qdata, x, n); }
+    }
+    #[allow(unreachable_code)]
     dot_q6_k_f32_scalar(qdata, x, n)
 }
 
@@ -913,6 +928,85 @@ fn get_scale_min_k4(j: usize, q: &[u8; 12]) -> (u8, u8) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    use std::arch::aarch64::*;
+    let n_blocks = n / 256;
+    let block_size = 210;
+    let mut total = vdupq_n_f32(0.0);
+    let mask_lo4 = vdupq_n_u8(0x0F);
+    let mask_03  = vdupq_n_u8(0x03);
+    let sub32    = vdupq_n_u8(32);
+
+    for b in 0..n_blocks {
+        let block = qdata.as_ptr().add(b * block_size);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+        let xbase = x.as_ptr().add(b * 256);
+        let mut ql_ptr = block;
+        let mut qh_ptr = block.add(128);
+        let mut sc_ptr = block.add(192);
+        let mut grp_x_base = 0usize;
+
+        for _grp in 0..2 {
+            for half in 0..2usize {
+                let l = half * 16;
+                let is = half;
+
+                let sv1 = vdupq_n_f32(d * (*sc_ptr.add(is    ) as i8) as f32);
+                let sv2 = vdupq_n_f32(d * (*sc_ptr.add(is + 2) as i8) as f32);
+                let sv3 = vdupq_n_f32(d * (*sc_ptr.add(is + 4) as i8) as f32);
+                let sv4 = vdupq_n_f32(d * (*sc_ptr.add(is + 6) as i8) as f32);
+
+                let ql1 = vld1q_u8(ql_ptr.add(l));
+                let ql2 = vld1q_u8(ql_ptr.add(l + 32));
+                let qhv = vld1q_u8(qh_ptr.add(l));
+
+                let lo1 = vandq_u8(ql1, mask_lo4);
+                let hi1 = vshrq_n_u8(ql1, 4);
+                let lo2 = vandq_u8(ql2, mask_lo4);
+                let hi2 = vshrq_n_u8(ql2, 4);
+
+                let h1 = vandq_u8(qhv,                    mask_03);
+                let h2 = vandq_u8(vshrq_n_u8(qhv, 2), mask_03);
+                let h3 = vandq_u8(vshrq_n_u8(qhv, 4), mask_03);
+                let h4 =          vshrq_n_u8(qhv, 6);
+
+                let q1 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo1, vshlq_n_u8(h1, 4)), sub32));
+                let q2 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo2, vshlq_n_u8(h2, 4)), sub32));
+                let q3 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(hi1, vshlq_n_u8(h3, 4)), sub32));
+                let q4 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(hi2, vshlq_n_u8(h4, 4)), sub32));
+
+                macro_rules! dot16 {
+                    ($qi8:expr, $xptr:expr, $sv:expr) => {{
+                        let qlo = vmovl_s8(vget_low_s8($qi8));
+                        let qhi = vmovl_s8(vget_high_s8($qi8));
+                        let f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qlo)));
+                        let f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qlo)));
+                        let f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qhi)));
+                        let f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qhi)));
+                        total = vmlaq_f32(total, vmulq_f32(f0, $sv), vld1q_f32($xptr));
+                        total = vmlaq_f32(total, vmulq_f32(f1, $sv), vld1q_f32($xptr.add(4)));
+                        total = vmlaq_f32(total, vmulq_f32(f2, $sv), vld1q_f32($xptr.add(8)));
+                        total = vmlaq_f32(total, vmulq_f32(f3, $sv), vld1q_f32($xptr.add(12)));
+                    }};
+                }
+
+                let x_off = grp_x_base + l;
+                dot16!(q1, xbase.add(x_off),       sv1);
+                dot16!(q2, xbase.add(x_off + 32),  sv2);
+                dot16!(q3, xbase.add(x_off + 64),  sv3);
+                dot16!(q4, xbase.add(x_off + 96),  sv4);
+            }
+            ql_ptr = ql_ptr.add(64);
+            qh_ptr = qh_ptr.add(32);
+            sc_ptr = sc_ptr.add(8);
+            grp_x_base += 128;
+        }
+    }
+    vaddvq_f32(total)
+}
+
 #[allow(dead_code)]
 fn dot_q4_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 256;
@@ -1130,27 +1224,13 @@ fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     sum
 }
 
-#[inline]
+#[inline(always)]
 fn mxfp4_nibble_to_f32(v: u8) -> f32 {
-    match v & 0x0F {
-        0 => 0.0,
-        1 => 0.5,
-        2 => 1.0,
-        3 => 1.5,
-        4 => 2.0,
-        5 => 3.0,
-        6 => 4.0,
-        7 => 6.0,
-        8 => -0.0,
-        9 => -0.5,
-        10 => -1.0,
-        11 => -1.5,
-        12 => -2.0,
-        13 => -3.0,
-        14 => -4.0,
-        15 => -6.0,
-        _ => 0.0,
-    }
+    const LUT: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    LUT[(v & 0x0F) as usize]
 }
 
 fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
@@ -1372,17 +1452,31 @@ unsafe fn hsum_avx(v: std::arch::x86_64::__m256) -> f32 {
 unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     let n = a.len();
-    let main = n / 8;
-    let mut acc = _mm256_setzero_ps();
+    let main = n / 32;
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
     let mut ap = a.as_ptr();
     let mut bp = b.as_ptr();
     for _ in 0..main {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap),       _mm256_loadu_ps(bp),       acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(8)),  _mm256_loadu_ps(bp.add(8)),  acc1);
+        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(16)), _mm256_loadu_ps(bp.add(16)), acc2);
+        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(24)), _mm256_loadu_ps(bp.add(24)), acc3);
+        ap = ap.add(32);
+        bp = bp.add(32);
+    }
+    let mut acc = _mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
+    let tail_start = main * 32;
+    let tail_8 = (n - tail_start) / 8;
+    for _ in 0..tail_8 {
         acc = _mm256_fmadd_ps(_mm256_loadu_ps(ap), _mm256_loadu_ps(bp), acc);
         ap = ap.add(8);
         bp = bp.add(8);
     }
     let mut sum = hsum_avx(acc);
-    for i in (main * 8)..n {
+    for i in (tail_start + tail_8 * 8)..n {
         sum += a[i] * b[i];
     }
     sum
