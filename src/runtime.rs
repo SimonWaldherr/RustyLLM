@@ -5,6 +5,15 @@ use crate::tokenizer::Tokenizer;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+/// Embedding result returned by [`Runner::embed`].
+#[derive(Clone, Debug)]
+pub struct EmbeddingResult {
+    /// L2-normalized embedding vector of dimension `config.dim`.
+    pub embedding: Vec<f32>,
+    /// Number of tokens in the input prompt.
+    pub token_count: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum ChatRole {
     System,
@@ -40,6 +49,9 @@ pub struct GenerationOptions {
     pub sampler: SamplerConfig,
     pub seed: u64,
     pub system_prompt: String,
+    /// Stop generation when any of these strings appears in the output.
+    /// The matched sequence is not included in the returned text.
+    pub stop_sequences: Vec<String>,
 }
 
 impl Default for GenerationOptions {
@@ -49,6 +61,7 @@ impl Default for GenerationOptions {
             sampler: SamplerConfig::default(),
             seed: 0,
             system_prompt: String::from("You are a helpful assistant."),
+            stop_sequences: Vec::new(),
         }
     }
 }
@@ -137,6 +150,20 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "phi"
             | "phi2"
             | "phi3"
+            | "phi4"
+            | "falcon"
+            | "falcon3"
+            | "stablelm"
+            | "starcoder2"
+            | "command-r"
+            | "cohere"
+            | "internlm2"
+            | "olmo"
+            | "olmo2"
+            | "exaone"
+            | "solar"
+            | "yi"
+            | "arctic"
             | "nomic-bert"
             | "nomic-embed"
             | "text-embedding-nomic-embed-text"
@@ -377,7 +404,16 @@ impl Runner {
         let mut pos = tokens.len();
         let mut recent: VecDeque<u32> = tokens.iter().copied().collect();
 
-        for _ in 0..options.max_tokens {
+        // Pre-compute the longest stop sequence length so we only scan a small
+        // trailing window of `output` on each token instead of the full string.
+        let max_stop_len = options
+            .stop_sequences
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+
+        'decode: for _ in 0..options.max_tokens {
             let token = sampling::sample(
                 &mut logits,
                 &options.sampler,
@@ -390,8 +426,24 @@ impl Runner {
             }
 
             let text = self.tok.decode_token(token);
-            on_token(&text);
             output.push_str(&text);
+
+            // Check stop sequences only within a trailing window equal to the
+            // longest stop sequence length plus the current token length.  This
+            // keeps the scan O(max_stop_len) per token instead of O(output_len).
+            if max_stop_len > 0 {
+                let window_start = output.len().saturating_sub(max_stop_len + text.len());
+                let window = &output[window_start..];
+                for stop in &options.stop_sequences {
+                    if let Some(rel_idx) = window.find(stop.as_str()) {
+                        // Map the relative index back to an absolute offset.
+                        output.truncate(window_start + rel_idx);
+                        break 'decode;
+                    }
+                }
+            }
+
+            on_token(&text);
 
             generated.push(token);
             recent.push_back(token);
@@ -438,6 +490,106 @@ impl Runner {
                 model::forward(&self.config, weights, cache, buf, token, pos)
             }
         }
+    }
+
+    /// Like `forward_token` but returns the normalized hidden state (dim-sized)
+    /// before the output projection.  Used for embedding generation.
+    fn forward_hidden_token(
+        &self,
+        cache: &mut KVCache,
+        buf: &mut DecodeBuffer,
+        token: u32,
+        pos: usize,
+    ) -> Vec<f32> {
+        match &self.weights {
+            LoadedWeights::GptOss(weights) => {
+                model::forward_hidden_gpt_oss(&self.config, weights, cache, token, pos)
+            }
+            LoadedWeights::Gemma4(weights) => {
+                model::forward_hidden_gemma4(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::Standard(weights) => {
+                model::forward_hidden(&self.config, weights, cache, buf, token, pos)
+            }
+        }
+    }
+
+    /// Embed `text` as a dense vector.
+    ///
+    /// Runs the full prefill pass, mean-pools the per-token hidden states
+    /// across all input positions, then L2-normalises the result.  The
+    /// returned vector has dimension `config.dim` and is suitable for cosine
+    /// similarity comparisons (RAG retrieval, semantic search, etc.).
+    pub fn embed(&self, text: &str) -> Result<EmbeddingResult, String> {
+        let tokens = self.tok.encode(text);
+        if tokens.is_empty() {
+            return Err(String::from("embed: input tokenised to zero tokens"));
+        }
+
+        let cache_len = std::cmp::min(self.config.max_seq_len, tokens.len() + 1);
+
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = match &self.weights
+        {
+            LoadedWeights::Gemma4(w) => {
+                let mut max_hd = self.config.head_dim;
+                let mut max_kv_heads = self.config.n_kv_heads;
+                let mut max_val = self.config.value_dim;
+                for l in w.layers.iter() {
+                    if l.head_dim > max_hd {
+                        max_hd = l.head_dim;
+                    }
+                    if l.n_kv_heads > max_kv_heads {
+                        max_kv_heads = l.n_kv_heads;
+                    }
+                    if l.value_dim > max_val {
+                        max_val = l.value_dim;
+                    }
+                }
+                let kk = max_kv_heads * max_hd;
+                let vv = max_kv_heads * max_val;
+                (kk, vv, max_hd, max_kv_heads, max_val)
+            }
+            _ => (
+                self.config.n_kv_heads * self.config.head_dim,
+                self.config.kv_dim,
+                self.config.head_dim,
+                self.config.n_kv_heads,
+                self.config.value_dim,
+            ),
+        };
+
+        let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
+        let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
+
+        let dim = self.config.dim;
+        let mut sum = vec![0.0f32; dim];
+        let token_count = tokens.len();
+
+        for (pos, &tok_id) in tokens.iter().enumerate() {
+            let h = self.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
+            for (i, &v) in h.iter().enumerate() {
+                sum[i] += v;
+            }
+        }
+
+        // Mean pool across all token positions.
+        let scale = 1.0 / token_count as f32;
+        for v in sum.iter_mut() {
+            *v *= scale;
+        }
+
+        // L2 normalise so cosine similarity == dot product.
+        let norm: f32 = sum.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        if norm > 1e-8 {
+            for v in sum.iter_mut() {
+                *v /= norm;
+            }
+        }
+
+        Ok(EmbeddingResult {
+            embedding: sum,
+            token_count,
+        })
     }
 
     fn is_stop_token(&self, token: u32) -> bool {

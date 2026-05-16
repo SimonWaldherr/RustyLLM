@@ -12,5 +12,6 @@ pub mod simd;
 pub mod tokenizer;
 
 pub use runtime::{
-    ChatMessage, ChatRole, GenerationOptions, GenerationResult, GenerationStats, LoadInfo, Runner,
+    ChatMessage, ChatRole, EmbeddingResult, GenerationOptions, GenerationResult, GenerationStats,
+    LoadInfo, Runner,
 };

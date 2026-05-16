@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn print_usage(name: &str) {
-    eprintln!("rusty-llm v0.2.0");
+    eprintln!("rusty-llm v0.3.0");
     eprintln!();
     eprintln!(
         "Usage: {} [model.gguf|model-name|model-dir] [options]",
@@ -41,6 +41,8 @@ fn print_usage(name: &str) {
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
     eprintln!("  --system-prompt <T>       Override the default system prompt");
+    eprintln!("  --stop <text>             Stop generation when this string appears");
+    eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
     eprintln!("  --list-tensors            Print GGUF tensor inventory and exit");
 }
 
@@ -107,6 +109,7 @@ fn run() -> Result<(), String> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut max_connections_override: Option<usize> = None;
+    let mut embed_mode = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -176,6 +179,14 @@ fn run() -> Result<(), String> {
             }
             "--system-prompt" => {
                 options.system_prompt = parse_arg::<String>(&args, &mut i, "--system-prompt")?;
+            }
+            "--stop" => {
+                options
+                    .stop_sequences
+                    .push(parse_arg::<String>(&args, &mut i, "--stop")?);
+            }
+            "--embed" => {
+                embed_mode = true;
             }
             "--list-tensors" => {
                 list_tensors = true;
@@ -274,6 +285,26 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    // Embedding mode: run prefill, print the L2-normalised embedding vector.
+    if embed_mode {
+        if prompt.is_empty() {
+            return Err(String::from("--embed requires --prompt <text>."));
+        }
+        let result = runner.embed(&prompt)?;
+        eprintln!(
+            "Embedding dim: {}, tokens: {}",
+            result.embedding.len(),
+            result.token_count
+        );
+        let floats: Vec<String> = result
+            .embedding
+            .iter()
+            .map(|v| format!("{:.6}", v))
+            .collect();
+        println!("[{}]", floats.join(", "));
+        return Ok(());
+    }
+
     // Server mode takes over the process after the model is loaded.
     if let Some(addr) = serve_addr {
         let protocol = if tls_cert.is_some() && tls_key.is_some() {
@@ -283,7 +314,9 @@ fn run() -> Result<(), String> {
         };
         let max_connections = max_connections_override.unwrap_or_else(|| (n_threads * 8).max(16));
         eprintln!("{} endpoint listening on {}", protocol, addr);
-        eprintln!("POST /generate and GET /health are available.");
+        eprintln!(
+            "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+        );
         eprintln!("Max concurrent connections: {}", max_connections);
         let serve_options = ServeOptions {
             addr,
