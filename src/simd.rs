@@ -1,4 +1,5 @@
 // simd.rs — Platform-specific SIMD kernels
+#![allow(unsafe_op_in_unsafe_fn)]
 //
 // Provides optimized dot products for:
 //   - f32 vectors (NEON / AVX2 / scalar)
@@ -10,6 +11,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(target_family = "wasm"))]
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(not(target_family = "wasm"))]
 use std::thread;
 
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -18,15 +21,11 @@ static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 #[inline(always)]
 pub fn f16_to_f32(h: u16) -> f32 {
-    // Use native hardware conversion where available
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(not(target_family = "wasm"))]
     {
-        // ARM has native f16 support
-        // But Rust doesn't expose vcvth_f32_f16 easily, so we do IEEE754 manually
-        // Still very fast on Apple Silicon's pipeline
-        f16_to_f32_soft(h)
+        f16_lookup()[h as usize]
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_family = "wasm")]
     {
         f16_to_f32_soft(h)
     }
@@ -44,31 +43,82 @@ fn num_threads() -> usize {
     } else if cfg!(target_family = "wasm") {
         1
     } else {
+        #[cfg(not(target_family = "wasm"))]
         {
-            #[cfg(not(target_family = "wasm"))]
-            {
+            static DEFAULT_THREADS: OnceLock<usize> = OnceLock::new();
+            *DEFAULT_THREADS.get_or_init(|| {
                 thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
-            }
-            #[cfg(target_family = "wasm")]
-            {
-                1
-            }
+            })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            1
         }
     }
 }
 
-fn parallel_matvec<T, F>(out: &mut [f32], rows: usize, row_span: usize, data: &[T], worker: F)
-where
-    T: Sync,
-    F: Fn(&[T]) -> f32 + Sync,
-{
+#[cfg(not(target_family = "wasm"))]
+fn f16_lookup() -> &'static [f32] {
+    static F16_LOOKUP: OnceLock<Vec<f32>> = OnceLock::new();
+    F16_LOOKUP.get_or_init(|| {
+        let mut table = vec![0.0f32; 1 << 16];
+        for (i, value) in table.iter_mut().enumerate() {
+            *value = f16_to_f32_soft(i as u16);
+        }
+        table
+    })
+}
+
+#[derive(Clone, Copy)]
+enum MatvecKind {
+    F32,
+    Q8_0,
+    Q4_0,
+    Q4K,
+    Q6K,
+    Mxfp4,
+}
+
+fn parallel_matvec_f32(out: &mut [f32], rows: usize, cols: usize, data: &[f32], x: &[f32]) {
+    parallel_matvec(
+        MatvecKind::F32,
+        out,
+        rows,
+        cols,
+        cols * std::mem::size_of::<f32>(),
+        data.as_ptr() as *const u8,
+        x.as_ptr(),
+    );
+}
+
+fn parallel_matvec_u8(
+    kind: MatvecKind,
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    row_span: usize,
+    data: &[u8],
+    x: &[f32],
+) {
+    parallel_matvec(kind, out, rows, cols, row_span, data.as_ptr(), x.as_ptr());
+}
+
+fn parallel_matvec(
+    kind: MatvecKind,
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+    row_span: usize,
+    data: *const u8,
+    x: *const f32,
+) {
     let threads = num_threads().min(rows);
 
     if threads <= 1 || rows < threads * 8 {
         for r in 0..rows {
-            out[r] = worker(&data[r * row_span..(r + 1) * row_span]);
+            out[r] = unsafe { dot_row(kind, data, x, r, cols, row_span) };
         }
         return;
     }
@@ -76,30 +126,209 @@ where
     #[cfg(target_family = "wasm")]
     {
         for r in 0..rows {
-            out[r] = worker(&data[r * row_span..(r + 1) * row_span]);
+            out[r] = unsafe { dot_row(kind, data, x, r, cols, row_span) };
         }
         return;
     }
 
     #[cfg(not(target_family = "wasm"))]
     {
-        let chunk_rows = rows.div_ceil(threads);
-        thread::scope(|scope| {
-            for (chunk_idx, out_chunk) in out.chunks_mut(chunk_rows).enumerate() {
-                let start_row = chunk_idx * chunk_rows;
-                let start = start_row * row_span;
-                let end = start + out_chunk.len() * row_span;
-                let data_chunk = &data[start..end];
-                let worker = &worker;
-                scope.spawn(move || {
-                    for (local_row, out_cell) in out_chunk.iter_mut().enumerate() {
-                        let row = &data_chunk[local_row * row_span..(local_row + 1) * row_span];
-                        *out_cell = worker(row);
-                    }
-                });
-            }
+        worker_pool().run(MatvecJob {
+            kind,
+            data,
+            x,
+            out: out.as_mut_ptr(),
+            rows,
+            cols,
+            row_span,
+            workers: threads,
         });
     }
+}
+
+#[inline]
+unsafe fn dot_row(
+    kind: MatvecKind,
+    data: *const u8,
+    x: *const f32,
+    row: usize,
+    cols: usize,
+    row_span: usize,
+) -> f32 {
+    let row_ptr = data.add(row * row_span);
+    let x = std::slice::from_raw_parts(x, cols);
+    match kind {
+        MatvecKind::F32 => {
+            let row = std::slice::from_raw_parts(row_ptr as *const f32, cols);
+            dot_f32(row, x)
+        }
+        MatvecKind::Q8_0 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q8_0_f32(row, x, cols)
+        }
+        MatvecKind::Q4_0 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q4_0_f32(row, x, cols)
+        }
+        MatvecKind::Q4K => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q4_k_f32(row, x, cols)
+        }
+        MatvecKind::Q6K => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q6_k_f32(row, x, cols)
+        }
+        MatvecKind::Mxfp4 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_mxfp4_f32(row, x, cols)
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct MatvecJob {
+    kind: MatvecKind,
+    data: *const u8,
+    x: *const f32,
+    out: *mut f32,
+    rows: usize,
+    cols: usize,
+    row_span: usize,
+    workers: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Send for MatvecJob {}
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Sync for MatvecJob {}
+
+#[cfg(not(target_family = "wasm"))]
+impl MatvecJob {
+    unsafe fn run_worker(self, worker_idx: usize) {
+        let start = self.rows * worker_idx / self.workers;
+        let end = self.rows * (worker_idx + 1) / self.workers;
+        for row in start..end {
+            *self.out.add(row) =
+                dot_row(self.kind, self.data, self.x, row, self.cols, self.row_span);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct WorkerState {
+    job: Option<MatvecJob>,
+    job_id: u64,
+    completed: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct WorkerPool {
+    state: Mutex<WorkerState>,
+    work_available: Condvar,
+    job_done: Condvar,
+    max_workers: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WorkerPool {
+    fn new(max_workers: usize) -> Arc<Self> {
+        let pool = Arc::new(Self {
+            state: Mutex::new(WorkerState {
+                job: None,
+                job_id: 0,
+                completed: 0,
+            }),
+            work_available: Condvar::new(),
+            job_done: Condvar::new(),
+            max_workers,
+        });
+
+        for worker_idx in 0..max_workers {
+            let pool = Arc::clone(&pool);
+            thread::Builder::new()
+                .name(format!("rusty-llm-matvec-{}", worker_idx))
+                .spawn(move || worker_loop(pool, worker_idx))
+                .expect("failed to start matvec worker");
+        }
+
+        pool
+    }
+
+    fn run(&self, mut job: MatvecJob) {
+        job.workers = job.workers.min(self.max_workers).min(job.rows).max(1);
+        if job.workers <= 1 || job.rows < job.workers * 8 {
+            for row in 0..job.rows {
+                unsafe {
+                    *job.out.add(row) =
+                        dot_row(job.kind, job.data, job.x, row, job.cols, job.row_span);
+                }
+            }
+            return;
+        }
+
+        let mut state = self.state.lock().expect("worker pool mutex poisoned");
+        while state.job.is_some() {
+            state = self
+                .job_done
+                .wait(state)
+                .expect("worker pool mutex poisoned");
+        }
+
+        state.job_id = state.job_id.wrapping_add(1);
+        state.completed = 0;
+        state.job = Some(job);
+        self.work_available.notify_all();
+
+        while state.job.is_some() {
+            state = self
+                .job_done
+                .wait(state)
+                .expect("worker pool mutex poisoned");
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
+    let mut last_job_id = 0u64;
+    loop {
+        let job = {
+            let mut state = pool.state.lock().expect("worker pool mutex poisoned");
+            while state.job_id == last_job_id || state.job.is_none() {
+                state = pool
+                    .work_available
+                    .wait(state)
+                    .expect("worker pool mutex poisoned");
+            }
+            last_job_id = state.job_id;
+            state.job.expect("job should be available")
+        };
+
+        if worker_idx < job.workers {
+            unsafe {
+                job.run_worker(worker_idx);
+            }
+            let mut state = pool.state.lock().expect("worker pool mutex poisoned");
+            state.completed += 1;
+            if state.completed == job.workers {
+                state.job = None;
+                pool.job_done.notify_all();
+            }
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn worker_pool() -> &'static WorkerPool {
+    static POOL: OnceLock<Arc<WorkerPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        WorkerPool::new(workers)
+    })
 }
 
 #[inline(always)]
@@ -151,6 +380,101 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         dot_f32_scalar(a, b)
+    }
+}
+
+/// out[i] += alpha * x[i]
+#[inline]
+pub fn axpy_f32(out: &mut [f32], alpha: f32, x: &[f32]) {
+    debug_assert_eq!(out.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { axpy_f32_neon(out, alpha, x) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { axpy_f32_avx2(out, alpha, x) }
+        } else {
+            axpy_f32_scalar(out, alpha, x)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        axpy_f32_scalar(out, alpha, x)
+    }
+}
+
+/// out[i] *= scale
+#[inline]
+pub fn scale_f32(out: &mut [f32], scale: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { scale_f32_neon(out, scale) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { scale_f32_avx2(out, scale) }
+        } else {
+            scale_f32_scalar(out, scale)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scale_f32_scalar(out, scale)
+    }
+}
+
+/// out[i] = out[i] * scale + add[i]
+#[inline]
+pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
+    debug_assert_eq!(out.len(), add.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { scale_add_f32_neon(out, scale, add) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe { scale_add_f32_avx2(out, scale, add) }
+        } else {
+            scale_add_f32_scalar(out, scale, add)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scale_add_f32_scalar(out, scale, add)
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn axpy_f32_scalar(out: &mut [f32], alpha: f32, x: &[f32]) {
+    for (o, xi) in out.iter_mut().zip(x.iter()) {
+        *o += alpha * *xi;
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn scale_f32_scalar(out: &mut [f32], scale: f32) {
+    for o in out.iter_mut() {
+        *o *= scale;
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+fn scale_add_f32_scalar(out: &mut [f32], scale: f32, add: &[f32]) {
+    for (o, a) in out.iter_mut().zip(add.iter()) {
+        *o = *o * scale + *a;
     }
 }
 
@@ -231,7 +555,7 @@ pub fn dot_mxfp4_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
 pub fn matvec_f32(weight: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, cols, weight, |row| dot_f32(row, x));
+    parallel_matvec_f32(&mut out, rows, cols, weight, x);
     out
 }
 
@@ -247,9 +571,15 @@ pub fn matvec_q8_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, row_bytes, qweight, |row| {
-        dot_q8_0_f32(row, x, cols)
-    });
+    parallel_matvec_u8(
+        MatvecKind::Q8_0,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
     out
 }
 
@@ -265,9 +595,15 @@ pub fn matvec_q4_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, row_bytes, qweight, |row| {
-        dot_q4_0_f32(row, x, cols)
-    });
+    parallel_matvec_u8(
+        MatvecKind::Q4_0,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
     out
 }
 
@@ -283,9 +619,11 @@ pub fn matvec_q4_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, row_bytes, qweight, |row| {
-        dot_q4_k_f32(row, x, cols)
-    });
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q4k_matvec_into(qweight, x, rows, cols, &mut out) {
+        return out;
+    }
+    parallel_matvec_u8(MatvecKind::Q4K, &mut out, rows, cols, row_bytes, qweight, x);
     out
 }
 
@@ -301,9 +639,7 @@ pub fn matvec_q6_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, row_bytes, qweight, |row| {
-        dot_q6_k_f32(row, x, cols)
-    });
+    parallel_matvec_u8(MatvecKind::Q6K, &mut out, rows, cols, row_bytes, qweight, x);
     out
 }
 
@@ -319,9 +655,15 @@ pub fn matvec_mxfp4(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
-    parallel_matvec(&mut out, rows, row_bytes, qweight, |row| {
-        dot_mxfp4_f32(row, x, cols)
-    });
+    parallel_matvec_u8(
+        MatvecKind::Mxfp4,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
     out
 }
 
@@ -329,47 +671,41 @@ pub fn matvec_mxfp4(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<
 
 pub fn matvec_f32_into(weight: &[f32], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, cols, weight, |row| dot_f32(row, x));
+    parallel_matvec_f32(out, rows, cols, weight, x);
 }
 
 pub fn matvec_q8_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 34;
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, row_bytes, qweight, |row| {
-        dot_q8_0_f32(row, x, cols)
-    });
+    parallel_matvec_u8(MatvecKind::Q8_0, out, rows, cols, row_bytes, qweight, x);
 }
 
 pub fn matvec_q4_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 18;
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, row_bytes, qweight, |row| {
-        dot_q4_0_f32(row, x, cols)
-    });
+    parallel_matvec_u8(MatvecKind::Q4_0, out, rows, cols, row_bytes, qweight, x);
 }
 
 pub fn matvec_q4_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 256) * 144;
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, row_bytes, qweight, |row| {
-        dot_q4_k_f32(row, x, cols)
-    });
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q4k_matvec_into(qweight, x, rows, cols, out) {
+        return;
+    }
+    parallel_matvec_u8(MatvecKind::Q4K, out, rows, cols, row_bytes, qweight, x);
 }
 
 pub fn matvec_q6_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 256) * 210;
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, row_bytes, qweight, |row| {
-        dot_q6_k_f32(row, x, cols)
-    });
+    parallel_matvec_u8(MatvecKind::Q6K, out, rows, cols, row_bytes, qweight, x);
 }
 
 pub fn matvec_mxfp4_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 17;
     out.resize(rows, 0.0);
-    parallel_matvec(out, rows, row_bytes, qweight, |row| {
-        dot_mxfp4_f32(row, x, cols)
-    });
+    parallel_matvec_u8(MatvecKind::Mxfp4, out, rows, cols, row_bytes, qweight, x);
 }
 
 pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
@@ -678,7 +1014,7 @@ unsafe fn dot_q4_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
     let n_blocks = n / 256;
     let mask_low = vdup_n_u8(0x0F);
-    let mut sum = 0.0f32;
+    let mut sum_acc = vdupq_n_f32(0.0);
 
     for b in 0..n_blocks {
         let block = qdata.as_ptr().add(b * 144);
@@ -694,10 +1030,10 @@ unsafe fn dot_q4_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         for chunk in 0..4usize {
             let (sc1, m1) = get_scale_min_k4(is, scales);
             let (sc2, m2) = get_scale_min_k4(is + 1, scales);
-            let d1 = d * sc1 as f32;
-            let d2 = d * sc2 as f32;
-            let min1 = dmin * m1 as f32;
-            let min2 = dmin * m2 as f32;
+            let d1 = vdupq_n_f32(d * sc1 as f32);
+            let d2 = vdupq_n_f32(d * sc2 as f32);
+            let min1 = vdupq_n_f32(dmin * m1 as f32);
+            let min2 = vdupq_n_f32(dmin * m2 as f32);
 
             let x1 = xbase.add(chunk * 64);
             let x2 = x1.add(32);
@@ -740,20 +1076,22 @@ unsafe fn dot_q4_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
                 xsum2b = vaddq_f32(xsum2b, x2b);
             }
 
-            let qdot1 = vaddvq_f32(vaddq_f32(qacc1a, qacc1b));
-            let qdot2 = vaddvq_f32(vaddq_f32(qacc2a, qacc2b));
-            let xs1 = vaddvq_f32(vaddq_f32(xsum1a, xsum1b));
-            let xs2 = vaddvq_f32(vaddq_f32(xsum2a, xsum2b));
-
-            sum += d1 * qdot1 - min1 * xs1;
-            sum += d2 * qdot2 - min2 * xs2;
+            let part1 = vsubq_f32(
+                vmulq_f32(vaddq_f32(qacc1a, qacc1b), d1),
+                vmulq_f32(vaddq_f32(xsum1a, xsum1b), min1),
+            );
+            let part2 = vsubq_f32(
+                vmulq_f32(vaddq_f32(qacc2a, qacc2b), d2),
+                vmulq_f32(vaddq_f32(xsum2a, xsum2b), min2),
+            );
+            sum_acc = vaddq_f32(sum_acc, vaddq_f32(part1, part2));
 
             q = q.add(32);
             is += 2;
         }
     }
 
-    sum
+    vaddvq_f32(sum_acc)
 }
 
 fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
@@ -945,6 +1283,74 @@ unsafe fn dot_q4_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     vaddvq_f32(sum_acc)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn axpy_f32_neon(out: &mut [f32], alpha: f32, x: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 8;
+    let av = vdupq_n_f32(alpha);
+    let mut op = out.as_mut_ptr();
+    let mut xp = x.as_ptr();
+    for _ in 0..main {
+        let o0 = vld1q_f32(op);
+        let o1 = vld1q_f32(op.add(4));
+        let x0 = vld1q_f32(xp);
+        let x1 = vld1q_f32(xp.add(4));
+        vst1q_f32(op, vmlaq_f32(o0, x0, av));
+        vst1q_f32(op.add(4), vmlaq_f32(o1, x1, av));
+        op = op.add(8);
+        xp = xp.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] += alpha * x[i];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn scale_f32_neon(out: &mut [f32], scale: f32) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 8;
+    let sv = vdupq_n_f32(scale);
+    let mut op = out.as_mut_ptr();
+    for _ in 0..main {
+        let o0 = vld1q_f32(op);
+        let o1 = vld1q_f32(op.add(4));
+        vst1q_f32(op, vmulq_f32(o0, sv));
+        vst1q_f32(op.add(4), vmulq_f32(o1, sv));
+        op = op.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] *= scale;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn scale_add_f32_neon(out: &mut [f32], scale: f32, add: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 8;
+    let sv = vdupq_n_f32(scale);
+    let mut op = out.as_mut_ptr();
+    let mut ap = add.as_ptr();
+    for _ in 0..main {
+        let o0 = vld1q_f32(op);
+        let o1 = vld1q_f32(op.add(4));
+        let a0 = vld1q_f32(ap);
+        let a1 = vld1q_f32(ap.add(4));
+        vst1q_f32(op, vmlaq_f32(a0, o0, sv));
+        vst1q_f32(op.add(4), vmlaq_f32(a1, o1, sv));
+        op = op.add(8);
+        ap = ap.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] = out[i] * scale + add[i];
+    }
+}
+
 // ─── AVX2 + FMA implementations (x86_64) ────────────────────────────────────
 
 /// Horizontal sum of 8 f32 in a __m256 register
@@ -1053,4 +1459,66 @@ unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         process8!(_mm_srli_si128(q_hi16, 8), 24); // q[24..32]· x[24..32]
     }
     hsum_avx(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_f32_avx2(out: &mut [f32], alpha: f32, x: &[f32]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8;
+    let av = _mm256_set1_ps(alpha);
+    let mut op = out.as_mut_ptr();
+    let mut xp = x.as_ptr();
+    for _ in 0..main {
+        let o = _mm256_loadu_ps(op);
+        let xv = _mm256_loadu_ps(xp);
+        let y = _mm256_fmadd_ps(av, xv, o);
+        _mm256_storeu_ps(op, y);
+        op = op.add(8);
+        xp = xp.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] += alpha * x[i];
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scale_f32_avx2(out: &mut [f32], scale: f32) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8;
+    let sv = _mm256_set1_ps(scale);
+    let mut op = out.as_mut_ptr();
+    for _ in 0..main {
+        let o = _mm256_loadu_ps(op);
+        _mm256_storeu_ps(op, _mm256_mul_ps(o, sv));
+        op = op.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] *= scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scale_add_f32_avx2(out: &mut [f32], scale: f32, add: &[f32]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8;
+    let sv = _mm256_set1_ps(scale);
+    let mut op = out.as_mut_ptr();
+    let mut ap = add.as_ptr();
+    for _ in 0..main {
+        let o = _mm256_loadu_ps(op);
+        let a = _mm256_loadu_ps(ap);
+        let y = _mm256_fmadd_ps(o, sv, a);
+        _mm256_storeu_ps(op, y);
+        op = op.add(8);
+        ap = ap.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] = out[i] * scale + add[i];
+    }
 }

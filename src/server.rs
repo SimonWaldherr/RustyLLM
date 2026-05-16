@@ -1,13 +1,18 @@
 use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
+#[cfg(feature = "tls")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+#[cfg(feature = "tls")]
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(feature = "tls")]
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+#[cfg(feature = "tls")]
+use std::io::BufReader;
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +31,14 @@ pub struct ServeOptions {
 
 impl ServeOptions {
     pub fn is_tls(&self) -> bool {
-        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+        #[cfg(feature = "tls")]
+        {
+            return self.tls_cert_path.is_some() && self.tls_key_path.is_some();
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            false
+        }
     }
 }
 
@@ -317,37 +329,46 @@ pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
     // Keep the server loop deliberately small: accept a connection, hand it to
     // a worker thread, and let the handler own the request lifecycle.
     if options.is_tls() {
-        let tls_config = Arc::new(load_tls_config(
-            options.tls_cert_path.as_deref().unwrap_or(""),
-            options.tls_key_path.as_deref().unwrap_or(""),
-        )?);
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-                    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-                    let _ = stream.set_nodelay(true);
-                    let Some(guard) = try_acquire_connection_slot(
-                        Arc::clone(&active_connections),
-                        max_connections,
-                    ) else {
-                        let _ = stream.shutdown(Shutdown::Both);
-                        continue;
-                    };
+        #[cfg(not(feature = "tls"))]
+        {
+            return Err(String::from(
+                "TLS serving requires a binary built with the `tls` feature.",
+            ));
+        }
+        #[cfg(feature = "tls")]
+        {
+            let tls_config = Arc::new(load_tls_config(
+                options.tls_cert_path.as_deref().unwrap_or(""),
+                options.tls_key_path.as_deref().unwrap_or(""),
+            )?);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                        let _ = stream.set_nodelay(true);
+                        let Some(guard) = try_acquire_connection_slot(
+                            Arc::clone(&active_connections),
+                            max_connections,
+                        ) else {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            continue;
+                        };
 
-                    let runner = Arc::clone(&runner);
-                    let options = options.clone();
-                    let tls_config = Arc::clone(&tls_config);
-                    thread::spawn(move || {
-                        let _guard = guard;
-                        if let Err(err) =
-                            handle_tls_connection(stream, runner, &options, tls_config)
-                        {
-                            eprintln!("HTTPS connection error: {}", err);
-                        }
-                    });
+                        let runner = Arc::clone(&runner);
+                        let options = options.clone();
+                        let tls_config = Arc::clone(&tls_config);
+                        thread::spawn(move || {
+                            let _guard = guard;
+                            if let Err(err) =
+                                handle_tls_connection(stream, runner, &options, tls_config)
+                            {
+                                eprintln!("HTTPS connection error: {}", err);
+                            }
+                        });
+                    }
+                    Err(err) => eprintln!("Accept error: {}", err),
                 }
-                Err(err) => eprintln!("Accept error: {}", err),
             }
         }
     } else {
@@ -410,6 +431,7 @@ fn handle_plain_connection(
     handle_connection(stream, runner, options)
 }
 
+#[cfg(feature = "tls")]
 fn handle_tls_connection(
     stream: TcpStream,
     runner: Arc<Runner>,
@@ -501,7 +523,7 @@ fn route_streaming_request<W: Write>(
                     }
                 };
                 let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
-                let gen = apply_generation_overrides(
+                let generation_options = apply_generation_overrides(
                     &options.defaults,
                     max_tok,
                     payload.temperature,
@@ -512,7 +534,7 @@ fn route_streaming_request<W: Write>(
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
                 );
-                (messages, gen)
+                (messages, generation_options)
             }
             Err(err) => {
                 write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
@@ -537,7 +559,7 @@ fn route_streaming_request<W: Write>(
                     }
                 };
                 let max_tok = payload.max_completion_tokens.or(payload.max_tokens);
-                let gen = apply_generation_overrides(
+                let generation_options = apply_generation_overrides(
                     &options.defaults,
                     max_tok,
                     payload.temperature,
@@ -548,7 +570,7 @@ fn route_streaming_request<W: Write>(
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
                 );
-                (vec![ChatMessage::user(prompt)], gen)
+                (vec![ChatMessage::user(prompt)], generation_options)
             }
             Err(err) => {
                 write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
@@ -1053,7 +1075,7 @@ where
             Ok(0) => {
                 return Err(HttpError::bad_request(
                     "Connection closed before request headers.",
-                ))
+                ));
             }
             Ok(_) => {
                 header_bytes.push(one[0]);
@@ -1180,6 +1202,7 @@ where
     stream.flush()
 }
 
+#[cfg(feature = "tls")]
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, String> {
     let mut cert_reader = BufReader::new(File::open(cert_path).map_err(|err| err.to_string())?);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
@@ -1210,7 +1233,7 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{read_http_request, write_http_response, MAX_BODY_BYTES};
+    use super::{MAX_BODY_BYTES, read_http_request, write_http_response};
     use std::io::Cursor;
 
     #[test]

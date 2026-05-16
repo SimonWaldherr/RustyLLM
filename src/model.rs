@@ -7,6 +7,7 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -241,6 +242,31 @@ impl Weight {
             }
         }
     }
+
+    /// Extract one row as f32 values into caller-owned storage.
+    pub fn row_into(&self, row: usize, cols: usize, out: &mut Vec<f32>) {
+        out.resize(cols, 0.0);
+        match self {
+            Weight::F32(data) => {
+                let start = row * cols;
+                out.copy_from_slice(&data[start..start + cols]);
+            }
+            Weight::Quantized { .. } => {
+                let row_data = self.row(row, cols);
+                out.copy_from_slice(&row_data);
+            }
+        }
+    }
+
+    pub fn row_f32(&self, row: usize, cols: usize) -> &[f32] {
+        match self {
+            Weight::F32(data) => {
+                let start = row * cols;
+                &data[start..start + cols]
+            }
+            _ => panic!("Expected f32 row storage"),
+        }
+    }
 }
 
 // ─── Layer + Model weights ───────────────────────────────────────────────────
@@ -285,6 +311,26 @@ impl ExpertWeight {
                 let expert_bytes = self.rows * row_bytes;
                 let start = expert * expert_bytes;
                 simd::matvec_mxfp4(&data[start..start + expert_bytes], x, self.rows, self.cols)
+            }
+            _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
+        }
+    }
+
+    pub fn matvec_expert_into(&self, expert: usize, x: &[f32], out: &mut Vec<f32>) {
+        assert!(expert < self.experts, "expert index out of bounds");
+        let data = self.data.as_slice();
+        match self.dtype {
+            GGMLType::MXFP4 => {
+                let row_bytes = (self.cols / 32) * 17;
+                let expert_bytes = self.rows * row_bytes;
+                let start = expert * expert_bytes;
+                simd::matvec_mxfp4_into(
+                    &data[start..start + expert_bytes],
+                    x,
+                    self.rows,
+                    self.cols,
+                    out,
+                );
             }
             _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
         }
@@ -352,6 +398,7 @@ impl KVCache {
 /// Pre-allocated working memory for a single forward pass.
 /// Eliminates per-token heap allocations in the hot decode loop.
 pub struct DecodeBuffer {
+    pub x: Vec<f32>,        // residual stream (dim)
     pub xn: Vec<f32>,       // rms-normed residual (dim)
     pub xn2: Vec<f32>,      // second rms norm (dim)
     pub q: Vec<f32>,        // query (n_heads * head_dim)
@@ -362,6 +409,64 @@ pub struct DecodeBuffer {
     pub gate: Vec<f32>,     // FFN gate projection (hidden_dim)
     pub up: Vec<f32>,       // FFN up projection (hidden_dim)
     pub hidden: Vec<f32>,   // FFN hidden (hidden_dim)
+    pub moe: Vec<f32>,      // MoE residual contribution (dim)
+    pub router_logits: Vec<f32>,
+    pub top_experts: Vec<(usize, f32)>,
+    pub expert_probs: Vec<f32>,
+    pub rope_inv_freq: Vec<f32>,
+    pub rope_gpt_oss_inv_freq: Vec<f32>,
+    pub rope_gpt_oss_concentration: f32,
+}
+
+fn build_rope_inv_freq(theta: f32, head_dim: usize, scaling: f32) -> Vec<f32> {
+    let pair_count = head_dim / 2;
+    let mut inv = vec![0.0f32; pair_count];
+    for (pair, slot) in inv.iter_mut().enumerate() {
+        let i = (pair * 2) as f32;
+        let base_freq = theta.powf(i / head_dim as f32);
+        *slot = 1.0 / (scaling * base_freq);
+    }
+    inv
+}
+
+fn build_rope_inv_freq_gpt_oss(config: &Config) -> (Vec<f32>, f32) {
+    let d_half = config.head_dim as f32 / 2.0;
+    let mut low = 0.0f32;
+    let mut high = 0.0f32;
+    if config.rope_scaling_factor > 1.0 {
+        low = d_half
+            * ((config.rope_original_context_length as f32 / (32.0 * 2.0 * std::f32::consts::PI))
+                .ln()
+                / config.rope_theta.ln());
+        high = d_half
+            * ((config.rope_original_context_length as f32 / (1.0 * 2.0 * std::f32::consts::PI))
+                .ln()
+                / config.rope_theta.ln());
+    }
+
+    let concentration = if config.rope_scaling_factor > 1.0 {
+        0.1 * config.rope_scaling_factor.ln() + 1.0
+    } else {
+        1.0
+    };
+
+    let pair_count = config.head_dim / 2;
+    let mut inv = vec![0.0f32; pair_count];
+    for (pair, slot) in inv.iter_mut().enumerate() {
+        let i = (pair * 2) as f32;
+        let base_freq = config.rope_theta.powf(i / config.head_dim as f32);
+        *slot = if config.rope_scaling_factor > 1.0 {
+            let idx = pair as f32;
+            let ramp = ((idx - low) / (high - low)).clamp(0.0, 1.0);
+            let mask = 1.0 - ramp;
+            let interpolation = 1.0 / (config.rope_scaling_factor * base_freq);
+            let extrapolation = 1.0 / base_freq;
+            interpolation * (1.0 - mask) + extrapolation * mask
+        } else {
+            1.0 / base_freq
+        };
+    }
+    (inv, concentration)
 }
 
 impl DecodeBuffer {
@@ -371,7 +476,11 @@ impl DecodeBuffer {
         max_n_kv_heads: usize,
         max_value_dim: usize,
     ) -> Self {
+        let rope_inv_freq = build_rope_inv_freq(config.rope_theta, max_head_dim, 1.0);
+        let (rope_gpt_oss_inv_freq, rope_gpt_oss_concentration) =
+            build_rope_inv_freq_gpt_oss(config);
         Self {
+            x: vec![0.0; config.dim],
             xn: vec![0.0; config.dim],
             xn2: vec![0.0; config.dim],
             q: vec![0.0; config.n_heads * max_head_dim],
@@ -382,6 +491,13 @@ impl DecodeBuffer {
             gate: vec![0.0; config.hidden_dim],
             up: vec![0.0; config.hidden_dim],
             hidden: vec![0.0; config.hidden_dim],
+            moe: vec![0.0; config.dim],
+            router_logits: vec![0.0; config.expert_count],
+            top_experts: Vec::with_capacity(config.expert_count.max(config.expert_used_count)),
+            expert_probs: Vec::with_capacity(config.expert_used_count),
+            rope_inv_freq,
+            rope_gpt_oss_inv_freq,
+            rope_gpt_oss_concentration,
         }
     }
 }
@@ -1208,7 +1324,8 @@ fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
 
 /// Apply RoPE to q/k vectors
 #[inline]
-fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta: f32) {
+fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, inv_freq: &[f32]) {
+    debug_assert!(inv_freq.len() >= head_dim / 2);
     for h in 0..n_heads {
         let off = h * head_dim;
         let last = head_dim - (head_dim % 2);
@@ -1218,8 +1335,7 @@ fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, thet
             if idx1 >= vec.len() {
                 break;
             }
-            let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
-            let angle = pos as f32 * freq;
+            let angle = pos as f32 * inv_freq[i / 2];
             let (sin_a, cos_a) = angle.sin_cos();
             let v0 = vec[idx0];
             let v1 = vec[idx1];
@@ -1227,6 +1343,29 @@ fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, thet
             vec[idx1] = v0 * sin_a + v1 * cos_a;
         }
     }
+}
+
+#[inline]
+fn fast_attn_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RUSTY_LLM_FAST_ATTN").is_some())
+}
+
+#[inline(always)]
+fn exp_attn(x: f32) -> f32 {
+    if fast_attn_enabled() {
+        fast_exp_approx(x)
+    } else {
+        x.exp()
+    }
+}
+
+#[inline(always)]
+fn fast_exp_approx(x: f32) -> f32 {
+    // Schraudolph-style approximation; enable only for aggressive throughput mode.
+    let xc = x.clamp(-80.0, 80.0);
+    let bits = (12102203.0f32 * xc + 1064866805.0f32) as i32;
+    f32::from_bits(bits as u32)
 }
 
 #[inline]
@@ -1255,29 +1394,23 @@ fn online_attention_with_sink(
 
         if score > max_score {
             let old_scale = if max_score.is_finite() {
-                (max_score - score).exp()
+                exp_attn(max_score - score)
             } else {
                 0.0
             };
-            for d in 0..value_head_dim {
-                out[d] = out[d] * old_scale + value_row[d];
-            }
+            simd::scale_add_f32(&mut out[..value_head_dim], old_scale, value_row);
             denom = denom * old_scale + 1.0;
             max_score = score;
         } else {
-            let weight = (score - max_score).exp();
-            for d in 0..value_head_dim {
-                out[d] += weight * value_row[d];
-            }
+            let weight = exp_attn(score - max_score);
+            simd::axpy_f32(&mut out[..value_head_dim], weight, value_row);
             denom += weight;
         }
     }
 
     if denom > 0.0 {
         let inv = 1.0 / denom;
-        for value in out.iter_mut() {
-            *value *= inv;
-        }
+        simd::scale_f32(&mut out[..value_head_dim], inv);
     }
 }
 
@@ -1306,29 +1439,23 @@ fn online_attention(
 
         if score > max_score {
             let old_scale = if max_score.is_finite() {
-                (max_score - score).exp()
+                exp_attn(max_score - score)
             } else {
                 0.0
             };
-            for d in 0..value_head_dim {
-                out[d] = out[d] * old_scale + value_row[d];
-            }
+            simd::scale_add_f32(&mut out[..value_head_dim], old_scale, value_row);
             denom = denom * old_scale + 1.0;
             max_score = score;
         } else {
-            let weight = (score - max_score).exp();
-            for d in 0..value_head_dim {
-                out[d] += weight * value_row[d];
-            }
+            let weight = exp_attn(score - max_score);
+            simd::axpy_f32(&mut out[..value_head_dim], weight, value_row);
             denom += weight;
         }
     }
 
     if denom > 0.0 {
         let inv = 1.0 / denom;
-        for value in out.iter_mut() {
-            *value *= inv;
-        }
+        simd::scale_f32(&mut out[..value_head_dim], inv);
     }
 }
 
@@ -1345,43 +1472,22 @@ fn swiglu_gpt_oss(g: f32, u: f32) -> f32 {
     g * (1.0 / (1.0 + (-1.702 * g).exp())) * (u + 1.0)
 }
 
-fn apply_rope_gpt_oss(q: &mut [f32], k: &mut [f32], pos: usize, config: &Config) {
-    let d_half = config.head_dim as f32 / 2.0;
-    let mut low = 0.0f32;
-    let mut high = 0.0f32;
-    if config.rope_scaling_factor > 1.0 {
-        low = d_half
-            * ((config.rope_original_context_length as f32 / (32.0 * 2.0 * std::f32::consts::PI))
-                .ln()
-                / config.rope_theta.ln());
-        high = d_half
-            * ((config.rope_original_context_length as f32 / (1.0 * 2.0 * std::f32::consts::PI))
-                .ln()
-                / config.rope_theta.ln());
-    }
-
-    let concentration = if config.rope_scaling_factor > 1.0 {
-        0.1 * config.rope_scaling_factor.ln() + 1.0
-    } else {
-        1.0
-    };
-
+fn apply_rope_gpt_oss(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    concentration: f32,
+    inv_freq: &[f32],
+) {
+    debug_assert!(inv_freq.len() >= head_dim / 2);
     let apply = |vec: &mut [f32], n_heads: usize| {
         for h in 0..n_heads {
-            let off = h * config.head_dim;
-            for i in (0..config.head_dim).step_by(2) {
-                let base_freq = config.rope_theta.powf(i as f32 / config.head_dim as f32);
-                let inv_freq = if config.rope_scaling_factor > 1.0 {
-                    let idx = i as f32 / 2.0;
-                    let ramp = ((idx - low) / (high - low)).clamp(0.0, 1.0);
-                    let mask = 1.0 - ramp;
-                    let interpolation = 1.0 / (config.rope_scaling_factor * base_freq);
-                    let extrapolation = 1.0 / base_freq;
-                    interpolation * (1.0 - mask) + extrapolation * mask
-                } else {
-                    1.0 / base_freq
-                };
-                let angle = pos as f32 * inv_freq;
+            let off = h * head_dim;
+            for i in (0..head_dim).step_by(2) {
+                let angle = pos as f32 * inv_freq[i / 2];
                 let (sin_a, cos_a) = angle.sin_cos();
                 let cos_a = cos_a * concentration;
                 let sin_a = sin_a * concentration;
@@ -1393,57 +1499,79 @@ fn apply_rope_gpt_oss(q: &mut [f32], k: &mut [f32], pos: usize, config: &Config)
         }
     };
 
-    apply(q, config.n_heads);
-    apply(k, config.n_kv_heads);
+    apply(q, n_heads);
+    apply(k, n_kv_heads);
 }
 
-fn softmax_selected(values: &[(usize, f32)]) -> Vec<f32> {
+fn softmax_selected_into(values: &[(usize, f32)], out: &mut Vec<f32>) {
     let max = values
         .iter()
         .map(|(_, v)| *v)
         .fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = values.iter().map(|(_, v)| (*v - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    exps.into_iter().map(|v| v / sum).collect()
+    out.resize(values.len(), 0.0);
+    let mut sum = 0.0f32;
+    for (out_cell, (_, value)) in out.iter_mut().zip(values.iter()) {
+        let exp = (*value - max).exp();
+        *out_cell = exp;
+        sum += exp;
+    }
+    if sum > 0.0 {
+        for value in out.iter_mut() {
+            *value /= sum;
+        }
+    }
 }
 
 pub fn forward_gpt_oss(
     config: &Config,
     weights: &GptOssWeights,
     cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
-    let mut x = weights.token_embd.row(token as usize, config.dim);
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
-        let xn = rms_norm(&x, &layer.attn_norm, config.rms_norm_eps);
-        let mut q = layer.wq.matvec(&xn);
-        let mut k = layer.wk.matvec(&xn);
-        let v = layer.wv.matvec(&xn);
-        for i in 0..q.len() {
-            q[i] += layer.bq[i];
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        layer.wq.matvec_into(&buf.xn, &mut buf.q);
+        layer.wk.matvec_into(&buf.xn, &mut buf.k);
+        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        for i in 0..buf.q.len() {
+            buf.q[i] += layer.bq[i];
         }
-        for i in 0..k.len() {
-            k[i] += layer.bk[i];
+        for i in 0..buf.k.len() {
+            buf.k[i] += layer.bk[i];
         }
-        let mut v = v;
-        for i in 0..v.len() {
-            v[i] += layer.bv[i];
+        for i in 0..buf.v.len() {
+            buf.v[i] += layer.bv[i];
         }
 
-        apply_rope_gpt_oss(&mut q, &mut k, pos, config);
+        apply_rope_gpt_oss(
+            &mut buf.q,
+            &mut buf.k,
+            pos,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            buf.rope_gpt_oss_concentration,
+            &buf.rope_gpt_oss_inv_freq,
+        );
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
         let kv_k_start = pos * cache.per_pos_k_dim;
         let kv_v_start = pos * cache.per_pos_v_dim;
-        cache.k[l][kv_k_start..kv_k_start + k.len()].copy_from_slice(&k);
-        cache.v[l][kv_v_start..kv_v_start + v.len()].copy_from_slice(&v);
+        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
+        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
-        let mut attn_out = vec![0.0f32; config.n_heads * config.value_dim];
+        for value in buf.attn_out.iter_mut() {
+            *value = 0.0;
+        }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let attn_window = if l % 2 == 0 && config.sliding_window > 0 {
             pos.saturating_sub(config.sliding_window)
@@ -1456,7 +1584,7 @@ pub fn forward_gpt_oss(
             let q_off = h * config.head_dim;
             let out_off = h * config.value_dim;
             online_attention_with_sink(
-                &q[q_off..q_off + config.head_dim],
+                &buf.q[q_off..q_off + config.head_dim],
                 &cache.k[l][kv_h * config.head_dim..],
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
@@ -1467,59 +1595,75 @@ pub fn forward_gpt_oss(
                 pos,
                 scale,
                 layer.sinks[h],
-                &mut attn_out[out_off..out_off + config.value_dim],
+                &mut buf.attn_out[out_off..out_off + config.value_dim],
             );
         }
 
-        let mut attn_proj = layer.wo.matvec(&attn_out);
-        for i in 0..attn_proj.len() {
-            attn_proj[i] += layer.bo[i];
-        }
+        layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..config.dim {
-            x[i] += attn_proj[i];
+            buf.x[i] += buf.proj[i] + layer.bo[i];
         }
 
-        let xn2 = rms_norm(&x, &layer.post_attn_norm, config.rms_norm_eps);
-        let mut gate_logits = layer.gate_inp.matvec(&xn2);
-        for i in 0..gate_logits.len() {
-            gate_logits[i] += layer.gate_inp_bias[i];
+        rms_norm_into(
+            &buf.x,
+            &layer.post_attn_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
+        layer.gate_inp.matvec_into(&buf.xn2, &mut buf.router_logits);
+        for i in 0..buf.router_logits.len() {
+            buf.router_logits[i] += layer.gate_inp_bias[i];
         }
 
-        let mut top: Vec<(usize, f32)> = gate_logits.iter().copied().enumerate().collect();
-        top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        top.truncate(config.expert_used_count);
-        let expert_probs = softmax_selected(&top);
+        buf.top_experts.clear();
+        buf.top_experts
+            .extend(buf.router_logits.iter().copied().enumerate());
+        buf.top_experts.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        buf.top_experts.truncate(config.expert_used_count);
+        softmax_selected_into(&buf.top_experts, &mut buf.expert_probs);
 
         // Evaluate only the routed experts, then accumulate their weighted
         // contributions back into the residual stream.
-        let mut moe_sum = vec![0.0f32; config.dim];
-        for ((expert_idx, _), expert_prob) in top.into_iter().zip(expert_probs.into_iter()) {
-            let gate_bias = layer.gate_exps_bias.row(expert_idx, config.hidden_dim);
-            let up_bias = layer.up_exps_bias.row(expert_idx, config.hidden_dim);
-            let down_bias = layer.down_exps_bias.row(expert_idx, config.dim);
+        for value in buf.moe.iter_mut() {
+            *value = 0.0;
+        }
+        for expert_slot in 0..buf.top_experts.len() {
+            let expert_idx = buf.top_experts[expert_slot].0;
+            let expert_prob = buf.expert_probs[expert_slot];
+            let gate_bias = layer.gate_exps_bias.row_f32(expert_idx, config.hidden_dim);
+            let up_bias = layer.up_exps_bias.row_f32(expert_idx, config.hidden_dim);
+            let down_bias = layer.down_exps_bias.row_f32(expert_idx, config.dim);
 
-            let mut gate = layer.gate_exps.matvec_expert(expert_idx, &xn2);
-            let mut up = layer.up_exps.matvec_expert(expert_idx, &xn2);
+            layer
+                .gate_exps
+                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
+            layer
+                .up_exps
+                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
             for i in 0..config.hidden_dim {
-                gate[i] += gate_bias[i];
-                up[i] += up_bias[i];
-                gate[i] = swiglu_gpt_oss(gate[i], up[i]);
+                buf.gate[i] = swiglu_gpt_oss(buf.gate[i] + gate_bias[i], buf.up[i] + up_bias[i]);
             }
 
-            let mut down = layer.down_exps.matvec_expert(expert_idx, &gate);
+            layer
+                .down_exps
+                .matvec_expert_into(expert_idx, &buf.gate, &mut buf.proj);
             for i in 0..config.dim {
-                down[i] = (down[i] + down_bias[i]) * expert_prob;
-                moe_sum[i] += down[i];
+                buf.moe[i] += (buf.proj[i] + down_bias[i]) * expert_prob;
             }
         }
 
         for i in 0..config.dim {
-            x[i] += moe_sum[i];
+            buf.x[i] += buf.moe[i];
         }
     }
 
-    let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
-    weights.output.matvec(&x)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    weights.output.matvec(&buf.xn)
 }
 
 /// Single forward pass for one token at position `pos`
@@ -1559,13 +1703,19 @@ pub fn forward(
             buf.v[i] += layer.bv[i];
         }
 
-        apply_rope(&mut buf.q, pos, head_dim, config.n_heads, config.rope_theta);
+        apply_rope(
+            &mut buf.q,
+            pos,
+            head_dim,
+            config.n_heads,
+            &buf.rope_inv_freq,
+        );
         apply_rope(
             &mut buf.k,
             pos,
             head_dim,
             config.n_kv_heads,
-            config.rope_theta,
+            &buf.rope_inv_freq,
         );
 
         // Store KV (keys and values may have different per-head dims)
@@ -1686,9 +1836,15 @@ pub fn forward_gemma4(
             pos,
             head_dim_l,
             config.n_heads,
-            config.rope_theta,
+            &buf.rope_inv_freq,
         );
-        apply_rope(&mut buf.k, pos, head_dim_l, n_kv_heads_l, config.rope_theta);
+        apply_rope(
+            &mut buf.k,
+            pos,
+            head_dim_l,
+            n_kv_heads_l,
+            &buf.rope_inv_freq,
+        );
 
         // Store KV into per-pos slots (cache uses fixed per-pos stride)
         // Important: only write the relevant portion based on per-layer dims
@@ -2480,13 +2636,19 @@ pub fn forward_hidden(
             buf.v[i] += layer.bv[i];
         }
 
-        apply_rope(&mut buf.q, pos, head_dim, config.n_heads, config.rope_theta);
+        apply_rope(
+            &mut buf.q,
+            pos,
+            head_dim,
+            config.n_heads,
+            &buf.rope_inv_freq,
+        );
         apply_rope(
             &mut buf.k,
             pos,
             head_dim,
             config.n_kv_heads,
-            config.rope_theta,
+            &buf.rope_inv_freq,
         );
 
         let kv_k_dim = cache.per_pos_k_dim;
@@ -2556,39 +2718,52 @@ pub fn forward_hidden_gpt_oss(
     config: &Config,
     weights: &GptOssWeights,
     cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
-    let mut x = weights.token_embd.row(token as usize, config.dim);
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
-        let xn = rms_norm(&x, &layer.attn_norm, config.rms_norm_eps);
-        let mut q = layer.wq.matvec(&xn);
-        let mut k = layer.wk.matvec(&xn);
-        let v = layer.wv.matvec(&xn);
-        for i in 0..q.len() {
-            q[i] += layer.bq[i];
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        layer.wq.matvec_into(&buf.xn, &mut buf.q);
+        layer.wk.matvec_into(&buf.xn, &mut buf.k);
+        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        for i in 0..buf.q.len() {
+            buf.q[i] += layer.bq[i];
         }
-        for i in 0..k.len() {
-            k[i] += layer.bk[i];
+        for i in 0..buf.k.len() {
+            buf.k[i] += layer.bk[i];
         }
-        let mut v = v;
-        for i in 0..v.len() {
-            v[i] += layer.bv[i];
+        for i in 0..buf.v.len() {
+            buf.v[i] += layer.bv[i];
         }
 
-        apply_rope_gpt_oss(&mut q, &mut k, pos, config);
+        apply_rope_gpt_oss(
+            &mut buf.q,
+            &mut buf.k,
+            pos,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            buf.rope_gpt_oss_concentration,
+            &buf.rope_gpt_oss_inv_freq,
+        );
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
         let kv_k_start = pos * cache.per_pos_k_dim;
         let kv_v_start = pos * cache.per_pos_v_dim;
-        cache.k[l][kv_k_start..kv_k_start + k.len()].copy_from_slice(&k);
-        cache.v[l][kv_v_start..kv_v_start + v.len()].copy_from_slice(&v);
+        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
+        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
-        let mut attn_out = vec![0.0f32; config.n_heads * config.value_dim];
+        for value in buf.attn_out.iter_mut() {
+            *value = 0.0;
+        }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let attn_window = if l % 2 == 0 && config.sliding_window > 0 {
             pos.saturating_sub(config.sliding_window)
@@ -2601,7 +2776,7 @@ pub fn forward_hidden_gpt_oss(
             let q_off = h * config.head_dim;
             let out_off = h * config.value_dim;
             online_attention_with_sink(
-                &q[q_off..q_off + config.head_dim],
+                &buf.q[q_off..q_off + config.head_dim],
                 &cache.k[l][kv_h * config.head_dim..],
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
@@ -2612,56 +2787,73 @@ pub fn forward_hidden_gpt_oss(
                 pos,
                 scale,
                 layer.sinks[h],
-                &mut attn_out[out_off..out_off + config.value_dim],
+                &mut buf.attn_out[out_off..out_off + config.value_dim],
             );
         }
 
-        let mut attn_proj = layer.wo.matvec(&attn_out);
-        for i in 0..attn_proj.len() {
-            attn_proj[i] += layer.bo[i];
-        }
+        layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..config.dim {
-            x[i] += attn_proj[i];
+            buf.x[i] += buf.proj[i] + layer.bo[i];
         }
 
-        let xn2 = rms_norm(&x, &layer.post_attn_norm, config.rms_norm_eps);
-        let mut gate_logits = layer.gate_inp.matvec(&xn2);
-        for i in 0..gate_logits.len() {
-            gate_logits[i] += layer.gate_inp_bias[i];
+        rms_norm_into(
+            &buf.x,
+            &layer.post_attn_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
+        layer.gate_inp.matvec_into(&buf.xn2, &mut buf.router_logits);
+        for i in 0..buf.router_logits.len() {
+            buf.router_logits[i] += layer.gate_inp_bias[i];
         }
 
-        let mut top: Vec<(usize, f32)> = gate_logits.iter().copied().enumerate().collect();
-        top.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        top.truncate(config.expert_used_count);
-        let expert_probs = softmax_selected(&top);
+        buf.top_experts.clear();
+        buf.top_experts
+            .extend(buf.router_logits.iter().copied().enumerate());
+        buf.top_experts.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        buf.top_experts.truncate(config.expert_used_count);
+        softmax_selected_into(&buf.top_experts, &mut buf.expert_probs);
 
-        let mut moe_sum = vec![0.0f32; config.dim];
-        for ((expert_idx, _), expert_prob) in top.into_iter().zip(expert_probs.into_iter()) {
-            let gate_bias = layer.gate_exps_bias.row(expert_idx, config.hidden_dim);
-            let up_bias = layer.up_exps_bias.row(expert_idx, config.hidden_dim);
-            let down_bias = layer.down_exps_bias.row(expert_idx, config.dim);
+        for value in buf.moe.iter_mut() {
+            *value = 0.0;
+        }
+        for expert_slot in 0..buf.top_experts.len() {
+            let expert_idx = buf.top_experts[expert_slot].0;
+            let expert_prob = buf.expert_probs[expert_slot];
+            let gate_bias = layer.gate_exps_bias.row_f32(expert_idx, config.hidden_dim);
+            let up_bias = layer.up_exps_bias.row_f32(expert_idx, config.hidden_dim);
+            let down_bias = layer.down_exps_bias.row_f32(expert_idx, config.dim);
 
-            let mut gate = layer.gate_exps.matvec_expert(expert_idx, &xn2);
-            let mut up = layer.up_exps.matvec_expert(expert_idx, &xn2);
+            layer
+                .gate_exps
+                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
+            layer
+                .up_exps
+                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
             for i in 0..config.hidden_dim {
-                gate[i] += gate_bias[i];
-                up[i] += up_bias[i];
-                gate[i] = swiglu_gpt_oss(gate[i], up[i]);
+                buf.gate[i] = swiglu_gpt_oss(buf.gate[i] + gate_bias[i], buf.up[i] + up_bias[i]);
             }
 
-            let mut down = layer.down_exps.matvec_expert(expert_idx, &gate);
+            layer
+                .down_exps
+                .matvec_expert_into(expert_idx, &buf.gate, &mut buf.proj);
             for i in 0..config.dim {
-                down[i] = (down[i] + down_bias[i]) * expert_prob;
-                moe_sum[i] += down[i];
+                buf.moe[i] += (buf.proj[i] + down_bias[i]) * expert_prob;
             }
         }
 
         for i in 0..config.dim {
-            x[i] += moe_sum[i];
+            buf.x[i] += buf.moe[i];
         }
     }
 
-    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    buf.xn.clone()
 }
 
 /// Forward for Gemma-4 models; returns the normalized hidden state.
@@ -2701,9 +2893,15 @@ pub fn forward_hidden_gemma4(
             pos,
             head_dim_l,
             config.n_heads,
-            config.rope_theta,
+            &buf.rope_inv_freq,
         );
-        apply_rope(&mut buf.k, pos, head_dim_l, n_kv_heads_l, config.rope_theta);
+        apply_rope(
+            &mut buf.k,
+            pos,
+            head_dim_l,
+            n_kv_heads_l,
+            &buf.rope_inv_freq,
+        );
 
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;

@@ -486,7 +486,7 @@ impl Runner {
     ) -> Vec<f32> {
         match &self.weights {
             LoadedWeights::GptOss(weights) => {
-                model::forward_gpt_oss(&self.config, weights, cache, token, pos)
+                model::forward_gpt_oss(&self.config, weights, cache, buf, token, pos)
             }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_gemma4(&self.config, weights, cache, buf, token, pos)
@@ -508,7 +508,7 @@ impl Runner {
     ) -> Vec<f32> {
         match &self.weights {
             LoadedWeights::GptOss(weights) => {
-                model::forward_hidden_gpt_oss(&self.config, weights, cache, token, pos)
+                model::forward_hidden_gpt_oss(&self.config, weights, cache, buf, token, pos)
             }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_hidden_gemma4(&self.config, weights, cache, buf, token, pos)

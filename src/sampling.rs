@@ -176,7 +176,7 @@ pub fn sample(
 
 #[cfg(test)]
 mod tests {
-    use super::{sample, Rng, SamplerConfig};
+    use super::{Rng, SamplerConfig, sample};
 
     #[test]
     fn top_k_1_only_keeps_single_best_token() {

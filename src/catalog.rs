@@ -168,7 +168,10 @@ fn choose_from_directory(dir: &Path, selector: Option<&str>) -> Result<PathBuf, 
         .collect();
 
     match usable.len() {
-        0 => Err(format!("No supported text GGUF models found in {}.", dir.display())),
+        0 => Err(format!(
+            "No supported text GGUF models found in {}.",
+            dir.display()
+        )),
         1 => Ok(usable[0].path.clone()),
         _ => Err(format!(
             "Found multiple GGUF models in {}. Choose one with --model <name> or pass an exact .gguf path.\n\n{}",
@@ -277,11 +280,7 @@ fn matching_entries<'a>(entries: &[&'a ModelEntry], selector: &str) -> Vec<&'a M
         }
     }
 
-    if exact.is_empty() {
-        partial
-    } else {
-        exact
-    }
+    if exact.is_empty() { partial } else { exact }
 }
 
 fn format_ambiguous(selector: &str, entries: &[&ModelEntry]) -> String {

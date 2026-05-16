@@ -106,13 +106,13 @@ unsafe fn libc_mmap(
     fd: i32,
     offset: i64,
 ) -> *mut std::ffi::c_void {
-    mmap(addr, len, prot, flags, fd, offset)
+    unsafe { mmap(addr, len, prot, flags, fd, offset) }
 }
 
 unsafe fn libc_munmap(addr: *mut std::ffi::c_void, len: usize) -> i32 {
-    munmap(addr, len)
+    unsafe { munmap(addr, len) }
 }
 
 unsafe fn libc_madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32 {
-    madvise(addr, len, advice)
+    unsafe { madvise(addr, len, advice) }
 }

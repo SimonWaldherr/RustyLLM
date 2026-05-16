@@ -2,15 +2,17 @@
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,
 };
-use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner};
 #[cfg(not(target_family = "wasm"))]
+use rusty_llm::metal;
+use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner};
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
 use std::env;
 use std::fmt::Display;
 use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,9 +32,13 @@ fn print_usage(name: &str) {
     eprintln!("  --list-models            List GGUF files in --model-dir and exit");
     eprintln!("  --prompt <text>           Input prompt (interactive if omitted)");
     eprintln!("  --repl                    Start an interactive REPL session");
+    #[cfg(feature = "server")]
     eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
+    #[cfg(feature = "server")]
     eprintln!("  --tls-cert <path>         PEM certificate for HTTPS");
+    #[cfg(feature = "server")]
     eprintln!("  --tls-key <path>          PEM private key for HTTPS");
+    #[cfg(feature = "server")]
     eprintln!("  --max-connections <N>     Max concurrent server connections");
     eprintln!("  --max-tokens <N>          Max tokens to generate (default: 256)");
     eprintln!("  --temp <F>                Temperature (default: 0.7, 0=greedy)");
@@ -228,6 +234,12 @@ fn run() -> Result<(), String> {
             "Both --tls-cert and --tls-key must be provided together.",
         ));
     }
+    #[cfg(not(feature = "tls"))]
+    if tls_cert.is_some() || tls_key.is_some() {
+        return Err(String::from(
+            "--tls-cert/--tls-key require a binary built with the `tls` feature.",
+        ));
+    }
     if let Some(n) = threads_override {
         if n == 0 {
             return Err(String::from("--threads must be greater than 0."));
@@ -261,6 +273,15 @@ fn run() -> Result<(), String> {
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     eprintln!("SIMD: scalar fallback");
+    #[cfg(not(target_family = "wasm"))]
+    if metal::enabled() {
+        eprintln!("Metal: Q4_K matvec enabled");
+    } else if std::env::var_os("RUSTY_LLM_METAL").is_some() {
+        eprintln!("Metal: unavailable, using CPU");
+    }
+    if std::env::var_os("RUSTY_LLM_FAST_ATTN").is_some() {
+        eprintln!("Attention: fast approximation mode enabled");
+    }
 
     if let Some(n) = threads_override {
         simd::set_num_threads(n);
@@ -337,26 +358,38 @@ fn run() -> Result<(), String> {
 
     // Server mode takes over the process after the model is loaded.
     if let Some(addr) = serve_addr {
-        let protocol = if tls_cert.is_some() && tls_key.is_some() {
-            "HTTPS"
-        } else {
-            "HTTP"
-        };
-        let max_connections = max_connections_override.unwrap_or_else(|| (n_threads * 8).max(16));
-        eprintln!("{} endpoint listening on {}", protocol, addr);
-        eprintln!(
-            "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
-        );
-        eprintln!("Max concurrent connections: {}", max_connections);
-        let serve_options = ServeOptions {
-            addr,
-            defaults: options.clone(),
-            tls_cert_path: tls_cert,
-            tls_key_path: tls_key,
-            max_concurrent_connections: max_connections,
-        };
-        server::serve(Arc::new(runner), serve_options)?;
-        return Ok(());
+        #[cfg(not(feature = "server"))]
+        {
+            let _ = addr;
+            return Err(String::from(
+                "--serve requires a binary built with the `server` feature.",
+            ));
+        }
+
+        #[cfg(feature = "server")]
+        {
+            let protocol = if tls_cert.is_some() && tls_key.is_some() {
+                "HTTPS"
+            } else {
+                "HTTP"
+            };
+            let max_connections =
+                max_connections_override.unwrap_or_else(|| (n_threads * 8).max(16));
+            eprintln!("{} endpoint listening on {}", protocol, addr);
+            eprintln!(
+                "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+            );
+            eprintln!("Max concurrent connections: {}", max_connections);
+            let serve_options = ServeOptions {
+                addr,
+                defaults: options.clone(),
+                tls_cert_path: tls_cert,
+                tls_key_path: tls_key,
+                max_concurrent_connections: max_connections,
+            };
+            server::serve(Arc::new(runner), serve_options)?;
+            return Ok(());
+        }
     }
 
     if repl_mode {
