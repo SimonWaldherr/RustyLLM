@@ -391,9 +391,14 @@ impl Runner {
         // Prefill runs the full prompt through the model once to seed the KV
         // cache; incremental decoding starts from the last prompt logits.
         let t_prefill = Instant::now();
-        let mut logits = vec![];
+        let mut logits = Vec::new();
+        let last_prompt_pos = tokens.len() - 1;
         for (pos, &tok_id) in tokens.iter().enumerate() {
-            logits = self.forward_token(&mut cache, &mut buf, tok_id, pos);
+            if pos == last_prompt_pos {
+                logits = self.forward_token(&mut cache, &mut buf, tok_id, pos);
+            } else {
+                let _ = self.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
+            }
         }
         let prefill_time = t_prefill.elapsed();
 
@@ -451,12 +456,12 @@ impl Runner {
                 recent.pop_front();
             }
 
-            logits = self.forward_token(&mut cache, &mut buf, token, pos);
-            pos += 1;
-
-            if pos >= cache_len {
+            if generated.len() >= options.max_tokens || pos >= cache_len {
                 break;
             }
+
+            logits = self.forward_token(&mut cache, &mut buf, token, pos);
+            pos += 1;
         }
 
         let decode_time = t_decode.elapsed();

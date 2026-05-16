@@ -27,6 +27,19 @@ cargo build --release
 
 The binary will be available at `target/release/rusty-llm`.
 
+For local performance testing on Apple Silicon, prefer the release binary and
+explicit thread counts:
+
+```bash
+cargo build --release
+./target/release/rusty-llm --model phi-4 --bench --bench-runs 3 --max-tokens 64 --threads 12
+```
+
+Ollama and LM Studio are usually faster on macOS because they run llama.cpp with
+Metal GPU acceleration and heavily tuned kernels. RustyLLM currently runs CPU
+inference only, so the benchmark numbers are most useful for tracking RustyLLM
+changes against itself.
+
 ## CLI Usage
 
 ```bash
@@ -60,6 +73,8 @@ Options:
 - `--system-prompt <text>`: override the default chat system prompt.
 - `--stop <text>`: stop generation when this string appears in the output (can be repeated).
 - `--embed`: run the prompt through the model and print the L2-normalised embedding vector instead of generating text.
+- `--bench`: run a non-streaming generation benchmark and print per-run throughput.
+- `--bench-runs <N>`: number of benchmark runs (default: `3`).
 - `--list-tensors`: print the GGUF tensor inventory and exit.
 
 Examples:
@@ -79,6 +94,16 @@ rusty-llm ./models/model.gguf --prompt "Name three fruits:" --stop "\n" --max-to
 
 # Embed text for RAG retrieval
 rusty-llm ./models/embed.gguf --embed --prompt "The quick brown fox"
+
+# Benchmark decode throughput
+rusty-llm --model phi-4 --bench --bench-runs 5 --max-tokens 64 --threads 8
+
+# Local LM Studio Ministral smoke test
+./target/release/rusty-llm "$HOME/.cache/lm-studio/models/lmstudio-community/Ministral-3-14B-Reasoning-2512-GGUF/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf" \
+  --prompt "Wer war Albert Einstein?"
+
+# Same benchmark through the Makefile release build
+make bench MODEL=/path/to/model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
 
 # Interactive mode
 rusty-llm ./models/model.gguf --repl

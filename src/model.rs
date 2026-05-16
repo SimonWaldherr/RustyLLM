@@ -358,6 +358,9 @@ pub struct DecodeBuffer {
     pub k: Vec<f32>,        // key   (n_kv_heads * head_dim)
     pub v: Vec<f32>,        // value (n_kv_heads * value_dim)
     pub attn_out: Vec<f32>, // attention output (n_heads * value_dim)
+    pub proj: Vec<f32>,     // projection output (dim)
+    pub gate: Vec<f32>,     // FFN gate projection (hidden_dim)
+    pub up: Vec<f32>,       // FFN up projection (hidden_dim)
     pub hidden: Vec<f32>,   // FFN hidden (hidden_dim)
 }
 
@@ -375,6 +378,9 @@ impl DecodeBuffer {
             k: vec![0.0; max_n_kv_heads * max_head_dim],
             v: vec![0.0; max_n_kv_heads * max_value_dim],
             attn_out: vec![0.0; config.n_heads * max_value_dim],
+            proj: vec![0.0; config.dim],
+            gate: vec![0.0; config.hidden_dim],
+            up: vec![0.0; config.hidden_dim],
             hidden: vec![0.0; config.hidden_dim],
         }
     }
@@ -1606,31 +1612,31 @@ pub fn forward(
         }
 
         // Output projection + residual
-        let attn_proj = layer.wo.matvec(&buf.attn_out);
+        layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += attn_proj[i];
+            x[i] += buf.proj[i];
         }
 
         // ── FFN (SwiGLU) ──
         rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        let gate = layer.w1.matvec(&buf.xn2);
-        let up = layer.w3.matvec(&buf.xn2);
+        layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
+        layer.w3.matvec_into(&buf.xn2, &mut buf.up);
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(gate[i]) * up[i];
+            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
         }
 
-        let ffn_out = layer.w2.matvec(&buf.hidden);
+        layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += ffn_out[i];
+            x[i] += buf.proj[i];
         }
     }
 
     // Final norm → logits
-    let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
-    weights.output.matvec(&x)
+    rms_norm_into(&x, &weights.output_norm, config.rms_norm_eps, &mut buf.xn);
+    weights.output.matvec(&buf.xn)
 }
 
 /// Forward pass for Gemma-4 models (initial implementation mirroring the
@@ -1727,31 +1733,31 @@ pub fn forward_gemma4(
         }
 
         // Output projection + residual
-        let attn_proj = layer.attn_output.matvec(&buf.attn_out);
+        layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += attn_proj[i];
+            x[i] += buf.proj[i];
         }
 
         // ── FFN (SwiGLU-like) ──
         rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        let gate = layer.ffn_gate.matvec(&buf.xn2);
-        let up = layer.ffn_up.matvec(&buf.xn2);
+        layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+        layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(gate[i]) * up[i];
+            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
         }
 
-        let ffn_out = layer.ffn_down.matvec(&buf.hidden);
+        layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += ffn_out[i];
+            x[i] += buf.proj[i];
         }
     }
 
     // Final norm → logits
-    let x = rms_norm(&x, &weights.output_norm, config.rms_norm_eps);
-    weights.output.matvec(&x)
+    rms_norm_into(&x, &weights.output_norm, config.rms_norm_eps, &mut buf.xn);
+    weights.output.matvec(&buf.xn)
 }
 
 #[derive(Clone)]
@@ -2520,24 +2526,24 @@ pub fn forward_hidden(
             );
         }
 
-        let attn_proj = layer.wo.matvec(&buf.attn_out);
+        layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += attn_proj[i];
+            x[i] += buf.proj[i];
         }
 
         rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        let gate = layer.w1.matvec(&buf.xn2);
-        let up = layer.w3.matvec(&buf.xn2);
+        layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
+        layer.w3.matvec_into(&buf.xn2, &mut buf.up);
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(gate[i]) * up[i];
+            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
         }
 
-        let ffn_out = layer.w2.matvec(&buf.hidden);
+        layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += ffn_out[i];
+            x[i] += buf.proj[i];
         }
     }
 
@@ -2738,24 +2744,24 @@ pub fn forward_hidden_gemma4(
             );
         }
 
-        let attn_proj = layer.attn_output.matvec(&buf.attn_out);
+        layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += attn_proj[i];
+            x[i] += buf.proj[i];
         }
 
         rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        let gate = layer.ffn_gate.matvec(&buf.xn2);
-        let up = layer.ffn_up.matvec(&buf.xn2);
+        layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+        layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(gate[i]) * up[i];
+            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
         }
 
-        let ffn_out = layer.ffn_down.matvec(&buf.hidden);
+        layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += ffn_out[i];
+            x[i] += buf.proj[i];
         }
     }
 

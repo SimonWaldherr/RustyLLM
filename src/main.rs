@@ -2,7 +2,7 @@
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,
 };
-use rusty_llm::runtime::{ChatMessage, GenerationOptions, Runner};
+use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
@@ -12,6 +12,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 fn print_usage(name: &str) {
     eprintln!("rusty-llm v0.3.0");
@@ -43,6 +44,8 @@ fn print_usage(name: &str) {
     eprintln!("  --system-prompt <T>       Override the default system prompt");
     eprintln!("  --stop <text>             Stop generation when this string appears");
     eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
+    eprintln!("  --bench                   Run a non-streaming generation benchmark");
+    eprintln!("  --bench-runs <N>          Number of benchmark runs (default: 3)");
     eprintln!("  --list-tensors            Print GGUF tensor inventory and exit");
 }
 
@@ -110,6 +113,8 @@ fn run() -> Result<(), String> {
     let mut tls_key: Option<String> = None;
     let mut max_connections_override: Option<usize> = None;
     let mut embed_mode = false;
+    let mut bench_mode = false;
+    let mut bench_runs = 3usize;
 
     let mut i = 1;
     while i < args.len() {
@@ -188,6 +193,12 @@ fn run() -> Result<(), String> {
             "--embed" => {
                 embed_mode = true;
             }
+            "--bench" => {
+                bench_mode = true;
+            }
+            "--bench-runs" => {
+                bench_runs = parse_arg::<usize>(&args, &mut i, "--bench-runs")?;
+            }
             "--list-tensors" => {
                 list_tensors = true;
             }
@@ -226,6 +237,9 @@ fn run() -> Result<(), String> {
         if n == 0 {
             return Err(String::from("--max-connections must be greater than 0."));
         }
+    }
+    if bench_runs == 0 {
+        return Err(String::from("--bench-runs must be greater than 0."));
     }
     options.validate()?;
 
@@ -277,11 +291,27 @@ fn run() -> Result<(), String> {
         load_info.load_time.as_secs_f32(),
         file_mb / load_info.load_time.as_secs_f64()
     );
+    io::stderr().flush().map_err(|err| err.to_string())?;
 
     if list_tensors {
         for tensor in &runner.gguf().tensors {
             eprintln!("{} {:?} {:?}", tensor.name, tensor.dtype, tensor.dims);
         }
+        return Ok(());
+    }
+
+    if bench_mode {
+        if embed_mode || repl_mode || serve_addr.is_some() {
+            return Err(String::from(
+                "--bench cannot be combined with --embed, --repl, or --serve.",
+            ));
+        }
+        let bench_prompt = if prompt.trim().is_empty() {
+            "Explain local LLM inference performance in one concise paragraph."
+        } else {
+            prompt.trim()
+        };
+        run_benchmark(&runner, &load_info, bench_prompt, &options, bench_runs)?;
         return Ok(());
     }
 
@@ -377,6 +407,96 @@ fn run() -> Result<(), String> {
         result.stats.generated_tokens as f32 / result.stats.decode_time.as_secs_f32().max(0.001)
     );
     eprintln!("Total: {:.2}s", result.stats.total_time.as_secs_f32());
+
+    Ok(())
+}
+
+fn run_benchmark(
+    runner: &Runner,
+    load_info: &LoadInfo,
+    prompt: &str,
+    options: &GenerationOptions,
+    runs: usize,
+) -> Result<(), String> {
+    println!("Benchmark");
+    println!("model={}", runner.model_name().unwrap_or("unknown"));
+    println!("architecture={}", runner.architecture());
+    println!("load_ms={}", load_info.load_time.as_millis());
+    println!("runs={}", runs);
+    println!("max_tokens={}", options.max_tokens);
+    println!();
+    println!(
+        "run,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s"
+    );
+
+    let mut total_prompt_tokens = 0usize;
+    let mut total_generated_tokens = 0usize;
+    let mut total_prefill = Duration::from_secs(0);
+    let mut total_decode = Duration::from_secs(0);
+    let mut total_model = Duration::from_secs(0);
+    let mut total_wall = Duration::from_secs(0);
+
+    for run in 0..runs {
+        let mut run_options = options.clone();
+        if options.seed != 0 {
+            run_options.seed = options.seed.wrapping_add(run as u64);
+        }
+
+        let wall_start = Instant::now();
+        let result = runner.generate(prompt, &run_options)?;
+        let wall = wall_start.elapsed();
+        let decode_tok_s = result.stats.generated_tokens as f64
+            / result.stats.decode_time.as_secs_f64().max(0.001);
+
+        println!(
+            "{},{},{},{},{},{},{},{:.2}",
+            run + 1,
+            result.stats.prompt_tokens,
+            result.stats.generated_tokens,
+            result.stats.prefill_time.as_millis(),
+            result.stats.decode_time.as_millis(),
+            result.stats.total_time.as_millis(),
+            wall.as_millis(),
+            decode_tok_s
+        );
+
+        total_prompt_tokens += result.stats.prompt_tokens;
+        total_generated_tokens += result.stats.generated_tokens;
+        total_prefill += result.stats.prefill_time;
+        total_decode += result.stats.decode_time;
+        total_model += result.stats.total_time;
+        total_wall += wall;
+    }
+
+    println!();
+    println!(
+        "avg_prompt_tokens={:.1}",
+        total_prompt_tokens as f64 / runs as f64
+    );
+    println!(
+        "avg_generated_tokens={:.1}",
+        total_generated_tokens as f64 / runs as f64
+    );
+    println!(
+        "avg_prefill_ms={:.1}",
+        total_prefill.as_secs_f64() * 1000.0 / runs as f64
+    );
+    println!(
+        "avg_decode_ms={:.1}",
+        total_decode.as_secs_f64() * 1000.0 / runs as f64
+    );
+    println!(
+        "avg_total_ms={:.1}",
+        total_model.as_secs_f64() * 1000.0 / runs as f64
+    );
+    println!(
+        "avg_wall_ms={:.1}",
+        total_wall.as_secs_f64() * 1000.0 / runs as f64
+    );
+    println!(
+        "aggregate_decode_tok_s={:.2}",
+        total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001)
+    );
 
     Ok(())
 }
