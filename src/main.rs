@@ -1,3 +1,7 @@
+#[cfg(not(target_family = "wasm"))]
+use rusty_llm::catalog::{
+    default_model_dir, discover_models, print_model_list, resolve_model_path,
+};
 use rusty_llm::runtime::{ChatMessage, GenerationOptions, Runner};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::server::{self, ServeOptions};
@@ -5,15 +9,24 @@ use rusty_llm::simd;
 use std::env;
 use std::fmt::Display;
 use std::io::{self, BufRead, Read, Write};
+use std::path::PathBuf;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
 fn print_usage(name: &str) {
     eprintln!("rusty-llm v0.2.0");
     eprintln!();
-    eprintln!("Usage: {} <model.gguf> [options]", name);
+    eprintln!(
+        "Usage: {} [model.gguf|model-name|model-dir] [options]",
+        name
+    );
     eprintln!();
     eprintln!("Options:");
+    eprintln!(
+        "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name"
+    );
+    eprintln!("  --model-dir <path>       Directory to recursively scan for GGUF files");
+    eprintln!("  --list-models            List GGUF files in --model-dir and exit");
     eprintln!("  --prompt <text>           Input prompt (interactive if omitted)");
     eprintln!("  --repl                    Start an interactive REPL session");
     eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
@@ -45,6 +58,21 @@ where
         .map_err(|err| format!("Invalid {} value '{}': {}", flag, args[*i], err))
 }
 
+fn set_model_selector(
+    current: &mut Option<String>,
+    value: String,
+    source: &str,
+) -> Result<(), String> {
+    if current.is_some() {
+        return Err(format!(
+            "Multiple model selectors were provided; remove the extra {} value.",
+            source
+        ));
+    }
+    *current = Some(value);
+    Ok(())
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{}", err);
@@ -57,19 +85,22 @@ fn run() -> Result<(), String> {
 
     if args.len() < 2 {
         print_usage(&args[0]);
-        return Err(String::from("Missing required <model.gguf> path."));
+        return Err(String::from(
+            "Missing model selector. Use --list-models to inspect the configured model directory.",
+        ));
     }
 
-    if args[1] == "--help" || args[1] == "-h" {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_usage(&args[0]);
         return Ok(());
     }
 
-    let model_path = &args[1];
-
+    let mut model_selector: Option<String> = None;
+    let mut model_dir: PathBuf = default_model_dir();
     let mut prompt = String::new();
     let mut options = GenerationOptions::default();
     let mut list_tensors = false;
+    let mut list_models = false;
     let mut threads_override: Option<usize> = None;
     let mut repl_mode = false;
     let mut serve_addr: Option<String> = None;
@@ -77,9 +108,31 @@ fn run() -> Result<(), String> {
     let mut tls_key: Option<String> = None;
     let mut max_connections_override: Option<usize> = None;
 
-    let mut i = 2;
+    let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--model" => {
+                let value = parse_arg::<String>(&args, &mut i, "--model")?;
+                if let Some(existing) = model_selector.as_deref() {
+                    let existing_path = PathBuf::from(existing);
+                    if existing_path.is_dir() {
+                        model_dir = existing_path;
+                        model_selector = Some(value);
+                    } else {
+                        return Err(String::from(
+                            "Multiple model selectors were provided; remove the extra --model value.",
+                        ));
+                    }
+                } else {
+                    set_model_selector(&mut model_selector, value, "--model")?;
+                }
+            }
+            "--model-dir" => {
+                model_dir = PathBuf::from(parse_arg::<String>(&args, &mut i, "--model-dir")?);
+            }
+            "--list-models" => {
+                list_models = true;
+            }
             "--prompt" | "-p" => {
                 prompt = parse_arg::<String>(&args, &mut i, "--prompt")?;
             }
@@ -128,10 +181,24 @@ fn run() -> Result<(), String> {
                 list_tensors = true;
             }
             other => {
-                return Err(format!("Unknown option: {}", other));
+                if other.starts_with('-') {
+                    return Err(format!("Unknown option: {}", other));
+                }
+                let positional_path = PathBuf::from(other);
+                if model_selector.is_some() && positional_path.is_dir() {
+                    model_dir = positional_path;
+                } else {
+                    set_model_selector(&mut model_selector, other.to_string(), "positional model")?;
+                }
             }
         }
         i += 1;
+    }
+
+    if list_models {
+        let entries = discover_models(&model_dir)?;
+        print_model_list(&entries);
+        return Ok(());
     }
 
     if tls_cert.is_some() ^ tls_key.is_some() {
@@ -175,8 +242,13 @@ fn run() -> Result<(), String> {
         eprintln!("Worker threads: {}", n);
     }
 
-    eprintln!("\nLoading: {}", model_path);
-    let (runner, load_info) = Runner::from_path(model_path)?;
+    let model_path = resolve_model_path(model_selector.as_deref(), &model_dir)?;
+
+    eprintln!("\nLoading: {}", model_path.display());
+    let model_path_str = model_path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF-8 model path: {}", model_path.display()))?;
+    let (runner, load_info) = Runner::from_path(model_path_str)?;
     let file_mb = load_info.file_size_bytes as f64 / (1024.0 * 1024.0);
     eprintln!("File size: {:.1} MB", file_mb);
     if let Some(name) = runner.model_name() {

@@ -273,6 +273,15 @@ pub struct GGUFFile {
 impl GGUFFile {
     /// Parse GGUF header + metadata + tensor info from a byte slice (typically mmap'd)
     pub fn parse(data: &[u8]) -> Result<Self, String> {
+        Self::parse_inner(data, true)
+    }
+
+    /// Parse GGUF metadata without printing header diagnostics.
+    pub fn parse_quiet(data: &[u8]) -> Result<Self, String> {
+        Self::parse_inner(data, false)
+    }
+
+    fn parse_inner(data: &[u8], verbose: bool) -> Result<Self, String> {
         let mut c = Cursor::new(data);
 
         if data.len() < 4 {
@@ -295,10 +304,12 @@ impl GGUFFile {
         let n_tensors = c.read_u64() as usize;
         let n_kv = c.read_u64() as usize;
 
-        eprintln!(
-            "GGUF v{} — {} tensors, {} metadata entries",
-            version, n_tensors, n_kv
-        );
+        if verbose {
+            eprintln!(
+                "GGUF v{} — {} tensors, {} metadata entries",
+                version, n_tensors, n_kv
+            );
+        }
 
         // Parse metadata
         let mut metadata = HashMap::with_capacity(n_kv);

@@ -1,3 +1,5 @@
+#[cfg(not(target_family = "wasm"))]
+pub mod catalog;
 pub mod gguf;
 #[cfg(not(target_family = "wasm"))]
 pub mod mmap;
