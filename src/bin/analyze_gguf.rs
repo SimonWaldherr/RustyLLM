@@ -28,7 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(blk_start) = tensor.name.find("blk.") {
             if let Some(blk_end) = tensor.name[blk_start..].find('.') {
                 let block_key = &tensor.name[blk_start..blk_start + blk_end];
-                blocks.entry(block_key.to_string())
+                blocks
+                    .entry(block_key.to_string())
                     .or_insert_with(Vec::new)
                     .push(tensor);
             }
@@ -56,7 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if layer_num == 0 { "" } else { "\n" },
                 block_key,
                 layer_num,
-                if is_special { "[SPECIAL LAYER]" } else { "[NORMAL LAYER]" },
+                if is_special {
+                    "[SPECIAL LAYER]"
+                } else {
+                    "[NORMAL LAYER]"
+                },
                 if layer_num == 0 { "" } else { "" }
             );
             println!("Tensor Count: {}\n", tensors.len());
@@ -94,7 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|d| d.to_string())
                         .collect::<Vec<_>>()
                         .join(" x ");
-                    let short_name = tensor.name.strip_prefix(&format!("{}.", block_key))
+                    let short_name = tensor
+                        .name
+                        .strip_prefix(&format!("{}.", block_key))
                         .unwrap_or(&tensor.name);
                     println!(
                         "    {:40} | shape: {:20} | dtype: {}",
@@ -122,7 +129,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn compare_blocks(blk_a: &[&rusty_llm::gguf::TensorInfo], blk_b: &[&rusty_llm::gguf::TensorInfo], name_a: &str, name_b: &str) {
+fn compare_blocks(
+    blk_a: &[&rusty_llm::gguf::TensorInfo],
+    blk_b: &[&rusty_llm::gguf::TensorInfo],
+    name_a: &str,
+    name_b: &str,
+) {
     // Extract just the tensor suffixes (after the block name)
     let mut map_a: HashMap<String, _> = HashMap::new();
     let mut map_b: HashMap<String, _> = HashMap::new();
@@ -156,13 +168,7 @@ fn compare_blocks(blk_a: &[&rusty_llm::gguf::TensorInfo], blk_b: &[&rusty_llm::g
                 if shape_a != shape_b || dtype_a != dtype_b {
                     differences.push(format!(
                         "{:40} | {}: {} ({}) | {}: {} ({})",
-                        key,
-                        name_a,
-                        shape_a,
-                        dtype_a,
-                        name_b,
-                        shape_b,
-                        dtype_b
+                        key, name_a, shape_a, dtype_a, name_b, shape_b, dtype_b
                     ));
                 }
             }

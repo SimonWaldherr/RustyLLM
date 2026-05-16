@@ -53,6 +53,25 @@ impl Default for GenerationOptions {
     }
 }
 
+impl GenerationOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 {
+            return Err(String::from("max_tokens must be greater than 0."));
+        }
+        if !self.sampler.temperature.is_finite() || self.sampler.temperature < 0.0 {
+            return Err(String::from("temperature must be a finite number >= 0."));
+        }
+        if !self.sampler.top_p.is_finite() || self.sampler.top_p <= 0.0 || self.sampler.top_p > 1.0
+        {
+            return Err(String::from("top_p must be in the range (0, 1]."));
+        }
+        if !self.sampler.repeat_penalty.is_finite() || self.sampler.repeat_penalty <= 0.0 {
+            return Err(String::from("repeat_penalty must be a finite number > 0."));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GenerationStats {
     pub prompt_tokens: usize,
@@ -275,6 +294,8 @@ impl Runner {
     where
         F: FnMut(&str),
     {
+        options.validate()?;
+
         if messages.is_empty() {
             return Err(String::from("No prompt provided."));
         }
@@ -293,35 +314,35 @@ impl Runner {
         // For architectures with per-layer layouts (Gemma-4), compute the
         // maximum per-layer head/value sizes so we can allocate buffers and
         // the KV cache with safe upper bounds.
-        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) =
-            match &self.weights {
-                LoadedWeights::Gemma4(w) => {
-                    let mut max_hd = self.config.head_dim;
-                    let mut max_kv_heads = self.config.n_kv_heads;
-                    let mut max_val = self.config.value_dim;
-                    for l in w.layers.iter() {
-                        if l.head_dim > max_hd {
-                            max_hd = l.head_dim;
-                        }
-                        if l.n_kv_heads > max_kv_heads {
-                            max_kv_heads = l.n_kv_heads;
-                        }
-                        if l.value_dim > max_val {
-                            max_val = l.value_dim;
-                        }
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = match &self.weights
+        {
+            LoadedWeights::Gemma4(w) => {
+                let mut max_hd = self.config.head_dim;
+                let mut max_kv_heads = self.config.n_kv_heads;
+                let mut max_val = self.config.value_dim;
+                for l in w.layers.iter() {
+                    if l.head_dim > max_hd {
+                        max_hd = l.head_dim;
                     }
-                    let kk = max_kv_heads * max_hd;
-                    let vv = max_kv_heads * max_val;
-                    (kk, vv, max_hd, max_kv_heads, max_val)
+                    if l.n_kv_heads > max_kv_heads {
+                        max_kv_heads = l.n_kv_heads;
+                    }
+                    if l.value_dim > max_val {
+                        max_val = l.value_dim;
+                    }
                 }
-                _ => (
-                    self.config.n_kv_heads * self.config.head_dim,
-                    self.config.kv_dim,
-                    self.config.head_dim,
-                    self.config.n_kv_heads,
-                    self.config.value_dim,
-                ),
-            };
+                let kk = max_kv_heads * max_hd;
+                let vv = max_kv_heads * max_val;
+                (kk, vv, max_hd, max_kv_heads, max_val)
+            }
+            _ => (
+                self.config.n_kv_heads * self.config.head_dim,
+                self.config.kv_dim,
+                self.config.head_dim,
+                self.config.n_kv_heads,
+                self.config.value_dim,
+            ),
+        };
 
         let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);

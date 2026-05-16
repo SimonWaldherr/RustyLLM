@@ -43,20 +43,21 @@ impl Config {
 
         let dim = gguf.get_u32(&format!("{}.embedding_length", p), 0) as usize;
         let n_heads = gguf.get_u32(&format!("{}.attention.head_count", p), 0) as usize;
-        let n_kv_heads = gguf.get_u32(&format!("{}.attention.head_count_kv", p), n_heads as u32) as usize;
-        let head_dim = gguf.get_u32(&format!("{}.attention.key_length", p), 0)
+        let n_kv_heads =
+            gguf.get_u32(&format!("{}.attention.head_count_kv", p), n_heads as u32) as usize;
+        let head_dim = gguf
+            .get_u32(&format!("{}.attention.key_length", p), 0)
             .max((dim / n_heads) as u32) as usize;
-        let value_dim = gguf.get_u32(&format!("{}.attention.value_length", p), head_dim as u32) as usize;
+        let value_dim =
+            gguf.get_u32(&format!("{}.attention.value_length", p), head_dim as u32) as usize;
 
-        let vocab_size = gguf
-            .get_u32(&format!("{}.vocab_size", p), 0)
-            .max(
-                gguf.metadata
-                    .get("tokenizer.ggml.tokens")
-                    .and_then(|v| v.as_string_array())
-                    .map(|v| v.len() as u32)
-                    .unwrap_or(0)
-            ) as usize;
+        let vocab_size = gguf.get_u32(&format!("{}.vocab_size", p), 0).max(
+            gguf.metadata
+                .get("tokenizer.ggml.tokens")
+                .and_then(|v| v.as_string_array())
+                .map(|v| v.len() as u32)
+                .unwrap_or(0),
+        ) as usize;
 
         Config {
             arch: p.clone(),
@@ -77,13 +78,14 @@ impl Config {
             expert_count: gguf.get_u32(&format!("{}.expert_count", p), 0) as usize,
             expert_used_count: gguf.get_u32(&format!("{}.expert_used_count", p), 0) as usize,
             rope_scaling_factor: gguf.get_f32(&format!("{}.rope.scaling.factor", p), 1.0),
-            rope_original_context_length: gguf.get_u32(&format!("{}.rope.scaling.original_context_length", p), 0) as usize,
+            rope_original_context_length: gguf
+                .get_u32(&format!("{}.rope.scaling.original_context_length", p), 0)
+                as usize,
         }
     }
 }
 
 // ─── Weight storage: either f32 Vec or raw quantized bytes (zero-copy) ───────
-
 
 // ─── Weight storage: either f32 Vec or raw quantized bytes (zero-copy) ───────
 
@@ -329,7 +331,12 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new(n_layers: usize, per_pos_k_dim: usize, per_pos_v_dim: usize, max_len: usize) -> Self {
+    pub fn new(
+        n_layers: usize,
+        per_pos_k_dim: usize,
+        per_pos_v_dim: usize,
+        max_len: usize,
+    ) -> Self {
         Self {
             k: vec![vec![0.0; max_len * per_pos_k_dim]; n_layers],
             v: vec![vec![0.0; max_len * per_pos_v_dim]; n_layers],
@@ -496,7 +503,10 @@ fn load_weight(
         | GGMLType::Q5_0
         | GGMLType::Q5_1 => {
             if effective_force_f32 {
-                if matches!(info.dtype, GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::MXFP4) {
+                if matches!(
+                    info.dtype,
+                    GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::MXFP4
+                ) {
                     panic!(
                         "{} force_f32 dequantization not implemented for {}",
                         format!("{:?}", info.dtype),
@@ -1645,19 +1655,17 @@ pub fn forward_gemma4(
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
-
-        
         // Standard attention path (or K=V reuse when attn_v is missing)
         rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
         layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
         layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
-        
+
         // If has_attn_v is false, V = K (K=V reuse)
         let head_dim_l = layer.head_dim;
         let n_kv_heads_l = layer.n_kv_heads;
         let value_dim_l = layer.value_dim;
-        
+
         if layer.has_attn_v {
             layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
         } else {
@@ -1667,14 +1675,20 @@ pub fn forward_gemma4(
         }
 
         // Apply RoPE using per-head dims
-        apply_rope(&mut buf.q, pos, head_dim_l, config.n_heads, config.rope_theta);
+        apply_rope(
+            &mut buf.q,
+            pos,
+            head_dim_l,
+            config.n_heads,
+            config.rope_theta,
+        );
         apply_rope(&mut buf.k, pos, head_dim_l, n_kv_heads_l, config.rope_theta);
 
         // Store KV into per-pos slots (cache uses fixed per-pos stride)
         // Important: only write the relevant portion based on per-layer dims
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;
-        
+
         let kv_k_start = pos * cache.per_pos_k_dim;
         let kv_v_start = pos * cache.per_pos_v_dim;
         cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
@@ -1733,7 +1747,6 @@ pub fn forward_gemma4(
         for i in 0..dim {
             x[i] += ffn_out[i];
         }
-
     }
 
     // Final norm → logits
@@ -1755,8 +1768,8 @@ pub struct Gemma4LayerWeights {
     pub head_dim: usize,
     pub n_kv_heads: usize,
     pub value_dim: usize,
-    pub has_attn_v: bool,  // True if layer has separate V projection; false = use K as V
-    // TODO: Add biases, global attn, etc. falls benötigt
+    pub has_attn_v: bool, // True if layer has separate V projection; false = use K as V
+                          // TODO: Add biases, global attn, etc. falls benötigt
 }
 
 #[derive(Clone)]
@@ -1892,10 +1905,7 @@ pub fn load_gemma4_model(
         config.kv_mul = config.n_heads / config.n_kv_heads;
         eprintln!(
             "Adjusted Gemma4 config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
-            config.head_dim,
-            config.value_dim,
-            config.kv_dim,
-            config.kv_mul
+            config.head_dim, config.value_dim, config.kv_dim, config.kv_mul
         );
     }
 
@@ -1981,10 +1991,7 @@ pub fn load_gemma4_model(
         config.kv_mul = config.n_heads / config.n_kv_heads;
         eprintln!(
             "Adjusted Gemma4 config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
-            config.head_dim,
-            config.value_dim,
-            config.kv_dim,
-            config.kv_mul
+            config.head_dim, config.value_dim, config.kv_dim, config.kv_mul
         );
     }
 
@@ -2123,7 +2130,7 @@ pub fn load_gemma4_model(
                 }
             }
         } else {
-            // V tensor is missing: use K=V reuse. 
+            // V tensor is missing: use K=V reuse.
             // value_dim_l should match K's geometry: k_rows = n_kv_heads * head_dim
             // So value_dim_l = head_dim_l (since V will use the same projection as K)
             value_dim_l = head_dim_l;
@@ -2270,7 +2277,14 @@ pub fn load_gemma4_model(
                 borrow_quantized,
             );
             // attn_output: rows = dim, cols = n_heads * value_dim
-            validate_shape(&out_name, l, &w, out_rows, config.n_heads * value_dim_l, &config);
+            validate_shape(
+                &out_name,
+                l,
+                &w,
+                out_rows,
+                config.n_heads * value_dim_l,
+                &config,
+            );
             w
         } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "output"]) {
             eprintln!(

@@ -1,6 +1,6 @@
+use rusty_llm::gguf::GGUFFile;
 use std::env;
 use std::fs;
-use rusty_llm::gguf::GGUFFile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -14,15 +14,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GGUFFile::parse(&data)?;
 
     println!("Total tensors: {}\n", gguf.tensors.len());
-    
+
     // Print first 30 tensor names
     for (i, tensor) in gguf.tensors.iter().take(30).enumerate() {
-        println!("{}: {} -> shape: {:?}, dtype: {:?}", 
-                 i, tensor.name, tensor.dims, tensor.dtype);
+        println!(
+            "{}: {} -> shape: {:?}, dtype: {:?}",
+            i, tensor.name, tensor.dims, tensor.dtype
+        );
     }
-    
+
     println!("\n...\n");
-    
+
     // Print some blk tensors
     for (i, tensor) in gguf.tensors.iter().enumerate() {
         if tensor.name.contains("blk.0") && i < 100 {

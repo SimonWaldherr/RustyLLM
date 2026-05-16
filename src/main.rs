@@ -3,7 +3,8 @@ use rusty_llm::runtime::{ChatMessage, GenerationOptions, Runner};
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::fmt::Display;
+use std::io::{self, BufRead, Read, Write};
 #[cfg(not(target_family = "wasm"))]
 use std::sync::Arc;
 
@@ -13,28 +14,55 @@ fn print_usage(name: &str) {
     eprintln!("Usage: {} <model.gguf> [options]", name);
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --prompt <text>       Input prompt (interactive if omitted)");
-    eprintln!("  --repl                Start an interactive REPL session");
-    eprintln!("  --serve <addr>        Start HTTP(S) API server, e.g. 127.0.0.1:8080");
-    eprintln!("  --tls-cert <path>     PEM certificate for HTTPS");
-    eprintln!("  --tls-key <path>      PEM private key for HTTPS");
-    eprintln!("  --max-tokens <N>      Max tokens to generate (default: 256)");
-    eprintln!("  --temp <F>            Temperature (default: 0.7, 0=greedy)");
-    eprintln!("  --top-p <F>           Nucleus sampling threshold (default: 0.9)");
-    eprintln!("  --top-k <N>           Top-K filtering (default: 40)");
-    eprintln!("  --repeat-penalty <F>  Repetition penalty (default: 1.1)");
-    eprintln!("  --seed <N>            RNG seed (default: time-based)");
-    eprintln!("  --threads <N>         Override thread count");
-    eprintln!("  --system-prompt <T>   Override the default system prompt");
-    eprintln!("  --list-tensors        Print GGUF tensor inventory and exit");
+    eprintln!("  --prompt <text>           Input prompt (interactive if omitted)");
+    eprintln!("  --repl                    Start an interactive REPL session");
+    eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
+    eprintln!("  --tls-cert <path>         PEM certificate for HTTPS");
+    eprintln!("  --tls-key <path>          PEM private key for HTTPS");
+    eprintln!("  --max-connections <N>     Max concurrent server connections");
+    eprintln!("  --max-tokens <N>          Max tokens to generate (default: 256)");
+    eprintln!("  --temp <F>                Temperature (default: 0.7, 0=greedy)");
+    eprintln!("  --top-p <F>               Nucleus sampling threshold (default: 0.9)");
+    eprintln!("  --top-k <N>               Top-K filtering (default: 40)");
+    eprintln!("  --repeat-penalty <F>      Repetition penalty (default: 1.1)");
+    eprintln!("  --seed <N>                RNG seed (default: time-based)");
+    eprintln!("  --threads <N>             Override thread count");
+    eprintln!("  --system-prompt <T>       Override the default system prompt");
+    eprintln!("  --list-tensors            Print GGUF tensor inventory and exit");
+}
+
+fn parse_arg<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: Display,
+{
+    *i += 1;
+    if *i >= args.len() {
+        return Err(format!("Missing value for {}.", flag));
+    }
+    args[*i]
+        .parse::<T>()
+        .map_err(|err| format!("Invalid {} value '{}': {}", flag, args[*i], err))
 }
 
 fn main() {
+    if let Err(err) = run() {
+        eprintln!("{}", err);
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+    if args.len() < 2 {
         print_usage(&args[0]);
-        std::process::exit(if args.len() < 2 { 1 } else { 0 });
+        return Err(String::from("Missing required <model.gguf> path."));
+    }
+
+    if args[1] == "--help" || args[1] == "-h" {
+        print_usage(&args[0]);
+        return Ok(());
     }
 
     let model_path = &args[1];
@@ -47,71 +75,81 @@ fn main() {
     let mut serve_addr: Option<String> = None;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut max_connections_override: Option<usize> = None;
 
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--prompt" | "-p" => {
-                i += 1;
-                prompt = args[i].clone();
+                prompt = parse_arg::<String>(&args, &mut i, "--prompt")?;
             }
             "--repl" => {
                 repl_mode = true;
             }
             "--serve" => {
-                i += 1;
-                serve_addr = Some(args[i].clone());
+                serve_addr = Some(parse_arg::<String>(&args, &mut i, "--serve")?);
             }
             "--tls-cert" => {
-                i += 1;
-                tls_cert = Some(args[i].clone());
+                tls_cert = Some(parse_arg::<String>(&args, &mut i, "--tls-cert")?);
             }
             "--tls-key" => {
-                i += 1;
-                tls_key = Some(args[i].clone());
+                tls_key = Some(parse_arg::<String>(&args, &mut i, "--tls-key")?);
+            }
+            "--max-connections" => {
+                max_connections_override =
+                    Some(parse_arg::<usize>(&args, &mut i, "--max-connections")?);
             }
             "--max-tokens" | "-n" => {
-                i += 1;
-                options.max_tokens = args[i].parse().expect("Invalid --max-tokens");
+                options.max_tokens = parse_arg::<usize>(&args, &mut i, "--max-tokens")?;
             }
             "--temp" | "-t" => {
-                i += 1;
-                options.sampler.temperature = args[i].parse().expect("Invalid --temp");
+                options.sampler.temperature = parse_arg::<f32>(&args, &mut i, "--temp")?;
             }
             "--top-p" => {
-                i += 1;
-                options.sampler.top_p = args[i].parse().expect("Invalid --top-p");
+                options.sampler.top_p = parse_arg::<f32>(&args, &mut i, "--top-p")?;
             }
             "--top-k" => {
-                i += 1;
-                options.sampler.top_k = args[i].parse().expect("Invalid --top-k");
+                options.sampler.top_k = parse_arg::<usize>(&args, &mut i, "--top-k")?;
             }
             "--repeat-penalty" => {
-                i += 1;
-                options.sampler.repeat_penalty = args[i].parse().expect("Invalid --repeat-penalty");
+                options.sampler.repeat_penalty =
+                    parse_arg::<f32>(&args, &mut i, "--repeat-penalty")?;
             }
             "--seed" => {
-                i += 1;
-                options.seed = args[i].parse().expect("Invalid --seed");
+                options.seed = parse_arg::<u64>(&args, &mut i, "--seed")?;
             }
             "--threads" => {
-                i += 1;
-                threads_override = Some(args[i].parse().expect("Invalid --threads"));
+                threads_override = Some(parse_arg::<usize>(&args, &mut i, "--threads")?);
             }
             "--system-prompt" => {
-                i += 1;
-                options.system_prompt = args[i].clone();
+                options.system_prompt = parse_arg::<String>(&args, &mut i, "--system-prompt")?;
             }
             "--list-tensors" => {
                 list_tensors = true;
             }
             other => {
-                eprintln!("Unknown option: {}", other);
-                std::process::exit(1);
+                return Err(format!("Unknown option: {}", other));
             }
         }
         i += 1;
     }
+
+    if tls_cert.is_some() ^ tls_key.is_some() {
+        return Err(String::from(
+            "Both --tls-cert and --tls-key must be provided together.",
+        ));
+    }
+    if let Some(n) = threads_override {
+        if n == 0 {
+            return Err(String::from("--threads must be greater than 0."));
+        }
+    }
+    if let Some(n) = max_connections_override {
+        if n == 0 {
+            return Err(String::from("--max-connections must be greater than 0."));
+        }
+    }
+    options.validate()?;
 
     let n_threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -134,14 +172,11 @@ fn main() {
 
     if let Some(n) = threads_override {
         simd::set_num_threads(n);
-        eprintln!("Worker threads: {}", n.max(1));
+        eprintln!("Worker threads: {}", n);
     }
 
     eprintln!("\nLoading: {}", model_path);
-    let (runner, load_info) = Runner::from_path(model_path).unwrap_or_else(|err| {
-        eprintln!("{}", err);
-        std::process::exit(1);
-    });
+    let (runner, load_info) = Runner::from_path(model_path)?;
     let file_mb = load_info.file_size_bytes as f64 / (1024.0 * 1024.0);
     eprintln!("File size: {:.1} MB", file_mb);
     if let Some(name) = runner.model_name() {
@@ -164,7 +199,7 @@ fn main() {
         for tensor in &runner.gguf().tensors {
             eprintln!("{} {:?} {:?}", tensor.name, tensor.dtype, tensor.dims);
         }
-        return;
+        return Ok(());
     }
 
     // Server mode takes over the process after the model is loaded.
@@ -174,24 +209,24 @@ fn main() {
         } else {
             "HTTP"
         };
+        let max_connections = max_connections_override.unwrap_or_else(|| (n_threads * 8).max(16));
         eprintln!("{} endpoint listening on {}", protocol, addr);
         eprintln!("POST /generate and GET /health are available.");
+        eprintln!("Max concurrent connections: {}", max_connections);
         let serve_options = ServeOptions {
             addr,
             defaults: options.clone(),
             tls_cert_path: tls_cert,
             tls_key_path: tls_key,
+            max_concurrent_connections: max_connections,
         };
-        server::serve(Arc::new(runner), serve_options).unwrap_or_else(|err| {
-            eprintln!("Server error: {}", err);
-            std::process::exit(1);
-        });
-        return;
+        server::serve(Arc::new(runner), serve_options)?;
+        return Ok(());
     }
 
     if repl_mode {
-        run_repl(&runner, &options);
-        return;
+        run_repl(&runner, &options)?;
+        return Ok(());
     }
 
     // Fall back to stdin when no prompt flag was provided so the binary works
@@ -199,30 +234,29 @@ fn main() {
     if prompt.is_empty() {
         if atty_is_stdin() {
             eprint!(">>> ");
-            io::stderr().flush().unwrap();
-            io::stdin().lock().read_line(&mut prompt).unwrap();
+            io::stderr().flush().map_err(|err| err.to_string())?;
+            io::stdin()
+                .lock()
+                .read_line(&mut prompt)
+                .map_err(|err| err.to_string())?;
             prompt = prompt.trim().to_string();
         } else {
             let mut buf = String::new();
-            io::stdin().lock().read_to_string_linewise(&mut buf);
+            io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|err| err.to_string())?;
             prompt = buf.trim().to_string();
         }
     }
 
     if prompt.is_empty() {
-        eprintln!("No prompt provided.");
-        std::process::exit(1);
+        return Err(String::from("No prompt provided."));
     }
 
-    let result = runner
-        .generate_stream(&prompt, &options, |text| {
-            print!("{}", text);
-            io::stdout().flush().unwrap();
-        })
-        .unwrap_or_else(|err| {
-            eprintln!("Generation error: {}", err);
-            std::process::exit(1);
-        });
+    let result = runner.generate_stream(&prompt, &options, |text| {
+        print!("{}", text);
+        let _ = io::stdout().flush();
+    })?;
 
     eprintln!("\n\n─── Stats ───────────────────────────────");
     eprintln!("Prompt: {} tokens", result.stats.prompt_tokens);
@@ -238,19 +272,26 @@ fn main() {
         result.stats.generated_tokens as f32 / result.stats.decode_time.as_secs_f32().max(0.001)
     );
     eprintln!("Total: {:.2}s", result.stats.total_time.as_secs_f32());
+
+    Ok(())
 }
 
-fn run_repl(runner: &Runner, options: &GenerationOptions) {
+fn run_repl(runner: &Runner, options: &GenerationOptions) -> Result<(), String> {
     eprintln!("REPL mode. Commands: /exit, /quit, /clear, /help");
     let stdin = io::stdin();
     let mut history: Vec<ChatMessage> = Vec::new();
 
     loop {
         eprint!("repl> ");
-        io::stderr().flush().unwrap();
+        io::stderr().flush().map_err(|err| err.to_string())?;
 
         let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+        if stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|err| err.to_string())?
+            == 0
+        {
             break;
         }
         let line = line.trim();
@@ -276,7 +317,7 @@ fn run_repl(runner: &Runner, options: &GenerationOptions) {
         history.push(ChatMessage::user(line));
         let result = runner.generate_chat_stream(&history, options, |text| {
             print!("{}", text);
-            io::stdout().flush().unwrap();
+            let _ = io::stdout().flush();
         });
 
         match result {
@@ -296,31 +337,14 @@ fn run_repl(runner: &Runner, options: &GenerationOptions) {
             }
         }
     }
+    Ok(())
 }
 
 /// Check if stdin is a terminal (not piped)
 fn atty_is_stdin() -> bool {
     // Use isatty via libc — available on both macOS and Linux without deps
-    extern "C" {
+    unsafe extern "C" {
         fn isatty(fd: i32) -> i32;
     }
     unsafe { isatty(0) != 0 }
-}
-
-/// Helper to read all lines from stdin
-trait ReadAllLines {
-    fn read_to_string_linewise(&mut self, buf: &mut String);
-}
-
-impl<T: BufRead> ReadAllLines for T {
-    fn read_to_string_linewise(&mut self, buf: &mut String) {
-        loop {
-            let mut line = String::new();
-            match self.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => buf.push_str(&line),
-                Err(_) => break,
-            }
-        }
-    }
 }

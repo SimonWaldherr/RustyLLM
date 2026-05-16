@@ -51,6 +51,9 @@ pub fn sample(
     recent_tokens: &[u32],
 ) -> u32 {
     let n = logits.len();
+    if n == 0 {
+        return 0;
+    }
 
     for v in logits.iter_mut() {
         if !v.is_finite() {
@@ -92,7 +95,7 @@ pub fn sample(
         let mut indices: Vec<usize> = (0..n).collect();
         indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
 
-        let threshold = logits[indices[config.top_k]];
+        let threshold = logits[indices[config.top_k - 1]];
         for i in 0..n {
             if logits[i] < threshold {
                 logits[i] = f32::NEG_INFINITY;
@@ -106,6 +109,14 @@ pub fn sample(
     for v in logits.iter_mut() {
         *v = (*v - max).exp();
         sum += *v;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
     }
     let inv_sum = 1.0 / sum;
     for v in logits.iter_mut() {
@@ -154,11 +165,41 @@ pub fn sample(
     let mut cumsum = 0.0f32;
     for (i, &p) in logits.iter().enumerate() {
         cumsum += p;
-        if cumsum >= r {
+        if cumsum > r {
             return i as u32;
         }
     }
 
     // Fallback
     (n - 1) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{sample, Rng, SamplerConfig};
+
+    #[test]
+    fn top_k_1_only_keeps_single_best_token() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 1,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        for _ in 0..64 {
+            let mut logits = vec![1.0, 10.0, 9.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert_eq!(token, 1);
+        }
+    }
+
+    #[test]
+    fn empty_logits_returns_zero_token() {
+        let config = SamplerConfig::default();
+        let mut rng = Rng::new(7);
+        let mut logits = Vec::new();
+        let token = sample(&mut logits, &config, &mut rng, &[]);
+        assert_eq!(token, 0);
+    }
 }
