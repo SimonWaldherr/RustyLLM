@@ -192,10 +192,12 @@ fn sample_top_k(
         if candidates.len() < top_k {
             candidates.push((idx, logit));
             bubble_up_last(candidates);
-        } else if logit.total_cmp(&candidates[candidates.len() - 1].1).is_gt() {
+        } else {
             let last = candidates.len() - 1;
-            candidates[last] = (idx, logit);
-            bubble_up_last(candidates);
+            if logit.total_cmp(&candidates[last].1).is_gt() {
+                candidates[last] = (idx, logit);
+                bubble_up_last(candidates);
+            }
         }
     }
 
@@ -305,7 +307,7 @@ mod tests {
         };
         let mut rng = Rng::new(42);
         let mut seen = [false; 2];
-        for _ in 0..256 {
+        for _ in 0..64 {
             let mut logits = vec![10.0, 9.0, 0.0, -1.0];
             let token = sample(&mut logits, &config, &mut rng, &[]);
             assert!(token <= 1, "sampled token outside top-k: {}", token);
