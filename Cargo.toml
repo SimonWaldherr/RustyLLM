@@ -10,7 +10,8 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["server", "tls"]
+default = ["cli", "server", "tls"]
+cli = []
 server = ["dep:serde", "dep:serde_json"]
 tls = ["server", "dep:rustls", "dep:rustls-pemfile"]
 wasm = ["dep:wasm-bindgen"]
@@ -34,3 +35,19 @@ panic = "abort"
 [[bin]]
 name = "rusty-llm"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "analyze_gguf"
+path = "src/bin/analyze_gguf.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "embedding_demo"
+path = "src/bin/embedding_demo.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "list_tensors"
+path = "src/bin/list_tensors.rs"
+required-features = ["cli"]

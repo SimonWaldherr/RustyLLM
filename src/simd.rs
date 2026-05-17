@@ -17,6 +17,15 @@ use std::thread;
 
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2_fma() -> bool {
+    static HAS_AVX2_FMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_AVX2_FMA.get_or_init(|| {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    })
+}
+
 // ─── f16 ↔ f32 conversion ────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -381,7 +390,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_f32_avx2(a, b) }
         } else {
             dot_f32_scalar(a, b)
@@ -404,7 +413,7 @@ pub fn axpy_f32(out: &mut [f32], alpha: f32, x: &[f32]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { axpy_f32_avx2(out, alpha, x) }
         } else {
             axpy_f32_scalar(out, alpha, x)
@@ -427,7 +436,7 @@ pub fn scale_f32(out: &mut [f32], scale: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { scale_f32_avx2(out, scale) }
         } else {
             scale_f32_scalar(out, scale)
@@ -451,7 +460,7 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { scale_add_f32_avx2(out, scale, add) }
         } else {
             scale_add_f32_scalar(out, scale, add)
@@ -500,7 +509,7 @@ pub fn dot_q8_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_q8_0_f32_avx2(qdata, x, n) }
         } else {
             dot_q8_0_f32_scalar(qdata, x, n)
@@ -522,7 +531,7 @@ pub fn dot_q4_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_q4_0_f32_avx2(qdata, x, n) }
         } else {
             dot_q4_0_f32_scalar(qdata, x, n)
