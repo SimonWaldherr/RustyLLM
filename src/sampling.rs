@@ -50,6 +50,17 @@ pub fn sample(
     rng: &mut Rng,
     recent_tokens: &[u32],
 ) -> u32 {
+    let mut candidates = Vec::new();
+    sample_with_scratch(logits, config, rng, recent_tokens, &mut candidates)
+}
+
+pub fn sample_with_scratch(
+    logits: &mut [f32],
+    config: &SamplerConfig,
+    rng: &mut Rng,
+    recent_tokens: &[u32],
+    candidates: &mut Vec<(usize, f32)>,
+) -> u32 {
     let n = logits.len();
     if n == 0 {
         return 0;
@@ -91,20 +102,7 @@ pub fn sample(
     }
 
     if config.top_k > 0 && config.top_k < n {
-        return sample_top_k(logits, config.top_k, config.top_p, rng);
-    }
-
-    // Top-K: keep only top_k highest logits
-    if config.top_k > 0 && config.top_k < n {
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-
-        let threshold = logits[indices[config.top_k - 1]];
-        for i in 0..n {
-            if logits[i] < threshold {
-                logits[i] = f32::NEG_INFINITY;
-            }
-        }
+        return sample_top_k(logits, config.top_k, config.top_p, rng, candidates);
     }
 
     // Softmax
@@ -178,17 +176,26 @@ pub fn sample(
     (n - 1) as u32
 }
 
-fn sample_top_k(logits: &[f32], top_k: usize, top_p: f32, rng: &mut Rng) -> u32 {
-    let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(top_k);
+fn sample_top_k(
+    logits: &[f32],
+    top_k: usize,
+    top_p: f32,
+    rng: &mut Rng,
+    candidates: &mut Vec<(usize, f32)>,
+) -> u32 {
+    candidates.clear();
+    if candidates.capacity() < top_k {
+        candidates.reserve(top_k - candidates.capacity());
+    }
 
     for (idx, &logit) in logits.iter().enumerate() {
         if candidates.len() < top_k {
             candidates.push((idx, logit));
-            bubble_up_last(&mut candidates);
+            bubble_up_last(candidates);
         } else if logit.total_cmp(&candidates[candidates.len() - 1].1).is_gt() {
             let last = candidates.len() - 1;
             candidates[last] = (idx, logit);
-            bubble_up_last(&mut candidates);
+            bubble_up_last(candidates);
         }
     }
 

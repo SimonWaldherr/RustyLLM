@@ -470,11 +470,12 @@ impl Runner {
             .unwrap_or(0);
 
         'decode: for _ in 0..options.max_tokens {
-            let token = sampling::sample(
+            let token = sampling::sample_with_scratch(
                 &mut logits,
                 &options.sampler,
                 &mut rng,
                 recent.make_contiguous(),
+                &mut buf.sampler_candidates,
             );
 
             if self.is_stop_token(token) {
