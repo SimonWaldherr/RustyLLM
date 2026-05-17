@@ -296,7 +296,27 @@ mod tests {
     }
 
     #[test]
-    fn top_k_top_p_keeps_minimal_candidate_set() {
+    fn top_k_samples_only_from_candidate_set() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 2,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        let mut seen = [false; 2];
+        for _ in 0..256 {
+            let mut logits = vec![10.0, 9.0, 0.0, -1.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert!(token <= 1, "sampled token outside top-k: {}", token);
+            seen[token as usize] = true;
+        }
+        assert!(seen[0], "best token was never sampled");
+        assert!(seen[1], "second top-k token was never sampled");
+    }
+
+    #[test]
+    fn top_p_truncates_top_k_candidate_set() {
         let config = SamplerConfig {
             temperature: 1.0,
             top_p: 0.6,

@@ -496,7 +496,7 @@ impl DecodeBuffer {
             router_logits: vec![0.0; config.expert_count],
             top_experts: Vec::with_capacity(config.expert_count.max(config.expert_used_count)),
             expert_probs: Vec::with_capacity(config.expert_used_count),
-            sampler_candidates: Vec::with_capacity(config.hidden_dim.min(64)),
+            sampler_candidates: Vec::with_capacity(64),
             rope_inv_freq,
             rope_gpt_oss_inv_freq,
             rope_gpt_oss_concentration,
