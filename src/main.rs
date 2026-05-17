@@ -35,6 +35,8 @@ fn print_usage(name: &str) {
     #[cfg(feature = "server")]
     eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
     #[cfg(feature = "server")]
+    eprintln!("  --chat                    Enable the minimal Web UI at /chat with --serve");
+    #[cfg(feature = "server")]
     eprintln!("  --tls-cert <path>         PEM certificate for HTTPS");
     #[cfg(feature = "server")]
     eprintln!("  --tls-key <path>          PEM private key for HTTPS");
@@ -115,6 +117,7 @@ fn run() -> Result<(), String> {
     let mut threads_override: Option<usize> = None;
     let mut repl_mode = false;
     let mut serve_addr: Option<String> = None;
+    let mut chat_ui = false;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut max_connections_override: Option<usize> = None;
@@ -155,6 +158,9 @@ fn run() -> Result<(), String> {
             }
             "--serve" => {
                 serve_addr = Some(parse_arg::<String>(&args, &mut i, "--serve")?);
+            }
+            "--chat" => {
+                chat_ui = true;
             }
             "--tls-cert" => {
                 tls_cert = Some(parse_arg::<String>(&args, &mut i, "--tls-cert")?);
@@ -233,6 +239,9 @@ fn run() -> Result<(), String> {
         return Err(String::from(
             "Both --tls-cert and --tls-key must be provided together.",
         ));
+    }
+    if chat_ui && serve_addr.is_none() {
+        return Err(String::from("--chat requires --serve <addr>."));
     }
     #[cfg(not(feature = "tls"))]
     if tls_cert.is_some() || tls_key.is_some() {
@@ -376,9 +385,15 @@ fn run() -> Result<(), String> {
             let max_connections =
                 max_connections_override.unwrap_or_else(|| (n_threads * 8).max(16));
             eprintln!("{} endpoint listening on {}", protocol, addr);
-            eprintln!(
-                "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
-            );
+            if chat_ui {
+                eprintln!(
+                    "Routes: GET /chat, GET /chat?expert, GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+                );
+            } else {
+                eprintln!(
+                    "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+                );
+            }
             eprintln!("Max concurrent connections: {}", max_connections);
             let serve_options = ServeOptions {
                 addr,
@@ -386,6 +401,7 @@ fn run() -> Result<(), String> {
                 tls_cert_path: tls_cert,
                 tls_key_path: tls_key,
                 max_concurrent_connections: max_connections,
+                chat_ui,
             };
             server::serve(Arc::new(runner), serve_options)?;
             return Ok(());

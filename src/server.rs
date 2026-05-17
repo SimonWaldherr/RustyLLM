@@ -27,6 +27,7 @@ pub struct ServeOptions {
     pub tls_cert_path: Option<String>,
     pub tls_key_path: Option<String>,
     pub max_concurrent_connections: usize,
+    pub chat_ui: bool,
 }
 
 impl ServeOptions {
@@ -467,8 +468,41 @@ where
             .map_err(|err| err.to_string());
     }
 
+    if request.method == "GET" && chat_ui_route(&request.path).is_some() {
+        if options.chat_ui {
+            let body = match chat_ui_route(&request.path) {
+                Some(ChatUiRoute::Simple) => chat_ui_html(),
+                Some(ChatUiRoute::Expert) => expert_chat_ui_html(),
+                None => unreachable!(),
+            };
+            return write_http_response_with_content_type(
+                &mut stream,
+                200,
+                "text/html; charset=utf-8",
+                body,
+            )
+            .map_err(|err| err.to_string());
+        }
+
+        let body = json_error("Not found");
+        return write_http_response(&mut stream, 404, &body).map_err(|err| err.to_string());
+    }
+
     let (status, body) = route_request(&request, &runner, options);
     write_http_response(&mut stream, status, &body).map_err(|err| err.to_string())
+}
+
+enum ChatUiRoute {
+    Simple,
+    Expert,
+}
+
+fn chat_ui_route(path: &str) -> Option<ChatUiRoute> {
+    match path {
+        "/chat" => Some(ChatUiRoute::Simple),
+        "/chat?expert" => Some(ChatUiRoute::Expert),
+        _ => None,
+    }
 }
 
 /// Returns true when the request body asks for SSE streaming.
@@ -1174,7 +1208,27 @@ where
     })
 }
 
+fn chat_ui_html() -> &'static str {
+    include_str!("web_ui/chat.html")
+}
+
+fn expert_chat_ui_html() -> &'static str {
+    include_str!("web_ui/expert.html")
+}
+
 fn write_http_response<T>(stream: &mut T, status: u16, body: &str) -> io::Result<()>
+where
+    T: Write,
+{
+    write_http_response_with_content_type(stream, status, "application/json", body)
+}
+
+fn write_http_response_with_content_type<T>(
+    stream: &mut T,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> io::Result<()>
 where
     T: Write,
 {
@@ -1193,10 +1247,11 @@ where
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nX-Content-Type-Options: nosniff\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nX-Content-Type-Options: nosniff\r\n\r\n{}",
         status,
         status_text,
-        body.len(),
+        content_type,
+        body.as_bytes().len(),
         body
     )?;
     stream.flush()
