@@ -1,5 +1,10 @@
 # RustyLLM
 
+[![CI](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml) 
+[![License](https://img.shields.io/github/license/SimonWaldherr/RustyLLM)](LICENSE) 
+[![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases) 
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)  
+
 RustyLLM is a small Rust inference runner for GGUF language models. It focuses on local execution with memory-mapped weights, quantized matvec kernels, and a minimal CLI/HTTP surface.
 
 ## Features
