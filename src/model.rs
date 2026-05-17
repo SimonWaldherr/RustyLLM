@@ -269,6 +269,64 @@ impl Weight {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn try_q4k_matvec3_into(
+    wq: &Weight,
+    wk: &Weight,
+    wv: &Weight,
+    x: &[f32],
+    q: &mut Vec<f32>,
+    k: &mut Vec<f32>,
+    v: &mut Vec<f32>,
+) -> bool {
+    match (wq, wk, wv) {
+        (
+            Weight::Quantized {
+                data: q_data,
+                dtype: GGMLType::Q4_K,
+                rows: q_rows,
+                cols: q_cols,
+            },
+            Weight::Quantized {
+                data: k_data,
+                dtype: GGMLType::Q4_K,
+                rows: k_rows,
+                cols: k_cols,
+            },
+            Weight::Quantized {
+                data: v_data,
+                dtype: GGMLType::Q4_K,
+                rows: v_rows,
+                cols: v_cols,
+            },
+        ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
+            crate::metal::q4k_matvec3_into(
+                (q_data.as_slice(), *q_rows, *q_cols),
+                (k_data.as_slice(), *k_rows, *k_cols),
+                (v_data.as_slice(), *v_rows, *v_cols),
+                x,
+                q,
+                k,
+                v,
+            )
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn try_q4k_matvec3_into(
+    _wq: &Weight,
+    _wk: &Weight,
+    _wv: &Weight,
+    _x: &[f32],
+    _q: &mut Vec<f32>,
+    _k: &mut Vec<f32>,
+    _v: &mut Vec<f32>,
+) -> bool {
+    false
+}
+
 // ─── Layer + Model weights ───────────────────────────────────────────────────
 
 pub struct LayerWeights {
@@ -1540,9 +1598,13 @@ pub fn forward_gpt_oss(
         let layer = &weights.layers[l];
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
-        layer.wq.matvec_into(&buf.xn, &mut buf.q);
-        layer.wk.matvec_into(&buf.xn, &mut buf.k);
-        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        if !try_q4k_matvec3_into(
+            &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
+        ) {
+            layer.wq.matvec_into(&buf.xn, &mut buf.q);
+            layer.wk.matvec_into(&buf.xn, &mut buf.k);
+            layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        }
         for i in 0..buf.q.len() {
             buf.q[i] += layer.bq[i];
         }
@@ -1691,9 +1753,13 @@ pub fn forward(
         // ── Attention ──
         rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        layer.wq.matvec_into(&buf.xn, &mut buf.q);
-        layer.wk.matvec_into(&buf.xn, &mut buf.k);
-        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        if !try_q4k_matvec3_into(
+            &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
+        ) {
+            layer.wq.matvec_into(&buf.xn, &mut buf.q);
+            layer.wk.matvec_into(&buf.xn, &mut buf.k);
+            layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        }
 
         for i in 0..buf.q.len() {
             buf.q[i] += layer.bq[i];
@@ -2624,9 +2690,13 @@ pub fn forward_hidden(
 
         rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        layer.wq.matvec_into(&buf.xn, &mut buf.q);
-        layer.wk.matvec_into(&buf.xn, &mut buf.k);
-        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        if !try_q4k_matvec3_into(
+            &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
+        ) {
+            layer.wq.matvec_into(&buf.xn, &mut buf.q);
+            layer.wk.matvec_into(&buf.xn, &mut buf.k);
+            layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        }
 
         for i in 0..buf.q.len() {
             buf.q[i] += layer.bq[i];
@@ -2732,9 +2802,13 @@ pub fn forward_hidden_gpt_oss(
         let layer = &weights.layers[l];
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
-        layer.wq.matvec_into(&buf.xn, &mut buf.q);
-        layer.wk.matvec_into(&buf.xn, &mut buf.k);
-        layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        if !try_q4k_matvec3_into(
+            &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
+        ) {
+            layer.wq.matvec_into(&buf.xn, &mut buf.q);
+            layer.wk.matvec_into(&buf.xn, &mut buf.k);
+            layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        }
         for i in 0..buf.q.len() {
             buf.q[i] += layer.bq[i];
         }
