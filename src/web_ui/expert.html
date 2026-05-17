@@ -1,612 +1,190 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RustyLLM Web UI</title>
-<style>
-:root {
-  color-scheme: light dark;
-  --bg: #f6f4ef;
-  --panel: #ffffff;
-  --ink: #1d1f24;
-  --muted: #666b74;
-  --line: #d9d5cc;
-  --accent: #176b87;
-  --accent-2: #8f4e2f;
-  --user: #e8f2f3;
-  --assistant: #ffffff;
-  --code: #101820;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #171717;
-    --panel: #222326;
-    --ink: #f0eee8;
-    --muted: #aaa49a;
-    --line: #393a3d;
-    --accent: #69b7c9;
-    --accent-2: #d69a73;
-    --user: #173941;
-    --assistant: #252629;
-    --code: #111214;
-  }
-}
-* { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  margin: 0;
-  font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-}
-.app {
-  min-height: 100%;
-  display: grid;
-  grid-template-rows: auto 1fr;
-}
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px clamp(14px, 3vw, 28px);
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 84%, transparent);
-}
-h1 {
-  margin: 0;
-  font-size: 17px;
-  font-weight: 650;
-  letter-spacing: 0;
-}
-.status {
-  color: var(--muted);
-  font-size: 13px;
-  white-space: nowrap;
-}
-.workspace {
-  min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(280px, 360px) 1fr;
-}
-aside {
-  overflow: auto;
-  border-right: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 72%, transparent);
-  padding: 14px;
-}
-main {
-  overflow: auto;
-  min-width: 0;
-  padding: 18px clamp(12px, 3vw, 28px);
-}
-.stack {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.field {
-  display: grid;
-  gap: 6px;
-}
-label, .label {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 650;
-}
-select,
-textarea,
-input {
-  width: 100%;
-  border: 1px solid var(--line);
-  border-radius: 7px;
-  padding: 9px 10px;
-  background: var(--panel);
-  color: var(--ink);
-  font: inherit;
-}
-textarea {
-  min-height: 74px;
-  max-height: 220px;
-  resize: vertical;
-}
-input[type="checkbox"] {
-  width: auto;
-}
-input[type="range"] {
-  accent-color: var(--accent);
-  padding: 0;
-}
-.inline {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-button {
-  min-height: 38px;
-  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
-  border-radius: 7px;
-  background: var(--accent);
-  color: white;
-  font: inherit;
-  font-weight: 650;
-  cursor: pointer;
-}
-button.secondary {
-  background: transparent;
-  color: var(--accent-2);
-  border-color: color-mix(in srgb, var(--accent-2) 55%, var(--line));
-}
-button:disabled {
-  cursor: not-allowed;
-  opacity: .55;
-}
-.transcript {
-  width: min(980px, 100%);
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.msg {
-  max-width: min(820px, 94%);
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.msg.user {
-  align-self: flex-end;
-  background: var(--user);
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
-}
-.msg.assistant {
-  align-self: flex-start;
-  background: var(--assistant);
-}
-.msg.tool {
-  align-self: stretch;
-  max-width: 100%;
-  background: var(--panel);
-}
-.empty {
-  margin: 17vh auto 0;
-  width: min(520px, 100%);
-  color: var(--muted);
-  text-align: center;
-}
-.stats {
-  color: var(--muted);
-  font-size: 13px;
-  width: min(980px, 100%);
-  margin: 0 auto;
-}
-pre {
-  margin: 0;
-  padding: 12px;
-  overflow: auto;
-  border-radius: 7px;
-  background: var(--code);
-  color: #f6f4ef;
-  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-.hint {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.35;
-}
-@media (max-width: 820px) {
-  .workspace { grid-template-columns: 1fr; }
-  aside { border-right: 0; border-bottom: 1px solid var(--line); }
-  .msg { max-width: 100%; }
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustyLLM Expert UI</title>
+
+  <meta name="description" content="Expert interface for RustyLLM — local LLM inference with chat completions, text completions, generate, and embeddings.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="RustyLLM Expert UI">
+  <meta property="og:description" content="Expert interface for RustyLLM — local LLM inference with chat, completions, generate, and embeddings.">
+  <meta property="og:locale" content="en_US">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RustyLLM Expert UI">
+  <meta name="twitter:description" content="Expert interface for RustyLLM — local LLM inference.">
+
+  <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="expert">
+
+<div id="announce" role="status" aria-live="polite" aria-atomic="true" class="sr-only"></div>
+
 <div class="app">
-  <header>
-    <h1>RustyLLM Web UI</h1>
-    <div class="status" id="status">Ready</div>
+  <header role="banner">
+    <h1>RustyLLM Expert UI</h1>
+    <div id="status" class="status" role="status" aria-live="polite">Ready</div>
   </header>
+
   <div class="workspace">
-    <aside>
-      <form id="form" class="stack">
+    <aside aria-label="Configuration panel">
+      <form id="form" class="stack" aria-label="Inference settings" aria-busy="false" novalidate>
+
         <div class="field">
           <label for="mode">Mode</label>
-          <select id="mode" name="mode">
+          <select id="mode" name="mode" autocomplete="off">
             <option value="chat">Chat completions</option>
             <option value="completion">Text completions</option>
             <option value="generate">Generate</option>
             <option value="embeddings">Embeddings</option>
+            <option value="rag">RAG Demo</option>
           </select>
         </div>
+
         <div class="field">
           <label for="model">Model</label>
-          <select id="model" name="model"></select>
-          <div class="hint" id="modelHint">Loading models...</div>
+          <select id="model" name="model" autocomplete="off" aria-describedby="modelHint"></select>
+          <div class="hint" id="modelHint" aria-live="polite">Loading models…</div>
         </div>
+
         <div class="field">
           <label for="prompt">Input</label>
-          <textarea id="prompt" name="prompt" rows="4" placeholder="Message RustyLLM" autofocus></textarea>
+          <textarea
+            id="prompt"
+            name="prompt"
+            rows="4"
+            placeholder="Message RustyLLM"
+            autofocus
+            autocomplete="off"
+            aria-required="true"
+            aria-describedby="promptHint"
+          ></textarea>
+          <div class="hint" id="promptHint">Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or <kbd>⌘</kbd>+<kbd>Enter</kbd> to send</div>
         </div>
-        <div class="field">
-          <label for="systemPrompt">System prompt</label>
-          <textarea id="systemPrompt" rows="2" placeholder="Optional system prompt"></textarea>
-        </div>
-        <div class="row">
-          <div class="field">
-            <label for="maxTokens">Max tokens</label>
-            <input id="maxTokens" type="number" min="1" max="4096" value="512">
+
+        <details id="advanced">
+          <summary>Advanced settings</summary>
+          <div class="inner-stack">
+
+            <div class="field">
+              <label for="systemPrompt">System prompt</label>
+              <textarea id="systemPrompt" rows="2" placeholder="Optional system prompt" autocomplete="off"></textarea>
+            </div>
+
+            <div class="row">
+              <div class="field">
+                <label for="maxTokens">Max tokens</label>
+                <input id="maxTokens" type="number" min="1" max="4096" value="512" inputmode="numeric" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="seed">Seed</label>
+                <input id="seed" type="number" min="0" placeholder="time" inputmode="numeric" autocomplete="off">
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="temperature">Temperature <span id="tempValue" aria-live="off">0.70</span></label>
+              <input
+                id="temperature"
+                type="range"
+                min="0" max="2" step="0.05" value="0.7"
+                aria-valuemin="0" aria-valuemax="2" aria-valuenow="0.7" aria-valuetext="0.70"
+              >
+            </div>
+
+            <div class="row">
+              <div class="field">
+                <label for="topP">Top P</label>
+                <input id="topP" type="number" min="0" max="1" step="0.01" value="0.9" inputmode="decimal" autocomplete="off">
+              </div>
+              <div class="field">
+                <label for="topK">Top K</label>
+                <input id="topK" type="number" min="0" max="1000" value="40" inputmode="numeric" autocomplete="off">
+              </div>
+            </div>
+
+            <div class="field">
+              <label for="repeatPenalty">Repeat penalty</label>
+              <input id="repeatPenalty" type="number" min="0" max="4" step="0.05" value="1.1" inputmode="decimal" autocomplete="off">
+            </div>
+
+            <div class="field">
+              <label for="stop">Stop strings</label>
+              <textarea id="stop" rows="2" placeholder="One per line" autocomplete="off"></textarea>
+            </div>
+
+            <label class="inline">
+              <input id="stream" type="checkbox" checked>
+              Stream when supported
+            </label>
+
           </div>
-          <div class="field">
-            <label for="seed">Seed</label>
-            <input id="seed" type="number" min="0" placeholder="time">
-          </div>
+        </details>
+
+        <div class="actions" role="group" aria-label="Session controls">
+          <button id="send" type="submit" aria-label="Send message">Send</button>
+          <button id="abort" class="secondary" type="button" disabled aria-label="Stop generation">Stop</button>
+          <button id="clear" class="secondary" type="button" aria-label="Clear conversation history">Clear</button>
+          <button id="refresh" class="secondary" type="button" aria-label="Refresh model list">Refresh</button>
         </div>
-        <div class="field">
-          <label for="temperature">Temperature <span id="tempValue">0.70</span></label>
-          <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7">
-        </div>
-        <div class="row">
-          <div class="field">
-            <label for="topP">Top P</label>
-            <input id="topP" type="number" min="0" max="1" step="0.01" value="0.9">
-          </div>
-          <div class="field">
-            <label for="topK">Top K</label>
-            <input id="topK" type="number" min="0" max="1000" value="40">
-          </div>
-        </div>
-        <div class="field">
-          <label for="repeatPenalty">Repeat penalty</label>
-          <input id="repeatPenalty" type="number" min="0" max="4" step="0.05" value="1.1">
-        </div>
-        <div class="field">
-          <label for="stop">Stop strings</label>
-          <textarea id="stop" rows="2" placeholder="One per line"></textarea>
-        </div>
-        <label class="inline">
-          <input id="stream" type="checkbox" checked>
-          Stream when supported
-        </label>
-        <div class="actions">
-          <button id="send" type="submit">Send</button>
-          <button id="abort" class="secondary" type="button" disabled>Stop</button>
-          <button id="clear" class="secondary" type="button">Clear</button>
-          <button id="refresh" class="secondary" type="button">Refresh</button>
-        </div>
+
       </form>
     </aside>
-    <main id="scroll">
-      <div class="stats" id="stats"></div>
-      <div class="transcript" id="messages">
-        <div class="empty" id="empty">Use the controls to try chat, completions, generate, embeddings, model listing, health, and streaming.</div>
+
+    <main id="scroll" aria-label="Conversation">
+      <div id="transcript-panel">
+        <div class="stats" id="stats" aria-live="polite" aria-atomic="true"></div>
+        <div
+          class="transcript"
+          id="messages"
+          role="log"
+          aria-label="Message history"
+          aria-live="polite"
+          aria-relevant="additions"
+        >
+          <div class="empty" id="empty">
+            Use the controls to try chat, completions, generate, embeddings, model listing, health, and streaming.
+          </div>
+        </div>
+      </div>
+
+      <div id="rag-panel" hidden aria-label="RAG Demo">
+        <div class="rag-columns">
+          <section class="rag-kb" aria-label="Knowledge base">
+            <h2>Knowledge Base <span id="rag-kb-count" class="rag-badge">0</span></h2>
+            <div class="field">
+              <label for="rag-passage">Passage</label>
+              <textarea id="rag-passage" rows="5" placeholder="Paste a passage to add to the knowledge base…" autocomplete="off"></textarea>
+            </div>
+            <button id="rag-add-btn" type="button">Add passage</button>
+            <div id="rag-kb-list" class="rag-kb-list" aria-label="Knowledge base entries" aria-live="polite"></div>
+          </section>
+
+          <section class="rag-search" aria-label="Semantic search">
+            <h2>Semantic Search</h2>
+            <div class="field">
+              <label for="rag-query">Query</label>
+              <input id="rag-query" type="text" placeholder="Search the knowledge base…" autocomplete="off">
+            </div>
+            <button id="rag-search-btn" type="button">Search</button>
+            <div id="rag-results" class="rag-results" aria-live="polite" aria-label="Search results"></div>
+            <button id="rag-ask-btn" type="button" hidden>Answer with LLM</button>
+            <div id="rag-answer" class="rag-answer" aria-live="polite"></div>
+          </section>
+        </div>
       </div>
     </main>
   </div>
 </div>
-<script>
-const form = document.getElementById("form");
-const modeEl = document.getElementById("mode");
-const modelEl = document.getElementById("model");
-const modelHintEl = document.getElementById("modelHint");
-const promptEl = document.getElementById("prompt");
-const systemPromptEl = document.getElementById("systemPrompt");
-const messagesEl = document.getElementById("messages");
-const emptyEl = document.getElementById("empty");
-const statusEl = document.getElementById("status");
-const statsEl = document.getElementById("stats");
-const sendEl = document.getElementById("send");
-const abortEl = document.getElementById("abort");
-const clearEl = document.getElementById("clear");
-const refreshEl = document.getElementById("refresh");
-const maxTokensEl = document.getElementById("maxTokens");
-const seedEl = document.getElementById("seed");
-const temperatureEl = document.getElementById("temperature");
-const tempValueEl = document.getElementById("tempValue");
-const topPEl = document.getElementById("topP");
-const topKEl = document.getElementById("topK");
-const repeatPenaltyEl = document.getElementById("repeatPenalty");
-const stopEl = document.getElementById("stop");
-const streamEl = document.getElementById("stream");
-const scrollEl = document.getElementById("scroll");
-const history = [];
-let controller = null;
-let activeTurn = 0;
 
-function setBusy(busy) {
-  sendEl.disabled = busy;
-  abortEl.disabled = !busy;
-  statusEl.textContent = busy ? "Generating" : "Ready";
-}
+<noscript>
+  <p style="padding:2rem;text-align:center;">RustyLLM Expert UI requires JavaScript to be enabled.</p>
+</noscript>
 
-function beginTurn() {
-  activeTurn += 1;
-  controller = new AbortController();
-  setBusy(true);
-  return { id: activeTurn, signal: controller.signal };
-}
-
-function finishTurn(turn) {
-  if (turn.id !== activeTurn) return;
-  controller = null;
-  setBusy(false);
-  promptEl.focus();
-}
-
-function setStatus(text) {
-  statusEl.textContent = text;
-}
-
-function addMessage(role, text, kind) {
-  emptyEl.hidden = true;
-  const el = document.createElement("div");
-  el.className = "msg " + (kind || role);
-  el.textContent = text;
-  messagesEl.appendChild(el);
-  scrollEl.scrollTop = scrollEl.scrollHeight;
-  return el;
-}
-
-function appendText(el, text) {
-  el.textContent += text;
-  scrollEl.scrollTop = scrollEl.scrollHeight;
-}
-
-function addJson(title, value) {
-  const box = addMessage("tool", "", "tool");
-  const label = document.createElement("div");
-  label.className = "label";
-  label.textContent = title;
-  const pre = document.createElement("pre");
-  pre.textContent = JSON.stringify(value, null, 2);
-  box.appendChild(label);
-  box.appendChild(pre);
-  return box;
-}
-
-function selectedModel() {
-  return modelEl.value || undefined;
-}
-
-function stopSpec() {
-  const lines = stopEl.value.split("\n").map((line) => line.trim()).filter(Boolean);
-  if (lines.length === 0) return undefined;
-  if (lines.length === 1) return lines[0];
-  return lines;
-}
-
-function openAiOptions() {
-  const options = {
-    model: selectedModel(),
-    max_tokens: Number(maxTokensEl.value) || 256,
-    temperature: Number(temperatureEl.value),
-    top_p: Number(topPEl.value),
-    top_k: Number(topKEl.value),
-    repeat_penalty: Number(repeatPenaltyEl.value)
-  };
-  const seed = seedEl.value.trim();
-  const system = systemPromptEl.value.trim();
-  const stop = stopSpec();
-  if (seed) options.seed = Number(seed);
-  if (system) options.system_prompt = system;
-  if (stop) options.stop = stop;
-  return options;
-}
-
-function generateOptions() {
-  const options = {
-    max_tokens: Number(maxTokensEl.value) || 256,
-    temp: Number(temperatureEl.value),
-    top_p: Number(topPEl.value),
-    top_k: Number(topKEl.value),
-    repeat_penalty: Number(repeatPenaltyEl.value)
-  };
-  const seed = seedEl.value.trim();
-  const system = systemPromptEl.value.trim();
-  const stop = stopSpec();
-  if (seed) options.seed = Number(seed);
-  if (system) options.system_prompt = system;
-  if (stop) options.stop = stop;
-  return options;
-}
-
-function updateStats(text) {
-  statsEl.textContent = text || "";
-}
-
-async function fetchJson(path, payload, signal) {
-  const response = await fetch(path, {
-    method: payload ? "POST" : "GET",
-    headers: payload ? { "Content-Type": "application/json" } : {},
-    body: payload ? JSON.stringify(payload) : undefined,
-    signal
-  });
-  const text = await response.text();
-  let parsed = null;
-  try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
-  if (!response.ok) throw new Error(parsed?.error || text || ("HTTP " + response.status));
-  return parsed;
-}
-
-async function loadModels() {
-  setStatus("Loading models");
-  try {
-    const health = await fetchJson("/health");
-    const models = await fetchJson("/v1/models");
-    modelEl.innerHTML = "";
-    for (const item of models.data || []) {
-      const option = document.createElement("option");
-      option.value = item.id;
-      option.textContent = item.id;
-      modelEl.appendChild(option);
-    }
-    modelHintEl.textContent = (models.data || []).length + " advertised id(s), health: " + health.status;
-    setStatus("Ready");
-  } catch (err) {
-    modelHintEl.textContent = err.message;
-    setStatus("Error");
-  }
-}
-
-function supportsStreaming(mode) {
-  return mode === "chat" || mode === "completion";
-}
-
-async function runStreaming(path, payload, mode, outputEl, signal) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...payload, stream: true }),
-    signal
-  });
-
-  if (!response.ok || !response.body) {
-    const err = await response.text();
-    throw new Error(err || ("HTTP " + response.status));
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let output = "";
-  while (true) {
-    const chunk = await reader.read();
-    if (chunk.done) break;
-    buffer += decoder.decode(chunk.value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      const line = part.split("\n").find((item) => item.startsWith("data: "));
-      if (!line) continue;
-      const data = line.slice(6).trim();
-      if (data === "[DONE]") continue;
-      const payload = JSON.parse(data);
-      const token = mode === "chat"
-        ? payload.choices?.[0]?.delta?.content || ""
-        : payload.choices?.[0]?.text || "";
-      if (token) {
-        output += token;
-        appendText(outputEl, token);
-      }
-    }
-  }
-  return output;
-}
-
-temperatureEl.addEventListener("input", () => {
-  tempValueEl.textContent = Number(temperatureEl.value).toFixed(2);
-});
-
-abortEl.addEventListener("click", () => {
-  if (controller) controller.abort();
-});
-
-clearEl.addEventListener("click", () => {
-  history.length = 0;
-  messagesEl.querySelectorAll(".msg").forEach((node) => node.remove());
-  emptyEl.hidden = false;
-  updateStats("");
-});
-
-refreshEl.addEventListener("click", () => {
-  loadModels();
-});
-
-modeEl.addEventListener("change", () => {
-  streamEl.disabled = !supportsStreaming(modeEl.value);
-  promptEl.placeholder = modeEl.value === "embeddings" ? "Text to embed" : "Message RustyLLM";
-});
-
-promptEl.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-    form.requestSubmit();
-  }
-});
-
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const text = promptEl.value.trim();
-  if (!text || controller) return;
-
-  const mode = modeEl.value;
-  const turn = beginTurn();
-  updateStats("");
-
-  try {
-    if (mode === "chat") {
-      promptEl.value = "";
-      addMessage("user", text);
-      const userMessage = { role: "user", content: text };
-      const requestMessages = history.concat(userMessage);
-      const assistantEl = addMessage("assistant", "");
-      const payload = { ...openAiOptions(), messages: requestMessages };
-      let answer = "";
-      if (streamEl.checked) {
-        answer = await runStreaming("/v1/chat/completions", payload, mode, assistantEl, turn.signal);
-      } else {
-        const result = await fetchJson("/v1/chat/completions", payload, turn.signal);
-        answer = result.choices?.[0]?.message?.content || "";
-        assistantEl.textContent = answer;
-        updateStats("prompt " + result.usage.prompt_tokens + " / completion " + result.usage.completion_tokens + " / total " + result.usage.total_tokens);
-      }
-      if (turn.id === activeTurn) {
-        history.push(userMessage, { role: "assistant", content: answer });
-      }
-    } else if (mode === "completion") {
-      addMessage("user", text);
-      const assistantEl = addMessage("assistant", "");
-      const payload = { ...openAiOptions(), prompt: text };
-      if (streamEl.checked) {
-        await runStreaming("/v1/completions", payload, mode, assistantEl, turn.signal);
-      } else {
-        const result = await fetchJson("/v1/completions", payload, turn.signal);
-        assistantEl.textContent = result.choices?.[0]?.text || "";
-        updateStats("prompt " + result.usage.prompt_tokens + " / completion " + result.usage.completion_tokens + " / total " + result.usage.total_tokens);
-      }
-    } else if (mode === "generate") {
-      addMessage("user", text);
-      const result = await fetchJson("/generate", { ...generateOptions(), prompt: text }, turn.signal);
-      addMessage("assistant", result.text || "");
-      updateStats("prompt " + result.prompt_tokens + " / generated " + result.generated_tokens + " / total " + result.total_ms + " ms");
-    } else if (mode === "embeddings") {
-      addMessage("user", text);
-      const result = await fetchJson("/v1/embeddings", { model: selectedModel(), input: text }, turn.signal);
-      const vector = result.data?.[0]?.embedding || [];
-      const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0));
-      addJson("Embedding", {
-        model: result.model,
-        dimensions: vector.length,
-        l2_norm: Number(norm.toFixed(6)),
-        preview: vector.slice(0, 16)
-      });
-      updateStats("embedding tokens " + (result.usage?.total_tokens ?? 0));
-    }
-  } catch (err) {
-    if (err.name === "AbortError") {
-      addMessage("tool", "Stopped.", "tool");
-    } else {
-      addMessage("tool", "Error: " + err.message, "tool");
-      statusEl.textContent = "Error";
-    }
-  } finally {
-    finishTurn(turn);
-  }
-});
-
-loadModels();
-</script>
+<script src="script.js"></script>
 </body>
 </html>

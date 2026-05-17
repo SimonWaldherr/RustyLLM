@@ -3,6 +3,7 @@ use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeig
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Embedding result returned by [`Runner::embed`].
@@ -169,6 +170,10 @@ pub struct Runner {
     tok: Tokenizer,
     config: Config,
     weights: LoadedWeights,
+    /// Serialises concurrent generation calls.
+    /// The worker pool's job slot is single-entry; two simultaneous
+    /// forward passes would race on it and produce corrupted output.
+    generation_lock: Mutex<()>,
     #[allow(dead_code)]
     #[cfg(not(target_family = "wasm"))]
     mapped_model: Option<crate::mmap::MmapFile>,
@@ -259,6 +264,7 @@ impl Runner {
             tok,
             config,
             weights,
+            generation_lock: Mutex::new(()),
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
         })
@@ -306,6 +312,7 @@ impl Runner {
             tok,
             config,
             weights,
+            generation_lock: Mutex::new(()),
             mapped_model: Some(mmap),
         };
         let load_time = t0.elapsed();
@@ -377,6 +384,7 @@ impl Runner {
     where
         F: FnMut(&str),
     {
+        let _guard = self.generation_lock.lock().expect("generation lock poisoned");
         options.validate()?;
 
         if messages.is_empty() {
@@ -578,6 +586,7 @@ impl Runner {
     /// returned vector has dimension `config.dim` and is suitable for cosine
     /// similarity comparisons (RAG retrieval, semantic search, etc.).
     pub fn embed(&self, text: &str) -> Result<EmbeddingResult, String> {
+        let _guard = self.generation_lock.lock().expect("generation lock poisoned");
         let tokens = self.tok.encode(text);
         if tokens.is_empty() {
             return Err(String::from("embed: input tokenised to zero tokens"));

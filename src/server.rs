@@ -488,6 +488,30 @@ where
         return write_http_response(&mut stream, 404, &body).map_err(|err| err.to_string());
     }
 
+    if request.method == "GET" && options.chat_ui {
+        match request.path.as_str() {
+            "/style.css" => {
+                return write_http_response_with_content_type(
+                    &mut stream,
+                    200,
+                    "text/css; charset=utf-8",
+                    include_str!("web_ui/style.css"),
+                )
+                .map_err(|err| err.to_string());
+            }
+            "/script.js" => {
+                return write_http_response_with_content_type(
+                    &mut stream,
+                    200,
+                    "text/javascript; charset=utf-8",
+                    include_str!("web_ui/script.js"),
+                )
+                .map_err(|err| err.to_string());
+            }
+            _ => {}
+        }
+    }
+
     let (status, body) = route_request(&request, &runner, options);
     write_http_response(&mut stream, status, &body).map_err(|err| err.to_string())
 }

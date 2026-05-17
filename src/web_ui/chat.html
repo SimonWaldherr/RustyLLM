@@ -1,360 +1,72 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" dir="ltr">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RustyLLM Chat</title>
-<style>
-:root {
-  color-scheme: light dark;
-  --bg: #f6f4ef;
-  --panel: #ffffff;
-  --ink: #1d1f24;
-  --muted: #666b74;
-  --line: #d9d5cc;
-  --accent: #176b87;
-  --accent-2: #8f4e2f;
-  --user: #e8f2f3;
-  --assistant: #ffffff;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #171717;
-    --panel: #222326;
-    --ink: #f0eee8;
-    --muted: #aaa49a;
-    --line: #393a3d;
-    --accent: #69b7c9;
-    --accent-2: #d69a73;
-    --user: #173941;
-    --assistant: #252629;
-  }
-}
-* { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  margin: 0;
-  font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--bg);
-  color: var(--ink);
-}
-.app {
-  min-height: 100%;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-}
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px clamp(14px, 3vw, 28px);
-  border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 84%, transparent);
-}
-h1 {
-  margin: 0;
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: 0;
-}
-a {
-  color: var(--accent-2);
-  text-decoration: none;
-  font-size: 13px;
-  font-weight: 650;
-}
-a:hover { text-decoration: underline; }
-.status {
-  color: var(--muted);
-  font-size: 13px;
-  white-space: nowrap;
-}
-.top {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-main {
-  overflow: auto;
-  padding: 20px clamp(12px, 3vw, 28px);
-}
-.messages {
-  width: min(900px, 100%);
-  margin: 0 auto;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.msg {
-  max-width: min(760px, 92%);
-  padding: 12px 14px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.msg.user {
-  align-self: flex-end;
-  background: var(--user);
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
-}
-.msg.assistant {
-  align-self: flex-start;
-  background: var(--assistant);
-}
-.empty {
-  margin: 18vh auto 0;
-  width: min(520px, 100%);
-  color: var(--muted);
-  text-align: center;
-}
-form {
-  border-top: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 88%, transparent);
-  padding: 12px clamp(12px, 3vw, 28px) 16px;
-}
-.composer {
-  width: min(900px, 100%);
-  margin: 0 auto;
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  align-items: end;
-}
-textarea {
-  width: 100%;
-  min-height: 48px;
-  max-height: 180px;
-  resize: vertical;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 12px;
-  background: var(--panel);
-  color: var(--ink);
-  font: inherit;
-}
-.actions {
-  display: grid;
-  gap: 8px;
-}
-button {
-  min-width: 74px;
-  height: 38px;
-  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
-  border-radius: 8px;
-  background: var(--accent);
-  color: white;
-  font: inherit;
-  font-weight: 650;
-  cursor: pointer;
-}
-button.secondary {
-  background: transparent;
-  color: var(--accent-2);
-  border-color: color-mix(in srgb, var(--accent-2) 55%, var(--line));
-}
-button:disabled {
-  cursor: not-allowed;
-  opacity: .55;
-}
-.settings {
-  width: min(900px, 100%);
-  margin: 8px auto 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  color: var(--muted);
-  font-size: 13px;
-}
-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-}
-input[type="number"] {
-  width: 76px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 5px 7px;
-  background: var(--panel);
-  color: var(--ink);
-  font: inherit;
-}
-input[type="range"] {
-  accent-color: var(--accent);
-}
-@media (max-width: 560px) {
-  .composer { grid-template-columns: 1fr; }
-  .actions { grid-template-columns: 1fr 1fr; }
-  button { width: 100%; }
-  .msg { max-width: 100%; }
-}
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustyLLM Chat</title>
+
+  <meta name="description" content="Simple chat interface for RustyLLM — local LLM inference.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="RustyLLM Chat">
+  <meta property="og:description" content="Simple chat interface for RustyLLM — local LLM inference.">
+  <meta property="og:locale" content="en_US">
+
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="RustyLLM Chat">
+  <meta name="twitter:description" content="Simple chat interface for RustyLLM — local LLM inference.">
+
+  <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="chat">
+
 <div class="app">
-  <header>
+  <header role="banner">
     <h1>RustyLLM Chat</h1>
     <div class="top">
-      <a href="/chat?expert">Expert demo</a>
-      <div class="status" id="status">Ready</div>
+      <a href="/chat?expert">Expert UI</a>
+      <div id="status" class="status" role="status" aria-live="polite">Ready</div>
     </div>
   </header>
-  <main id="scroll">
-    <div class="messages" id="messages">
+
+  <main id="scroll" aria-label="Conversation">
+    <div class="messages" id="messages" role="log" aria-label="Message history" aria-live="polite" aria-relevant="additions">
       <div class="empty" id="empty">Ask something to start a local chat.</div>
     </div>
   </main>
-  <form id="form">
+
+  <form id="form" aria-label="Chat input" novalidate>
     <div class="composer">
-      <textarea id="prompt" name="prompt" rows="2" placeholder="Message RustyLLM" autofocus></textarea>
+      <textarea
+        id="prompt"
+        name="prompt"
+        rows="2"
+        placeholder="Message RustyLLM"
+        autofocus
+        autocomplete="off"
+        aria-required="true"
+      ></textarea>
       <div class="actions">
-        <button id="send" type="submit">Send</button>
-        <button id="stop" class="secondary" type="button" disabled>Stop</button>
+        <button id="send" type="submit" aria-label="Send message">Send</button>
+        <button id="stop" class="secondary" type="button" disabled aria-label="Stop generation">Stop</button>
       </div>
     </div>
     <div class="settings">
-      <label>Max tokens <input id="maxTokens" type="number" min="1" max="4096" value="512"></label>
-      <label>Temperature <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7"><span id="tempValue">0.70</span></label>
+      <label>Max tokens <input id="maxTokens" type="number" min="1" max="4096" value="512" inputmode="numeric" autocomplete="off"></label>
+      <label>Temperature
+        <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0.7">
+        <span id="tempValue">0.70</span>
+      </label>
     </div>
   </form>
 </div>
-<script>
-const form = document.getElementById("form");
-const promptEl = document.getElementById("prompt");
-const messagesEl = document.getElementById("messages");
-const emptyEl = document.getElementById("empty");
-const statusEl = document.getElementById("status");
-const sendEl = document.getElementById("send");
-const stopEl = document.getElementById("stop");
-const maxTokensEl = document.getElementById("maxTokens");
-const temperatureEl = document.getElementById("temperature");
-const tempValueEl = document.getElementById("tempValue");
-const scrollEl = document.getElementById("scroll");
-const history = [];
-let controller = null;
-let activeTurn = 0;
 
-function setBusy(busy) {
-  sendEl.disabled = busy;
-  stopEl.disabled = !busy;
-  statusEl.textContent = busy ? "Generating" : "Ready";
-}
+<noscript>
+  <p style="padding:2rem;text-align:center;">RustyLLM Chat requires JavaScript to be enabled.</p>
+</noscript>
 
-function beginTurn() {
-  activeTurn += 1;
-  controller = new AbortController();
-  setBusy(true);
-  return { id: activeTurn, signal: controller.signal };
-}
-
-function finishTurn(turn) {
-  if (turn.id !== activeTurn) return;
-  controller = null;
-  setBusy(false);
-  promptEl.focus();
-}
-
-function addMessage(role, text) {
-  emptyEl.hidden = true;
-  const el = document.createElement("div");
-  el.className = "msg " + role;
-  el.textContent = text;
-  messagesEl.appendChild(el);
-  scrollEl.scrollTop = scrollEl.scrollHeight;
-  return el;
-}
-
-function appendText(el, text) {
-  el.textContent += text;
-  scrollEl.scrollTop = scrollEl.scrollHeight;
-}
-
-temperatureEl.addEventListener("input", () => {
-  tempValueEl.textContent = Number(temperatureEl.value).toFixed(2);
-});
-
-stopEl.addEventListener("click", () => {
-  if (controller) controller.abort();
-});
-
-promptEl.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-    form.requestSubmit();
-  }
-});
-
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const text = promptEl.value.trim();
-  if (!text || controller) return;
-
-  promptEl.value = "";
-  addMessage("user", text);
-  const userMessage = { role: "user", content: text };
-  const requestMessages = history.concat(userMessage);
-  const assistantEl = addMessage("assistant", "");
-  let assistantText = "";
-  const turn = beginTurn();
-
-  try {
-    const response = await fetch("/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        messages: requestMessages,
-        stream: true,
-        max_tokens: Number(maxTokensEl.value) || 512,
-        temperature: Number(temperatureEl.value)
-      }),
-      signal: turn.signal
-    });
-
-    if (!response.ok || !response.body) {
-      const err = await response.text();
-      throw new Error(err || ("HTTP " + response.status));
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      for (const part of parts) {
-        const line = part.split("\n").find((item) => item.startsWith("data: "));
-        if (!line) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-        const payload = JSON.parse(data);
-        const token = payload.choices?.[0]?.delta?.content || "";
-        if (token) {
-          assistantText += token;
-          appendText(assistantEl, token);
-        }
-      }
-    }
-    if (turn.id === activeTurn) {
-      history.push(userMessage, { role: "assistant", content: assistantText });
-    }
-  } catch (err) {
-    if (err.name === "AbortError") {
-      appendText(assistantEl, "\n[stopped]");
-      if (assistantText && turn.id === activeTurn) {
-        history.push(userMessage, { role: "assistant", content: assistantText });
-      }
-    } else {
-      assistantEl.textContent = "Error: " + err.message;
-      statusEl.textContent = "Error";
-    }
-  } finally {
-    finishTurn(turn);
-  }
-});
-</script>
+<script src="script.js"></script>
 </body>
 </html>
