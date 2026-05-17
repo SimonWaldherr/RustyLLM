@@ -140,10 +140,7 @@ pub fn print_model_list(entries: &[ModelEntry]) {
         return;
     }
 
-    println!(
-        "{:<62} {:<14} {:<12} {}",
-        "id", "architecture", "status", "size"
-    );
+    println!("{:<62} {:<14} {:<12} size", "id", "architecture", "status");
     for entry in entries {
         let size_gb = entry.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         println!(

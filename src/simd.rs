@@ -1,5 +1,9 @@
 // simd.rs — Platform-specific SIMD kernels
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(
+    unsafe_op_in_unsafe_fn,
+    clippy::needless_range_loop,
+    clippy::needless_return
+)]
 //
 // Provides optimized dot products for:
 //   - f32 vectors (NEON / AVX2 / scalar)
@@ -819,7 +823,7 @@ pub fn dequant_row_q6_k(qrow: &[u8], cols: usize) -> Vec<f32> {
         for n in (0..256).step_by(128) {
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((((ql[l] & 0x0F) | (((qh[l] >> 0) & 0x03) << 4)) as i32) - 32) as f32;
+                let q1 = ((((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32) - 32) as f32;
                 let q2 =
                     ((((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32) - 32) as f32;
                 let q3 = ((((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32) - 32) as f32;
@@ -1214,7 +1218,7 @@ fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         for n in (0..256).step_by(128) {
             for l in 0..32 {
                 let is = l / 16;
-                let q1 = ((((ql[l] & 0x0F) | (((qh[l] >> 0) & 0x03) << 4)) as i32) - 32) as f32;
+                let q1 = ((((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32) - 32) as f32;
                 let q2 =
                     ((((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32) - 32) as f32;
                 let q3 = ((((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32) - 32) as f32;

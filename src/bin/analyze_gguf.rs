@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Analyze specific layers: normal layers (0, 1, 2, 3, 4, 6, 7...) vs special layers (5, 11, 17, 23, 29)
-    let special_layers = vec![5, 11, 17, 23, 29];
+    let special_layers = [5, 11, 17, 23, 29];
     let analysis_layers = vec![0, 5, 11];
 
     for layer_num in analysis_layers {
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tensors) = blocks.get(&block_key) {
             let is_special = special_layers.contains(&layer_num);
             println!(
-                "{}=== {} (Layer {}) {} ==={}",
+                "{}=== {} (Layer {}) {} ===",
                 if layer_num == 0 { "" } else { "\n" },
                 block_key,
                 layer_num,
@@ -61,8 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "[SPECIAL LAYER]"
                 } else {
                     "[NORMAL LAYER]"
-                },
-                if layer_num == 0 { "" } else { "" }
+                }
             );
             println!("Tensor Count: {}\n", tensors.len());
 

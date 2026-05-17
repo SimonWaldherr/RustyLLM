@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
 #[cfg(feature = "tls")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -34,7 +36,7 @@ impl ServeOptions {
     pub fn is_tls(&self) -> bool {
         #[cfg(feature = "tls")]
         {
-            return self.tls_cert_path.is_some() && self.tls_key_path.is_some();
+            self.tls_cert_path.is_some() && self.tls_key_path.is_some()
         }
         #[cfg(not(feature = "tls"))]
         {
@@ -1275,7 +1277,7 @@ where
         status,
         status_text,
         content_type,
-        body.as_bytes().len(),
+        body.len(),
         body
     )?;
     stream.flush()

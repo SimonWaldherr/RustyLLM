@@ -3,6 +3,7 @@
 // Key design: quantized weights stay as raw byte slices pointing into the mmap.
 // The SIMD kernels do fused dequant+dot, avoiding intermediate f32 buffers.
 // Only normalization weights and embeddings are stored as f32.
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
@@ -593,11 +594,10 @@ fn load_weight(
         });
     let offset = data_offset + info.offset as usize;
 
-    if offset
+    if !offset
         .checked_add(byte_size)
         .map(|end| end <= mmap_data.len())
         .unwrap_or(false)
-        == false
     {
         if let Some(&inferred) = inferred_sizes.get(name) {
             byte_size = inferred;
@@ -690,9 +690,8 @@ fn load_weight(
                     GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::MXFP4
                 ) {
                     panic!(
-                        "{} force_f32 dequantization not implemented for {}",
-                        format!("{:?}", info.dtype),
-                        name
+                        "{:?} force_f32 dequantization not implemented for {}",
+                        info.dtype, name
                     );
                 }
                 // Dequantize into f32 vector
@@ -872,12 +871,12 @@ pub fn load_model(
             .tensors
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.offset as u64, i))
+            .map(|(i, t)| (t.offset, i))
             .collect();
         offs.sort_unstable_by_key(|o| o.0);
 
         for w in 0..offs.len() {
-            let (off, _idx) = offs[w];
+            let (off, idx) = offs[w];
             let next_off = if w + 1 < offs.len() {
                 offs[w + 1].0
             } else {
@@ -890,10 +889,9 @@ pub fn load_model(
             };
             // Some quantized layouts do not match a simple dtype*numel formula,
             // so neighboring offsets are the most reliable fallback.
-            let idx = _idx as usize;
             let name = &gguf.tensors[idx].name;
             inferred_sizes.insert(name.clone(), byte_size);
-            let end = data_offset as usize + off as usize + byte_size;
+            let end = data_offset + off as usize + byte_size;
             if end > max_required_end {
                 max_required_end = end;
             }
@@ -1143,7 +1141,7 @@ pub fn load_gpt_oss_model(
             .tensors
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.offset as u64, i))
+            .map(|(i, t)| (t.offset, i))
             .collect();
         offs.sort_unstable_by_key(|o| o.0);
         for w in 0..offs.len() {
@@ -1360,18 +1358,6 @@ pub fn load_gpt_oss_model(
 }
 
 // ─── Forward Pass ────────────────────────────────────────────────────────────
-
-/// RMS Normalization
-#[inline]
-fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
-    let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
-    let scale = 1.0 / (ss + eps).sqrt();
-    x.iter()
-        .zip(weight)
-        .map(|(xi, wi)| xi * scale * wi)
-        .collect()
-}
 
 /// RMS Normalization writing into a pre-allocated output buffer.
 #[inline]
@@ -1593,6 +1579,20 @@ pub fn forward_gpt_oss(
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
+    let mut logits = Vec::new();
+    forward_gpt_oss_into(config, weights, cache, buf, token, pos, &mut logits);
+    logits
+}
+
+pub fn forward_gpt_oss_into(
+    config: &Config,
+    weights: &GptOssWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
     weights
         .token_embd
         .row_into(token as usize, config.dim, &mut buf.x);
@@ -1730,7 +1730,7 @@ pub fn forward_gpt_oss(
         config.rms_norm_eps,
         &mut buf.xn,
     );
-    weights.output.matvec(&buf.xn)
+    weights.output.matvec_into(&buf.xn, logits);
 }
 
 /// Single forward pass for one token at position `pos`
@@ -1742,19 +1742,33 @@ pub fn forward(
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
+    let mut logits = Vec::new();
+    forward_into(config, weights, cache, buf, token, pos, &mut logits);
+    logits
+}
+
+pub fn forward_into(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
     let dim = config.dim;
     let head_dim = config.head_dim;
     let _kv_dim = config.kv_dim;
     let kv_mul = config.kv_mul;
 
     // Token embedding
-    let mut x = weights.token_embd.row(token as usize, dim);
+    weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
         // ── Attention ──
-        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
         if !try_q4k_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
@@ -1835,11 +1849,11 @@ pub fn forward(
         // Output projection + residual
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
 
         // ── FFN (SwiGLU) ──
-        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+        rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
         layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
         layer.w3.matvec_into(&buf.xn2, &mut buf.up);
@@ -1851,13 +1865,18 @@ pub fn forward(
 
         layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
     }
 
     // Final norm → logits
-    rms_norm_into(&x, &weights.output_norm, config.rms_norm_eps, &mut buf.xn);
-    weights.output.matvec(&buf.xn)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    weights.output.matvec_into(&buf.xn, logits);
 }
 
 /// Forward pass for Gemma-4 models (initial implementation mirroring the
@@ -1871,19 +1890,33 @@ pub fn forward_gemma4(
     token: u32,
     pos: usize,
 ) -> Vec<f32> {
+    let mut logits = Vec::new();
+    forward_gemma4_into(config, weights, cache, buf, token, pos, &mut logits);
+    logits
+}
+
+pub fn forward_gemma4_into(
+    config: &Config,
+    weights: &Gemma4Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
     let dim = config.dim;
     // Per-layer head/value/k_v layout is stored in each Gemma4 layer.
     // `buf` and `cache` are sized using layer maxima; here we use the
     // per-layer descriptors to read/write the correct slices and strides.
 
     // Token embedding
-    let mut x = weights.token_embd.row(token as usize, dim);
+    weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
         // Standard attention path (or K=V reuse when attn_v is missing)
-        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
         layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
         layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
@@ -1962,11 +1995,11 @@ pub fn forward_gemma4(
         // Output projection + residual
         layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
 
         // ── FFN (SwiGLU-like) ──
-        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+        rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
         layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
         layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
@@ -1978,13 +2011,18 @@ pub fn forward_gemma4(
 
         layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
     }
 
     // Final norm → logits
-    rms_norm_into(&x, &weights.output_norm, config.rms_norm_eps, &mut buf.xn);
-    weights.output.matvec(&buf.xn)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    weights.output.matvec_into(&buf.xn, logits);
 }
 
 #[derive(Clone)]
@@ -2041,11 +2079,11 @@ pub fn load_gemma4_model(
             .tensors
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.offset as u64, i))
+            .map(|(i, t)| (t.offset, i))
             .collect();
         offs.sort_unstable_by_key(|o| o.0);
         for w in 0..offs.len() {
-            let (off, _idx) = offs[w];
+            let (off, idx) = offs[w];
             let next_off = if w + 1 < offs.len() {
                 offs[w + 1].0
             } else {
@@ -2056,7 +2094,6 @@ pub fn load_gemma4_model(
             } else {
                 0
             };
-            let idx = _idx as usize;
             let name = &gguf.tensors[idx].name;
             inferred_sizes.insert(name.clone(), byte_size);
         }
@@ -2686,12 +2723,12 @@ pub fn forward_hidden(
     let head_dim = config.head_dim;
     let kv_mul = config.kv_mul;
 
-    let mut x = weights.token_embd.row(token as usize, dim);
+    weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
-        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
         if !try_q4k_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
@@ -2765,10 +2802,10 @@ pub fn forward_hidden(
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
 
-        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+        rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
         layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
         layer.w3.matvec_into(&buf.xn2, &mut buf.up);
@@ -2780,12 +2817,18 @@ pub fn forward_hidden(
 
         layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
     }
 
     // Apply final norm but skip the output projection — return the hidden state.
-    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    buf.xn.clone()
 }
 
 /// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
@@ -2946,12 +2989,12 @@ pub fn forward_hidden_gemma4(
 ) -> Vec<f32> {
     let dim = config.dim;
 
-    let mut x = weights.token_embd.row(token as usize, dim);
+    weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
-        rms_norm_into(&x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
         layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
         layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
@@ -3023,10 +3066,10 @@ pub fn forward_hidden_gemma4(
 
         layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
 
-        rms_norm_into(&x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+        rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
         layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
         layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
@@ -3038,9 +3081,15 @@ pub fn forward_hidden_gemma4(
 
         layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
         for i in 0..dim {
-            x[i] += buf.proj[i];
+            buf.x[i] += buf.proj[i];
         }
     }
 
-    rms_norm(&x, &weights.output_norm, config.rms_norm_eps)
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    buf.xn.clone()
 }

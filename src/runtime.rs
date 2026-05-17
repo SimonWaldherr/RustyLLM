@@ -384,7 +384,10 @@ impl Runner {
     where
         F: FnMut(&str),
     {
-        let _guard = self.generation_lock.lock().expect("generation lock poisoned");
+        let _guard = self
+            .generation_lock
+            .lock()
+            .expect("generation lock poisoned");
         options.validate()?;
 
         if messages.is_empty() {
@@ -454,7 +457,7 @@ impl Runner {
         let last_prompt_pos = tokens.len() - 1;
         for (pos, &tok_id) in tokens.iter().enumerate() {
             if pos == last_prompt_pos {
-                logits = self.forward_token(&mut cache, &mut buf, tok_id, pos);
+                self.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);
             } else {
                 let _ = self.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
             }
@@ -520,7 +523,7 @@ impl Runner {
                 break;
             }
 
-            logits = self.forward_token(&mut cache, &mut buf, token, pos);
+            self.forward_token_into(&mut cache, &mut buf, token, pos, &mut logits);
             pos += 1;
         }
 
@@ -537,22 +540,23 @@ impl Runner {
         })
     }
 
-    fn forward_token(
+    fn forward_token_into(
         &self,
         cache: &mut KVCache,
         buf: &mut DecodeBuffer,
         token: u32,
         pos: usize,
-    ) -> Vec<f32> {
+        logits: &mut Vec<f32>,
+    ) {
         match &self.weights {
             LoadedWeights::GptOss(weights) => {
-                model::forward_gpt_oss(&self.config, weights, cache, buf, token, pos)
+                model::forward_gpt_oss_into(&self.config, weights, cache, buf, token, pos, logits)
             }
             LoadedWeights::Gemma4(weights) => {
-                model::forward_gemma4(&self.config, weights, cache, buf, token, pos)
+                model::forward_gemma4_into(&self.config, weights, cache, buf, token, pos, logits)
             }
             LoadedWeights::Standard(weights) => {
-                model::forward(&self.config, weights, cache, buf, token, pos)
+                model::forward_into(&self.config, weights, cache, buf, token, pos, logits)
             }
         }
     }
@@ -586,7 +590,10 @@ impl Runner {
     /// returned vector has dimension `config.dim` and is suitable for cosine
     /// similarity comparisons (RAG retrieval, semantic search, etc.).
     pub fn embed(&self, text: &str) -> Result<EmbeddingResult, String> {
-        let _guard = self.generation_lock.lock().expect("generation lock poisoned");
+        let _guard = self
+            .generation_lock
+            .lock()
+            .expect("generation lock poisoned");
         let tokens = self.tok.encode(text);
         if tokens.is_empty() {
             return Err(String::from("embed: input tokenised to zero tokens"));

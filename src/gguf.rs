@@ -344,7 +344,7 @@ impl GGUFFile {
             .get("general.alignment")
             .and_then(|v| v.as_u32())
             .unwrap_or(32) as usize;
-        let data_offset = (c.pos + alignment - 1) / alignment * alignment;
+        let data_offset = c.pos.div_ceil(alignment) * alignment;
 
         Ok(Self {
             metadata,
