@@ -935,6 +935,9 @@ pub fn load_model(
 
     // Layers
     let mut layers = Vec::with_capacity(config.n_layers);
+    let q_rows = config.n_heads * config.head_dim;
+    let k_rows = config.n_kv_heads * config.head_dim;
+    let v_rows = config.n_kv_heads * config.value_dim;
     for l in 0..config.n_layers {
         let layer = LayerWeights {
             attn_norm: load_f32_vec(
@@ -959,7 +962,7 @@ pub fn load_model(
                 &format!("blk.{}.attn_q.bias", l),
                 &tensor_idx,
                 &inferred_sizes,
-                config.dim,
+                q_rows,
             ),
             wk: load_weight(
                 mmap_data,
@@ -976,7 +979,7 @@ pub fn load_model(
                 &format!("blk.{}.attn_k.bias", l),
                 &tensor_idx,
                 &inferred_sizes,
-                config.kv_dim,
+                k_rows,
             ),
             wv: load_weight(
                 mmap_data,
@@ -993,7 +996,7 @@ pub fn load_model(
                 &format!("blk.{}.attn_v.bias", l),
                 &tensor_idx,
                 &inferred_sizes,
-                config.kv_dim,
+                v_rows,
             ),
             wo: load_weight(
                 mmap_data,
