@@ -50,6 +50,17 @@ pub fn sample(
     rng: &mut Rng,
     recent_tokens: &[u32],
 ) -> u32 {
+    let mut candidates = Vec::new();
+    sample_with_scratch(logits, config, rng, recent_tokens, &mut candidates)
+}
+
+pub fn sample_with_scratch(
+    logits: &mut [f32],
+    config: &SamplerConfig,
+    rng: &mut Rng,
+    recent_tokens: &[u32],
+    candidates: &mut Vec<(usize, f32)>,
+) -> u32 {
     let n = logits.len();
     if n == 0 {
         return 0;
@@ -90,17 +101,8 @@ pub fn sample(
         *v *= inv_temp;
     }
 
-    // Top-K: keep only top_k highest logits
     if config.top_k > 0 && config.top_k < n {
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-
-        let threshold = logits[indices[config.top_k - 1]];
-        for i in 0..n {
-            if logits[i] < threshold {
-                logits[i] = f32::NEG_INFINITY;
-            }
-        }
+        return sample_top_k(logits, config.top_k, config.top_p, rng, candidates);
     }
 
     // Softmax
@@ -174,6 +176,98 @@ pub fn sample(
     (n - 1) as u32
 }
 
+fn sample_top_k(
+    logits: &[f32],
+    top_k: usize,
+    top_p: f32,
+    rng: &mut Rng,
+    candidates: &mut Vec<(usize, f32)>,
+) -> u32 {
+    candidates.clear();
+    if candidates.capacity() < top_k {
+        candidates.reserve(top_k - candidates.capacity());
+    }
+
+    for (idx, &logit) in logits.iter().enumerate() {
+        if candidates.len() < top_k {
+            candidates.push((idx, logit));
+            bubble_up_last(candidates);
+        } else {
+            let last = candidates.len() - 1;
+            if logit.total_cmp(&candidates[last].1).is_gt() {
+                candidates[last] = (idx, logit);
+                bubble_up_last(candidates);
+            }
+        }
+    }
+
+    if candidates.is_empty() || !candidates[0].1.is_finite() {
+        return argmax_token(logits);
+    }
+
+    let max = candidates[0].1;
+    let mut sum = 0.0f32;
+    for (_, prob) in candidates.iter_mut() {
+        *prob = (*prob - max).exp();
+        sum += *prob;
+    }
+    if !sum.is_finite() || sum <= 0.0 {
+        return candidates[0].0 as u32;
+    }
+    let inv_sum = 1.0 / sum;
+    for (_, prob) in candidates.iter_mut() {
+        *prob *= inv_sum;
+    }
+
+    let mut cutoff = candidates.len();
+    if top_p < 1.0 {
+        let mut cumsum = 0.0f32;
+        for (i, &(_, prob)) in candidates.iter().enumerate() {
+            cumsum += prob;
+            if cumsum > top_p {
+                cutoff = i + 1;
+                break;
+            }
+        }
+
+        let kept_sum: f32 = candidates[..cutoff].iter().map(|&(_, prob)| prob).sum();
+        if kept_sum > 0.0 {
+            let inv = 1.0 / kept_sum;
+            for (_, prob) in candidates[..cutoff].iter_mut() {
+                *prob *= inv;
+            }
+        }
+    }
+
+    let r = rng.next_f32();
+    let mut cumsum = 0.0f32;
+    for &(idx, prob) in &candidates[..cutoff] {
+        cumsum += prob;
+        if cumsum > r {
+            return idx as u32;
+        }
+    }
+
+    candidates[cutoff - 1].0 as u32
+}
+
+fn bubble_up_last(candidates: &mut [(usize, f32)]) {
+    let mut i = candidates.len() - 1;
+    while i > 0 && candidates[i].1.total_cmp(&candidates[i - 1].1).is_gt() {
+        candidates.swap(i, i - 1);
+        i -= 1;
+    }
+}
+
+fn argmax_token(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Rng, SamplerConfig, sample};
@@ -201,5 +295,41 @@ mod tests {
         let mut logits = Vec::new();
         let token = sample(&mut logits, &config, &mut rng, &[]);
         assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn top_k_samples_only_from_candidate_set() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 2,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        let mut seen = [false; 2];
+        for _ in 0..64 {
+            let mut logits = vec![10.0, 9.0, 0.0, -1.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert!(token <= 1, "sampled token outside top-k: {}", token);
+            seen[token as usize] = true;
+        }
+        assert!(seen[0], "best token was never sampled");
+        assert!(seen[1], "second top-k token was never sampled");
+    }
+
+    #[test]
+    fn top_p_truncates_top_k_candidate_set() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 0.6,
+            top_k: 2,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        for _ in 0..64 {
+            let mut logits = vec![10.0, 9.0, 0.0, -1.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert_eq!(token, 0);
+        }
     }
 }

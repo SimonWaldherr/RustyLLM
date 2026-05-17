@@ -17,6 +17,14 @@ use std::thread;
 
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2_fma() -> bool {
+    static HAS_AVX2_FMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_AVX2_FMA
+        .get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"))
+}
+
 // ─── f16 ↔ f32 conversion ────────────────────────────────────────────────────
 
 #[inline(always)]
@@ -288,7 +296,7 @@ impl WorkerPool {
                 break;
             }
             drop(state);
-            
+
             if spins < 10000 {
                 std::hint::spin_loop();
                 spins += 1;
@@ -296,7 +304,7 @@ impl WorkerPool {
                 thread::yield_now();
             }
         }
-        
+
         // Final cleanup
         let mut state = self.state.lock().expect("worker pool mutex poisoned");
         state.job = None;
@@ -381,7 +389,7 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_f32_avx2(a, b) }
         } else {
             dot_f32_scalar(a, b)
@@ -404,7 +412,7 @@ pub fn axpy_f32(out: &mut [f32], alpha: f32, x: &[f32]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { axpy_f32_avx2(out, alpha, x) }
         } else {
             axpy_f32_scalar(out, alpha, x)
@@ -427,7 +435,7 @@ pub fn scale_f32(out: &mut [f32], scale: f32) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { scale_f32_avx2(out, scale) }
         } else {
             scale_f32_scalar(out, scale)
@@ -451,7 +459,7 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { scale_add_f32_avx2(out, scale, add) }
         } else {
             scale_add_f32_scalar(out, scale, add)
@@ -500,7 +508,7 @@ pub fn dot_q8_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_q8_0_f32_avx2(qdata, x, n) }
         } else {
             dot_q8_0_f32_scalar(qdata, x, n)
@@ -522,7 +530,7 @@ pub fn dot_q4_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if has_avx2_fma() {
             unsafe { dot_q4_0_f32_avx2(qdata, x, n) }
         } else {
             dot_q4_0_f32_scalar(qdata, x, n)
@@ -554,7 +562,9 @@ pub fn dot_q6_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 256 == 0);
     #[cfg(target_arch = "aarch64")]
     {
-        unsafe { return dot_q6_k_f32_neon(qdata, x, n); }
+        unsafe {
+            return dot_q6_k_f32_neon(qdata, x, n);
+        }
     }
     #[allow(unreachable_code)]
     dot_q6_k_f32_scalar(qdata, x, n)
@@ -936,8 +946,8 @@ unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let block_size = 210;
     let mut total = vdupq_n_f32(0.0);
     let mask_lo4 = vdupq_n_u8(0x0F);
-    let mask_03  = vdupq_n_u8(0x03);
-    let sub32    = vdupq_n_u8(32);
+    let mask_03 = vdupq_n_u8(0x03);
+    let sub32 = vdupq_n_u8(32);
 
     for b in 0..n_blocks {
         let block = qdata.as_ptr().add(b * block_size);
@@ -953,7 +963,7 @@ unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
                 let l = half * 16;
                 let is = half;
 
-                let sv1 = vdupq_n_f32(d * (*sc_ptr.add(is    ) as i8) as f32);
+                let sv1 = vdupq_n_f32(d * (*sc_ptr.add(is) as i8) as f32);
                 let sv2 = vdupq_n_f32(d * (*sc_ptr.add(is + 2) as i8) as f32);
                 let sv3 = vdupq_n_f32(d * (*sc_ptr.add(is + 4) as i8) as f32);
                 let sv4 = vdupq_n_f32(d * (*sc_ptr.add(is + 6) as i8) as f32);
@@ -967,10 +977,10 @@ unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
                 let lo2 = vandq_u8(ql2, mask_lo4);
                 let hi2 = vshrq_n_u8(ql2, 4);
 
-                let h1 = vandq_u8(qhv,                    mask_03);
+                let h1 = vandq_u8(qhv, mask_03);
                 let h2 = vandq_u8(vshrq_n_u8(qhv, 2), mask_03);
                 let h3 = vandq_u8(vshrq_n_u8(qhv, 4), mask_03);
-                let h4 =          vshrq_n_u8(qhv, 6);
+                let h4 = vshrq_n_u8(qhv, 6);
 
                 let q1 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo1, vshlq_n_u8(h1, 4)), sub32));
                 let q2 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo2, vshlq_n_u8(h2, 4)), sub32));
@@ -993,10 +1003,10 @@ unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
                 }
 
                 let x_off = grp_x_base + l;
-                dot16!(q1, xbase.add(x_off),       sv1);
-                dot16!(q2, xbase.add(x_off + 32),  sv2);
-                dot16!(q3, xbase.add(x_off + 64),  sv3);
-                dot16!(q4, xbase.add(x_off + 96),  sv4);
+                dot16!(q1, xbase.add(x_off), sv1);
+                dot16!(q2, xbase.add(x_off + 32), sv2);
+                dot16!(q3, xbase.add(x_off + 64), sv3);
+                dot16!(q4, xbase.add(x_off + 96), sv4);
             }
             ql_ptr = ql_ptr.add(64);
             qh_ptr = qh_ptr.add(32);
@@ -1227,8 +1237,7 @@ fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[inline(always)]
 fn mxfp4_nibble_to_f32(v: u8) -> f32 {
     const LUT: [f32; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-        -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
     ];
     LUT[(v & 0x0F) as usize]
 }
@@ -1460,10 +1469,18 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut ap = a.as_ptr();
     let mut bp = b.as_ptr();
     for _ in 0..main {
-        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap),       _mm256_loadu_ps(bp),       acc0);
-        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(8)),  _mm256_loadu_ps(bp.add(8)),  acc1);
-        acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(16)), _mm256_loadu_ps(bp.add(16)), acc2);
-        acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(24)), _mm256_loadu_ps(bp.add(24)), acc3);
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ap), _mm256_loadu_ps(bp), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(ap.add(8)), _mm256_loadu_ps(bp.add(8)), acc1);
+        acc2 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(ap.add(16)),
+            _mm256_loadu_ps(bp.add(16)),
+            acc2,
+        );
+        acc3 = _mm256_fmadd_ps(
+            _mm256_loadu_ps(ap.add(24)),
+            _mm256_loadu_ps(bp.add(24)),
+            acc3,
+        );
         ap = ap.add(32);
         bp = bp.add(32);
     }
