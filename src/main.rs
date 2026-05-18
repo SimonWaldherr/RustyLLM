@@ -2,12 +2,17 @@
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,
 };
+use rusty_llm::gguf::{GGMLType, GGUFFile};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::metal;
-use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner};
+use rusty_llm::model::Config;
+use rusty_llm::runtime::{
+    ChatMessage, GenerationOptions, LoadInfo, Runner, architecture_supported,
+};
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Display;
 use std::io::{self, BufRead, Read, Write};
@@ -53,7 +58,12 @@ fn print_usage(name: &str) {
     eprintln!("  --stop <text>             Stop generation when this string appears");
     eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
     eprintln!("  --bench                   Run a non-streaming generation benchmark");
+    eprintln!("  --bench-json              Run benchmark and emit machine-readable JSON");
     eprintln!("  --bench-runs <N>          Number of benchmark runs (default: 3)");
+    eprintln!(
+        "  --inspect                 Inspect GGUF metadata and compatibility without loading weights"
+    );
+    eprintln!("  --chat-history <path>     Append chat/generation turns to a JSON file");
     eprintln!("  --list-tensors            Print GGUF tensor inventory and exit");
 }
 
@@ -123,6 +133,9 @@ fn run() -> Result<(), String> {
     let mut max_connections_override: Option<usize> = None;
     let mut embed_mode = false;
     let mut bench_mode = false;
+    let mut bench_json = false;
+    let mut inspect_mode = false;
+    let mut chat_history_path: Option<String> = None;
     let mut bench_runs = 3usize;
 
     let mut i = 1;
@@ -208,8 +221,18 @@ fn run() -> Result<(), String> {
             "--bench" => {
                 bench_mode = true;
             }
+            "--bench-json" | "—bench-json" => {
+                bench_mode = true;
+                bench_json = true;
+            }
             "--bench-runs" => {
                 bench_runs = parse_arg::<usize>(&args, &mut i, "--bench-runs")?;
+            }
+            "--inspect" => {
+                inspect_mode = true;
+            }
+            "--chat-history" | "--chat-log" => {
+                chat_history_path = Some(parse_arg::<String>(&args, &mut i, "--chat-history")?);
             }
             "--list-tensors" => {
                 list_tensors = true;
@@ -299,6 +322,11 @@ fn run() -> Result<(), String> {
 
     let model_path = resolve_model_path(model_selector.as_deref(), &model_dir)?;
 
+    if inspect_mode {
+        inspect_model_file(&model_path)?;
+        return Ok(());
+    }
+
     eprintln!("\nLoading: {}", model_path.display());
     let model_path_str = model_path
         .to_str()
@@ -341,7 +369,14 @@ fn run() -> Result<(), String> {
         } else {
             prompt.trim()
         };
-        run_benchmark(&runner, &load_info, bench_prompt, &options, bench_runs)?;
+        run_benchmark(
+            &runner,
+            &load_info,
+            bench_prompt,
+            &options,
+            bench_runs,
+            bench_json,
+        )?;
         return Ok(());
     }
 
@@ -402,6 +437,8 @@ fn run() -> Result<(), String> {
                 tls_key_path: tls_key,
                 max_concurrent_connections: max_connections,
                 chat_ui,
+                chat_history_path: chat_history_path.clone(),
+                chat_history_lock: Arc::new(std::sync::Mutex::new(())),
             };
             server::serve(Arc::new(runner), serve_options)?;
             return Ok(());
@@ -409,7 +446,7 @@ fn run() -> Result<(), String> {
     }
 
     if repl_mode {
-        run_repl(&runner, &options)?;
+        run_repl(&runner, &options, chat_history_path.as_deref())?;
         return Ok(());
     }
 
@@ -441,6 +478,13 @@ fn run() -> Result<(), String> {
         print!("{}", text);
         let _ = io::stdout().flush();
     })?;
+    append_cli_history(
+        chat_history_path.as_deref(),
+        &runner,
+        "cli.generate",
+        &[ChatMessage::user(prompt.clone())],
+        &result,
+    )?;
 
     eprintln!("\n\n─── Stats ───────────────────────────────");
     eprintln!("Prompt: {} tokens", result.stats.prompt_tokens);
@@ -460,13 +504,112 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| format!("Non-UTF-8 model path: {}", path.display()))?;
+    let mmap = rusty_llm::mmap::MmapFile::open(path_str).map_err(|err| err.to_string())?;
+    let gguf = GGUFFile::parse_quiet(mmap.as_slice())?;
+    let arch = gguf.get_str("general.architecture").unwrap_or("unknown");
+    let config = Config::from_gguf(&gguf);
+    let metadata_count = gguf.metadata.len();
+    let tensor_count = gguf.tensors.len();
+    let mut dtype_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unsupported_tensor_types = Vec::new();
+
+    for tensor in &gguf.tensors {
+        *dtype_counts
+            .entry(format!("{:?}", tensor.dtype))
+            .or_insert(0) += 1;
+        if matches!(
+            tensor.dtype,
+            GGMLType::Q2_K | GGMLType::Q3_K | GGMLType::Q5_K | GGMLType::Q8_K | GGMLType::Unknown
+        ) {
+            unsupported_tensor_types.push(tensor.name.clone());
+        }
+    }
+
+    let tokenizer_vocab = gguf
+        .metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(|value| value.as_string_array())
+        .map(|tokens| tokens.len())
+        .unwrap_or(0);
+    let file_size_bytes = std::fs::metadata(path)
+        .map_err(|err| err.to_string())?
+        .len();
+    let supported_architecture = architecture_supported(arch);
+    let status = if supported_architecture && unsupported_tensor_types.is_empty() {
+        "supported"
+    } else if supported_architecture {
+        "partially-supported"
+    } else {
+        "unsupported"
+    };
+
+    let report = serde_json::json!({
+        "type": "rusty-llm.inspect",
+        "path": path.display().to_string(),
+        "file_size_bytes": file_size_bytes,
+        "status": status,
+        "model": {
+            "name": gguf.get_str("general.name"),
+            "architecture": arch,
+            "supported_architecture": supported_architecture,
+        },
+        "config": {
+            "dim": config.dim,
+            "hidden_dim": config.hidden_dim,
+            "layers": config.n_layers,
+            "heads": config.n_heads,
+            "kv_heads": config.n_kv_heads,
+            "head_dim": config.head_dim,
+            "value_dim": config.value_dim,
+            "kv_dim": config.kv_dim,
+            "context_length": config.max_seq_len,
+            "vocab_size": config.vocab_size,
+            "rope_theta": config.rope_theta,
+            "rms_norm_eps": config.rms_norm_eps,
+            "sliding_window": config.sliding_window,
+            "expert_count": config.expert_count,
+            "expert_used_count": config.expert_used_count,
+        },
+        "tokenizer": {
+            "vocab_size": tokenizer_vocab,
+            "chat_template": gguf.metadata.get("tokenizer.chat_template").and_then(|v| v.as_str()).is_some(),
+        },
+        "gguf": {
+            "metadata_entries": metadata_count,
+            "tensors": tensor_count,
+            "data_offset": gguf.data_offset,
+            "tensor_types": dtype_counts,
+            "unsupported_tensor_examples": unsupported_tensor_types.iter().take(16).collect::<Vec<_>>(),
+            "unsupported_tensor_count": unsupported_tensor_types.len(),
+        },
+        "api_compatibility": {
+            "openai": ["/v1/models", "/v1/completions", "/v1/chat/completions", "/v1/embeddings"],
+            "lm_studio": ["/api/v0/models", "/api/v0/completions", "/api/v0/chat/completions", "/api/v0/embeddings"],
+            "ollama": ["/api/tags", "/api/generate", "/api/chat", "/api/embeddings"],
+        }
+    });
+    let body = serde_json::to_string_pretty(&report)
+        .map_err(|err| format!("Failed to serialize inspect JSON: {}", err))?;
+    println!("{}", body);
+    Ok(())
+}
+
 fn run_benchmark(
     runner: &Runner,
     load_info: &LoadInfo,
     prompt: &str,
     options: &GenerationOptions,
     runs: usize,
+    json: bool,
 ) -> Result<(), String> {
+    if json {
+        return run_benchmark_json(runner, load_info, prompt, options, runs);
+    }
+
     println!("Benchmark");
     println!("model={}", runner.model_name().unwrap_or("unknown"));
     println!("architecture={}", runner.architecture());
@@ -550,7 +693,95 @@ fn run_benchmark(
     Ok(())
 }
 
-fn run_repl(runner: &Runner, options: &GenerationOptions) -> Result<(), String> {
+fn run_benchmark_json(
+    runner: &Runner,
+    load_info: &LoadInfo,
+    prompt: &str,
+    options: &GenerationOptions,
+    runs: usize,
+) -> Result<(), String> {
+    let mut total_prompt_tokens = 0usize;
+    let mut total_generated_tokens = 0usize;
+    let mut total_prefill = Duration::from_secs(0);
+    let mut total_decode = Duration::from_secs(0);
+    let mut total_model = Duration::from_secs(0);
+    let mut total_wall = Duration::from_secs(0);
+    let mut run_values = Vec::with_capacity(runs);
+
+    for run in 0..runs {
+        let mut run_options = options.clone();
+        if options.seed != 0 {
+            run_options.seed = options.seed.wrapping_add(run as u64);
+        }
+
+        let wall_start = Instant::now();
+        let result = runner.generate(prompt, &run_options)?;
+        let wall = wall_start.elapsed();
+        let decode_tok_s = result.stats.generated_tokens as f64
+            / result.stats.decode_time.as_secs_f64().max(0.001);
+        let prefill_tok_s =
+            result.stats.prompt_tokens as f64 / result.stats.prefill_time.as_secs_f64().max(0.001);
+
+        run_values.push(serde_json::json!({
+            "run": run + 1,
+            "prompt_tokens": result.stats.prompt_tokens,
+            "generated_tokens": result.stats.generated_tokens,
+            "prefill_ms": result.stats.prefill_time.as_millis(),
+            "decode_ms": result.stats.decode_time.as_millis(),
+            "total_ms": result.stats.total_time.as_millis(),
+            "wall_ms": wall.as_millis(),
+            "prefill_tok_s": prefill_tok_s,
+            "decode_tok_s": decode_tok_s,
+        }));
+
+        total_prompt_tokens += result.stats.prompt_tokens;
+        total_generated_tokens += result.stats.generated_tokens;
+        total_prefill += result.stats.prefill_time;
+        total_decode += result.stats.decode_time;
+        total_model += result.stats.total_time;
+        total_wall += wall;
+    }
+
+    let response = serde_json::json!({
+        "type": "rusty-llm.benchmark",
+        "model": runner.model_name().unwrap_or("unknown"),
+        "architecture": runner.architecture(),
+        "load_ms": load_info.load_time.as_millis(),
+        "file_size_bytes": load_info.file_size_bytes,
+        "runs": runs,
+        "prompt": prompt,
+        "options": {
+            "max_tokens": options.max_tokens,
+            "temperature": options.sampler.temperature,
+            "top_p": options.sampler.top_p,
+            "top_k": options.sampler.top_k,
+            "repeat_penalty": options.sampler.repeat_penalty,
+            "seed": options.seed,
+            "stop_sequences": options.stop_sequences,
+        },
+        "results": run_values,
+        "summary": {
+            "avg_prompt_tokens": total_prompt_tokens as f64 / runs as f64,
+            "avg_generated_tokens": total_generated_tokens as f64 / runs as f64,
+            "avg_prefill_ms": total_prefill.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_decode_ms": total_decode.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_total_ms": total_model.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_wall_ms": total_wall.as_secs_f64() * 1000.0 / runs as f64,
+            "aggregate_prefill_tok_s": total_prompt_tokens as f64 / total_prefill.as_secs_f64().max(0.001),
+            "aggregate_decode_tok_s": total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001),
+        }
+    });
+    let body = serde_json::to_string_pretty(&response)
+        .map_err(|err| format!("Failed to serialize benchmark JSON: {}", err))?;
+    println!("{}", body);
+    Ok(())
+}
+
+fn run_repl(
+    runner: &Runner,
+    options: &GenerationOptions,
+    chat_history_path: Option<&str>,
+) -> Result<(), String> {
     eprintln!("REPL mode. Commands: /exit, /quit, /clear, /help");
     let stdin = io::stdin();
     let mut history: Vec<ChatMessage> = Vec::new();
@@ -597,6 +828,7 @@ fn run_repl(runner: &Runner, options: &GenerationOptions) -> Result<(), String> 
         match result {
             Ok(result) => {
                 println!();
+                append_cli_history(chat_history_path, runner, "cli.repl", &history, &result)?;
                 history.push(ChatMessage::assistant(result.text));
                 eprintln!(
                     "stats: prompt={} generated={} total={:.2}s",
@@ -612,6 +844,71 @@ fn run_repl(runner: &Runner, options: &GenerationOptions) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn append_cli_history(
+    path: Option<&str>,
+    runner: &Runner,
+    source: &str,
+    messages: &[ChatMessage],
+    result: &rusty_llm::runtime::GenerationResult,
+) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut entries = match std::fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => {
+            serde_json::from_str::<Vec<serde_json::Value>>(&text)
+                .map_err(|err| format!("Failed to parse chat history {}: {}", path, err))?
+        }
+        Ok(_) => Vec::new(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(format!("Failed to read chat history {}: {}", path, err)),
+    };
+    entries.push(serde_json::json!({
+        "timestamp": unix_timestamp(),
+        "source": source,
+        "model": runner.model_name().unwrap_or(runner.architecture()),
+        "architecture": runner.architecture(),
+        "messages": messages.iter().map(chat_message_json).collect::<Vec<_>>(),
+        "response": result.text,
+        "usage": {
+            "prompt_tokens": result.stats.prompt_tokens,
+            "completion_tokens": result.stats.generated_tokens,
+            "total_tokens": result.stats.prompt_tokens + result.stats.generated_tokens,
+        },
+        "timings_ms": {
+            "prefill": result.stats.prefill_time.as_millis(),
+            "decode": result.stats.decode_time.as_millis(),
+            "total": result.stats.total_time.as_millis(),
+        }
+    }));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
+        }
+    }
+    let body = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("Failed to serialize chat history: {}", err))?;
+    std::fs::write(path, body)
+        .map_err(|err| format!("Failed to write chat history {}: {}", path, err))
+}
+
+fn chat_message_json(message: &ChatMessage) -> serde_json::Value {
+    let role = match message.role {
+        rusty_llm::runtime::ChatRole::System => "system",
+        rusty_llm::runtime::ChatRole::User => "user",
+        rusty_llm::runtime::ChatRole::Assistant => "assistant",
+    };
+    serde_json::json!({ "role": role, "content": message.content })
+}
+
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Check if stdin is a terminal (not piped)

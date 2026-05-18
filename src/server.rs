@@ -7,16 +7,17 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fs;
 #[cfg(feature = "tls")]
 use std::fs::File;
 #[cfg(feature = "tls")]
 use std::io::BufReader;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -30,6 +31,8 @@ pub struct ServeOptions {
     pub tls_key_path: Option<String>,
     pub max_concurrent_connections: usize,
     pub chat_ui: bool,
+    pub chat_history_path: Option<String>,
+    pub chat_history_lock: Arc<Mutex<()>>,
 }
 
 impl ServeOptions {
@@ -209,6 +212,48 @@ struct EmbeddingsRequest {
 enum EmbeddingsInput {
     Single(String),
     Batch(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct OllamaGenerateRequest {
+    model: Option<String>,
+    prompt: Option<String>,
+    system: Option<String>,
+    stream: Option<bool>,
+    options: Option<OllamaOptions>,
+    stop: Option<StopSpec>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatRequest {
+    model: Option<String>,
+    messages: Vec<OllamaMessage>,
+    stream: Option<bool>,
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Deserialize)]
+struct OllamaMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct OllamaOptions {
+    num_predict: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+    stop: Option<StopSpec>,
+}
+
+#[derive(Deserialize)]
+struct OllamaEmbeddingRequest {
+    model: Option<String>,
+    prompt: Option<String>,
+    input: Option<EmbeddingsInput>,
 }
 
 // ─── Response types ───────────────────────────────────────────────────────────
@@ -538,7 +583,13 @@ fn is_streaming_request(request: &HttpRequest) -> bool {
     if method != "POST" {
         return false;
     }
-    if path != "/v1/chat/completions" && path != "/v1/completions" {
+    if !matches!(
+        path,
+        "/v1/chat/completions"
+            | "/v1/completions"
+            | "/api/v0/chat/completions"
+            | "/api/v0/completions"
+    ) {
         return false;
     }
     // Quick JSON field scan — avoid full deserialisation just for the flag.
@@ -559,14 +610,15 @@ fn route_streaming_request<W: Write>(
     let created = unix_timestamp();
     let comp_id = format!(
         "{}rustyllm-{}",
-        if request.path == "/v1/chat/completions" {
+        if request.path == "/v1/chat/completions" || request.path == "/api/v0/chat/completions" {
             "chatcmpl-"
         } else {
             "cmpl-"
         },
         created
     );
-    let is_chat = request.path == "/v1/chat/completions";
+    let is_chat =
+        request.path == "/v1/chat/completions" || request.path == "/api/v0/chat/completions";
     let model_name = model_ids
         .first()
         .cloned()
@@ -675,6 +727,9 @@ fn route_streaming_request<W: Write>(
         let line = format!("data: {}\n\n", chunk);
         let _ = stream.write_all(line.as_bytes());
     });
+    if let Ok(result) = &result {
+        let _ = append_chat_history(options, "openai.stream", &model_name, &messages, result);
+    }
 
     // Send final chunk with finish_reason and [DONE].
     let finish_reason = if result.is_ok() { "stop" } else { "error" };
@@ -707,8 +762,12 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
 
     let model_ids = advertised_model_ids(runner);
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health") => (200, String::from("{\"status\":\"ok\"}")),
-        ("GET", "/v1/models") => {
+        ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") | ("GET", "/ready") => {
+            (200, String::from("{\"status\":\"ok\"}"))
+        }
+        ("GET", "/api/version") => (200, String::from("{\"version\":\"rusty-llm-0.3.0\"}")),
+        ("GET", "/api/tags") => route_ollama_tags(runner, &model_ids),
+        ("GET", "/v1/models") | ("GET", "/api/v0/models") => {
             let created = unix_timestamp();
             let response = OpenAiModelListResponse {
                 object: "list",
@@ -727,7 +786,17 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
         ("POST", path)
             if matches!(
                 path,
-                "/generate" | "/v1/completions" | "/v1/chat/completions" | "/v1/embeddings"
+                "/generate"
+                    | "/v1/completions"
+                    | "/v1/chat/completions"
+                    | "/v1/embeddings"
+                    | "/api/v0/completions"
+                    | "/api/v0/chat/completions"
+                    | "/api/v0/embeddings"
+                    | "/api/generate"
+                    | "/api/chat"
+                    | "/api/embeddings"
+                    | "/api/embed"
             ) =>
         {
             if !request
@@ -740,13 +809,22 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
             }
             match path {
                 "/generate" => route_generate(&request.body, runner, options),
-                "/v1/completions" => {
+                "/v1/completions" | "/api/v0/completions" => {
                     route_openai_completion(&request.body, runner, options, &model_ids)
                 }
-                "/v1/chat/completions" => {
+                "/v1/chat/completions" | "/api/v0/chat/completions" => {
                     route_openai_chat(&request.body, runner, options, &model_ids)
                 }
-                "/v1/embeddings" => route_embeddings(&request.body, runner, &model_ids),
+                "/v1/embeddings" | "/api/v0/embeddings" => {
+                    route_embeddings(&request.body, runner, &model_ids)
+                }
+                "/api/generate" => {
+                    route_ollama_generate(&request.body, runner, options, &model_ids)
+                }
+                "/api/chat" => route_ollama_chat(&request.body, runner, options, &model_ids),
+                "/api/embeddings" | "/api/embed" => {
+                    route_ollama_embeddings(&request.body, runner, &model_ids)
+                }
                 _ => (404, json_error("Not found")),
             }
         }
@@ -770,26 +848,41 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                 payload.stop.map(|s| s.into_vec()),
             );
 
+            let mut history_messages = Vec::new();
             let result = if let Some(messages) = payload.messages {
                 match parse_api_messages(messages) {
-                    Ok(messages) => runner.generate_chat(&messages, &generation),
+                    Ok(messages) => {
+                        history_messages = messages;
+                        runner.generate_chat(&history_messages, &generation)
+                    }
                     Err(err) => Err(err),
                 }
             } else if let Some(prompt) = payload.prompt {
+                history_messages = vec![ChatMessage::user(prompt.clone())];
                 runner.generate(&prompt, &generation)
             } else {
                 Err(String::from("Missing prompt or messages."))
             };
 
             match result {
-                Ok(result) => json_response(GenerateResponse {
-                    text: &result.text,
-                    prompt_tokens: result.stats.prompt_tokens,
-                    generated_tokens: result.stats.generated_tokens,
-                    prefill_ms: result.stats.prefill_time.as_millis(),
-                    decode_ms: result.stats.decode_time.as_millis(),
-                    total_ms: result.stats.total_time.as_millis(),
-                }),
+                Ok(result) => {
+                    let model = runner.model_name().unwrap_or(runner.architecture());
+                    let _ = append_chat_history(
+                        options,
+                        "rusty.generate",
+                        model,
+                        &history_messages,
+                        &result,
+                    );
+                    json_response(GenerateResponse {
+                        text: &result.text,
+                        prompt_tokens: result.stats.prompt_tokens,
+                        generated_tokens: result.stats.generated_tokens,
+                        prefill_ms: result.stats.prefill_time.as_millis(),
+                        decode_ms: result.stats.decode_time.as_millis(),
+                        total_ms: result.stats.total_time.as_millis(),
+                    })
+                }
                 Err(err) => (400, json_error(&err)),
             }
         }
@@ -829,6 +922,14 @@ fn route_openai_completion(
             );
             match runner.generate(&prompt, &generation) {
                 Ok(result) => {
+                    let messages = [ChatMessage::user(prompt)];
+                    let _ = append_chat_history(
+                        options,
+                        "openai.completion",
+                        &model,
+                        &messages,
+                        &result,
+                    );
                     let created = unix_timestamp();
                     let usage = OpenAiUsage {
                         prompt_tokens: result.stats.prompt_tokens,
@@ -882,6 +983,7 @@ fn route_openai_chat(
             );
             match runner.generate_chat(&messages, &generation) {
                 Ok(result) => {
+                    let _ = append_chat_history(options, "openai.chat", &model, &messages, &result);
                     let created = unix_timestamp();
                     let usage = OpenAiUsage {
                         prompt_tokens: result.stats.prompt_tokens,
@@ -955,6 +1057,275 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
         }
         Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
     }
+}
+
+fn route_ollama_tags(runner: &Runner, model_ids: &[String]) -> (u16, String) {
+    let modified_at = iso_timestamp();
+    let size = runner.gguf().tensors.len();
+    let models = model_ids
+        .iter()
+        .map(|id| {
+            serde_json::json!({
+                "name": id,
+                "model": id,
+                "modified_at": modified_at,
+                "size": size,
+                "digest": format!("rusty-llm-{}", runner.architecture()),
+                "details": {
+                    "format": "gguf",
+                    "family": runner.architecture(),
+                    "families": [runner.architecture()],
+                    "parameter_size": "unknown",
+                    "quantization_level": dominant_quantization(runner),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json_response(serde_json::json!({ "models": models }))
+}
+
+fn route_ollama_generate(
+    body: &[u8],
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
+    match serde_json::from_slice::<OllamaGenerateRequest>(body) {
+        Ok(payload) => {
+            let model = resolve_model(payload.model.as_deref(), model_ids);
+            let Some(prompt) = payload.prompt else {
+                return (400, json_error("Missing prompt."));
+            };
+            let mut generation = apply_ollama_options(&options.defaults, payload.options);
+            if let Some(system) = payload.system {
+                generation.system_prompt = system;
+            }
+            if let Some(stop) = payload.stop {
+                generation.stop_sequences = stop.into_vec();
+            }
+            if payload.stream.unwrap_or(false) {
+                eprintln!(
+                    "Warning: Ollama stream=true requested; returning a single final JSON response."
+                );
+            }
+            let started = Instant::now();
+            match runner.generate(&prompt, &generation) {
+                Ok(result) => {
+                    let messages = [ChatMessage::user(prompt)];
+                    let _ =
+                        append_chat_history(options, "ollama.generate", &model, &messages, &result);
+                    json_response(serde_json::json!({
+                        "model": model,
+                        "created_at": iso_timestamp(),
+                        "response": result.text,
+                        "done": true,
+                        "context": [],
+                        "total_duration": started.elapsed().as_nanos(),
+                        "load_duration": 0,
+                        "prompt_eval_count": result.stats.prompt_tokens,
+                        "prompt_eval_duration": result.stats.prefill_time.as_nanos(),
+                        "eval_count": result.stats.generated_tokens,
+                        "eval_duration": result.stats.decode_time.as_nanos(),
+                    }))
+                }
+                Err(err) => (400, json_error(&err)),
+            }
+        }
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn route_ollama_chat(
+    body: &[u8],
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
+    match serde_json::from_slice::<OllamaChatRequest>(body) {
+        Ok(payload) => {
+            let model = resolve_model(payload.model.as_deref(), model_ids);
+            let messages = match parse_ollama_messages(payload.messages) {
+                Ok(messages) => messages,
+                Err(err) => return (400, json_error(&err)),
+            };
+            let generation = apply_ollama_options(&options.defaults, payload.options);
+            if payload.stream.unwrap_or(false) {
+                eprintln!(
+                    "Warning: Ollama stream=true requested; returning a single final JSON response."
+                );
+            }
+            let started = Instant::now();
+            match runner.generate_chat(&messages, &generation) {
+                Ok(result) => {
+                    let _ = append_chat_history(options, "ollama.chat", &model, &messages, &result);
+                    json_response(serde_json::json!({
+                        "model": model,
+                        "created_at": iso_timestamp(),
+                        "message": {
+                            "role": "assistant",
+                            "content": result.text,
+                        },
+                        "done": true,
+                        "total_duration": started.elapsed().as_nanos(),
+                        "load_duration": 0,
+                        "prompt_eval_count": result.stats.prompt_tokens,
+                        "prompt_eval_duration": result.stats.prefill_time.as_nanos(),
+                        "eval_count": result.stats.generated_tokens,
+                        "eval_duration": result.stats.decode_time.as_nanos(),
+                    }))
+                }
+                Err(err) => (400, json_error(&err)),
+            }
+        }
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16, String) {
+    match serde_json::from_slice::<OllamaEmbeddingRequest>(body) {
+        Ok(payload) => {
+            let model = resolve_model(payload.model.as_deref(), model_ids);
+            let inputs = if let Some(input) = payload.input {
+                match input {
+                    EmbeddingsInput::Single(text) => vec![text],
+                    EmbeddingsInput::Batch(texts) => texts,
+                }
+            } else if let Some(prompt) = payload.prompt {
+                vec![prompt]
+            } else {
+                return (400, json_error("Missing prompt or input."));
+            };
+            if inputs.is_empty() {
+                return (400, json_error("input must not be empty."));
+            }
+            let mut embeddings = Vec::with_capacity(inputs.len());
+            for input in &inputs {
+                match runner.embed(input) {
+                    Ok(result) => embeddings.push(result.embedding),
+                    Err(err) => return (400, json_error(&err)),
+                }
+            }
+            if embeddings.len() == 1 {
+                json_response(serde_json::json!({
+                    "model": model,
+                    "embedding": embeddings.remove(0),
+                }))
+            } else {
+                json_response(serde_json::json!({
+                    "model": model,
+                    "embeddings": embeddings,
+                }))
+            }
+        }
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn apply_ollama_options(
+    defaults: &GenerationOptions,
+    options: Option<OllamaOptions>,
+) -> GenerationOptions {
+    let Some(options) = options else {
+        return defaults.clone();
+    };
+    apply_generation_overrides(
+        defaults,
+        options.num_predict,
+        options.temperature,
+        options.top_p,
+        options.top_k,
+        options.repeat_penalty,
+        options.seed,
+        None,
+        options.stop.map(|s| s.into_vec()),
+    )
+}
+
+fn parse_ollama_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage>, String> {
+    messages
+        .into_iter()
+        .map(|message| match message.role.as_str() {
+            "system" => Ok(ChatMessage {
+                role: ChatRole::System,
+                content: message.content,
+            }),
+            "user" => Ok(ChatMessage::user(message.content)),
+            "assistant" => Ok(ChatMessage::assistant(message.content)),
+            other => Err(format!("Unsupported role: {}", other)),
+        })
+        .collect()
+}
+
+fn dominant_quantization(runner: &Runner) -> String {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for tensor in &runner.gguf().tensors {
+        *counts.entry(format!("{:?}", tensor.dtype)).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(dtype, _)| dtype)
+        .unwrap_or_else(|| String::from("unknown"))
+}
+
+fn append_chat_history(
+    options: &ServeOptions,
+    source: &str,
+    model: &str,
+    messages: &[ChatMessage],
+    result: &crate::runtime::GenerationResult,
+) -> Result<(), String> {
+    let Some(path) = options.chat_history_path.as_deref() else {
+        return Ok(());
+    };
+    let _guard = options
+        .chat_history_lock
+        .lock()
+        .map_err(|_| String::from("chat history lock poisoned"))?;
+    let mut entries = match fs::read_to_string(path) {
+        Ok(text) if !text.trim().is_empty() => {
+            serde_json::from_str::<Vec<serde_json::Value>>(&text)
+                .map_err(|err| format!("Failed to parse chat history {}: {}", path, err))?
+        }
+        Ok(_) => Vec::new(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(format!("Failed to read chat history {}: {}", path, err)),
+    };
+    entries.push(serde_json::json!({
+        "timestamp": unix_timestamp(),
+        "source": source,
+        "model": model,
+        "messages": messages.iter().map(history_message_json).collect::<Vec<_>>(),
+        "response": result.text,
+        "usage": {
+            "prompt_tokens": result.stats.prompt_tokens,
+            "completion_tokens": result.stats.generated_tokens,
+            "total_tokens": result.stats.prompt_tokens + result.stats.generated_tokens,
+        },
+        "timings_ms": {
+            "prefill": result.stats.prefill_time.as_millis(),
+            "decode": result.stats.decode_time.as_millis(),
+            "total": result.stats.total_time.as_millis(),
+        }
+    }));
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create {}: {}", parent.display(), err))?;
+        }
+    }
+    let body = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("Failed to serialize chat history: {}", err))?;
+    fs::write(path, body).map_err(|err| format!("Failed to write chat history {}: {}", path, err))
+}
+
+fn history_message_json(message: &ChatMessage) -> serde_json::Value {
+    let role = match message.role {
+        ChatRole::System => "system",
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+    };
+    serde_json::json!({ "role": role, "content": message.content })
 }
 
 fn json_response<T: Serialize>(response: T) -> (u16, String) {
@@ -1108,6 +1479,10 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn iso_timestamp() -> String {
+    format!("{}Z", unix_timestamp())
 }
 
 fn json_error(message: &str) -> String {
