@@ -42,7 +42,7 @@ help:
 	@printf '%s\n' "  WASM_OUT=$(WASM_OUT)"
 	@printf '%s\n' ""
 	@printf '%s\n' "USEFUL ENV FLAGS"
-	@printf '%s\n' "  RUSTY_LLM_METAL=0          Force CPU path on macOS"
+	@printf '%s\n' "  RUSTY_LLM_METAL=1          Enable experimental macOS Metal Q4_K path"
 	@printf '%s\n' "  RUSTY_LLM_FAST_ATTN=1      Enable fast attention path when available"
 	@printf '%s\n' "  RUSTY_LLM_MODEL_DIR=...    Default directory for model discovery"
 	@printf '%s\n' ""

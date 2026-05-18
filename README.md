@@ -1,28 +1,73 @@
 # RustyLLM
 
-[![CI](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml) 
-[![License](https://img.shields.io/github/license/SimonWaldherr/RustyLLM)](LICENSE) 
-[![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases) 
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)  
+[![CI](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/SimonWaldherr/RustyLLM)](LICENSE)
+[![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-RustyLLM is a small Rust inference runner for GGUF language models. It focuses on local execution with memory-mapped weights, quantized matvec kernels, and a minimal CLI/HTTP surface.
+RustyLLM is a compact Rust inference runner for local GGUF language models. It
+loads model weights directly from disk, keeps quantized tensors in memory-mapped
+storage on native targets, and exposes the same runner through a CLI, a small
+HTTP server, OpenAI-compatible endpoints, LM Studio-compatible aliases, and a
+library API.
 
-## Features
+The project is intentionally dependency-light. It is useful for experimenting
+with GGUF parsing, tokenizer handling, CPU/SIMD kernels, embeddings, minimal
+OpenAI-compatible serving, and local model tooling without pulling in a larger
+runtime.
 
-- Loads GGUF models directly from disk with zero-copy memory mapping on native targets.
-- Supports GGUF architectures including `llama`/`llama2`/`llama3`, `mistral`/`mixtral`/`ministral`, `qwen2`/`qwen3`, `gpt-oss`, `gemma`/`gemma2`/`gemma4`, `deepseek` variants, `nemotron`, `hermes`, `phi`/`phi2`/`phi3`/`phi4`, `falcon`/`falcon3`, `stablelm`, `starcoder2`, `command-r`/`cohere`, `internlm2`, `olmo`/`olmo2`, `exaone`, `solar`, `yi`, `arctic`, and `nomic` embeddings.
-- Handles SentencePiece and GPT-2 style tokenizers from GGUF metadata.
-- Runs quantized inference paths for `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K`, and `MXFP4` tensors.
-- Uses native SIMD backends on Apple Silicon and AVX2/FMA-capable x86_64 systems, with scalar fallback elsewhere.
-- Exposes three entry points: one-shot generation, interactive REPL, and a small HTTP(S) API.
-- **Text embedding** (`Runner::embed`) for RAG retrieval: mean-pools the last transformer layer, L2-normalises, and returns a dense vector.
-- **Multimodal message format** (OpenAI vision API): accepts `content` arrays with `text` and `image_url` parts; image references are described as `[image: ...]` placeholders.
-- **Stop sequences**: generation halts as soon as any configured stop string appears in the output.
-- **Streaming SSE**: `/v1/chat/completions` and `/v1/completions` honour `"stream": true` and emit Server-Sent Events.
-- **`/v1/embeddings`** endpoint (OpenAI-compatible) for RAG pipelines.
-- `max_completion_tokens` alias for `max_tokens` (OpenAI spec ≥ 2024-10).
-- Lenient model-ID resolution: unknown model names are silently mapped to the loaded model, so RAG pipelines can send any model name.
-- Builds as both a library and a CLI binary.
+## Highlights
+
+- Native GGUF loading with zero-copy memory mapping on macOS and Linux.
+- GGUF metadata inspection, model discovery, model selection, and tensor listing.
+- Tokenizer support for SentencePiece-style and GPT-2-style metadata.
+- Quantized inference paths for `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K`, and `MXFP4`
+  tensors.
+- SIMD kernels for Apple Silicon NEON and x86_64 AVX2/FMA, with scalar fallback.
+- Optional experimental Metal acceleration for Q4_K matrix-vector work on macOS
+  when the Objective-C shim builds and `RUSTY_LLM_METAL` is set.
+- One-shot generation, interactive REPL mode, benchmark mode, JSON benchmark
+  output, and append-only chat history logging.
+- OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`, and
+  `/v1/embeddings` routes.
+- LM Studio-style `/api/v0/*` aliases and Ollama-style `/api/*` compatibility
+  routes.
+- Server-Sent Events streaming for OpenAI-compatible completions and chat
+  completions.
+- Text embeddings via `Runner::embed`, mean-pooled over the last transformer
+  layer and L2-normalized for cosine similarity.
+- Minimal browser chat UI served from `/chat` and an expert UI from
+  `/chat?expert`.
+- Library API for embedding RustyLLM in other Rust applications.
+- `wasm32-unknown-unknown` check support for the no-default-features WASM build.
+
+## Supported Model Families
+
+RustyLLM accepts GGUF files whose `general.architecture` metadata matches one of
+the supported architecture identifiers:
+
+`llama`, `llama2`, `llama3`, `mistral`, `mistral3`, `mixtral`, `ministral`,
+`qwen2`, `qwen3`, `gpt-oss`, `gemma`, `gemma2`, `gemma4`, `granite`,
+`granite3`, `granite4`, `deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`,
+`hermes`, `phi`, `phi2`, `phi3`, `phi4`, `falcon`, `falcon3`, `stablelm`,
+`starcoder2`, `command-r`, `cohere`, `internlm2`, `olmo`, `olmo2`, `exaone`,
+`solar`, `yi`, `arctic`, `nomic-bert`, `nomic-embed`, and
+`text-embedding-nomic-embed-text`.
+
+Support still depends on the tensors present in a specific GGUF file. Use
+`--inspect` before loading an unfamiliar model to verify architecture, tensor
+types, tokenizer metadata, and API compatibility.
+
+## Requirements
+
+- Rust 1.85 or newer. The repository pins `1.85.0` in
+  [rust-toolchain.toml](rust-toolchain.toml).
+- A GGUF model file. The runner does not download models.
+- macOS or Linux for native memory-mapped execution.
+- Optional for WebAssembly experiments: `wasm-pack` and the
+  `wasm32-unknown-unknown` target.
+- Optional for macOS Metal experiments: Xcode command line tools with `xcrun`,
+  `clang`, and `ar`.
 
 ## Build
 
@@ -30,107 +75,190 @@ RustyLLM is a small Rust inference runner for GGUF language models. It focuses o
 cargo build --release
 ```
 
-The binary will be available at `target/release/rusty-llm`.
+The release binary is written to:
 
-For local performance testing on Apple Silicon, prefer the release binary and
-explicit thread counts:
-
-```bash
-cargo build --release
-./target/release/rusty-llm --model phi-4 --bench --bench-runs 3 --max-tokens 64 --threads 12
+```text
+target/release/rusty-llm
 ```
 
-Ollama and LM Studio are usually faster on macOS because they run llama.cpp with
-Metal GPU acceleration and heavily tuned kernels. RustyLLM currently runs CPU
-inference only, so the benchmark numbers are most useful for tracking RustyLLM
-changes against itself.
-
-## CLI Usage
+For local performance work, build for the native CPU:
 
 ```bash
-cargo run --release --bin rusty-llm -- /path/to/model.gguf --prompt "Write a short poem"
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-General form:
+The Makefile wraps the common commands:
+
+```bash
+make help
+make release
+make run MODEL=/path/to/model.gguf PROMPT="Explain GGUF in one paragraph"
+make repl MODEL=/path/to/model.gguf
+make serve MODEL=/path/to/model.gguf ADDR=127.0.0.1:8080 CHAT=1
+make bench MODEL=/path/to/model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
+```
+
+## Quick Start
+
+Run one prompt:
+
+```bash
+./target/release/rusty-llm ./models/model.gguf \
+  --prompt "Explain rotary embeddings in two sentences." \
+  --max-tokens 128
+```
+
+Start a chat REPL:
+
+```bash
+./target/release/rusty-llm ./models/model.gguf --repl
+```
+
+Start the HTTP API:
+
+```bash
+./target/release/rusty-llm ./models/model.gguf --serve 127.0.0.1:8080
+```
+
+Start the HTTP API with the built-in chat UI:
+
+```bash
+./target/release/rusty-llm ./models/model.gguf --serve 127.0.0.1:8080 --chat
+```
+
+Then open:
+
+- `http://127.0.0.1:8080/chat`
+- `http://127.0.0.1:8080/chat?expert`
+
+## Model Discovery
+
+The general CLI form is:
 
 ```bash
 rusty-llm [model.gguf|model-name|model-dir] [options]
 ```
 
-Options:
-
-- `--model <name>`: select a GGUF from `--model-dir` by repository, file name, or GGUF metadata name.
-- `--model-dir <path>`: directory to recursively scan for GGUF files. Defaults to `$RUSTY_LLM_MODEL_DIR` or the LM Studio community cache under `~/.cache/lm-studio/models/lmstudio-community`.
-- `--list-models`: list GGUF files in `--model-dir` and exit.
-- `--prompt <text>`: generate from a single prompt.
-- `--repl`: start an interactive chat session.
-- `--serve <addr>`: start the HTTP(S) server, for example `127.0.0.1:8080`.
-- `--tls-cert <path>`: PEM certificate for HTTPS.
-- `--tls-key <path>`: PEM private key for HTTPS.
-- `--max-connections <N>`: max concurrent server connections (default: `max(16, threads*8)`).
-- `--max-tokens <N>`: maximum generated tokens.
-- `--temp <F>`: temperature, where `0` switches to greedy decoding.
-- `--top-p <F>`: nucleus sampling threshold.
-- `--top-k <N>`: top-k filtering limit.
-- `--repeat-penalty <F>`: repetition penalty applied to recent tokens.
-- `--seed <N>`: deterministic RNG seed.
-- `--threads <N>`: override worker thread count for SIMD kernels.
-- `--system-prompt <text>`: override the default chat system prompt.
-- `--stop <text>`: stop generation when this string appears in the output (can be repeated).
-- `--embed`: run the prompt through the model and print the L2-normalised embedding vector instead of generating text.
-- `--bench`: run a non-streaming generation benchmark and print per-run throughput.
-- `--bench-runs <N>`: number of benchmark runs (default: `3`).
-- `--list-tensors`: print the GGUF tensor inventory and exit.
-
-Examples:
+You can pass an exact `.gguf` file:
 
 ```bash
-# One-shot generation
-rusty-llm ./models/model.gguf --prompt "Explain rotary embeddings" --max-tokens 128
+rusty-llm ./models/model.gguf --prompt "Hello"
+```
 
-# List models downloaded by LM Studio
+You can also select a model from a directory:
+
+```bash
+rusty-llm --model-dir ./models --list-models
+rusty-llm --model-dir ./models --model phi-4 --prompt "Write a Rust enum example"
+```
+
+If no model directory is provided, RustyLLM uses:
+
+1. `RUSTY_LLM_MODEL_DIR`, when set and non-empty.
+2. `$HOME/.cache/lm-studio/models/lmstudio-community`.
+3. `.cache/lm-studio/models/lmstudio-community` as a final fallback.
+
+Model selection is intentionally lenient: `--model` can match repository names,
+file names, relative IDs, or GGUF metadata names. If a selector matches multiple
+models, RustyLLM prints the matching choices and asks for a more specific value.
+
+Projector files such as `mmproj-*.gguf` are ignored for text model selection.
+
+## CLI Reference
+
+```text
+rusty-llm [model.gguf|model-name|model-dir] [options]
+```
+
+Model and inspection options:
+
+- `--model <name>` selects a GGUF from `--model-dir`.
+- `--model-dir <path>` recursively scans a directory for `.gguf` files.
+- `--list-models` lists discovered models and exits.
+- `--inspect` prints a JSON compatibility report without loading weights.
+- `--list-tensors` loads the model and prints tensor names, dtypes, and shapes.
+
+Execution modes:
+
+- `--prompt <text>` or `-p <text>` runs one-shot generation.
+- `--repl` starts an interactive chat session.
+- `--serve <addr>` starts the HTTP(S) server, for example `127.0.0.1:8080`.
+- `--chat` enables the built-in web UI at `/chat` and `/chat?expert`.
+- `--embed` embeds `--prompt` and prints the embedding vector.
+- `--bench` runs a non-streaming generation benchmark.
+- `--bench-json` runs benchmark mode and emits a machine-readable JSON report.
+
+Generation options:
+
+- `--max-tokens <N>` or `-n <N>` sets the maximum number of generated tokens.
+- `--temp <F>` or `-t <F>` sets temperature; `0` uses greedy decoding.
+- `--top-p <F>` sets nucleus sampling in the range `(0, 1]`.
+- `--top-k <N>` sets top-k filtering.
+- `--repeat-penalty <F>` applies a repetition penalty to recent tokens.
+- `--seed <N>` sets the RNG seed. `0` uses the default time-based behavior.
+- `--system-prompt <text>` overrides the default chat system prompt.
+- `--stop <text>` stops generation when the text appears. The flag can be
+  repeated.
+- `--threads <N>` overrides the SIMD worker thread count.
+
+Server options:
+
+- `--tls-cert <path>` enables HTTPS with a PEM certificate.
+- `--tls-key <path>` enables HTTPS with a PEM private key.
+- `--max-connections <N>` caps concurrent server connections. The default is
+  `max(16, available_threads * 8)`.
+- `--chat-history <path>` or `--chat-log <path>` appends CLI and server turns to
+  a JSON file.
+
+## CLI Examples
+
+One-shot generation:
+
+```bash
+rusty-llm ./models/model.gguf \
+  --prompt "Name three practical uses for local embeddings." \
+  --max-tokens 96 \
+  --temp 0.7 \
+  --top-p 0.9
+```
+
+Read a prompt from stdin:
+
+```bash
+printf "Summarize grouped-query attention." | rusty-llm ./models/model.gguf
+```
+
+Stop at a custom delimiter:
+
+```bash
+rusty-llm ./models/model.gguf \
+  --prompt "Name three fruits:" \
+  --stop "\n" \
+  --max-tokens 32
+```
+
+Use the LM Studio community cache:
+
+```bash
 rusty-llm --list-models
-
-# Select by repository or file substring from the LM Studio cache
-rusty-llm --model phi-4 --prompt "Write a Rust enum example"
-
-# Stop generation at a custom delimiter
-rusty-llm ./models/model.gguf --prompt "Name three fruits:" --stop "\n" --max-tokens 32
-
-# Embed text for RAG retrieval
-rusty-llm ./models/embed.gguf --embed --prompt "The quick brown fox"
-
-# Benchmark decode throughput
-rusty-llm --model phi-4 --bench --bench-runs 5 --max-tokens 64 --threads 8
-
-# Local LM Studio Ministral smoke test
-./target/release/rusty-llm "$HOME/.cache/lm-studio/models/lmstudio-community/Ministral-3-14B-Reasoning-2512-GGUF/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf" \
-  --prompt "Wer war Albert Einstein?"
-
-# Same benchmark through the Makefile release build
-make bench MODEL=/path/to/model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
-
-# Interactive mode
-rusty-llm ./models/model.gguf --repl
-
-# Inspect tensor names and dtypes
-rusty-llm ./models/model.gguf --list-tensors
+rusty-llm --model phi-4 --prompt "Write a concise Rust trait example"
 ```
 
-Embedding demo (cosine similarity check with three texts):
+Run a local HTTPS server:
 
 ```bash
-cargo run --release --bin embedding_demo -- \
-  "$HOME/.cache/lm-studio/models/lmstudio-community/Ministral-3-14B-Reasoning-2512-GGUF/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf" \
-  "Albert Einstein was a physicist." \
-  "Einstein developed the theory of relativity." \
-  "A banana is a tropical fruit."
+rusty-llm ./models/model.gguf \
+  --serve 127.0.0.1:8443 \
+  --tls-cert cert.pem \
+  --tls-key key.pem
 ```
 
-Embedding-focused tests:
+Write chat history:
 
 ```bash
-cargo test runtime::tests
+rusty-llm ./models/model.gguf \
+  --repl \
+  --chat-history ./runs/chat-history.json
 ```
 
 ## HTTP API
@@ -141,16 +269,35 @@ Start the server:
 rusty-llm ./models/model.gguf --serve 127.0.0.1:8080
 ```
 
-Available routes:
+Health and metadata routes:
 
-- `GET /health`
+- `GET /`, `GET /health`, `GET /healthz`, `GET /ready`
+- `GET /api/version`
+- `GET /v1/models`
+- `GET /api/v0/models`
+- `GET /api/tags`
+
+Generation and embedding routes:
+
 - `POST /generate`
-- `GET /v1/models` (OpenAI-compatible)
-- `POST /v1/completions` (OpenAI-compatible, streaming supported)
-- `POST /v1/chat/completions` (OpenAI-compatible, streaming and multimodal content supported)
-- `POST /v1/embeddings` (OpenAI-compatible, for RAG)
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+- `POST /v1/embeddings`
+- `POST /api/v0/completions`
+- `POST /api/v0/chat/completions`
+- `POST /api/v0/embeddings`
+- `POST /api/generate`
+- `POST /api/chat`
+- `POST /api/embeddings`
+- `POST /api/embed`
 
-### Prompt generation
+All `POST` routes require `Content-Type: application/json`. Requests are bounded
+by header and body limits and a per-connection I/O timeout. CORS headers are
+included on responses.
+
+### Native `/generate`
+
+Prompt input:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/generate \
@@ -166,7 +313,7 @@ curl -X POST http://127.0.0.1:8080/generate \
   }'
 ```
 
-### Chat generation
+Chat input:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/generate \
@@ -180,7 +327,7 @@ curl -X POST http://127.0.0.1:8080/generate \
   }'
 ```
 
-Response shape:
+Response:
 
 ```json
 {
@@ -193,7 +340,9 @@ Response shape:
 }
 ```
 
-### OpenAI-compatible chat (non-streaming)
+### OpenAI-Compatible Chat
+
+Non-streaming:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
@@ -210,28 +359,52 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-### OpenAI-compatible chat (streaming SSE)
+Streaming SSE:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+curl -N -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "llama3",
     "messages": [{"role": "user", "content": "Tell me a joke."}],
-    "max_tokens": 128,
+    "max_completion_tokens": 128,
     "stream": true
   }'
 ```
 
-Each SSE chunk has the form:
+Each chunk is emitted as:
 
-```
+```text
 data: {"id":"chatcmpl-...","object":"chat.completion.chunk","created":...,"model":"llama3","choices":[{"index":0,"delta":{"content":"..."},"finish_reason":null}]}
 ```
 
-The final event is `data: [DONE]`.
+The final event is:
 
-### Multimodal messages
+```text
+data: [DONE]
+```
+
+`max_completion_tokens` is accepted as an alias for `max_tokens`.
+
+### OpenAI-Compatible Completions
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
+    "prompt": "Complete this sentence: Rust is",
+    "max_tokens": 48,
+    "temperature": 0.5
+  }'
+```
+
+Streaming is also supported on `/v1/completions` and `/api/v0/completions` with
+`"stream": true`.
+
+### Multimodal Message Format
+
+RustyLLM accepts OpenAI-style multimodal `content` arrays on chat routes:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
@@ -251,11 +424,13 @@ curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-Image URL references are described as `[image: <url>]` in the prompt.  A full
-vision encoder pipeline can extend this by processing the image bytes before
-sending the request.
+Image references are converted into text placeholders such as
+`[image: https://example.com/photo.jpg]` or `[image: base64 data]`. RustyLLM does
+not currently run a vision encoder.
 
-### Embeddings (RAG)
+### Embeddings
+
+OpenAI-compatible single input:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/embeddings \
@@ -266,7 +441,7 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
   }'
 ```
 
-Batch embedding:
+OpenAI-compatible batch input:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/v1/embeddings \
@@ -277,17 +452,137 @@ curl -X POST http://127.0.0.1:8080/v1/embeddings \
   }'
 ```
 
-Response shape (OpenAI-compatible):
+Response shape:
 
 ```json
 {
   "object": "list",
   "data": [
-    {"object": "embedding", "embedding": [0.012, -0.034, ...], "index": 0}
+    {"object": "embedding", "embedding": [0.012, -0.034], "index": 0}
   ],
   "model": "nomic-embed",
   "usage": {"prompt_tokens": 9, "total_tokens": 9}
 }
+```
+
+Ollama-style embeddings:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/embeddings \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "nomic-embed", "prompt": "The quick brown fox"}'
+```
+
+### Ollama-Compatible Routes
+
+List tags:
+
+```bash
+curl http://127.0.0.1:8080/api/tags
+```
+
+Generate:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local",
+    "prompt": "Why are GGUF models convenient?",
+    "options": {
+      "num_predict": 80,
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 40,
+      "repeat_penalty": 1.1
+    }
+  }'
+```
+
+Chat:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local",
+    "messages": [{"role": "user", "content": "What is memory mapping?"}]
+  }'
+```
+
+Ollama `stream: true` requests are accepted, but RustyLLM currently returns a
+single final JSON response for Ollama-style routes.
+
+## Benchmarking
+
+Run a text benchmark:
+
+```bash
+rusty-llm ./models/model.gguf \
+  --bench \
+  --bench-runs 5 \
+  --max-tokens 64 \
+  --threads 8 \
+  --prompt "Explain local LLM inference performance in one concise paragraph."
+```
+
+Emit JSON for scripts or CI artifacts:
+
+```bash
+rusty-llm ./models/model.gguf \
+  --bench-json \
+  --bench-runs 5 \
+  --max-tokens 64 \
+  --prompt "Explain SIMD briefly" > benchmark.json
+```
+
+Benchmark output includes prompt tokens, generated tokens, prefill time, decode
+time, wall time, and aggregate throughput. Use the same model, prompt,
+temperature, seed, thread count, and build flags when comparing changes.
+
+Ollama and LM Studio are often faster on macOS because they use heavily tuned
+llama.cpp kernels and GPU paths. RustyLLM benchmark numbers are most useful for
+tracking RustyLLM changes against itself.
+
+## Inspection and Utilities
+
+Inspect compatibility without loading model weights:
+
+```bash
+rusty-llm ./models/model.gguf --inspect
+```
+
+List tensors through the main binary:
+
+```bash
+rusty-llm ./models/model.gguf --list-tensors
+```
+
+Run utility binaries:
+
+```bash
+cargo run --release --bin list_tensors -- ./models/model.gguf
+cargo run --release --bin analyze_gguf -- ./models/model.gguf
+```
+
+`analyze_gguf` is currently focused on Gemma-style layer structure analysis.
+
+## Embedding Demo
+
+The embedding demo computes embedding vectors and compares cosine similarity:
+
+```bash
+cargo run --release --bin embedding_demo -- \
+  ./models/embed.gguf \
+  "Albert Einstein was a physicist." \
+  "Einstein developed the theory of relativity." \
+  "A banana is a tropical fruit."
+```
+
+You can also call the CLI embedding mode directly:
+
+```bash
+rusty-llm ./models/embed.gguf --embed --prompt "The quick brown fox"
 ```
 
 ## Library Usage
@@ -298,11 +593,9 @@ use rusty_llm::runtime::{GenerationOptions, Runner};
 fn main() -> Result<(), String> {
     let (runner, _) = Runner::from_path("./models/model.gguf")?;
 
-    // Text generation
     let result = runner.generate("Hello", &GenerationOptions::default())?;
     println!("{}", result.text);
 
-    // Embedding (for RAG)
     let emb = runner.embed("The quick brown fox")?;
     println!("dim={} tokens={}", emb.embedding.len(), emb.token_count);
 
@@ -310,12 +603,105 @@ fn main() -> Result<(), String> {
 }
 ```
 
-## Notes
+Chat generation:
 
-- Native builds use memory mapping; WASM builds load from in-memory GGUF bytes.
-- The HTTP parser expects HTTP/1.1 with `Content-Length` and `application/json` on `POST /generate`.
-- Server requests are bounded (header/body size limits, per-connection timeouts, and concurrency cap).
-- Some GGUF chat templates are mapped into internal prompt renderers; unsupported templates fall back to a plain `System/User/Assistant` transcript.
-- SSE streaming does not include `Content-Length`; the stream ends when the socket closes.
-- Embeddings are mean-pooled across all input token positions and L2-normalised, making them suitable for cosine similarity comparisons.
-- Unknown model IDs sent to the API are silently accepted and mapped to the loaded model, so existing RAG pipelines don't need to know the exact model name.
+```rust
+use rusty_llm::runtime::{ChatMessage, GenerationOptions, Runner};
+
+fn main() -> Result<(), String> {
+    let (runner, _) = Runner::from_path("./models/model.gguf")?;
+    let messages = vec![
+        ChatMessage::user("Explain GGUF in one sentence."),
+    ];
+    let result = runner.generate_chat(&messages, &GenerationOptions::default())?;
+    println!("{}", result.text);
+    Ok(())
+}
+```
+
+Cosine similarity:
+
+```rust
+use rusty_llm::runtime::{cosine_similarity, Runner};
+
+fn main() -> Result<(), String> {
+    let (runner, _) = Runner::from_path("./models/embed.gguf")?;
+    let a = runner.embed("Einstein developed relativity.")?;
+    let b = runner.embed("Relativity was developed by Einstein.")?;
+    println!("{:.4}", cosine_similarity(&a.embedding, &b.embedding)?);
+    Ok(())
+}
+```
+
+## Features and Build Profiles
+
+Default Cargo features:
+
+- `cli`: builds the CLI binaries and enables JSON helpers for command-line
+  tools.
+- `server`: enables the HTTP server.
+- `tls`: enables HTTPS serving through `rustls`.
+
+Optional feature:
+
+- `wasm`: enables the wasm-bindgen interface and is intended for
+  `wasm32-unknown-unknown` builds without default native features.
+
+Examples:
+
+```bash
+cargo build --release --all-features
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+make wasm
+```
+
+The release profile uses `opt-level = 3`, fat LTO, one codegen unit, stripping,
+and `panic = "abort"`.
+
+## Environment Variables
+
+- `RUSTY_LLM_MODEL_DIR`: default directory used by model discovery.
+- `RUSTY_LLM_FAST_ATTN`: enables the approximate fast attention path when set.
+- `RUSTY_LLM_METAL`: enables the experimental macOS Metal Q4_K path when set
+  and when the backend was compiled successfully.
+
+Leave `RUSTY_LLM_METAL` unset to use the CPU path.
+
+## Development
+
+Useful checks:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+```
+
+The CI workflow runs these checks on Ubuntu and macOS.
+
+Focused embedding tests:
+
+```bash
+cargo test runtime::tests
+```
+
+## Notes and Limitations
+
+- Native builds use memory mapping; WASM builds load GGUF bytes from memory.
+- Generation calls are serialized inside a `Runner` to protect shared inference
+  state.
+- The HTTP parser is intentionally small and expects HTTP/1.1 requests with
+  `Content-Length` for JSON `POST` bodies.
+- Server requests have bounded header and body sizes, per-connection timeouts,
+  and a configurable concurrency cap.
+- Some GGUF chat templates are mapped into internal prompt renderers;
+  unsupported templates fall back to a plain `System/User/Assistant` transcript.
+- SSE responses do not include `Content-Length`; the stream ends with
+  `data: [DONE]` and the socket closes.
+- Embeddings are mean-pooled over input token positions and L2-normalized.
+- Unknown model IDs sent to the API are accepted and mapped to the loaded model,
+  which helps existing OpenAI, LM Studio, and RAG clients work without knowing
+  the exact local model name.
+- Multimodal request bodies are accepted for API compatibility, but images are
+  represented as text placeholders rather than processed by a vision encoder.
