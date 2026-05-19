@@ -301,7 +301,7 @@ fn try_q4k_matvec3_into(
                 cols: v_cols,
             },
         ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
-            crate::metal::q4k_matvec3_into(
+            crate::simd::matvec_q4_k3_into(
                 (q_data.as_slice(), *q_rows, *q_cols),
                 (k_data.as_slice(), *k_rows, *k_cols),
                 (v_data.as_slice(), *v_rows, *v_cols),

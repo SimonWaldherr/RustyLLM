@@ -228,8 +228,134 @@ impl MatvecJob {
 }
 
 #[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct Q4KMatvec3Job {
+    a_data: *const u8,
+    b_data: *const u8,
+    c_data: *const u8,
+    x: *const f32,
+    out_a: *mut f32,
+    out_b: *mut f32,
+    out_c: *mut f32,
+    rows_a: usize,
+    rows_b: usize,
+    rows_c: usize,
+    cols: usize,
+    row_span: usize,
+    workers: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Send for Q4KMatvec3Job {}
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Sync for Q4KMatvec3Job {}
+
+#[cfg(not(target_family = "wasm"))]
+impl Q4KMatvec3Job {
+    #[inline]
+    fn work_items(self) -> usize {
+        self.rows_a + self.rows_b + self.rows_c
+    }
+
+    unsafe fn run_worker(self, worker_idx: usize) {
+        let total = self.work_items();
+        let start = total * worker_idx / self.workers;
+        let end = total * (worker_idx + 1) / self.workers;
+
+        let (a_start, a_end) = clipped_range(start, end, 0, self.rows_a);
+        q4k_matvec3_rows(
+            self.a_data,
+            self.x,
+            self.out_a,
+            self.cols,
+            self.row_span,
+            a_start,
+            a_end,
+        );
+
+        let b_offset = self.rows_a;
+        let (b_start, b_end) = clipped_range(start, end, b_offset, self.rows_b);
+        q4k_matvec3_rows(
+            self.b_data,
+            self.x,
+            self.out_b,
+            self.cols,
+            self.row_span,
+            b_start,
+            b_end,
+        );
+
+        let c_offset = self.rows_a + self.rows_b;
+        let (c_start, c_end) = clipped_range(start, end, c_offset, self.rows_c);
+        q4k_matvec3_rows(
+            self.c_data,
+            self.x,
+            self.out_c,
+            self.cols,
+            self.row_span,
+            c_start,
+            c_end,
+        );
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn clipped_range(start: usize, end: usize, offset: usize, len: usize) -> (usize, usize) {
+    let local_start = start.saturating_sub(offset).min(len);
+    let local_end = end.saturating_sub(offset).min(len);
+    if local_end > local_start {
+        (local_start, local_end)
+    } else {
+        (0, 0)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+unsafe fn q4k_matvec3_rows(
+    data: *const u8,
+    x: *const f32,
+    out: *mut f32,
+    cols: usize,
+    row_span: usize,
+    start: usize,
+    end: usize,
+) {
+    for row in start..end {
+        *out.add(row) = dot_row(MatvecKind::Q4K, data, x, row, cols, row_span);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+enum WorkerJob {
+    Matvec(MatvecJob),
+    Q4KMatvec3(Q4KMatvec3Job),
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl WorkerJob {
+    #[inline]
+    fn workers(self) -> usize {
+        match self {
+            WorkerJob::Matvec(job) => job.workers,
+            WorkerJob::Q4KMatvec3(job) => job.workers,
+        }
+    }
+
+    #[inline]
+    unsafe fn run_worker(self, worker_idx: usize) {
+        match self {
+            WorkerJob::Matvec(job) => job.run_worker(worker_idx),
+            WorkerJob::Q4KMatvec3(job) => job.run_worker(worker_idx),
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
 struct WorkerState {
-    job: Option<MatvecJob>,
+    job: Option<WorkerJob>,
     job_id: u64,
     completed: AtomicUsize,
 }
@@ -277,6 +403,24 @@ impl WorkerPool {
             return;
         }
 
+        self.run_job(WorkerJob::Matvec(job), job.workers);
+    }
+
+    fn run_q4k_matvec3(&self, mut job: Q4KMatvec3Job) {
+        let rows = job.work_items();
+        job.workers = job.workers.min(self.max_workers).min(rows).max(1);
+        if job.workers <= 1 || rows < job.workers * 8 {
+            job.workers = 1;
+            unsafe {
+                job.run_worker(0);
+            }
+            return;
+        }
+
+        self.run_job(WorkerJob::Q4KMatvec3(job), job.workers);
+    }
+
+    fn run_job(&self, job: WorkerJob, workers: usize) {
         // Fast spin-wait if previous job is finishing (usually very quick)
         loop {
             let mut state = self.state.lock().expect("worker pool mutex poisoned");
@@ -296,7 +440,7 @@ impl WorkerPool {
         let mut spins = 0;
         loop {
             let state = self.state.lock().expect("worker pool mutex poisoned");
-            if state.completed.load(Ordering::Acquire) == job.workers {
+            if state.completed.load(Ordering::Acquire) == workers {
                 break;
             }
             drop(state);
@@ -331,7 +475,7 @@ fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
             state.job.expect("job should be available")
         };
 
-        if worker_idx < job.workers {
+        if worker_idx < job.workers() {
             unsafe {
                 job.run_worker(worker_idx);
             }
@@ -723,6 +867,109 @@ pub fn matvec_q4_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out
         return;
     }
     parallel_matvec_u8(MatvecKind::Q4K, out, rows, cols, row_bytes, qweight, x);
+}
+
+pub fn matvec_q4_k3_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (weights_a, rows_a, cols_a) = a;
+    let (weights_b, rows_b, cols_b) = b;
+    let (weights_c, rows_c, cols_c) = c;
+    if cols_a == 0 || cols_a % 256 != 0 || cols_a != cols_b || cols_a != cols_c || cols_a != x.len()
+    {
+        return false;
+    }
+
+    let row_bytes = (cols_a / 256) * 144;
+    let needed_a = match row_bytes.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_c = match row_bytes.checked_mul(rows_c) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b || weights_c.len() < needed_c {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+    out_c.resize(rows_c, 0.0);
+
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q4k_matvec3_into(
+        (weights_a, rows_a, cols_a),
+        (weights_b, rows_b, cols_b),
+        (weights_c, rows_c, cols_c),
+        x,
+        out_a,
+        out_b,
+        out_c,
+    ) {
+        return true;
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        for row in 0..rows_a {
+            out_a[row] = dot_q4_k_f32(
+                &weights_a[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_q4_k_f32(
+                &weights_b[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_c {
+            out_c[row] = dot_q4_k_f32(
+                &weights_c[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b + rows_c;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_c.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_c.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c,
+            cols: cols_a,
+            row_span: row_bytes,
+            workers,
+        });
+        true
+    }
 }
 
 pub fn matvec_q6_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
@@ -1635,5 +1882,91 @@ unsafe fn scale_add_f32_avx2(out: &mut [f32], scale: f32, add: &[f32]) {
     }
     for i in (main * 8)..n {
         out[i] = out[i] * scale + add[i];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_q4k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+        let row_bytes = (cols / 256) * 144;
+        let mut data = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..(cols / 256) {
+                let base = row * row_bytes + block * 144;
+                data[base] = 0x00;
+                data[base + 1] = 0x3c; // f16 1.0
+                data[base + 2] = 0x00;
+                data[base + 3] = 0x00; // f16 0.0 for dmin
+                for i in 0..12 {
+                    data[base + 4 + i] =
+                        1 + ((seed.wrapping_add(row as u8).wrapping_add(i as u8)) & 0x07);
+                }
+                for i in 0..128 {
+                    data[base + 16 + i] =
+                        seed.wrapping_add((row * 17 + block * 29 + i * 3) as u8) & 0x7f;
+                }
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn q4k_matvec3_matches_separate_matvecs() {
+        set_num_threads(3);
+        let cols = 512;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.013).sin() * 0.5) + ((i % 7) as f32 * 0.01))
+            .collect();
+        let a = make_q4k_weights(5, cols, 3);
+        let b = make_q4k_weights(7, cols, 19);
+        let c = make_q4k_weights(4, cols, 41);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        let mut exp_c = Vec::new();
+        matvec_q4_k_into(&a, &x, 5, cols, &mut exp_a);
+        matvec_q4_k_into(&b, &x, 7, cols, &mut exp_b);
+        matvec_q4_k_into(&c, &x, 4, cols, &mut exp_c);
+
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        let mut got_c = Vec::new();
+        assert!(matvec_q4_k3_into(
+            (&a, 5, cols),
+            (&b, 7, cols),
+            (&c, 4, cols),
+            &x,
+            &mut got_a,
+            &mut got_b,
+            &mut got_c
+        ));
+
+        assert_eq!(got_a, exp_a);
+        assert_eq!(got_b, exp_b);
+        assert_eq!(got_c, exp_c);
+    }
+
+    #[test]
+    fn q4k_matvec3_rejects_incompatible_shapes() {
+        let cols = 512;
+        let x = vec![0.0f32; cols];
+        let a = make_q4k_weights(1, cols, 1);
+        let b = make_q4k_weights(1, cols, 2);
+        let c = make_q4k_weights(1, cols, 3);
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+        let mut out_c = Vec::new();
+
+        assert!(!matvec_q4_k3_into(
+            (&a, 1, cols),
+            (&b, 1, cols),
+            (&c, 1, cols - 256),
+            &x,
+            &mut out_a,
+            &mut out_b,
+            &mut out_c
+        ));
     }
 }
