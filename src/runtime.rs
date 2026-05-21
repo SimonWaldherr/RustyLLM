@@ -93,6 +93,9 @@ pub struct GenerationStats {
     pub prefill_time: Duration,
     pub decode_time: Duration,
     pub total_time: Duration,
+    /// Number of prompt tokens that were served from the KV cache without
+    /// re-evaluation.  Always 0 for stateless (non-session) generation.
+    pub cached_tokens: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -514,35 +517,7 @@ impl Runner {
         // For architectures with per-layer layouts (Gemma-4), compute the
         // maximum per-layer head/value sizes so we can allocate buffers and
         // the KV cache with safe upper bounds.
-        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = match &self.weights
-        {
-            LoadedWeights::Gemma4(w) => {
-                let mut max_hd = self.config.head_dim;
-                let mut max_kv_heads = self.config.n_kv_heads;
-                let mut max_val = self.config.value_dim;
-                for l in w.layers.iter() {
-                    if l.head_dim > max_hd {
-                        max_hd = l.head_dim;
-                    }
-                    if l.n_kv_heads > max_kv_heads {
-                        max_kv_heads = l.n_kv_heads;
-                    }
-                    if l.value_dim > max_val {
-                        max_val = l.value_dim;
-                    }
-                }
-                let kk = max_kv_heads * max_hd;
-                let vv = max_kv_heads * max_val;
-                (kk, vv, max_hd, max_kv_heads, max_val)
-            }
-            _ => (
-                self.config.n_kv_heads * self.config.head_dim,
-                self.config.kv_dim,
-                self.config.head_dim,
-                self.config.n_kv_heads,
-                self.config.value_dim,
-            ),
-        };
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
 
         let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
@@ -642,6 +617,7 @@ impl Runner {
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
+                cached_tokens: 0,
             },
         })
     }
@@ -707,35 +683,7 @@ impl Runner {
 
         let cache_len = std::cmp::min(self.config.max_seq_len, tokens.len() + 1);
 
-        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = match &self.weights
-        {
-            LoadedWeights::Gemma4(w) => {
-                let mut max_hd = self.config.head_dim;
-                let mut max_kv_heads = self.config.n_kv_heads;
-                let mut max_val = self.config.value_dim;
-                for l in w.layers.iter() {
-                    if l.head_dim > max_hd {
-                        max_hd = l.head_dim;
-                    }
-                    if l.n_kv_heads > max_kv_heads {
-                        max_kv_heads = l.n_kv_heads;
-                    }
-                    if l.value_dim > max_val {
-                        max_val = l.value_dim;
-                    }
-                }
-                let kk = max_kv_heads * max_hd;
-                let vv = max_kv_heads * max_val;
-                (kk, vv, max_hd, max_kv_heads, max_val)
-            }
-            _ => (
-                self.config.n_kv_heads * self.config.head_dim,
-                self.config.kv_dim,
-                self.config.head_dim,
-                self.config.n_kv_heads,
-                self.config.value_dim,
-            ),
-        };
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
 
         let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
@@ -922,6 +870,268 @@ impl Runner {
             None
         }
     }
+
+    // ─── Session-based generation ────────────────────────────────────────────
+
+    /// Compute the Longest Common Prefix length between two token sequences.
+    fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    }
+
+    /// Compute the dimension parameters needed to allocate a KV cache and
+    /// decode buffer for this model.
+    fn kv_dims(&self) -> (usize, usize, usize, usize, usize) {
+        match &self.weights {
+            LoadedWeights::Gemma4(w) => {
+                let mut max_hd = self.config.head_dim;
+                let mut max_kv_heads = self.config.n_kv_heads;
+                let mut max_val = self.config.value_dim;
+                for l in w.layers.iter() {
+                    if l.head_dim > max_hd {
+                        max_hd = l.head_dim;
+                    }
+                    if l.n_kv_heads > max_kv_heads {
+                        max_kv_heads = l.n_kv_heads;
+                    }
+                    if l.value_dim > max_val {
+                        max_val = l.value_dim;
+                    }
+                }
+                (
+                    max_kv_heads * max_hd,
+                    max_kv_heads * max_val,
+                    max_hd,
+                    max_kv_heads,
+                    max_val,
+                )
+            }
+            _ => (
+                self.config.n_kv_heads * self.config.head_dim,
+                self.config.kv_dim,
+                self.config.head_dim,
+                self.config.n_kv_heads,
+                self.config.value_dim,
+            ),
+        }
+    }
+
+    /// Create a blank [`Session`] pre-allocated for this model.
+    ///
+    /// `max_cached_tokens` caps the KV-cache length at the given token count
+    /// (clamped to `config.max_seq_len`).
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    pub fn new_session(&self, max_cached_tokens: usize) -> crate::session::Session {
+        let cap = max_cached_tokens.min(self.config.max_seq_len).max(1);
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
+        let kv_cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cap);
+        let decode_buf =
+            DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
+        crate::session::Session::new(kv_cache, decode_buf)
+    }
+
+    /// Multi-turn generation that reuses a persistent [`Session`].
+    ///
+    /// On each call the full chat prompt is rendered and tokenised.  A
+    /// Longest-Common-Prefix comparison against the session's cached token
+    /// sequence determines how much of the KV cache can be reused:
+    ///
+    /// * Only the differing suffix is prefilled.
+    /// * Each generated token is forwarded into the same KV cache before the
+    ///   next sampling step.
+    /// * Logits and cached tokens are persisted in the session for the next
+    ///   turn.
+    ///
+    /// Falls back to a full prefill when the new prompt exceeds the session's
+    /// KV-cache capacity.
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    pub fn generate_chat_with_session<F>(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+        session: &mut crate::session::Session,
+        mut on_token: F,
+    ) -> Result<GenerationResult, String>
+    where
+        F: FnMut(&str),
+    {
+        let _guard = self
+            .generation_lock
+            .lock()
+            .expect("generation lock poisoned");
+        options.validate()?;
+
+        if messages.is_empty() {
+            return Err(String::from("No prompt provided."));
+        }
+
+        let total_start = Instant::now();
+        session.last_used = total_start;
+
+        let tokens = self.render_messages(messages, &options.system_prompt);
+        if tokens.is_empty() {
+            return Err(String::from("Prompt rendered to zero tokens."));
+        }
+
+        let cache_limit = session.kv_cache.max_len;
+
+        // If the prompt alone already exceeds the KV-cache capacity, reset the
+        // session so we fall back to a clean full prefill.
+        if tokens.len() >= cache_limit {
+            session.reset();
+        }
+
+        let prefix_len = Self::longest_common_prefix(&tokens, &session.cached_tokens);
+        let reused = prefix_len;
+        let new_prompt_tokens = tokens.len() - prefix_len;
+        session.cached_tokens_served += reused;
+        session.evaluated_tokens += new_prompt_tokens;
+
+        // ── Prefill ──────────────────────────────────────────────────────────
+        let t_prefill = Instant::now();
+        let mut logits = Vec::new();
+        let last_prompt_pos = tokens.len() - 1;
+
+        if prefix_len == tokens.len() {
+            // All prompt tokens are already in the cache; reuse last logits.
+            if !session.last_logits.is_empty() {
+                logits = std::mem::take(&mut session.last_logits);
+            } else {
+                // No saved logits (e.g. session was just created or reset).
+                // Re-forward the last prompt token to obtain them.
+                self.forward_token_into(
+                    &mut session.kv_cache,
+                    &mut session.decode_buf,
+                    tokens[last_prompt_pos],
+                    last_prompt_pos,
+                    &mut logits,
+                );
+            }
+        } else {
+            // Prefill only the suffix that differs from the cached prefix.
+            for (idx, &tok_id) in tokens[prefix_len..].iter().enumerate() {
+                let pos = prefix_len + idx;
+                if pos == last_prompt_pos {
+                    self.forward_token_into(
+                        &mut session.kv_cache,
+                        &mut session.decode_buf,
+                        tok_id,
+                        pos,
+                        &mut logits,
+                    );
+                } else {
+                    let _ = self.forward_hidden_token(
+                        &mut session.kv_cache,
+                        &mut session.decode_buf,
+                        tok_id,
+                        pos,
+                    );
+                }
+            }
+        }
+        let prefill_time = t_prefill.elapsed();
+
+        // Capture values needed for the decode phase before transferring
+        // ownership of `tokens` into the session.
+        let prompt_len = tokens.len();
+        // Update the session's token list to the current prompt.
+        // Generated tokens are appended below during the decode loop.
+        session.cached_tokens = tokens;
+
+        // ── Decode ───────────────────────────────────────────────────────────
+        let t_decode = Instant::now();
+        let mut output = String::new();
+        let mut generated = Vec::new();
+        let mut pos = prompt_len;
+
+        // Initialise the recent-token ring from the full prompt (same as the
+        // stateless path) so repeat-penalty covers the current turn.
+        let mut recent: VecDeque<u32> = session.cached_tokens.iter().copied().collect();
+
+        let max_stop_len = options
+            .stop_sequences
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+
+        let mut rng = if options.seed == 0 {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            sampling::Rng::new(t)
+        } else {
+            sampling::Rng::new(options.seed)
+        };
+
+        'decode: for _ in 0..options.max_tokens {
+            let token = sampling::sample_with_scratch(
+                &mut logits,
+                &options.sampler,
+                &mut rng,
+                recent.make_contiguous(),
+                &mut session.decode_buf.sampler_candidates,
+            );
+
+            if self.is_stop_token(token) {
+                break;
+            }
+
+            let text = self.tok.decode_token(token);
+            output.push_str(&text);
+
+            if max_stop_len > 0 {
+                let window_start = output.len().saturating_sub(max_stop_len + text.len());
+                let window = &output[window_start..];
+                for stop in &options.stop_sequences {
+                    if let Some(rel_idx) = window.find(stop.as_str()) {
+                        output.truncate(window_start + rel_idx);
+                        break 'decode;
+                    }
+                }
+            }
+
+            on_token(&text);
+
+            generated.push(token);
+            session.cached_tokens.push(token);
+            recent.push_back(token);
+            if recent.len() > 64 {
+                recent.pop_front();
+            }
+
+            if pos >= cache_limit - 1 {
+                break;
+            }
+
+            self.forward_token_into(
+                &mut session.kv_cache,
+                &mut session.decode_buf,
+                token,
+                pos,
+                &mut logits,
+            );
+            pos += 1;
+        }
+
+        // Save logits as the starting point for the next turn's sampling.
+        session.last_logits = logits;
+        session.recent = recent;
+        session.evaluated_tokens += generated.len();
+
+        let decode_time = t_decode.elapsed();
+        Ok(GenerationResult {
+            text: output,
+            stats: GenerationStats {
+                prompt_tokens: prompt_len,
+                generated_tokens: generated.len(),
+                prefill_time,
+                decode_time,
+                total_time: total_start.elapsed(),
+                cached_tokens: reused,
+            },
+        })
+    }
 }
 
 fn measure_matvec(
@@ -1035,6 +1245,36 @@ mod tests {
         assert!(cosine_similarity(&[], &[]).is_err());
         assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
         assert!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn longest_common_prefix_identical_sequences() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3, 4, 5];
+        assert_eq!(Runner::longest_common_prefix(&a, &a), 5);
+    }
+
+    #[test]
+    fn longest_common_prefix_partial_match() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3, 4, 5];
+        let b = vec![1u32, 2, 3, 7, 8, 9];
+        assert_eq!(Runner::longest_common_prefix(&a, &b), 3);
+    }
+
+    #[test]
+    fn longest_common_prefix_no_match() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3];
+        let b = vec![9u32, 8, 7];
+        assert_eq!(Runner::longest_common_prefix(&a, &b), 0);
+    }
+
+    #[test]
+    fn longest_common_prefix_empty_inputs() {
+        use super::Runner;
+        assert_eq!(Runner::longest_common_prefix(&[], &[1u32, 2]), 0);
+        assert_eq!(Runner::longest_common_prefix(&[1u32, 2], &[]), 0);
     }
 }
 

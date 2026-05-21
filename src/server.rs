@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
+use crate::session::SessionStore;
 #[cfg(feature = "tls")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 #[cfg(feature = "tls")]
@@ -23,6 +24,11 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default maximum number of concurrent sessions when `--max-sessions` is not specified.
+pub const DEFAULT_MAX_SESSIONS: usize = 8;
+/// Default per-session KV-cache capacity in tokens when `--max-cached-tokens` is not specified.
+pub const DEFAULT_MAX_CACHED_TOKENS: usize = 2048;
+
 #[derive(Clone)]
 pub struct ServeOptions {
     pub addr: String,
@@ -33,6 +39,9 @@ pub struct ServeOptions {
     pub chat_ui: bool,
     pub chat_history_path: Option<String>,
     pub chat_history_lock: Arc<Mutex<()>>,
+    /// Session store for persistent KV-cache conversations.
+    /// `None` when session caching is disabled (`--max-sessions 0`).
+    pub session_store: Option<Arc<SessionStore>>,
 }
 
 impl ServeOptions {
@@ -145,6 +154,10 @@ struct GenerateRequest {
     seed: Option<u64>,
     system_prompt: Option<String>,
     stop: Option<StopSpec>,
+    /// Optional conversation ID for persistent KV-cache sessions.
+    conversation_id: Option<String>,
+    /// When `true` (and `conversation_id` is set), use the persistent session.
+    cache_prompt: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +207,10 @@ struct OpenAiChatCompletionsRequest {
     stream: Option<bool>,
     system_prompt: Option<String>,
     stop: Option<StopSpec>,
+    /// Optional conversation ID for persistent KV-cache sessions.
+    conversation_id: Option<String>,
+    /// When `true` (and `conversation_id` is set), use the persistent session.
+    cache_prompt: Option<bool>,
 }
 
 /// OpenAI-compatible `/v1/embeddings` request.
@@ -258,6 +275,16 @@ struct OllamaEmbeddingRequest {
 
 // ─── Response types ───────────────────────────────────────────────────────────
 
+/// Optional cache performance metrics included in responses when session
+/// caching was active for the request.
+#[derive(Serialize)]
+struct CacheStats {
+    cached_tokens: usize,
+    evaluated_tokens: usize,
+    prefill_ms: u128,
+    decode_ms: u128,
+}
+
 #[derive(Serialize)]
 struct GenerateResponse<'a> {
     text: &'a str,
@@ -266,6 +293,31 @@ struct GenerateResponse<'a> {
     prefill_ms: u128,
     decode_ms: u128,
     total_ms: u128,
+    /// Present only when session caching was active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_stats: Option<CacheStats>,
+}
+
+/// Build a [`CacheStats`] for a session-backed response.
+///
+/// Only returns `Some` when `use_session` is `true` AND a `conversation_id`
+/// was provided; returns `None` for stateless requests so the field is
+/// omitted from the JSON response.
+fn make_cache_stats(
+    stats: &crate::runtime::GenerationStats,
+    use_session: bool,
+    conv_id: Option<&str>,
+) -> Option<CacheStats> {
+    if use_session && conv_id.is_some() {
+        Some(CacheStats {
+            cached_tokens: stats.cached_tokens,
+            evaluated_tokens: stats.prompt_tokens - stats.cached_tokens + stats.generated_tokens,
+            prefill_ms: stats.prefill_time.as_millis(),
+            decode_ms: stats.decode_time.as_millis(),
+        })
+    } else {
+        None
+    }
 }
 
 struct ActiveConnectionGuard {
@@ -349,6 +401,9 @@ struct OpenAiChatCompletionResponse {
     model: String,
     choices: Vec<OpenAiChatChoice>,
     usage: OpenAiUsage,
+    /// Present only when session caching was active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_stats: Option<CacheStats>,
 }
 
 #[derive(Serialize)]
@@ -624,7 +679,7 @@ fn route_streaming_request<W: Write>(
         .cloned()
         .unwrap_or_else(|| runner.architecture().to_string());
 
-    let (messages, generation) = if is_chat {
+    let (messages, generation, use_session, conv_id) = if is_chat {
         match serde_json::from_slice::<OpenAiChatCompletionsRequest>(&request.body) {
             Ok(payload) => {
                 let messages = match parse_api_messages(payload.messages) {
@@ -646,7 +701,9 @@ fn route_streaming_request<W: Write>(
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
                 );
-                (messages, generation_options)
+                let use_session = payload.cache_prompt.unwrap_or(false);
+                let conv_id = payload.conversation_id;
+                (messages, generation_options, use_session, conv_id)
             }
             Err(err) => {
                 write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
@@ -682,7 +739,12 @@ fn route_streaming_request<W: Write>(
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
                 );
-                (vec![ChatMessage::user(prompt)], generation_options)
+                (
+                    vec![ChatMessage::user(prompt)],
+                    generation_options,
+                    false,
+                    None,
+                )
             }
             Err(err) => {
                 write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
@@ -698,35 +760,43 @@ fn route_streaming_request<W: Write>(
     )?;
 
     // Stream each token as a Server-Sent Event chunk.
-    let result = runner.generate_chat_stream(&messages, &generation, |text| {
-        let chunk = if is_chat {
-            serde_json::json!({
-                "id": comp_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": text},
-                    "finish_reason": null
-                }]
-            })
-        } else {
-            serde_json::json!({
-                "id": comp_id,
-                "object": "text_completion",
-                "created": created,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "text": text,
-                    "finish_reason": null
-                }]
-            })
-        };
-        let line = format!("data: {}\n\n", chunk);
-        let _ = stream.write_all(line.as_bytes());
-    });
+    let result = generate_with_optional_session(
+        runner,
+        options,
+        &messages,
+        &generation,
+        use_session,
+        conv_id.as_deref(),
+        |text| {
+            let chunk = if is_chat {
+                serde_json::json!({
+                    "id": comp_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": text},
+                        "finish_reason": null
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "id": comp_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "text": text,
+                        "finish_reason": null
+                    }]
+                })
+            };
+            let line = format!("data: {}\n\n", chunk);
+            let _ = stream.write_all(line.as_bytes());
+        },
+    );
     if let Ok(result) = &result {
         let _ = append_chat_history(options, "openai.stream", &model_name, &messages, result);
     }
@@ -833,6 +903,36 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
     }
 }
 
+/// Generate a response, either stateless or via a persistent session.
+///
+/// When `use_session` is `true` and `conv_id` is `Some`, the request is
+/// routed through the session store so that the KV cache is reused across
+/// turns.  Falls back to stateless generation when the session store is
+/// unavailable or disabled.
+fn generate_with_optional_session<F>(
+    runner: &Runner,
+    options: &ServeOptions,
+    messages: &[ChatMessage],
+    generation: &GenerationOptions,
+    use_session: bool,
+    conv_id: Option<&str>,
+    on_token: F,
+) -> Result<crate::runtime::GenerationResult, String>
+where
+    F: FnMut(&str),
+{
+    if use_session {
+        if let (Some(id), Some(store)) = (conv_id, &options.session_store) {
+            let max_cached = store.max_cached_tokens();
+            let session_arc = store.get_or_create(id, || runner.new_session(max_cached));
+            let mut session = session_arc.lock().expect("session lock poisoned");
+            return runner.generate_chat_with_session(messages, generation, &mut session, on_token);
+        }
+    }
+    // Stateless fallback.
+    runner.generate_chat_stream(messages, generation, on_token)
+}
+
 fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16, String) {
     match serde_json::from_slice::<GenerateRequest>(body) {
         Ok(payload) => {
@@ -848,18 +948,38 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                 payload.stop.map(|s| s.into_vec()),
             );
 
+            let use_session = payload.cache_prompt.unwrap_or(false);
+            let conv_id = payload.conversation_id.clone();
+
             let mut history_messages = Vec::new();
             let result = if let Some(messages) = payload.messages {
                 match parse_api_messages(messages) {
-                    Ok(messages) => {
+                    Ok(messages) => generate_with_optional_session(
+                        runner,
+                        options,
+                        &messages,
+                        &generation,
+                        use_session,
+                        conv_id.as_deref(),
+                        |_| {},
+                    )
+                    .map(|r| {
                         history_messages = messages;
-                        runner.generate_chat(&history_messages, &generation)
-                    }
+                        r
+                    }),
                     Err(err) => Err(err),
                 }
             } else if let Some(prompt) = payload.prompt {
                 history_messages = vec![ChatMessage::user(prompt.clone())];
-                runner.generate(&prompt, &generation)
+                generate_with_optional_session(
+                    runner,
+                    options,
+                    &[ChatMessage::user(prompt)],
+                    &generation,
+                    use_session,
+                    conv_id.as_deref(),
+                    |_| {},
+                )
             } else {
                 Err(String::from("Missing prompt or messages."))
             };
@@ -874,6 +994,8 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                         &history_messages,
                         &result,
                     );
+                    let cache_stats =
+                        make_cache_stats(&result.stats, use_session, conv_id.as_deref());
                     json_response(GenerateResponse {
                         text: &result.text,
                         prompt_tokens: result.stats.prompt_tokens,
@@ -881,6 +1003,7 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                         prefill_ms: result.stats.prefill_time.as_millis(),
                         decode_ms: result.stats.decode_time.as_millis(),
                         total_ms: result.stats.total_time.as_millis(),
+                        cache_stats,
                     })
                 }
                 Err(err) => (400, json_error(&err)),
@@ -981,7 +1104,18 @@ fn route_openai_chat(
                 payload.system_prompt,
                 payload.stop.map(|s| s.into_vec()),
             );
-            match runner.generate_chat(&messages, &generation) {
+            let use_session = payload.cache_prompt.unwrap_or(false);
+            let conv_id = payload.conversation_id.clone();
+            let result = generate_with_optional_session(
+                runner,
+                options,
+                &messages,
+                &generation,
+                use_session,
+                conv_id.as_deref(),
+                |_| {},
+            );
+            match result {
                 Ok(result) => {
                     let _ = append_chat_history(options, "openai.chat", &model, &messages, &result);
                     let created = unix_timestamp();
@@ -990,6 +1124,8 @@ fn route_openai_chat(
                         completion_tokens: result.stats.generated_tokens,
                         total_tokens: result.stats.prompt_tokens + result.stats.generated_tokens,
                     };
+                    let cache_stats =
+                        make_cache_stats(&result.stats, use_session, conv_id.as_deref());
                     json_response(OpenAiChatCompletionResponse {
                         id: format!("chatcmpl-rustyllm-{}", created),
                         object: "chat.completion",
@@ -1004,6 +1140,7 @@ fn route_openai_chat(
                             finish_reason: "stop",
                         }],
                         usage,
+                        cache_stats,
                     })
                 }
                 Err(err) => (400, json_error(&err)),
