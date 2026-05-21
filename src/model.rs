@@ -336,9 +336,6 @@ fn try_q4k_matvec2_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
-    if crate::metal::enabled() {
-        return false;
-    }
     match (a, b) {
         (
             Weight::Quantized {

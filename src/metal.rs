@@ -269,32 +269,6 @@ fn parse_env_flag(value: &str) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_env_flag;
-
-    #[test]
-    fn metal_env_flag_accepts_explicit_truthy_values() {
-        for value in ["", "1", "true", "TRUE", "yes", "on"] {
-            assert!(parse_env_flag(value), "{value:?} should enable Metal");
-        }
-    }
-
-    #[test]
-    fn metal_env_flag_rejects_explicit_false_values() {
-        for value in ["0", "false", "FALSE", "no", "off", "maybe"] {
-            assert!(!parse_env_flag(value), "{value:?} should disable Metal");
-        }
-    }
-
-    #[test]
-    fn q4k_single_metal_heuristic_skips_small_projections() {
-        assert!(!super::q4k_single_should_use_metal(1024, 3072));
-        assert!(super::q4k_single_should_use_metal(9216, 3072));
-        assert!(super::q4k_single_should_use_metal(3072, 4096));
-    }
-}
-
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 #[allow(clippy::too_many_arguments)]
 fn q4k_matvec2_raw(
@@ -337,4 +311,30 @@ fn q4k_matvec3_raw(
     _out_c: &mut [f32],
 ) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_env_flag;
+
+    #[test]
+    fn metal_env_flag_accepts_explicit_truthy_values() {
+        for value in ["", "1", "true", "TRUE", "yes", "on"] {
+            assert!(parse_env_flag(value), "{value:?} should enable Metal");
+        }
+    }
+
+    #[test]
+    fn metal_env_flag_rejects_explicit_false_values() {
+        for value in ["0", "false", "FALSE", "no", "off", "maybe"] {
+            assert!(!parse_env_flag(value), "{value:?} should disable Metal");
+        }
+    }
+
+    #[test]
+    fn q4k_single_metal_heuristic_skips_small_projections() {
+        assert!(!super::q4k_single_should_use_metal(1024, 3072));
+        assert!(super::q4k_single_should_use_metal(9216, 3072));
+        assert!(super::q4k_single_should_use_metal(3072, 4096));
+    }
 }
