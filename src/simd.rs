@@ -357,13 +357,13 @@ impl WorkerJob {
 struct WorkerState {
     job: Option<WorkerJob>,
     job_id: u64,
-    completed: AtomicUsize,
 }
 
 #[cfg(not(target_family = "wasm"))]
 struct WorkerPool {
     state: Mutex<WorkerState>,
     work_available: Condvar,
+    completed: AtomicUsize,
     max_workers: usize,
 }
 
@@ -374,9 +374,9 @@ impl WorkerPool {
             state: Mutex::new(WorkerState {
                 job: None,
                 job_id: 0,
-                completed: AtomicUsize::new(0),
             }),
             work_available: Condvar::new(),
+            completed: AtomicUsize::new(0),
             max_workers,
         });
 
@@ -426,7 +426,7 @@ impl WorkerPool {
             let mut state = self.state.lock().expect("worker pool mutex poisoned");
             if state.job.is_none() {
                 state.job_id = state.job_id.wrapping_add(1);
-                state.completed.store(0, Ordering::Release);
+                self.completed.store(0, Ordering::Release);
                 state.job = Some(job);
                 self.work_available.notify_all();
                 break;
@@ -439,11 +439,9 @@ impl WorkerPool {
         // This is a micro-job, so sleeping via Condvar is too slow for LLM latencies.
         let mut spins = 0;
         loop {
-            let state = self.state.lock().expect("worker pool mutex poisoned");
-            if state.completed.load(Ordering::Acquire) == workers {
+            if self.completed.load(Ordering::Acquire) == workers {
                 break;
             }
-            drop(state);
 
             if spins < 10000 {
                 std::hint::spin_loop();
@@ -479,8 +477,7 @@ fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
             unsafe {
                 job.run_worker(worker_idx);
             }
-            let state = pool.state.lock().expect("worker pool mutex poisoned");
-            state.completed.fetch_add(1, Ordering::Release);
+            pool.completed.fetch_add(1, Ordering::Release);
         }
     }
 }
@@ -812,6 +809,10 @@ pub fn matvec_q6_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         qweight.len()
     );
     let mut out = vec![0.0f32; rows];
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q6k_matvec_into(qweight, x, rows, cols, &mut out) {
+        return out;
+    }
     parallel_matvec_u8(MatvecKind::Q6K, &mut out, rows, cols, row_bytes, qweight, x);
     out
 }
@@ -972,9 +973,98 @@ pub fn matvec_q4_k3_into(
     }
 }
 
+pub fn matvec_q4_k2_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (weights_a, rows_a, cols_a) = a;
+    let (weights_b, rows_b, cols_b) = b;
+    if cols_a == 0 || cols_a % 256 != 0 || cols_a != cols_b || cols_a != x.len() {
+        return false;
+    }
+
+    let row_bytes = (cols_a / 256) * 144;
+    let needed_a = match row_bytes.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q4k_matvec2_into(
+        (weights_a, rows_a, cols_a),
+        (weights_b, rows_b, cols_b),
+        x,
+        out_a,
+        out_b,
+    ) {
+        return true;
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        for row in 0..rows_a {
+            out_a[row] = dot_q4_k_f32(
+                &weights_a[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_q4_k_f32(
+                &weights_b[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_b.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_b.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c: 0,
+            cols: cols_a,
+            row_span: row_bytes,
+            workers,
+        });
+        true
+    }
+}
+
 pub fn matvec_q6_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 256) * 210;
     out.resize(rows, 0.0);
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q6k_matvec_into(qweight, x, rows, cols, out) {
+        return;
+    }
     parallel_matvec_u8(MatvecKind::Q6K, out, rows, cols, row_bytes, qweight, x);
 }
 
@@ -1910,6 +2000,35 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn q4k_matvec2_matches_separate_matvecs() {
+        set_num_threads(3);
+        let cols = 512;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.017).cos() * 0.5) + ((i % 11) as f32 * 0.01))
+            .collect();
+        let a = make_q4k_weights(5, cols, 3);
+        let b = make_q4k_weights(7, cols, 19);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        matvec_q4_k_into(&a, &x, 5, cols, &mut exp_a);
+        matvec_q4_k_into(&b, &x, 7, cols, &mut exp_b);
+
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        assert!(matvec_q4_k2_into(
+            (&a, 5, cols),
+            (&b, 7, cols),
+            &x,
+            &mut got_a,
+            &mut got_b,
+        ));
+
+        assert_eq!(got_a, exp_a);
+        assert_eq!(got_b, exp_b);
     }
 
     #[test]

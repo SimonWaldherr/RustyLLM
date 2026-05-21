@@ -328,6 +328,53 @@ fn try_q4k_matvec3_into(
     false
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn try_q4k_matvec2_into(
+    a: &Weight,
+    b: &Weight,
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    if crate::metal::enabled() {
+        return false;
+    }
+    match (a, b) {
+        (
+            Weight::Quantized {
+                data: a_data,
+                dtype: GGMLType::Q4_K,
+                rows: a_rows,
+                cols: a_cols,
+            },
+            Weight::Quantized {
+                data: b_data,
+                dtype: GGMLType::Q4_K,
+                rows: b_rows,
+                cols: b_cols,
+            },
+        ) if *a_cols == *b_cols && *a_cols == x.len() => crate::simd::matvec_q4_k2_into(
+            (a_data.as_slice(), *a_rows, *a_cols),
+            (b_data.as_slice(), *b_rows, *b_cols),
+            x,
+            out_a,
+            out_b,
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn try_q4k_matvec2_into(
+    _a: &Weight,
+    _b: &Weight,
+    _x: &[f32],
+    _out_a: &mut Vec<f32>,
+    _out_b: &mut Vec<f32>,
+) -> bool {
+    false
+}
+
 // ─── Layer + Model weights ───────────────────────────────────────────────────
 
 pub struct LayerWeights {
@@ -1855,8 +1902,10 @@ pub fn forward_into(
         // ── FFN (SwiGLU) ──
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
-        layer.w3.matvec_into(&buf.xn2, &mut buf.up);
+        if !try_q4k_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
+            layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
+            layer.w3.matvec_into(&buf.xn2, &mut buf.up);
+        }
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {
@@ -2807,8 +2856,10 @@ pub fn forward_hidden(
 
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
-        layer.w3.matvec_into(&buf.xn2, &mut buf.up);
+        if !try_q4k_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
+            layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
+            layer.w3.matvec_into(&buf.xn2, &mut buf.up);
+        }
 
         buf.hidden.resize(config.hidden_dim, 0.0);
         for i in 0..config.hidden_dim {

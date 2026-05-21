@@ -66,6 +66,24 @@ pub fn sample_with_scratch(
         return 0;
     }
 
+    if config.temperature < 1e-6 {
+        if config.repeat_penalty != 1.0 {
+            for &tok in recent_tokens {
+                if (tok as usize) < n {
+                    let v = logits[tok as usize];
+                    logits[tok as usize] = if !v.is_finite() {
+                        f32::NEG_INFINITY
+                    } else if v > 0.0 {
+                        v / config.repeat_penalty
+                    } else {
+                        v * config.repeat_penalty
+                    };
+                }
+            }
+        }
+        return argmax_finite_token(logits);
+    }
+
     for v in logits.iter_mut() {
         if !v.is_finite() {
             *v = f32::NEG_INFINITY;
@@ -83,16 +101,6 @@ pub fn sample_with_scratch(
                 }
             }
         }
-    }
-
-    // Greedy
-    if config.temperature < 1e-6 {
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.total_cmp(b.1))
-            .map(|(i, _)| i as u32)
-            .unwrap();
     }
 
     // Temperature
@@ -266,6 +274,23 @@ fn argmax_token(logits: &[f32]) -> u32 {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i as u32)
         .unwrap_or(0)
+}
+
+fn argmax_finite_token(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_value = logits
+        .first()
+        .copied()
+        .filter(|v| v.is_finite())
+        .unwrap_or(f32::NEG_INFINITY);
+    for (i, &v) in logits.iter().enumerate().skip(1) {
+        let v = if v.is_finite() { v } else { f32::NEG_INFINITY };
+        if v > best_value {
+            best_value = v;
+            best = i;
+        }
+    }
+    best as u32
 }
 
 #[cfg(test)]

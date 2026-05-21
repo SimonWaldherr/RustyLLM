@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Display;
 use std::io::{self, BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,7 +59,12 @@ fn print_usage(name: &str) {
     eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
     eprintln!("  --bench                   Run a non-streaming generation benchmark");
     eprintln!("  --bench-json              Run benchmark and emit machine-readable JSON");
+    eprintln!("  --bench-output            Include generated text for each benchmark run");
     eprintln!("  --bench-runs <N>          Number of benchmark runs (default: 3)");
+    eprintln!("  --kernel-bench            Run isolated kernel benchmark");
+    eprintln!("  --kernel-bench-json       Emit isolated kernel benchmark JSON");
+    eprintln!("  --kernel-bench-runs <N>   Number of kernel benchmark runs (default: 25)");
+    eprintln!("  --kernel-bench-layer <N>  Transformer layer to benchmark (default: 0)");
     eprintln!(
         "  --inspect                 Inspect GGUF metadata and compatibility without loading weights"
     );
@@ -134,6 +139,11 @@ fn run() -> Result<(), String> {
     let mut embed_mode = false;
     let mut bench_mode = false;
     let mut bench_json = false;
+    let mut bench_output = false;
+    let mut kernel_bench = false;
+    let mut kernel_bench_json = false;
+    let mut kernel_bench_runs = 25usize;
+    let mut kernel_bench_layer = 0usize;
     let mut inspect_mode = false;
     let mut chat_history_path: Option<String> = None;
     let mut bench_runs = 3usize;
@@ -224,9 +234,26 @@ fn run() -> Result<(), String> {
             "--bench-json" | "—bench-json" => {
                 bench_mode = true;
                 bench_json = true;
+                bench_output = true;
+            }
+            "--bench-output" => {
+                bench_output = true;
             }
             "--bench-runs" => {
                 bench_runs = parse_arg::<usize>(&args, &mut i, "--bench-runs")?;
+            }
+            "--kernel-bench" => {
+                kernel_bench = true;
+            }
+            "--kernel-bench-json" => {
+                kernel_bench = true;
+                kernel_bench_json = true;
+            }
+            "--kernel-bench-runs" => {
+                kernel_bench_runs = parse_arg::<usize>(&args, &mut i, "--kernel-bench-runs")?;
+            }
+            "--kernel-bench-layer" => {
+                kernel_bench_layer = parse_arg::<usize>(&args, &mut i, "--kernel-bench-layer")?;
             }
             "--inspect" => {
                 inspect_mode = true;
@@ -285,6 +312,9 @@ fn run() -> Result<(), String> {
     if bench_runs == 0 {
         return Err(String::from("--bench-runs must be greater than 0."));
     }
+    if kernel_bench_runs == 0 {
+        return Err(String::from("--kernel-bench-runs must be greater than 0."));
+    }
     options.validate()?;
 
     let n_threads = std::thread::available_parallelism()
@@ -307,9 +337,11 @@ fn run() -> Result<(), String> {
     eprintln!("SIMD: scalar fallback");
     #[cfg(not(target_family = "wasm"))]
     if metal::enabled() {
-        eprintln!("Metal: Q4_K matvec enabled");
-    } else if std::env::var_os("RUSTY_LLM_METAL").is_some() {
+        eprintln!("Metal: Q4_K matvec enabled, Q6_K output matvec enabled");
+    } else if metal::requested() == Some(true) {
         eprintln!("Metal: unavailable, using CPU");
+    } else if metal::requested() == Some(false) {
+        eprintln!("Metal: disabled by RUSTY_LLM_METAL");
     }
     if std::env::var_os("RUSTY_LLM_FAST_ATTN").is_some() {
         eprintln!("Attention: fast approximation mode enabled");
@@ -376,6 +408,23 @@ fn run() -> Result<(), String> {
             &options,
             bench_runs,
             bench_json,
+            bench_output,
+        )?;
+        return Ok(());
+    }
+
+    if kernel_bench {
+        if embed_mode || repl_mode || serve_addr.is_some() {
+            return Err(String::from(
+                "--kernel-bench cannot be combined with --embed, --repl, or --serve.",
+            ));
+        }
+        run_kernel_benchmark(
+            &runner,
+            &model_path,
+            kernel_bench_runs,
+            kernel_bench_layer,
+            kernel_bench_json,
         )?;
         return Ok(());
     }
@@ -605,9 +654,10 @@ fn run_benchmark(
     options: &GenerationOptions,
     runs: usize,
     json: bool,
+    output: bool,
 ) -> Result<(), String> {
     if json {
-        return run_benchmark_json(runner, load_info, prompt, options, runs);
+        return run_benchmark_json(runner, load_info, prompt, options, runs, output);
     }
 
     println!("Benchmark");
@@ -651,6 +701,9 @@ fn run_benchmark(
             wall.as_millis(),
             decode_tok_s
         );
+        if output {
+            println!("run {} output: {}", run + 1, result.text);
+        }
 
         total_prompt_tokens += result.stats.prompt_tokens;
         total_generated_tokens += result.stats.generated_tokens;
@@ -699,6 +752,7 @@ fn run_benchmark_json(
     prompt: &str,
     options: &GenerationOptions,
     runs: usize,
+    output: bool,
 ) -> Result<(), String> {
     let mut total_prompt_tokens = 0usize;
     let mut total_generated_tokens = 0usize;
@@ -722,7 +776,7 @@ fn run_benchmark_json(
         let prefill_tok_s =
             result.stats.prompt_tokens as f64 / result.stats.prefill_time.as_secs_f64().max(0.001);
 
-        run_values.push(serde_json::json!({
+        let mut run_value = serde_json::json!({
             "run": run + 1,
             "prompt_tokens": result.stats.prompt_tokens,
             "generated_tokens": result.stats.generated_tokens,
@@ -732,7 +786,11 @@ fn run_benchmark_json(
             "wall_ms": wall.as_millis(),
             "prefill_tok_s": prefill_tok_s,
             "decode_tok_s": decode_tok_s,
-        }));
+        });
+        if output {
+            run_value["text"] = serde_json::json!(result.text);
+        }
+        run_values.push(run_value);
 
         total_prompt_tokens += result.stats.prompt_tokens;
         total_generated_tokens += result.stats.generated_tokens;
@@ -774,6 +832,78 @@ fn run_benchmark_json(
     let body = serde_json::to_string_pretty(&response)
         .map_err(|err| format!("Failed to serialize benchmark JSON: {}", err))?;
     println!("{}", body);
+    Ok(())
+}
+
+fn run_kernel_benchmark(
+    runner: &Runner,
+    model_path: &Path,
+    runs: usize,
+    layer: usize,
+    json: bool,
+) -> Result<(), String> {
+    let (layer, rows) = runner.kernel_benchmark(runs, layer)?;
+    if json {
+        let kernels: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "name": row.name,
+                    "dtype": row.dtype,
+                    "rows": row.rows,
+                    "cols": row.cols,
+                    "runs": row.runs,
+                    "avg_ms": row.avg_ms,
+                    "total_ms": row.total_ms,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "type": "rusty-llm.kernel_benchmark",
+            "format": "llm-kernel-bench.v1",
+            "runtime": "RustyLLM",
+            "model": {
+                "path": model_path.display().to_string(),
+                "name": runner.model_name().unwrap_or(""),
+                "arch": runner.architecture(),
+                "dim": runner.config().dim,
+                "hidden_dim": runner.config().hidden_dim,
+                "layers": runner.config().n_layers,
+            },
+            "metal": {
+                "available": metal::available(),
+                "enabled": metal::enabled(),
+                "q4_k": metal::enabled(),
+                "q6_k": metal::q6k_enabled(),
+                "q6_k_min_rows": 32768,
+            },
+            "layer": layer,
+            "runs": runs,
+            "kernels": kernels,
+        });
+        let body = serde_json::to_string_pretty(&payload)
+            .map_err(|err| format!("Failed to serialize kernel benchmark JSON: {}", err))?;
+        println!("{}", body);
+        return Ok(());
+    }
+
+    println!(
+        "Kernel benchmark format=llm-kernel-bench.v1 runtime=RustyLLM layer={} runs={}",
+        layer, runs
+    );
+    println!(
+        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows=32768",
+        metal::available(),
+        metal::enabled(),
+        metal::enabled(),
+        metal::q6k_enabled()
+    );
+    for row in rows {
+        println!(
+            "{} dtype={} rows={} cols={} avg={:.3}ms total={:.3}ms",
+            row.name, row.dtype, row.rows, row.cols, row.avg_ms, row.total_ms
+        );
+    }
     Ok(())
 }
 

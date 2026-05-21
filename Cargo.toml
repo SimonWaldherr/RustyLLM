@@ -14,12 +14,13 @@ default = ["cli", "server", "tls"]
 cli = ["dep:serde_json"]
 server = ["dep:serde", "dep:serde_json"]
 tls = ["server", "dep:rustls", "dep:rustls-pemfile"]
-wasm = ["dep:wasm-bindgen"]
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen = { version = "=0.2.100", optional = true }
+js-sys = { version = "=0.3.77", optional = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }

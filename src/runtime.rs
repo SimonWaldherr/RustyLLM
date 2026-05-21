@@ -1,5 +1,5 @@
 use crate::gguf::GGUFFile;
-use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights};
+use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight};
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use std::collections::VecDeque;
@@ -105,6 +105,17 @@ pub struct GenerationResult {
 pub struct LoadInfo {
     pub file_size_bytes: usize,
     pub load_time: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct KernelBenchRow {
+    pub name: String,
+    pub dtype: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub runs: usize,
+    pub avg_ms: f64,
+    pub total_ms: f64,
 }
 
 #[inline]
@@ -343,6 +354,101 @@ impl Runner {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn kernel_benchmark(
+        &self,
+        runs: usize,
+        requested_layer: usize,
+    ) -> Result<(usize, Vec<KernelBenchRow>), String> {
+        if runs == 0 {
+            return Err(String::from("--kernel-bench-runs must be greater than 0."));
+        }
+        let LoadedWeights::Standard(weights) = &self.weights else {
+            return Err(String::from(
+                "--kernel-bench currently supports standard transformer weights only.",
+            ));
+        };
+        let layer = requested_layer.min(weights.layers.len().saturating_sub(1));
+        let mut rows = Vec::new();
+        let mut row_out = Vec::new();
+        rows.push(measure_kernel(
+            "token_embd.row",
+            &weights.token_embd,
+            self.config.vocab_size,
+            self.config.dim,
+            runs,
+            || {
+                row_out = weights.token_embd.row(0, self.config.dim);
+                std::hint::black_box(row_out.len());
+            },
+        ));
+        if weights.layers.is_empty() {
+            return Ok((layer, rows));
+        }
+        let layer_weights = &weights.layers[layer];
+        let dim_input = deterministic_bench_vector(self.config.dim);
+        let attn_out_input =
+            deterministic_bench_vector(self.config.n_heads * self.config.value_dim);
+        let hidden_input = deterministic_bench_vector(self.config.hidden_dim);
+        let mut out = Vec::new();
+        rows.push(measure_matvec(
+            "attn_q",
+            &layer_weights.wq,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "attn_k",
+            &layer_weights.wk,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "attn_v",
+            &layer_weights.wv,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "attn_output",
+            &layer_weights.wo,
+            &attn_out_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "ffn_gate",
+            &layer_weights.w1,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "ffn_up",
+            &layer_weights.w3,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "ffn_down",
+            &layer_weights.w2,
+            &hidden_input,
+            runs,
+            &mut out,
+        ));
+        rows.push(measure_matvec(
+            "output",
+            &weights.output,
+            &dim_input,
+            runs,
+            &mut out,
+        ));
+        Ok((layer, rows))
     }
 
     pub fn generate(
@@ -818,6 +924,73 @@ impl Runner {
     }
 }
 
+fn measure_matvec(
+    name: &str,
+    weight: &Weight,
+    x: &[f32],
+    runs: usize,
+    out: &mut Vec<f32>,
+) -> KernelBenchRow {
+    let (rows, cols) = weight_shape(weight, x.len());
+    measure_kernel(name, weight, rows, cols, runs, || {
+        weight.matvec_into(x, out);
+        std::hint::black_box(out.len());
+    })
+}
+
+fn measure_kernel<F>(
+    name: &str,
+    weight: &Weight,
+    rows: usize,
+    cols: usize,
+    runs: usize,
+    mut body: F,
+) -> KernelBenchRow
+where
+    F: FnMut(),
+{
+    body();
+    let start = Instant::now();
+    for _ in 0..runs {
+        body();
+    }
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    KernelBenchRow {
+        name: name.to_string(),
+        dtype: weight_dtype(weight),
+        rows,
+        cols,
+        runs,
+        avg_ms: total_ms / runs as f64,
+        total_ms,
+    }
+}
+
+fn weight_shape(weight: &Weight, input_cols: usize) -> (usize, usize) {
+    match weight {
+        Weight::F32(data) => {
+            let cols = input_cols.max(1);
+            (data.len() / cols, input_cols)
+        }
+        Weight::Quantized { rows, cols, .. } => (*rows, *cols),
+    }
+}
+
+fn weight_dtype(weight: &Weight) -> String {
+    match weight {
+        Weight::F32(_) => String::from("F32"),
+        Weight::Quantized { dtype, .. } => format!("{:?}", dtype),
+    }
+}
+
+fn deterministic_bench_vector(n: usize) -> Vec<f32> {
+    let mut out = vec![0.0; n];
+    for (i, value) in out.iter_mut().enumerate() {
+        *value = ((i % 251) as f32 - 125.0) / 125.0;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cosine_similarity, l2_normalize_in_place, mean_pool_in_place};
@@ -896,5 +1069,25 @@ impl WasmRunner {
             .generate(prompt, &options)
             .map(|result| result.text)
             .map_err(|err| JsValue::from_str(&err))
+    }
+
+    /// Returns an L2-normalised embedding vector as a `Float32Array`.
+    /// Suitable for cosine similarity / RAG retrieval directly in JS.
+    pub fn embed(&self, text: &str) -> Result<js_sys::Float32Array, JsValue> {
+        self.inner
+            .embed(text)
+            .map(|r| js_sys::Float32Array::from(r.embedding.as_slice()))
+            .map_err(|err| JsValue::from_str(&err))
+    }
+
+    /// Cosine similarity between two `Float32Array` embeddings produced by `embed()`.
+    /// Returns a value in [-1, 1]; higher means more similar.
+    pub fn cosine_similarity(
+        a: &js_sys::Float32Array,
+        b: &js_sys::Float32Array,
+    ) -> Result<f32, JsValue> {
+        let a_vec: Vec<f32> = a.to_vec();
+        let b_vec: Vec<f32> = b.to_vec();
+        crate::runtime::cosine_similarity(&a_vec, &b_vec).map_err(|err| JsValue::from_str(&err))
     }
 }
