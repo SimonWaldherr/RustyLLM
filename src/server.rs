@@ -298,6 +298,28 @@ struct GenerateResponse<'a> {
     cache_stats: Option<CacheStats>,
 }
 
+/// Build a [`CacheStats`] for a session-backed response.
+///
+/// Only returns `Some` when `use_session` is `true` AND a `conversation_id`
+/// was provided; returns `None` for stateless requests so the field is
+/// omitted from the JSON response.
+fn make_cache_stats(
+    stats: &crate::runtime::GenerationStats,
+    use_session: bool,
+    conv_id: Option<&str>,
+) -> Option<CacheStats> {
+    if use_session && conv_id.is_some() {
+        Some(CacheStats {
+            cached_tokens: stats.cached_tokens,
+            evaluated_tokens: stats.prompt_tokens - stats.cached_tokens + stats.generated_tokens,
+            prefill_ms: stats.prefill_time.as_millis(),
+            decode_ms: stats.decode_time.as_millis(),
+        })
+    } else {
+        None
+    }
+}
+
 struct ActiveConnectionGuard {
     active_connections: Arc<AtomicUsize>,
 }
@@ -972,18 +994,8 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                         &history_messages,
                         &result,
                     );
-                    let cache_stats = if use_session && conv_id.is_some() {
-                        Some(CacheStats {
-                            cached_tokens: result.stats.cached_tokens,
-                            evaluated_tokens: result.stats.prompt_tokens
-                                - result.stats.cached_tokens
-                                + result.stats.generated_tokens,
-                            prefill_ms: result.stats.prefill_time.as_millis(),
-                            decode_ms: result.stats.decode_time.as_millis(),
-                        })
-                    } else {
-                        None
-                    };
+                    let cache_stats =
+                        make_cache_stats(&result.stats, use_session, conv_id.as_deref());
                     json_response(GenerateResponse {
                         text: &result.text,
                         prompt_tokens: result.stats.prompt_tokens,
@@ -1112,18 +1124,8 @@ fn route_openai_chat(
                         completion_tokens: result.stats.generated_tokens,
                         total_tokens: result.stats.prompt_tokens + result.stats.generated_tokens,
                     };
-                    let cache_stats = if use_session && conv_id.is_some() {
-                        Some(CacheStats {
-                            cached_tokens: result.stats.cached_tokens,
-                            evaluated_tokens: result.stats.prompt_tokens
-                                - result.stats.cached_tokens
-                                + result.stats.generated_tokens,
-                            prefill_ms: result.stats.prefill_time.as_millis(),
-                            decode_ms: result.stats.decode_time.as_millis(),
-                        })
-                    } else {
-                        None
-                    };
+                    let cache_stats =
+                        make_cache_stats(&result.stats, use_session, conv_id.as_deref());
                     json_response(OpenAiChatCompletionResponse {
                         id: format!("chatcmpl-rustyllm-{}", created),
                         object: "chat.completion",
