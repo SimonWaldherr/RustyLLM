@@ -1030,19 +1030,22 @@ impl Runner {
         }
         let prefill_time = t_prefill.elapsed();
 
+        // Capture values needed for the decode phase before transferring
+        // ownership of `tokens` into the session.
+        let prompt_len = tokens.len();
         // Update the session's token list to the current prompt.
         // Generated tokens are appended below during the decode loop.
-        session.cached_tokens = tokens.clone();
+        session.cached_tokens = tokens;
 
         // ── Decode ───────────────────────────────────────────────────────────
         let t_decode = Instant::now();
         let mut output = String::new();
         let mut generated = Vec::new();
-        let mut pos = tokens.len();
+        let mut pos = prompt_len;
 
         // Initialise the recent-token ring from the full prompt (same as the
         // stateless path) so repeat-penalty covers the current turn.
-        let mut recent: VecDeque<u32> = tokens.iter().copied().collect();
+        let mut recent: VecDeque<u32> = session.cached_tokens.iter().copied().collect();
 
         let max_stop_len = options
             .stop_sequences
@@ -1097,7 +1100,7 @@ impl Runner {
                 recent.pop_front();
             }
 
-            if generated.len() >= options.max_tokens || pos >= cache_limit - 1 {
+            if pos >= cache_limit - 1 {
                 break;
             }
 
@@ -1120,7 +1123,7 @@ impl Runner {
         Ok(GenerationResult {
             text: output,
             stats: GenerationStats {
-                prompt_tokens: tokens.len(),
+                prompt_tokens: prompt_len,
                 generated_tokens: generated.len(),
                 prefill_time,
                 decode_time,
@@ -1242,6 +1245,36 @@ mod tests {
         assert!(cosine_similarity(&[], &[]).is_err());
         assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
         assert!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn longest_common_prefix_identical_sequences() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3, 4, 5];
+        assert_eq!(Runner::longest_common_prefix(&a, &a), 5);
+    }
+
+    #[test]
+    fn longest_common_prefix_partial_match() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3, 4, 5];
+        let b = vec![1u32, 2, 3, 7, 8, 9];
+        assert_eq!(Runner::longest_common_prefix(&a, &b), 3);
+    }
+
+    #[test]
+    fn longest_common_prefix_no_match() {
+        use super::Runner;
+        let a = vec![1u32, 2, 3];
+        let b = vec![9u32, 8, 7];
+        assert_eq!(Runner::longest_common_prefix(&a, &b), 0);
+    }
+
+    #[test]
+    fn longest_common_prefix_empty_inputs() {
+        use super::Runner;
+        assert_eq!(Runner::longest_common_prefix(&[], &[1u32, 2]), 0);
+        assert_eq!(Runner::longest_common_prefix(&[1u32, 2], &[]), 0);
     }
 }
 

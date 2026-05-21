@@ -112,7 +112,13 @@ impl SessionStore {
                 .min_by_key(|(_, arc)| {
                     arc.lock()
                         .map(|s| s.last_used)
-                        .unwrap_or_else(|_| Instant::now())
+                        // A poisoned session has undefined state; treat it as
+                        // the oldest possible entry so it is evicted first.
+                        .unwrap_or_else(|_| {
+                            Instant::now()
+                                .checked_sub(std::time::Duration::from_secs(u32::MAX as u64))
+                                .unwrap_or_else(Instant::now)
+                        })
                 })
                 .map(|(k, _)| k.clone());
             if let Some(key) = lru_key {

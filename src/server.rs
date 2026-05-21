@@ -932,18 +932,19 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
             let mut history_messages = Vec::new();
             let result = if let Some(messages) = payload.messages {
                 match parse_api_messages(messages) {
-                    Ok(messages) => {
-                        history_messages = messages.clone();
-                        generate_with_optional_session(
-                            runner,
-                            options,
-                            &messages,
-                            &generation,
-                            use_session,
-                            conv_id.as_deref(),
-                            |_| {},
-                        )
-                    }
+                    Ok(messages) => generate_with_optional_session(
+                        runner,
+                        options,
+                        &messages,
+                        &generation,
+                        use_session,
+                        conv_id.as_deref(),
+                        |_| {},
+                    )
+                    .map(|r| {
+                        history_messages = messages;
+                        r
+                    }),
                     Err(err) => Err(err),
                 }
             } else if let Some(prompt) = payload.prompt {
