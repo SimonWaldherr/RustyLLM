@@ -10,6 +10,8 @@ pub mod runtime;
 pub mod sampling;
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 pub mod server;
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+pub mod session;
 pub mod simd;
 pub mod tokenizer;
 

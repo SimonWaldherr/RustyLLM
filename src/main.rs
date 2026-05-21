@@ -47,6 +47,12 @@ fn print_usage(name: &str) {
     eprintln!("  --tls-key <path>          PEM private key for HTTPS");
     #[cfg(feature = "server")]
     eprintln!("  --max-connections <N>     Max concurrent server connections");
+    #[cfg(feature = "server")]
+    eprintln!(
+        "  --max-sessions <N>        Max persistent conversation sessions (default: 8, 0=disable)"
+    );
+    #[cfg(feature = "server")]
+    eprintln!("  --max-cached-tokens <N>   Max KV-cache tokens per session (default: 2048)");
     eprintln!("  --max-tokens <N>          Max tokens to generate (default: 256)");
     eprintln!("  --temp <F>                Temperature (default: 0.7, 0=greedy)");
     eprintln!("  --top-p <F>               Nucleus sampling threshold (default: 0.9)");
@@ -136,6 +142,10 @@ fn run() -> Result<(), String> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut max_connections_override: Option<usize> = None;
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let mut max_sessions: usize = server::DEFAULT_MAX_SESSIONS;
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let mut max_cached_tokens: usize = server::DEFAULT_MAX_CACHED_TOKENS;
     let mut embed_mode = false;
     let mut bench_mode = false;
     let mut bench_json = false;
@@ -194,6 +204,26 @@ fn run() -> Result<(), String> {
             "--max-connections" => {
                 max_connections_override =
                     Some(parse_arg::<usize>(&args, &mut i, "--max-connections")?);
+            }
+            "--max-sessions" => {
+                #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+                {
+                    max_sessions = parse_arg::<usize>(&args, &mut i, "--max-sessions")?;
+                }
+                #[cfg(not(all(not(target_family = "wasm"), feature = "server")))]
+                {
+                    let _ = parse_arg::<usize>(&args, &mut i, "--max-sessions")?;
+                }
+            }
+            "--max-cached-tokens" => {
+                #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+                {
+                    max_cached_tokens = parse_arg::<usize>(&args, &mut i, "--max-cached-tokens")?;
+                }
+                #[cfg(not(all(not(target_family = "wasm"), feature = "server")))]
+                {
+                    let _ = parse_arg::<usize>(&args, &mut i, "--max-cached-tokens")?;
+                }
             }
             "--max-tokens" | "-n" => {
                 options.max_tokens = parse_arg::<usize>(&args, &mut i, "--max-tokens")?;
@@ -479,6 +509,17 @@ fn run() -> Result<(), String> {
                 );
             }
             eprintln!("Max concurrent connections: {}", max_connections);
+            let session_store = if max_sessions > 0 {
+                use rusty_llm::session::SessionStore;
+                eprintln!(
+                    "Session cache: {} sessions, {} tokens/session",
+                    max_sessions, max_cached_tokens
+                );
+                Some(Arc::new(SessionStore::new(max_sessions, max_cached_tokens)))
+            } else {
+                eprintln!("Session cache: disabled (--max-sessions 0)");
+                None
+            };
             let serve_options = ServeOptions {
                 addr,
                 defaults: options.clone(),
@@ -488,6 +529,7 @@ fn run() -> Result<(), String> {
                 chat_ui,
                 chat_history_path: chat_history_path.clone(),
                 chat_history_lock: Arc::new(std::sync::Mutex::new(())),
+                session_store,
             };
             server::serve(Arc::new(runner), serve_options)?;
             return Ok(());
