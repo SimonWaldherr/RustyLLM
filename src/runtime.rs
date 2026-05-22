@@ -713,13 +713,13 @@ impl Runner {
 
     /// Like `forward_token` but returns the normalized hidden state (dim-sized)
     /// before the output projection.  Used for embedding generation.
-    fn forward_hidden_token(
+    fn forward_hidden_token<'a>(
         &self,
         cache: &mut KVCache,
-        buf: &mut DecodeBuffer,
+        buf: &'a mut DecodeBuffer,
         token: u32,
         pos: usize,
-    ) -> Vec<f32> {
+    ) -> &'a [f32] {
         match &self.weights {
             LoadedWeights::GptOss(weights) => {
                 model::forward_hidden_gpt_oss(&self.config, weights, cache, buf, token, pos)

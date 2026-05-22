@@ -17,7 +17,7 @@
       --muted:    #7a7f9a;
       --success:  #4caf82;
       --danger:   #e05555;
-      --radius:   10px;
+      --radius:   8px;
       --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
     }
 
@@ -43,7 +43,7 @@
     .header-text h1 {
       font-size: 1.25rem;
       font-weight: 700;
-      letter-spacing: -0.02em;
+      letter-spacing: 0;
     }
 
     .header-text p {
@@ -66,7 +66,7 @@
 
     main {
       flex: 1;
-      max-width: 900px;
+      max-width: 1120px;
       width: 100%;
       margin: 0 auto;
       padding: 32px 24px;
@@ -104,7 +104,7 @@
     .drop-zone {
       border: 2px dashed var(--border);
       border-radius: var(--radius);
-      padding: 36px;
+      padding: 34px;
       text-align: center;
       cursor: pointer;
       transition: border-color 0.2s, background 0.2s;
@@ -128,7 +128,7 @@
     .url-hint a:hover { text-decoration: underline; }
 
     .model-info {
-      display: none; align-items: center; gap: 12px; margin-top: 14px;
+      display: none; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap;
       padding: 12px 16px; background: rgba(76,175,130,0.08);
       border: 1px solid rgba(76,175,130,0.25); border-radius: 8px;
     }
@@ -160,6 +160,13 @@
     .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
     .tab-panel { display: none; padding-top: 24px; }
     .tab-panel.active { display: block; }
+
+    .embedding-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+      gap: 16px;
+      align-items: start;
+    }
 
     /* ── Cards ── */
     .card {
@@ -195,6 +202,7 @@
       padding: 8px 16px; transition: border-color 0.15s, color 0.15s; white-space: nowrap;
     }
     button.secondary:hover { border-color: var(--text); color: var(--text); }
+    button.secondary:disabled { opacity: 0.45; cursor: not-allowed; }
 
     /* ── Text entries ── */
     .texts-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
@@ -215,8 +223,9 @@
     .remove-btn:disabled { opacity: 0.2; cursor: default; }
 
     .text-entry-footer {
-      display: flex; justify-content: space-between; align-items: center;
+      display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
     }
+    .entry-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .add-text-btn {
       background: none; border: 1px dashed var(--border); border-radius: 8px;
       color: var(--muted); cursor: pointer; font-size: 0.83rem;
@@ -235,6 +244,34 @@
     td.sim-high   { color: #4caf82; }
     td.sim-medium { color: #e0b02e; }
     td.sim-low    { color: var(--muted); }
+
+    .query-box textarea { min-height: 132px; }
+    .embedding-controls {
+      display: flex; justify-content: flex-end; align-items: center; gap: 12px;
+      margin-bottom: 16px; flex-wrap: wrap;
+    }
+    .result-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+    .result-row {
+      display: grid; grid-template-columns: 34px minmax(0, 1fr) 76px;
+      gap: 10px; align-items: center; padding: 10px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    }
+    .result-label {
+      color: var(--accent2); font-family: var(--font-mono); font-weight: 700;
+      text-align: center;
+    }
+    .result-text {
+      min-width: 0; color: var(--text); font-size: 0.84rem; line-height: 1.4;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .score-wrap { display: flex; flex-direction: column; gap: 5px; align-items: flex-end; }
+    .score-value { font-family: var(--font-mono); font-size: 0.82rem; color: var(--success); }
+    .score-bar { width: 70px; height: 5px; background: var(--border); border-radius: 999px; overflow: hidden; }
+    .score-fill { height: 100%; background: var(--success); border-radius: inherit; }
+    .empty-state {
+      color: var(--muted); border: 1px dashed var(--border); border-radius: 8px;
+      padding: 16px; font-size: 0.84rem; line-height: 1.5;
+    }
 
     /* ── Generation ── */
     .gen-controls { display: flex; gap: 12px; align-items: flex-end; margin-bottom: 16px; }
@@ -287,6 +324,22 @@
       transition: opacity 0.2s, transform 0.2s; pointer-events: none;
     }
     .copy-toast.show { opacity: 1; transform: translateY(0); }
+
+    @media (max-width: 820px) {
+      header { padding: 16px 18px; }
+      .badge { display: none; }
+      main { padding: 22px 14px; }
+      .embedding-layout { grid-template-columns: 1fr; }
+      .url-row, .gen-controls { flex-direction: column; align-items: stretch; }
+      .tab-bar { overflow-x: auto; }
+      .tab-btn { padding: 12px 14px; white-space: nowrap; }
+      .drop-zone { padding: 24px 16px; }
+      .text-entry { gap: 8px; }
+      .text-entry .label-bubble { min-width: 30px; padding: 6px 8px; }
+      .result-row { grid-template-columns: 30px minmax(0, 1fr); }
+      .score-wrap { grid-column: 2; align-items: stretch; }
+      .score-bar { width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -348,44 +401,66 @@
   <!-- Tabs -->
   <div class="tabs" id="tabs">
     <div class="tab-bar">
-      <button class="tab-btn active" data-tab="embedding">Embedding / RAG</button>
+      <button class="tab-btn active" data-tab="embedding">Embedding Search</button>
       <button class="tab-btn" data-tab="generation">Text Generation</button>
     </div>
 
     <!-- Embedding tab -->
     <div class="tab-panel active" id="tab-embedding">
-      <div class="card">
-        <label>Texts to compare</label>
-        <div class="texts-grid" id="textsGrid">
-          <div class="text-entry">
-            <div class="label-bubble">A</div>
-            <textarea placeholder="Albert Einstein was a theoretical physicist."></textarea>
-            <button class="remove-btn" title="Remove">×</button>
+      <div class="embedding-layout">
+        <div class="card">
+          <label>Corpus</label>
+          <div class="texts-grid" id="textsGrid">
+            <div class="text-entry">
+              <div class="label-bubble">A</div>
+              <textarea>Albert Einstein was a theoretical physicist who developed the theory of relativity.</textarea>
+              <button class="remove-btn" title="Remove">×</button>
+            </div>
+            <div class="text-entry">
+              <div class="label-bubble">B</div>
+              <textarea>Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.</textarea>
+              <button class="remove-btn" title="Remove">×</button>
+            </div>
+            <div class="text-entry">
+              <div class="label-bubble">C</div>
+              <textarea>Bananas are sweet tropical fruit often used in smoothies and baked desserts.</textarea>
+              <button class="remove-btn" title="Remove">×</button>
+            </div>
+            <div class="text-entry">
+              <div class="label-bubble">D</div>
+              <textarea>Retrieval augmented generation finds relevant documents before asking a language model to answer.</textarea>
+              <button class="remove-btn" title="Remove">×</button>
+            </div>
           </div>
-          <div class="text-entry">
-            <div class="label-bubble">B</div>
-            <textarea placeholder="Einstein developed the theory of relativity."></textarea>
-            <button class="remove-btn" title="Remove">×</button>
-          </div>
-          <div class="text-entry">
-            <div class="label-bubble">C</div>
-            <textarea placeholder="A banana is a tropical fruit."></textarea>
-            <button class="remove-btn" title="Remove">×</button>
+          <div class="text-entry-footer">
+            <div class="entry-actions">
+              <button class="add-text-btn" id="addTextBtn">+ Add text</button>
+              <button class="secondary" id="sampleTextsBtn" type="button">Samples</button>
+              <button class="secondary" id="clearTextsBtn" type="button">Clear</button>
+            </div>
+            <span class="stat" id="textCount"></span>
           </div>
         </div>
-        <div class="text-entry-footer">
-          <button class="add-text-btn" id="addTextBtn">+ Add text</button>
-          <span class="stat" id="textCount"></span>
+
+        <div>
+          <div class="card query-box">
+            <label>Query</label>
+            <textarea id="queryInput">Who discovered relativity?</textarea>
+          </div>
+          <div class="card" id="rankingCard" style="display:none">
+            <label>Top matches</label>
+            <div class="result-list" id="rankingList"></div>
+          </div>
         </div>
       </div>
 
-      <div style="display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-bottom:16px;">
+      <div class="embedding-controls">
         <span class="stat"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
-        <button class="primary" id="embedBtn" disabled>Compute embeddings</button>
+        <button class="primary" id="embedBtn" disabled>Run retrieval</button>
       </div>
 
       <div class="card" id="simCard" style="display:none">
-        <label>Cosine similarity matrix</label>
+        <label>Corpus similarity matrix</label>
         <div class="sim-matrix" id="simMatrix"></div>
         <div class="stats-bar" id="embedStats"></div>
       </div>
@@ -440,6 +515,14 @@
 
   let runner = null;
   const embedCache = new Map(); // text -> Float32Array
+  const SAMPLE_TEXTS = [
+    'Albert Einstein was a theoretical physicist who developed the theory of relativity.',
+    'Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.',
+    'Bananas are sweet tropical fruit often used in smoothies and baked desserts.',
+    'Retrieval augmented generation finds relevant documents before asking a language model to answer.'
+  ];
+  const SAMPLE_QUERY = 'Who discovered relativity?';
+  const LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
   // ── Loader sub-tabs ───────────────────────────────────────────────────────────
   document.querySelectorAll('.loader-tab').forEach(tab => {
@@ -466,6 +549,29 @@
     document.getElementById('progressFill').style.width = pct + '%';
     document.getElementById('progressLabel').textContent = label;
     document.getElementById('progressPct').textContent = right;
+  }
+
+  function escapeHtml(text) {
+    return text.replace(/[&<>"']/g, ch => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    }[ch]));
+  }
+
+  function yieldToBrowser() {
+    return new Promise(resolve => setTimeout(resolve, 20));
+  }
+
+  function normalizedText(text) {
+    return text.trim().replace(/\s+/g, ' ');
+  }
+
+  function setButtonBusy(btn, label, busy) {
+    btn.disabled = busy;
+    btn.innerHTML = busy ? `<span class="spinner"></span>${label}` : label;
   }
 
   // ── Model loading ─────────────────────────────────────────────────────────────
@@ -572,8 +678,6 @@
   });
 
   // ── Text entries ──────────────────────────────────────────────────────────────
-  const LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-
   function syncTextUI() {
     const entries = [...document.querySelectorAll('#textsGrid .text-entry')];
     entries.forEach((entry, i) => {
@@ -585,16 +689,60 @@
     document.getElementById('addTextBtn').disabled = entries.length >= 8;
   }
 
+  function persistEmbeddingInputs() {
+    try {
+      const texts = [...document.querySelectorAll('#textsGrid textarea')].map(t => t.value);
+      const query = document.getElementById('queryInput').value;
+      localStorage.setItem('rustyEmbeddingTexts', JSON.stringify(texts));
+      localStorage.setItem('rustyEmbeddingQuery', query);
+    } catch {}
+  }
+
+  function attachTextEvents(entry) {
+    attachRemove(entry.querySelector('.remove-btn'));
+    entry.querySelector('textarea').addEventListener('input', persistEmbeddingInputs);
+  }
+
+  function setCorpusTexts(texts) {
+    const grid = document.getElementById('textsGrid');
+    grid.innerHTML = '';
+    texts.slice(0, 8).forEach(text => {
+      const entry = document.createElement('div');
+      entry.className = 'text-entry';
+      entry.innerHTML = `
+        <div class="label-bubble"></div>
+        <textarea></textarea>
+        <button class="remove-btn" title="Remove">×</button>`;
+      entry.querySelector('textarea').value = text;
+      grid.appendChild(entry);
+      attachTextEvents(entry);
+    });
+    while (grid.children.length < 2) {
+      const entry = document.createElement('div');
+      entry.className = 'text-entry';
+      entry.innerHTML = `
+        <div class="label-bubble"></div>
+        <textarea placeholder="Enter text…"></textarea>
+        <button class="remove-btn" title="Remove">×</button>`;
+      grid.appendChild(entry);
+      attachTextEvents(entry);
+    }
+    syncTextUI();
+    persistEmbeddingInputs();
+  }
+
   function attachRemove(btn) {
     btn.addEventListener('click', () => {
       const entries = document.querySelectorAll('#textsGrid .text-entry');
       if (entries.length <= 2) return;
       btn.closest('.text-entry').remove();
       syncTextUI();
+      persistEmbeddingInputs();
     });
   }
 
-  document.querySelectorAll('#textsGrid .remove-btn').forEach(attachRemove);
+  document.querySelectorAll('#textsGrid .text-entry').forEach(attachTextEvents);
+  document.getElementById('queryInput').addEventListener('input', persistEmbeddingInputs);
   syncTextUI();
 
   document.getElementById('addTextBtn').addEventListener('click', () => {
@@ -607,81 +755,174 @@
       <textarea placeholder="Enter text…"></textarea>
       <button class="remove-btn" title="Remove">×</button>`;
     grid.appendChild(entry);
-    attachRemove(entry.querySelector('.remove-btn'));
+    attachTextEvents(entry);
     syncTextUI();
+    persistEmbeddingInputs();
     entry.querySelector('textarea').focus();
   });
 
+  document.getElementById('sampleTextsBtn').addEventListener('click', () => {
+    setCorpusTexts(SAMPLE_TEXTS);
+    document.getElementById('queryInput').value = SAMPLE_QUERY;
+    persistEmbeddingInputs();
+  });
+
+  document.getElementById('clearTextsBtn').addEventListener('click', () => {
+    setCorpusTexts(['', '']);
+    document.getElementById('queryInput').value = '';
+    document.getElementById('simCard').style.display = 'none';
+    document.getElementById('rankingCard').style.display = 'none';
+    persistEmbeddingInputs();
+  });
+
+  try {
+    const savedTexts = JSON.parse(localStorage.getItem('rustyEmbeddingTexts') || 'null');
+    if (Array.isArray(savedTexts) && savedTexts.length > 0) setCorpusTexts(savedTexts);
+    const savedQuery = localStorage.getItem('rustyEmbeddingQuery');
+    if (savedQuery !== null) document.getElementById('queryInput').value = savedQuery;
+  } catch {}
+
   // ── Embedding ─────────────────────────────────────────────────────────────────
-  async function runEmbedding() {
-    hideError('embedError');
-    const btn = document.getElementById('embedBtn');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Computing…';
+  function readCorpusEntries() {
+    return [...document.querySelectorAll('#textsGrid textarea')]
+      .map((textarea, i) => ({
+        label: LABELS[i],
+        text: normalizedText(textarea.value)
+      }))
+      .filter(entry => entry.text.length > 0);
+  }
 
-    const texts = [...document.querySelectorAll('#textsGrid textarea')]
-      .map(t => t.value.trim()).filter(Boolean);
+  function dotNormalized(a, b) {
+    const n = Math.min(a.length, b.length);
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += a[i] * b[i];
+    return Math.max(-1, Math.min(1, sum));
+  }
 
-    if (texts.length < 2) {
-      showError('embedError', 'Please enter at least 2 texts.');
-      btn.disabled = false;
-      btn.textContent = 'Compute embeddings';
-      return;
+  async function embedText(text, counters) {
+    const key = normalizedText(text);
+    if (embedCache.has(key)) {
+      counters.cached++;
+      return embedCache.get(key);
     }
+    counters.computed++;
+    const vec = runner.embed(key);
+    embedCache.set(key, vec);
+    return vec;
+  }
 
-    const t0 = performance.now();
-    let embeddings;
-    try {
-      embeddings = texts.map(text => {
-        if (embedCache.has(text)) return embedCache.get(text);
-        const vec = runner.embed(text);
-        embedCache.set(text, vec);
-        return vec;
-      });
-    } catch (e) {
-      showError('embedError', `Embedding failed: ${e}`);
-      btn.disabled = false;
-      btn.textContent = 'Compute embeddings';
-      return;
-    }
-    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+  function similarityClass(v) {
+    return v > 0.7 ? 'sim-high' : v > 0.4 ? 'sim-medium' : 'sim-low';
+  }
 
-    const n = texts.length;
-    // Compute upper triangle, mirror lower
+  function renderMatrix(entries, embeddings) {
+    const n = entries.length;
     const sims = Array.from({length: n}, () => new Array(n).fill(null));
-    for (let i = 0; i < n; i++)
-      for (let j = i + 1; j < n; j++)
-        sims[i][j] = sims[j][i] = WasmRunner.cosine_similarity(embeddings[i], embeddings[j]);
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        sims[i][j] = sims[j][i] = dotNormalized(embeddings[i], embeddings[j]);
+      }
+    }
 
-    const labelList = LABELS.slice(0, n).split('');
     let html = '<table><thead><tr><th></th>';
-    labelList.forEach(l => { html += `<th>${l}</th>`; });
+    entries.forEach(entry => { html += `<th>${entry.label}</th>`; });
     html += '</tr></thead><tbody>';
     for (let i = 0; i < n; i++) {
-      html += `<tr><th>${labelList[i]}</th>`;
+      html += `<tr><th>${entries[i].label}</th>`;
       for (let j = 0; j < n; j++) {
         if (i === j) {
-          html += `<td class="self">—</td>`;
+          html += '<td class="self">—</td>';
         } else {
           const v = sims[i][j];
-          const cls = v > 0.7 ? 'sim-high' : v > 0.4 ? 'sim-medium' : 'sim-low';
           const alpha = (Math.max(0, v) * 0.25).toFixed(2);
-          html += `<td class="${cls}" style="background:rgba(76,175,130,${alpha})">${v.toFixed(4)}</td>`;
+          html += `<td class="${similarityClass(v)}" style="background:rgba(76,175,130,${alpha})">${v.toFixed(4)}</td>`;
         }
       }
       html += '</tr>';
     }
     html += '</tbody></table>';
-
     document.getElementById('simMatrix').innerHTML = html;
-    document.getElementById('embedStats').innerHTML =
-      `<span class="stat">Texts: <strong>${n}</strong></span>` +
-      `<span class="stat">Dim: <strong>${embeddings[0].length}</strong></span>` +
-      `<span class="stat">Time: <strong>${elapsed}s</strong></span>`;
     document.getElementById('simCard').style.display = 'block';
+  }
 
-    btn.disabled = false;
-    btn.textContent = 'Compute embeddings';
+  function renderRanking(entries, embeddings, queryVec) {
+    const ranked = entries
+      .map((entry, i) => ({ ...entry, score: dotNormalized(queryVec, embeddings[i]) }))
+      .sort((a, b) => b.score - a.score);
+
+    const list = document.getElementById('rankingList');
+    if (ranked.length === 0) {
+      list.innerHTML = '<div class="empty-state">No corpus texts.</div>';
+    } else {
+      list.innerHTML = ranked.map(item => {
+        const pct = Math.max(0, Math.min(1, item.score)) * 100;
+        return `
+          <div class="result-row">
+            <div class="result-label">${item.label}</div>
+            <div class="result-text" title="${escapeHtml(item.text)}">${escapeHtml(item.text)}</div>
+            <div class="score-wrap">
+              <div class="score-value">${item.score.toFixed(4)}</div>
+              <div class="score-bar"><div class="score-fill" style="width:${pct.toFixed(1)}%"></div></div>
+            </div>
+          </div>`;
+      }).join('');
+    }
+    document.getElementById('rankingCard').style.display = 'block';
+  }
+
+  async function runEmbedding() {
+    hideError('embedError');
+    const btn = document.getElementById('embedBtn');
+    setButtonBusy(btn, 'Embedding…', true);
+    await yieldToBrowser();
+
+    const entries = readCorpusEntries();
+    const query = normalizedText(document.getElementById('queryInput').value);
+
+    if (entries.length < 2) {
+      showError('embedError', 'Please enter at least 2 texts.');
+      setButtonBusy(btn, 'Run retrieval', false);
+      return;
+    }
+
+    const t0 = performance.now();
+    let embeddings, queryEmbedding;
+    const counters = { computed: 0, cached: 0 };
+    try {
+      embeddings = [];
+      for (let i = 0; i < entries.length; i++) {
+        btn.innerHTML = `<span class="spinner"></span>Embedding ${i + 1}/${entries.length}`;
+        await yieldToBrowser();
+        embeddings.push(await embedText(entries[i].text, counters));
+      }
+      if (query) {
+        btn.innerHTML = '<span class="spinner"></span>Ranking';
+        await yieldToBrowser();
+        queryEmbedding = await embedText(query, counters);
+      }
+    } catch (e) {
+      showError('embedError', `Embedding failed: ${e}`);
+      setButtonBusy(btn, 'Run retrieval', false);
+      return;
+    }
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+
+    renderMatrix(entries, embeddings);
+    if (queryEmbedding) {
+      renderRanking(entries, embeddings, queryEmbedding);
+    } else {
+      document.getElementById('rankingCard').style.display = 'none';
+    }
+
+    document.getElementById('embedStats').innerHTML =
+      `<span class="stat">Texts: <strong>${entries.length}</strong></span>` +
+      `<span class="stat">Dim: <strong>${embeddings[0].length}</strong></span>` +
+      `<span class="stat">New: <strong>${counters.computed}</strong></span>` +
+      `<span class="stat">Cached: <strong>${counters.cached}</strong></span>` +
+      `<span class="stat">Time: <strong>${elapsed}s</strong></span>`;
+    persistEmbeddingInputs();
+
+    setButtonBusy(btn, 'Run retrieval', false);
   }
 
   document.getElementById('embedBtn').addEventListener('click', runEmbedding);

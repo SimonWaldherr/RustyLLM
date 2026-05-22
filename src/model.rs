@@ -2797,14 +2797,14 @@ pub fn load_gemma4_model(
 
 /// Forward for standard (LLaMA-style) models; returns the normalized hidden
 /// state of dimension `config.dim` instead of vocabulary logits.
-pub fn forward_hidden(
+pub fn forward_hidden<'a>(
     config: &Config,
     weights: &ModelWeights,
     cache: &mut KVCache,
-    buf: &mut DecodeBuffer,
+    buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
-) -> Vec<f32> {
+) -> &'a [f32] {
     let dim = config.dim;
     let head_dim = config.head_dim;
     let kv_mul = config.kv_mul;
@@ -2907,18 +2907,18 @@ pub fn forward_hidden(
         config.rms_norm_eps,
         &mut buf.xn,
     );
-    buf.xn.clone()
+    &buf.xn
 }
 
 /// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
-pub fn forward_hidden_gpt_oss(
+pub fn forward_hidden_gpt_oss<'a>(
     config: &Config,
     weights: &GptOssWeights,
     cache: &mut KVCache,
-    buf: &mut DecodeBuffer,
+    buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
-) -> Vec<f32> {
+) -> &'a [f32] {
     weights
         .token_embd
         .row_into(token as usize, config.dim, &mut buf.x);
@@ -3054,18 +3054,18 @@ pub fn forward_hidden_gpt_oss(
         config.rms_norm_eps,
         &mut buf.xn,
     );
-    buf.xn.clone()
+    &buf.xn
 }
 
 /// Forward for Gemma-4 models; returns the normalized hidden state.
-pub fn forward_hidden_gemma4(
+pub fn forward_hidden_gemma4<'a>(
     config: &Config,
     weights: &Gemma4Weights,
     cache: &mut KVCache,
-    buf: &mut DecodeBuffer,
+    buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
-) -> Vec<f32> {
+) -> &'a [f32] {
     let dim = config.dim;
 
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
@@ -3161,5 +3161,5 @@ pub fn forward_hidden_gemma4(
         config.rms_norm_eps,
         &mut buf.xn,
     );
-    buf.xn.clone()
+    &buf.xn
 }
