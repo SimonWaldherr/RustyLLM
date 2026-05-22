@@ -1,4 +1,4 @@
-use crate::gguf::GGUFFile;
+use crate::gguf::{GGMLType, GGUFFile};
 use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight};
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -264,6 +264,36 @@ pub fn architecture_supported(arch: &str) -> bool {
     )
 }
 
+/// Checks that every tensor in `gguf` uses a quantization type that the
+/// inference kernels support.  Returns a descriptive error for any tensor
+/// whose dtype would cause a panic inside `load_weight`.
+fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
+    for tensor in &gguf.tensors {
+        match tensor.dtype {
+            GGMLType::F32
+            | GGMLType::F16
+            | GGMLType::Q4_0
+            | GGMLType::Q4_1
+            | GGMLType::Q5_0
+            | GGMLType::Q5_1
+            | GGMLType::Q8_0
+            | GGMLType::Q8_1
+            | GGMLType::Q4_K
+            | GGMLType::Q6_K
+            | GGMLType::MXFP4 => {}
+            unsupported => {
+                return Err(format!(
+                    "Tensor '{}' uses unsupported quantization type {:?}. \
+                     Please re-quantize the model using a supported format: \
+                     F16, Q8_0, Q4_0, Q4_K_M, Q6_K, or Q5_K_M.",
+                    tensor.name, unsupported
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Runner {
     /// Loads a runner from GGUF bytes already present in memory.
     pub fn from_gguf_bytes(data: &[u8]) -> Result<Self, String> {
@@ -279,6 +309,8 @@ impl Runner {
                 arch
             ));
         }
+
+        validate_tensor_dtypes(&gguf)?;
 
         let tok = Tokenizer::from_metadata(&gguf.metadata);
         let (config, weights) = match arch.as_str() {
@@ -328,6 +360,8 @@ impl Runner {
                 arch
             ));
         }
+
+        validate_tensor_dtypes(&gguf)?;
 
         let tok = Tokenizer::from_metadata(&gguf.metadata);
         let (config, weights) = match arch.as_str() {

@@ -254,30 +254,33 @@ impl<'a> Cursor<'a> {
     }
 
     /// reads one typed GGUF metadata value.
-    fn read_value(&mut self, vtype: u32) -> MetaValue {
+    fn read_value(&mut self, vtype: u32) -> Result<MetaValue, String> {
         match vtype {
-            0 => MetaValue::U8(self.read_u8()),
-            1 => MetaValue::I8(self.read_u8() as i8),
-            2 => MetaValue::U16(self.read_u16()),
-            3 => MetaValue::I16(self.read_u16() as i16),
-            4 => MetaValue::U32(self.read_u32()),
-            5 => MetaValue::I32(self.read_i32()),
-            6 => MetaValue::F32(self.read_f32()),
-            7 => MetaValue::Bool(self.read_bool()),
-            8 => MetaValue::Str(self.read_string()),
+            0 => Ok(MetaValue::U8(self.read_u8())),
+            1 => Ok(MetaValue::I8(self.read_u8() as i8)),
+            2 => Ok(MetaValue::U16(self.read_u16())),
+            3 => Ok(MetaValue::I16(self.read_u16() as i16)),
+            4 => Ok(MetaValue::U32(self.read_u32())),
+            5 => Ok(MetaValue::I32(self.read_i32())),
+            6 => Ok(MetaValue::F32(self.read_f32())),
+            7 => Ok(MetaValue::Bool(self.read_bool())),
+            8 => Ok(MetaValue::Str(self.read_string())),
             9 => {
                 let elem_type = self.read_u32();
                 let count = self.read_u64() as usize;
                 let mut arr = Vec::with_capacity(count);
                 for _ in 0..count {
-                    arr.push(self.read_value(elem_type));
+                    arr.push(self.read_value(elem_type)?);
                 }
-                MetaValue::Array(arr)
+                Ok(MetaValue::Array(arr))
             }
-            10 => MetaValue::U64(self.read_u64()),
-            11 => MetaValue::I64(self.read_i64()),
-            12 => MetaValue::F64(self.read_f64()),
-            _ => panic!("Unknown GGUF value type: {}", vtype),
+            10 => Ok(MetaValue::U64(self.read_u64())),
+            11 => Ok(MetaValue::I64(self.read_i64())),
+            12 => Ok(MetaValue::F64(self.read_f64())),
+            _ => Err(format!(
+                "Unknown GGUF metadata value type {}. The file may use a newer GGUF format version.",
+                vtype
+            )),
         }
     }
 }
@@ -336,7 +339,7 @@ impl GGUFFile {
         for _ in 0..n_kv {
             let key = c.read_string();
             let vtype = c.read_u32();
-            let value = c.read_value(vtype);
+            let value = c.read_value(vtype)?;
             metadata.insert(key, value);
         }
 
