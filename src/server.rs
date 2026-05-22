@@ -45,6 +45,7 @@ pub struct ServeOptions {
 }
 
 impl ServeOptions {
+    /// Reports whether both TLS certificate and key paths are configured.
     pub fn is_tls(&self) -> bool {
         #[cfg(feature = "tls")]
         {
@@ -132,6 +133,7 @@ enum StopSpec {
 }
 
 impl StopSpec {
+    /// Normalizes a stop specification into a list of stop strings.
     fn into_vec(self) -> Vec<String> {
         match self {
             StopSpec::One(s) => vec![s],
@@ -325,6 +327,7 @@ struct ActiveConnectionGuard {
 }
 
 impl Drop for ActiveConnectionGuard {
+    /// Releases the resource represented by this guard or mapping.
     fn drop(&mut self) {
         self.active_connections.fetch_sub(1, Ordering::Release);
     }
@@ -337,6 +340,7 @@ struct HttpError {
 }
 
 impl HttpError {
+    /// Creates an HTTP 400 parsing error.
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: 400,
@@ -344,6 +348,7 @@ impl HttpError {
         }
     }
 
+    /// Creates an HTTP 413 parsing error.
     fn payload_too_large(message: impl Into<String>) -> Self {
         Self {
             status: 413,
@@ -351,6 +356,7 @@ impl HttpError {
         }
     }
 
+    /// Creates an HTTP 408 parsing error.
     fn request_timeout(message: impl Into<String>) -> Self {
         Self {
             status: 408,
@@ -423,6 +429,7 @@ struct OpenAiCompletionResponse {
     usage: OpenAiUsage,
 }
 
+/// Starts the blocking HTTP or HTTPS server loop.
 pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
     let listener = TcpListener::bind(&options.addr)
         .map_err(|err| format!("Failed to bind {}: {}", options.addr, err))?;
@@ -508,6 +515,7 @@ pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// Attempts to reserve capacity for one accepted connection.
 fn try_acquire_connection_slot(
     active_connections: Arc<AtomicUsize>,
     max_connections: usize,
@@ -526,6 +534,7 @@ fn try_acquire_connection_slot(
     }
 }
 
+/// Handles one accepted TCP connection without TLS.
 fn handle_plain_connection(
     stream: TcpStream,
     runner: Arc<Runner>,
@@ -535,6 +544,7 @@ fn handle_plain_connection(
 }
 
 #[cfg(feature = "tls")]
+/// Wraps one TCP connection in TLS and handles the request.
 fn handle_tls_connection(
     stream: TcpStream,
     runner: Arc<Runner>,
@@ -546,6 +556,7 @@ fn handle_tls_connection(
     handle_connection(tls_stream, runner, options)
 }
 
+/// Reads, routes, and responds to one HTTP request.
 fn handle_connection<T>(
     mut stream: T,
     runner: Arc<Runner>,
@@ -623,6 +634,7 @@ enum ChatUiRoute {
     Expert,
 }
 
+/// Maps a request path to one of the embedded chat UI assets.
 fn chat_ui_route(path: &str) -> Option<ChatUiRoute> {
     match path {
         "/chat" => Some(ChatUiRoute::Simple),
@@ -825,6 +837,7 @@ fn route_streaming_request<W: Write>(
     stream.flush()
 }
 
+/// Routes non-streaming HTTP requests.
 fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions) -> (u16, String) {
     if request.method == "OPTIONS" {
         return (204, String::new());
@@ -933,6 +946,7 @@ where
     runner.generate_chat_stream(messages, generation, on_token)
 }
 
+/// Handles the native `/generate` JSON endpoint.
 fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16, String) {
     match serde_json::from_slice::<GenerateRequest>(body) {
         Ok(payload) => {
@@ -1013,6 +1027,7 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
     }
 }
 
+/// Handles OpenAI-compatible text completion requests.
 fn route_openai_completion(
     body: &[u8],
     runner: &Runner,
@@ -1079,6 +1094,7 @@ fn route_openai_completion(
     }
 }
 
+/// Handles OpenAI-compatible chat completion requests.
 fn route_openai_chat(
     body: &[u8],
     runner: &Runner,
@@ -1150,6 +1166,7 @@ fn route_openai_chat(
     }
 }
 
+/// Handles OpenAI-compatible embedding requests.
 fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16, String) {
     match serde_json::from_slice::<EmbeddingsRequest>(body) {
         Ok(payload) => {
@@ -1196,6 +1213,7 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
     }
 }
 
+/// Handles the Ollama-compatible model listing route.
 fn route_ollama_tags(runner: &Runner, model_ids: &[String]) -> (u16, String) {
     let modified_at = iso_timestamp();
     let size = runner.gguf().tensors.len();
@@ -1221,6 +1239,7 @@ fn route_ollama_tags(runner: &Runner, model_ids: &[String]) -> (u16, String) {
     json_response(serde_json::json!({ "models": models }))
 }
 
+/// Handles the Ollama-compatible generate route.
 fn route_ollama_generate(
     body: &[u8],
     runner: &Runner,
@@ -1272,6 +1291,7 @@ fn route_ollama_generate(
     }
 }
 
+/// Handles the Ollama-compatible chat route.
 fn route_ollama_chat(
     body: &[u8],
     runner: &Runner,
@@ -1318,6 +1338,7 @@ fn route_ollama_chat(
     }
 }
 
+/// Handles the Ollama-compatible embedding routes.
 fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16, String) {
     match serde_json::from_slice::<OllamaEmbeddingRequest>(body) {
         Ok(payload) => {
@@ -1358,6 +1379,7 @@ fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -
     }
 }
 
+/// Copies Ollama option fields into RustyLLM generation options.
 fn apply_ollama_options(
     defaults: &GenerationOptions,
     options: Option<OllamaOptions>,
@@ -1378,6 +1400,7 @@ fn apply_ollama_options(
     )
 }
 
+/// Converts Ollama chat messages into runtime chat messages.
 fn parse_ollama_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage>, String> {
     messages
         .into_iter()
@@ -1393,6 +1416,7 @@ fn parse_ollama_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage
         .collect()
 }
 
+/// Finds the most representative quantization format among loaded weights.
 fn dominant_quantization(runner: &Runner) -> String {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for tensor in &runner.gguf().tensors {
@@ -1405,6 +1429,7 @@ fn dominant_quantization(runner: &Runner) -> String {
         .unwrap_or_else(|| String::from("unknown"))
 }
 
+/// Appends server chat history to a JSON history file.
 fn append_chat_history(
     options: &ServeOptions,
     source: &str,
@@ -1456,6 +1481,7 @@ fn append_chat_history(
     fs::write(path, body).map_err(|err| format!("Failed to write chat history {}: {}", path, err))
 }
 
+/// Serializes one chat message for the history log.
 fn history_message_json(message: &ChatMessage) -> serde_json::Value {
     let role = match message.role {
         ChatRole::System => "system",
@@ -1465,6 +1491,7 @@ fn history_message_json(message: &ChatMessage) -> serde_json::Value {
     serde_json::json!({ "role": role, "content": message.content })
 }
 
+/// Serializes a response object with a JSON content type.
 fn json_response<T: Serialize>(response: T) -> (u16, String) {
     match serde_json::to_string(&response) {
         Ok(body) => (200, body),
@@ -1472,6 +1499,7 @@ fn json_response<T: Serialize>(response: T) -> (u16, String) {
     }
 }
 
+/// Checks whether a Content-Type header represents JSON.
 fn is_json_content_type(content_type: &str) -> bool {
     content_type
         .split(';')
@@ -1480,6 +1508,7 @@ fn is_json_content_type(content_type: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Applies request-provided sampling and length overrides.
 fn apply_generation_overrides(
     defaults: &GenerationOptions,
     max_tokens: Option<usize>,
@@ -1519,6 +1548,7 @@ fn apply_generation_overrides(
     generation
 }
 
+/// Converts OpenAI-compatible messages into runtime chat messages.
 fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, String> {
     messages
         .into_iter()
@@ -1561,6 +1591,7 @@ fn resolve_model(requested: Option<&str>, model_ids: &[String]) -> String {
     }
 }
 
+/// Builds the model IDs and aliases exposed by compatibility APIs.
 fn advertised_model_ids(runner: &Runner) -> Vec<String> {
     let mut ids = Vec::new();
     if let Some(model_name) = runner.model_name() {
@@ -1581,6 +1612,7 @@ fn advertised_model_ids(runner: &Runner) -> Vec<String> {
     ids
 }
 
+/// Returns compatibility aliases for a model architecture.
 fn model_aliases_for_arch(arch: &str) -> &'static [&'static str] {
     match arch {
         "llama" | "llama2" | "llama3" => &["llama", "llama2", "llama3"],
@@ -1611,6 +1643,7 @@ fn model_aliases_for_arch(arch: &str) -> &'static [&'static str] {
     }
 }
 
+/// Returns the current Unix timestamp in seconds.
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1618,10 +1651,12 @@ fn unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// Formats the current timestamp for lightweight logs.
 fn iso_timestamp() -> String {
     format!("{}Z", unix_timestamp())
 }
 
+/// Formats an error message as a JSON object.
 fn json_error(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -1634,6 +1669,7 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+/// Reads and validates one bounded HTTP request from a stream.
 fn read_http_request<T>(stream: &mut T) -> Result<HttpRequest, HttpError>
 where
     T: Read,
@@ -1746,14 +1782,17 @@ where
     })
 }
 
+/// Returns the embedded default chat UI HTML.
 fn chat_ui_html() -> &'static str {
     include_str!("web_ui/chat.html")
 }
 
+/// Returns the embedded expert chat UI HTML.
 fn expert_chat_ui_html() -> &'static str {
     include_str!("web_ui/expert.html")
 }
 
+/// Writes a standard HTML response.
 fn write_http_response<T>(stream: &mut T, status: u16, body: &str) -> io::Result<()>
 where
     T: Write,
@@ -1761,6 +1800,7 @@ where
     write_http_response_with_content_type(stream, status, "application/json", body)
 }
 
+/// Writes an HTTP response with explicit type, length, and CORS headers.
 fn write_http_response_with_content_type<T>(
     stream: &mut T,
     status: u16,
@@ -1796,6 +1836,7 @@ where
 }
 
 #[cfg(feature = "tls")]
+/// Loads TLS certificate and private key files into a rustls server config.
 fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, String> {
     let mut cert_reader = BufReader::new(File::open(cert_path).map_err(|err| err.to_string())?);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
@@ -1830,6 +1871,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    /// Verifies that JSON content types with parameters are parsed as JSON requests.
     fn read_http_request_parses_json_content_type() {
         let req = b"POST /generate HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\n\r\n{}";
         let mut cursor = Cursor::new(req.as_slice());
@@ -1844,6 +1886,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that invalid Content-Length values produce a bad-request error.
     fn read_http_request_rejects_invalid_content_length() {
         let req = b"POST /generate HTTP/1.1\r\nContent-Length: nope\r\n\r\n";
         let mut cursor = Cursor::new(req.as_slice());
@@ -1852,6 +1895,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that oversized request bodies are rejected before allocation.
     fn read_http_request_rejects_oversized_body() {
         let req = format!(
             "POST /generate HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
@@ -1863,6 +1907,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that normal responses include permissive CORS headers.
     fn write_http_response_includes_cors_headers() {
         let mut out = Vec::new();
         write_http_response(&mut out, 200, "{\"status\":\"ok\"}").expect("response write");

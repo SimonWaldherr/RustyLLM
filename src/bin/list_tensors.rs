@@ -2,6 +2,7 @@ use rusty_llm::gguf::GGUFFile;
 use std::env;
 use std::fs;
 
+/// runs the CLI and prints fatal errors.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {

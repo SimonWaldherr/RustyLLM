@@ -53,23 +53,27 @@ impl MmapFile {
 
     /// Get the full memory-mapped region as a byte slice
     #[inline]
+    /// Returns the tensor bytes regardless of whether they are owned or borrowed.
     pub fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
     /// Length in bytes
     #[inline]
+    /// Returns the number of stored items or bytes.
     pub fn len(&self) -> usize {
         self.len
     }
 
     #[inline]
+    /// Reports whether the collection or mapping is empty.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 }
 
 impl Drop for MmapFile {
+    /// Releases the resource represented by this guard or mapping.
     fn drop(&mut self) {
         unsafe {
             libc_munmap(self.ptr as *mut std::ffi::c_void, self.len);
@@ -89,6 +93,7 @@ const MADV_WILLNEED: i32 = 3;
 
 // These use the libc ABI directly — same on macOS and Linux
 unsafe extern "C" {
+    /// Maps a file descriptor into this process address space through the libc ABI.
     fn mmap(
         addr: *mut std::ffi::c_void,
         len: usize,
@@ -98,8 +103,10 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut std::ffi::c_void;
 
+    /// Releases a memory range previously returned by `mmap`.
     fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
 
+    /// Provides sequential-read and prefetch advice for the mapped model bytes.
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
 }
 

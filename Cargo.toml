@@ -3,7 +3,7 @@ name = "rusty-llm"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
-description = "LLM inference engine — NEON (Apple Silicon) + AVX2 (x86)"
+description = "Lightweight, educational GGUF AI-inference runner in Rust"
 build = "build.rs"
 
 [lib]

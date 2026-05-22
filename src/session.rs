@@ -10,7 +10,7 @@
 //! [`SessionStore`] manages a bounded set of sessions with LRU eviction.
 
 use crate::model::{DecodeBuffer, KVCache};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,8 +28,8 @@ pub struct Session {
     /// Logits produced by the last forward pass; used as the starting point
     /// for the next sampling step, avoiding one redundant forward call.
     pub last_logits: Vec<f32>,
-    /// Ring buffer of recent tokens fed to the repeat-penalty sampler.
-    pub recent: VecDeque<u32>,
+    /// Recent tokens fed to the repeat-penalty sampler, capped at 64 entries.
+    pub recent: Vec<u32>,
     /// Wall-clock time of the most recent access, used for LRU eviction.
     pub last_used: Instant,
     /// Cumulative count of prompt tokens served from the cache (no re-eval).
@@ -39,13 +39,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// Creates a reusable chat session from its KV cache and decode scratch buffer.
     pub fn new(kv_cache: KVCache, decode_buf: DecodeBuffer) -> Self {
         Self {
             kv_cache,
             decode_buf,
             cached_tokens: Vec::new(),
             last_logits: Vec::new(),
-            recent: VecDeque::new(),
+            recent: Vec::new(),
             last_used: Instant::now(),
             cached_tokens_served: 0,
             evaluated_tokens: 0,
@@ -154,6 +155,7 @@ mod tests {
     use super::*;
     use crate::model::{Config, DecodeBuffer, KVCache};
 
+    /// Builds a minimal session used by store behavior tests.
     fn dummy_session() -> Session {
         // Minimal KV cache and decode buffer for testing session management
         // (not used for actual inference).
@@ -184,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that resetting a session clears token and cache progress.
     fn session_reset_clears_state() {
         let mut s = dummy_session();
         s.cached_tokens = vec![1, 2, 3];
@@ -198,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that the session store creates an entry when an ID is missing.
     fn store_creates_new_session_on_miss() {
         let store = SessionStore::new(4, 64);
         let arc = store.get_or_create("conv1", dummy_session);
@@ -206,6 +210,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that the session store reuses an existing entry for the same ID.
     fn store_returns_existing_session_on_hit() {
         let store = SessionStore::new(4, 64);
         let a1 = store.get_or_create("conv1", dummy_session);
@@ -215,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that the session store evicts the least-recently-used entry at capacity.
     fn store_evicts_lru_when_full() {
         let store = SessionStore::new(2, 64);
         // Insert first session and mark it as older.
@@ -237,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that deleting a session removes it from the store.
     fn store_delete_removes_session() {
         let store = SessionStore::new(4, 64);
         store.get_or_create("conv1", dummy_session);

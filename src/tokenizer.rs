@@ -26,6 +26,7 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// Builds a tokenizer from GGUF tokenizer metadata.
     pub fn from_metadata(metadata: &HashMap<String, MetaValue>) -> Self {
         let vocab = metadata
             .get("tokenizer.ggml.tokens")
@@ -117,6 +118,7 @@ impl Tokenizer {
         tokens
     }
 
+    /// Encodes text into token IDs without adding BOS.
     pub fn encode_without_bos(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
 
@@ -159,14 +161,17 @@ impl Tokenizer {
         raw.replace('\u{2581}', " ")
     }
 
+    /// Returns the number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
 
+    /// Looks up the ID of a special token string.
     pub fn special_id(&self, token: &str) -> Option<u32> {
         self.token_to_id.get(token).copied()
     }
 
+    /// Encodes text with the SentencePiece-style BPE path.
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         // SentencePiece models encode word starts with U+2581, so we inject a
         // leading space before splitting to preserve first-token behavior.
@@ -215,6 +220,7 @@ impl Tokenizer {
         current_tokens
     }
 
+    /// Encodes text with byte-level GPT-2 BPE.
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
         for piece in pretokenize_gpt2(text) {
@@ -258,6 +264,7 @@ impl Tokenizer {
         out
     }
 
+    /// Maps token pieces to IDs, falling back to byte tokens when needed.
     fn encode_from_pieces<I>(&self, pieces: I) -> Vec<u32>
     where
         I: IntoIterator<Item = String>,
@@ -278,6 +285,7 @@ impl Tokenizer {
         out
     }
 
+    /// Decodes GPT-2 byte-level token text back to UTF-8 where possible.
     fn decode_gpt2_bytes(&self, raw: &str) -> String {
         let mut bytes = Vec::with_capacity(raw.len());
         for ch in raw.chars() {
@@ -291,6 +299,7 @@ impl Tokenizer {
     }
 }
 
+/// Splits text into GPT-2 BPE pre-token chunks.
 fn pretokenize_gpt2(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut pieces = Vec::new();
@@ -342,6 +351,7 @@ fn pretokenize_gpt2(text: &str) -> Vec<String> {
     pieces
 }
 
+/// Builds reversible GPT-2 byte encoder and decoder tables.
 fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
     // Mirrors GPT-2's bytes_to_unicode table so arbitrary byte sequences can
     // flow through BPE merges without losing reversibility.

@@ -20,6 +20,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Returns a human-readable model discovery status.
     pub fn status(&self) -> &'static str {
         if self.is_projector {
             "projector"
@@ -31,6 +32,7 @@ impl ModelEntry {
     }
 }
 
+/// Resolves the default local model directory.
 pub fn default_model_dir() -> PathBuf {
     if let Ok(path) = env::var("RUSTY_LLM_MODEL_DIR") {
         if !path.trim().is_empty() {
@@ -45,6 +47,7 @@ pub fn default_model_dir() -> PathBuf {
     PathBuf::from(LM_STUDIO_COMMUNITY_SUBDIR)
 }
 
+/// Scans a directory tree and inspects discovered GGUF models.
 pub fn discover_models(root: &Path) -> Result<Vec<ModelEntry>, String> {
     let mut files = Vec::new();
     collect_gguf_files(root, &mut files)
@@ -63,6 +66,7 @@ pub fn discover_models(root: &Path) -> Result<Vec<ModelEntry>, String> {
     Ok(entries)
 }
 
+/// Resolves a user model selector to one GGUF path.
 pub fn resolve_model_path(selection: Option<&str>, model_dir: &Path) -> Result<PathBuf, String> {
     if let Some(selection) = selection {
         let selected_path = Path::new(selection);
@@ -86,6 +90,7 @@ pub fn resolve_model_path(selection: Option<&str>, model_dir: &Path) -> Result<P
     choose_from_directory(model_dir, None)
 }
 
+/// Selects one supported model entry from discovered candidates.
 pub fn select_model<'a>(
     entries: &'a [ModelEntry],
     selector: &str,
@@ -134,6 +139,7 @@ pub fn select_model<'a>(
     ))
 }
 
+/// Prints discovered models in a compact table.
 pub fn print_model_list(entries: &[ModelEntry]) {
     if entries.is_empty() {
         println!("No GGUF files found.");
@@ -153,6 +159,7 @@ pub fn print_model_list(entries: &[ModelEntry]) {
     }
 }
 
+/// Chooses one model from a directory or reports ambiguity.
 fn choose_from_directory(dir: &Path, selector: Option<&str>) -> Result<PathBuf, String> {
     let entries = discover_models(dir)?;
     if let Some(selector) = selector {
@@ -178,6 +185,7 @@ fn choose_from_directory(dir: &Path, selector: Option<&str>) -> Result<PathBuf, 
     }
 }
 
+/// Collects GGUF files recursively from a directory.
 fn collect_gguf_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -198,6 +206,7 @@ fn collect_gguf_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()>
     Ok(())
 }
 
+/// Builds a model catalog entry by reading GGUF metadata.
 fn inspect_model(root: &Path, path: &Path) -> Result<ModelEntry, String> {
     let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
     let mmap = crate::mmap::MmapFile::open(
@@ -253,6 +262,7 @@ fn inspect_model(root: &Path, path: &Path) -> Result<ModelEntry, String> {
     })
 }
 
+/// Finds catalog entries that match a user selector.
 fn matching_entries<'a>(entries: &[&'a ModelEntry], selector: &str) -> Vec<&'a ModelEntry> {
     let needle = selector.to_ascii_lowercase();
     let mut exact = Vec::new();
@@ -280,6 +290,7 @@ fn matching_entries<'a>(entries: &[&'a ModelEntry], selector: &str) -> Vec<&'a M
     if exact.is_empty() { partial } else { exact }
 }
 
+/// Formats an ambiguity error for multiple model matches.
 fn format_ambiguous(selector: &str, entries: &[&ModelEntry]) -> String {
     format!(
         "Model selector '{}' matched multiple GGUF files:\n\n{}",
@@ -288,6 +299,7 @@ fn format_ambiguous(selector: &str, entries: &[&ModelEntry]) -> String {
     )
 }
 
+/// Formats model choices for CLI output.
 fn format_model_choices(entries: &[&ModelEntry]) -> String {
     entries
         .iter()
@@ -303,6 +315,7 @@ fn format_model_choices(entries: &[&ModelEntry]) -> String {
         .join("\n")
 }
 
+/// Truncates a display string to a maximum character count.
 fn truncate(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_string();
@@ -318,6 +331,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Builds a compact catalog entry fixture for selector tests.
     fn entry(id: &str, arch: &str, is_projector: bool) -> ModelEntry {
         let file_name = id
             .rsplit('/')
@@ -339,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that text models win over matching projector files during selection.
     fn select_model_ignores_projector_matches_when_text_model_exists() {
         let entries = vec![
             entry("gemma-4/mmproj-gemma-4", "clip", true),
@@ -351,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that ambiguous model selectors return a helpful error.
     fn select_model_reports_ambiguous_text_matches() {
         let entries = vec![
             entry("phi-4/phi-4-Q4_K_M", "phi3", false),

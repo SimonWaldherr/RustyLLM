@@ -1,2 +1,3 @@
 target
 Cargo.lock
+demo/wasm/pkg/*wasm

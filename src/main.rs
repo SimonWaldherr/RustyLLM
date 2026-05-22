@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Prints CLI usage text.
 fn print_usage(name: &str) {
     eprintln!("rusty-llm v0.3.0");
     eprintln!();
@@ -78,6 +79,7 @@ fn print_usage(name: &str) {
     eprintln!("  --list-tensors            Print GGUF tensor inventory and exit");
 }
 
+/// Parses the value following a command-line flag.
 fn parse_arg<T>(args: &[String], i: &mut usize, flag: &str) -> Result<T, String>
 where
     T: std::str::FromStr,
@@ -92,6 +94,7 @@ where
         .map_err(|err| format!("Invalid {} value '{}': {}", flag, args[*i], err))
 }
 
+/// Records a model selector while rejecting conflicting selectors.
 fn set_model_selector(
     current: &mut Option<String>,
     value: String,
@@ -107,6 +110,7 @@ fn set_model_selector(
     Ok(())
 }
 
+/// runs the CLI and prints fatal errors.
 fn main() {
     if let Err(err) = run() {
         eprintln!("{}", err);
@@ -114,6 +118,7 @@ fn main() {
     }
 }
 
+/// Executes a queued worker-pool job and waits for completion.
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
@@ -595,6 +600,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Prints a JSON inspection report for one GGUF model file.
 fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
     let path_str = path
         .to_str()
@@ -689,6 +695,7 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs a human-readable generation benchmark.
 fn run_benchmark(
     runner: &Runner,
     load_info: &LoadInfo,
@@ -788,6 +795,7 @@ fn run_benchmark(
     Ok(())
 }
 
+/// Runs a generation benchmark and emits JSON.
 fn run_benchmark_json(
     runner: &Runner,
     load_info: &LoadInfo,
@@ -877,6 +885,7 @@ fn run_benchmark_json(
     Ok(())
 }
 
+/// Runs matrix-vector kernel benchmarks for the loaded model.
 fn run_kernel_benchmark(
     runner: &Runner,
     model_path: &Path,
@@ -949,6 +958,7 @@ fn run_kernel_benchmark(
     Ok(())
 }
 
+/// Runs the interactive chat REPL.
 fn run_repl(
     runner: &Runner,
     options: &GenerationOptions,
@@ -1018,6 +1028,7 @@ fn run_repl(
     Ok(())
 }
 
+/// Appends one CLI chat turn to the history file.
 fn append_cli_history(
     path: Option<&str>,
     runner: &Runner,
@@ -1067,6 +1078,7 @@ fn append_cli_history(
         .map_err(|err| format!("Failed to write chat history {}: {}", path, err))
 }
 
+/// Serializes a chat message for history output.
 fn chat_message_json(message: &ChatMessage) -> serde_json::Value {
     let role = match message.role {
         rusty_llm::runtime::ChatRole::System => "system",
@@ -1076,6 +1088,7 @@ fn chat_message_json(message: &ChatMessage) -> serde_json::Value {
     serde_json::json!({ "role": role, "content": message.content })
 }
 
+/// Returns the current Unix timestamp in seconds.
 fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1087,6 +1100,7 @@ fn unix_timestamp() -> u64 {
 fn atty_is_stdin() -> bool {
     // Use isatty via libc — available on both macOS and Linux without deps
     unsafe extern "C" {
+        /// Returns nonzero when the file descriptor is attached to a terminal.
         fn isatty(fd: i32) -> i32;
     }
     unsafe { isatty(0) != 0 }

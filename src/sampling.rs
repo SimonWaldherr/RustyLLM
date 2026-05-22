@@ -6,6 +6,7 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// Initializes the sampler PRNG, replacing seed 0 with a fixed fallback seed.
     pub fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 {
@@ -34,6 +35,7 @@ pub struct SamplerConfig {
 }
 
 impl Default for SamplerConfig {
+    /// provides conservative sampling defaults.
     fn default() -> Self {
         Self {
             temperature: 0.7,
@@ -44,6 +46,7 @@ impl Default for SamplerConfig {
     }
 }
 
+/// Samples one token from logits using a temporary candidate buffer.
 pub fn sample(
     logits: &mut [f32],
     config: &SamplerConfig,
@@ -54,6 +57,7 @@ pub fn sample(
     sample_with_scratch(logits, config, rng, recent_tokens, &mut candidates)
 }
 
+/// Samples one token from logits while reusing caller-owned scratch space.
 pub fn sample_with_scratch(
     logits: &mut [f32],
     config: &SamplerConfig,
@@ -184,6 +188,7 @@ pub fn sample_with_scratch(
     (n - 1) as u32
 }
 
+/// Samples from the top-k candidate set with optional nucleus truncation.
 fn sample_top_k(
     logits: &[f32],
     top_k: usize,
@@ -259,6 +264,7 @@ fn sample_top_k(
     candidates[cutoff - 1].0 as u32
 }
 
+/// Restores descending-logit order after replacing the last candidate.
 fn bubble_up_last(candidates: &mut [(usize, f32)]) {
     let mut i = candidates.len() - 1;
     while i > 0 && candidates[i].1.total_cmp(&candidates[i - 1].1).is_gt() {
@@ -267,6 +273,7 @@ fn bubble_up_last(candidates: &mut [(usize, f32)]) {
     }
 }
 
+/// Returns the index of the highest logit.
 fn argmax_token(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -276,6 +283,7 @@ fn argmax_token(logits: &[f32]) -> u32 {
         .unwrap_or(0)
 }
 
+/// Returns the index of the highest finite logit.
 fn argmax_finite_token(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut best_value = logits
@@ -298,6 +306,7 @@ mod tests {
     use super::{Rng, SamplerConfig, sample};
 
     #[test]
+    /// Verifies that `top_k = 1` always returns the highest-logit token.
     fn top_k_1_only_keeps_single_best_token() {
         let config = SamplerConfig {
             temperature: 1.0,
@@ -314,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that sampling an empty logits slice returns token 0.
     fn empty_logits_returns_zero_token() {
         let config = SamplerConfig::default();
         let mut rng = Rng::new(7);
@@ -323,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that top-k sampling never selects tokens outside the retained candidates.
     fn top_k_samples_only_from_candidate_set() {
         let config = SamplerConfig {
             temperature: 1.0,
@@ -343,6 +354,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that top-p truncation can narrow an already top-k-filtered set.
     fn top_p_truncates_top_k_candidate_set() {
         let config = SamplerConfig {
             temperature: 1.0,

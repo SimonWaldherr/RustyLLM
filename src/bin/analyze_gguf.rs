@@ -5,6 +5,7 @@ use std::fs;
 // Import from the library
 use rusty_llm::gguf::GGUFFile;
 
+/// runs the CLI and prints fatal errors.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -128,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Compares selected tensor blocks for the GGUF analysis utility.
 fn compare_blocks(
     blk_a: &[&rusty_llm::gguf::TensorInfo],
     blk_b: &[&rusty_llm::gguf::TensorInfo],
@@ -221,6 +223,7 @@ fn compare_blocks(
     }
 }
 
+/// Formats tensor dimensions for CLI display.
 fn format_dims(dims: &[u64]) -> String {
     dims.iter()
         .map(|d| d.to_string())

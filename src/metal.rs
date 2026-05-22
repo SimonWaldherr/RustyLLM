@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 #[cfg(all(target_os = "macos", rusty_metal))]
 mod ffi {
     unsafe extern "C" {
+        /// Returns whether the Objective-C Metal backend initialized successfully.
         pub fn rusty_metal_available() -> i32;
+        /// Runs one Q4_K matrix-vector multiply on the Metal backend.
         pub fn rusty_metal_q4k_matvec(
             weights: *const u8,
             weights_len: usize,
@@ -12,6 +14,7 @@ mod ffi {
             cols: usize,
             out: *mut f32,
         ) -> i32;
+        /// Runs one Q6_K matrix-vector multiply on the Metal backend.
         pub fn rusty_metal_q6k_matvec(
             weights: *const u8,
             weights_len: usize,
@@ -20,6 +23,7 @@ mod ffi {
             cols: usize,
             out: *mut f32,
         ) -> i32;
+        /// Runs two Q4_K projections in one Metal dispatch.
         pub fn rusty_metal_q4k_matvec2(
             weights_a: *const u8,
             weights_a_len: usize,
@@ -32,6 +36,7 @@ mod ffi {
             out_a: *mut f32,
             out_b: *mut f32,
         ) -> i32;
+        /// Runs three Q4_K projections in one Metal dispatch.
         pub fn rusty_metal_q4k_matvec3(
             weights_a: *const u8,
             weights_a_len: usize,
@@ -52,28 +57,34 @@ mod ffi {
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
+/// Reports whether the optional Metal backend is compiled and usable.
 pub fn available() -> bool {
     unsafe { ffi::rusty_metal_available() != 0 }
 }
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
+/// Reports whether the optional Metal backend is compiled and usable.
 pub fn available() -> bool {
     false
 }
 
+/// Reports whether Metal acceleration is both requested and available.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| requested() == Some(true) && available())
 }
 
+/// Reads the environment flag that requests Metal acceleration.
 pub fn requested() -> Option<bool> {
     env_flag("RUSTY_LLM_METAL")
 }
 
+/// Reads the environment flag for experimental Q6_K Metal acceleration.
 pub fn q6k_enabled() -> bool {
     enabled()
 }
 
+/// Attempts a Metal Q4_K matrix-vector multiply into the output buffer.
 pub fn q4k_matvec_into(
     weights: &[u8],
     x: &[f32],
@@ -88,6 +99,7 @@ pub fn q4k_matvec_into(
     q4k_matvec_raw(weights, x, rows, cols, out)
 }
 
+/// Attempts a Metal Q6_K matrix-vector multiply into the output buffer.
 pub fn q6k_matvec_into(
     weights: &[u8],
     x: &[f32],
@@ -95,13 +107,14 @@ pub fn q6k_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < 32_768 {
+    if !enabled() || rows < 2048 {
         return false;
     }
     out.resize(rows, 0.0);
     q6k_matvec_raw(weights, x, rows, cols, out)
 }
 
+/// Attempts two fused Metal Q4_K matrix-vector projections.
 pub fn q4k_matvec2_into(
     a: (&[u8], usize, usize),
     b: (&[u8], usize, usize),
@@ -124,6 +137,7 @@ pub fn q4k_matvec2_into(
     )
 }
 
+/// Attempts three fused Metal Q4_K matrix-vector projections.
 pub fn q4k_matvec3_into(
     a: (&[u8], usize, usize),
     b: (&[u8], usize, usize),
@@ -150,11 +164,13 @@ pub fn q4k_matvec3_into(
     )
 }
 
+/// Decides whether a single Q4_K projection is large enough for Metal dispatch.
 fn q4k_single_should_use_metal(rows: usize, cols: usize) -> bool {
     rows >= 8_192 || cols >= 4_096
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
+/// Calls the raw Metal Q4_K projection shim or reports unsupported.
 fn q4k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) -> bool {
     unsafe {
         ffi::rusty_metal_q4k_matvec(
@@ -170,6 +186,7 @@ fn q4k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut
 
 #[cfg(all(target_os = "macos", rusty_metal))]
 #[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal fused two-projection shim or reports unsupported.
 fn q4k_matvec2_raw(
     weights_a: &[u8],
     rows_a: usize,
@@ -197,6 +214,7 @@ fn q4k_matvec2_raw(
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
+/// Calls the raw Metal Q6_K projection shim or reports unsupported.
 fn q6k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) -> bool {
     unsafe {
         ffi::rusty_metal_q6k_matvec(
@@ -212,6 +230,7 @@ fn q6k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut
 
 #[cfg(all(target_os = "macos", rusty_metal))]
 #[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal fused three-projection shim or reports unsupported.
 fn q4k_matvec3_raw(
     weights_a: &[u8],
     rows_a: usize,
@@ -246,6 +265,7 @@ fn q4k_matvec3_raw(
 }
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
+/// Calls the raw Metal Q4_K projection shim or reports unsupported.
 fn q4k_matvec_raw(
     _weights: &[u8],
     _x: &[f32],
@@ -256,11 +276,13 @@ fn q4k_matvec_raw(
     false
 }
 
+/// Reads an optional boolean-like environment variable.
 fn env_flag(name: &str) -> Option<bool> {
     let value = std::env::var(name).ok()?;
     Some(parse_env_flag(&value))
 }
 
+/// Parses common truthy and falsey environment flag values.
 fn parse_env_flag(value: &str) -> bool {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "1" | "true" | "yes" | "on" => true,
@@ -271,6 +293,7 @@ fn parse_env_flag(value: &str) -> bool {
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 #[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal fused two-projection shim or reports unsupported.
 fn q4k_matvec2_raw(
     _weights_a: &[u8],
     _rows_a: usize,
@@ -285,6 +308,7 @@ fn q4k_matvec2_raw(
 }
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
+/// Calls the raw Metal Q6_K projection shim or reports unsupported.
 fn q6k_matvec_raw(
     _weights: &[u8],
     _x: &[f32],
@@ -297,6 +321,7 @@ fn q6k_matvec_raw(
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 #[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal fused three-projection shim or reports unsupported.
 fn q4k_matvec3_raw(
     _weights_a: &[u8],
     _rows_a: usize,
@@ -318,6 +343,7 @@ mod tests {
     use super::parse_env_flag;
 
     #[test]
+    /// Verifies truthy environment values accepted by the Metal flag parser.
     fn metal_env_flag_accepts_explicit_truthy_values() {
         for value in ["", "1", "true", "TRUE", "yes", "on"] {
             assert!(parse_env_flag(value), "{value:?} should enable Metal");
@@ -325,6 +351,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies falsey environment values rejected by the Metal flag parser.
     fn metal_env_flag_rejects_explicit_false_values() {
         for value in ["0", "false", "FALSE", "no", "off", "maybe"] {
             assert!(!parse_env_flag(value), "{value:?} should disable Metal");
@@ -332,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that tiny Q4_K projections stay on the CPU path.
     fn q4k_single_metal_heuristic_skips_small_projections() {
         assert!(!super::q4k_single_should_use_metal(1024, 3072));
         assert!(super::q4k_single_should_use_metal(9216, 3072));

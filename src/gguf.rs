@@ -29,6 +29,7 @@ pub enum GGMLType {
 }
 
 impl From<u32> for GGMLType {
+    /// converts raw GGUF tensor type IDs into `GGMLType` variants.
     fn from(v: u32) -> Self {
         match v {
             0 => Self::F32,
@@ -108,6 +109,7 @@ pub enum MetaValue {
 }
 
 impl MetaValue {
+    /// reads integer-like metadata as `u32`.
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::U32(v) => Some(*v),
@@ -120,6 +122,7 @@ impl MetaValue {
         }
     }
 
+    /// reads numeric metadata as `f32`.
     pub fn as_f32(&self) -> Option<f32> {
         match self {
             Self::F32(v) => Some(*v),
@@ -128,6 +131,7 @@ impl MetaValue {
         }
     }
 
+    /// reads string metadata.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::Str(s) => Some(s),
@@ -135,6 +139,7 @@ impl MetaValue {
         }
     }
 
+    /// reads string-array metadata.
     pub fn as_string_array(&self) -> Option<Vec<String>> {
         match self {
             Self::Array(arr) => Some(
@@ -152,6 +157,7 @@ impl MetaValue {
         }
     }
 
+    /// reads float-array metadata.
     pub fn as_f32_array(&self) -> Option<Vec<f32>> {
         match self {
             Self::Array(arr) => Some(arr.iter().filter_map(|v| v.as_f32()).collect()),
@@ -169,6 +175,7 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// returns the tensor element count from its dimensions.
     pub fn numel(&self) -> usize {
         self.dims.iter().map(|d| *d as usize).product()
     }
@@ -181,60 +188,72 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    /// Starts a little-endian reader at the beginning of a GGUF byte slice.
     fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
+    /// Reads one unsigned byte and advances the cursor.
     fn read_u8(&mut self) -> u8 {
         let v = self.data[self.pos];
         self.pos += 1;
         v
     }
+    /// Reads one little-endian `u16` and advances the cursor.
     fn read_u16(&mut self) -> u16 {
         let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
         v
     }
+    /// Reads one little-endian `u32` and advances the cursor.
     fn read_u32(&mut self) -> u32 {
         let b = &self.data[self.pos..self.pos + 4];
         self.pos += 4;
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
+    /// Reads one little-endian `i32` and advances the cursor.
     fn read_i32(&mut self) -> i32 {
         let b = &self.data[self.pos..self.pos + 4];
         self.pos += 4;
         i32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
+    /// Reads one little-endian `u64` and advances the cursor.
     fn read_u64(&mut self) -> u64 {
         let b = &self.data[self.pos..self.pos + 8];
         self.pos += 8;
         u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     }
+    /// Reads one little-endian `i64` and advances the cursor.
     fn read_i64(&mut self) -> i64 {
         let b = &self.data[self.pos..self.pos + 8];
         self.pos += 8;
         i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     }
+    /// Reads one little-endian `f32` and advances the cursor.
     fn read_f32(&mut self) -> f32 {
         let b = &self.data[self.pos..self.pos + 4];
         self.pos += 4;
         f32::from_le_bytes([b[0], b[1], b[2], b[3]])
     }
+    /// Reads one little-endian `f64` and advances the cursor.
     fn read_f64(&mut self) -> f64 {
         let b = &self.data[self.pos..self.pos + 8];
         self.pos += 8;
         f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     }
+    /// reads a GGUF length-prefixed UTF-8 string.
     fn read_string(&mut self) -> String {
         let len = self.read_u64() as usize;
         let s = String::from_utf8_lossy(&self.data[self.pos..self.pos + len]).to_string();
         self.pos += len;
         s
     }
+    /// reads a GGUF boolean.
     fn read_bool(&mut self) -> bool {
         self.read_u8() != 0
     }
 
+    /// reads one typed GGUF metadata value.
     fn read_value(&mut self, vtype: u32) -> MetaValue {
         match vtype {
             0 => MetaValue::U8(self.read_u8()),
@@ -281,6 +300,7 @@ impl GGUFFile {
         Self::parse_inner(data, false)
     }
 
+    /// implements shared GGUF header, metadata, tensor, and.
     fn parse_inner(data: &[u8], verbose: bool) -> Result<Self, String> {
         let mut c = Cursor::new(data);
 
@@ -353,6 +373,7 @@ impl GGUFFile {
         })
     }
 
+    /// returns a `u32` metadata value or a default.
     pub fn get_u32(&self, key: &str, default: u32) -> u32 {
         self.metadata
             .get(key)
@@ -360,6 +381,7 @@ impl GGUFFile {
             .unwrap_or(default)
     }
 
+    /// returns an `f32` metadata value or a default.
     pub fn get_f32(&self, key: &str, default: f32) -> f32 {
         self.metadata
             .get(key)
@@ -367,6 +389,7 @@ impl GGUFFile {
             .unwrap_or(default)
     }
 
+    /// returns a string metadata value when present.
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.metadata.get(key).and_then(|v| v.as_str())
     }

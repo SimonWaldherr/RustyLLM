@@ -23,6 +23,7 @@ static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+/// Detects whether AVX2/FMA kernels can be used on this CPU.
 fn has_avx2_fma() -> bool {
     static HAS_AVX2_FMA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HAS_AVX2_FMA
@@ -32,6 +33,7 @@ fn has_avx2_fma() -> bool {
 // ─── f16 ↔ f32 conversion ────────────────────────────────────────────────────
 
 #[inline(always)]
+/// Converts a half-precision bit pattern into `f32`.
 pub fn f16_to_f32(h: u16) -> f32 {
     #[cfg(not(target_family = "wasm"))]
     {
@@ -43,11 +45,13 @@ pub fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
+/// Sets the process-wide matrix-vector worker count.
 pub fn set_num_threads(n: usize) {
     NUM_THREADS.store(n.max(1), Ordering::Relaxed);
 }
 
 #[inline]
+/// Returns the configured matrix-vector worker count.
 fn num_threads() -> usize {
     let configured = NUM_THREADS.load(Ordering::Relaxed);
     if configured > 0 {
@@ -72,6 +76,7 @@ fn num_threads() -> usize {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Returns the lazily initialized half-to-float lookup table.
 fn f16_lookup() -> &'static [f32] {
     static F16_LOOKUP: OnceLock<Vec<f32>> = OnceLock::new();
     F16_LOOKUP.get_or_init(|| {
@@ -93,6 +98,7 @@ enum MatvecKind {
     Mxfp4,
 }
 
+/// Runs an f32 matrix-vector job through the worker pool.
 fn parallel_matvec_f32(out: &mut [f32], rows: usize, cols: usize, data: &[f32], x: &[f32]) {
     parallel_matvec(
         MatvecKind::F32,
@@ -105,6 +111,7 @@ fn parallel_matvec_f32(out: &mut [f32], rows: usize, cols: usize, data: &[f32], 
     );
 }
 
+/// Runs a quantized-byte matrix-vector job through the worker pool.
 fn parallel_matvec_u8(
     kind: MatvecKind,
     out: &mut [f32],
@@ -117,6 +124,7 @@ fn parallel_matvec_u8(
     parallel_matvec(kind, out, rows, cols, row_span, data.as_ptr(), x.as_ptr());
 }
 
+/// Dispatches a matrix-vector job, using workers when the shape is large enough.
 fn parallel_matvec(
     kind: MatvecKind,
     out: &mut [f32],
@@ -253,6 +261,7 @@ unsafe impl Sync for Q4KMatvec3Job {}
 #[cfg(not(target_family = "wasm"))]
 impl Q4KMatvec3Job {
     #[inline]
+    /// Returns the amount of row work represented by this job.
     fn work_items(self) -> usize {
         self.rows_a + self.rows_b + self.rows_c
     }
@@ -301,6 +310,7 @@ impl Q4KMatvec3Job {
 
 #[cfg(not(target_family = "wasm"))]
 #[inline]
+/// Clips a worker row range to an output slice range.
 fn clipped_range(start: usize, end: usize, offset: usize, len: usize) -> (usize, usize) {
     let local_start = start.saturating_sub(offset).min(len);
     let local_end = end.saturating_sub(offset).min(len);
@@ -337,6 +347,7 @@ enum WorkerJob {
 #[cfg(not(target_family = "wasm"))]
 impl WorkerJob {
     #[inline]
+    /// Returns how many workers should execute this job.
     fn workers(self) -> usize {
         match self {
             WorkerJob::Matvec(job) => job.workers,
@@ -369,6 +380,7 @@ struct WorkerPool {
 
 #[cfg(not(target_family = "wasm"))]
 impl WorkerPool {
+    /// Spawns a fixed set of worker threads for shared matrix-vector jobs.
     fn new(max_workers: usize) -> Arc<Self> {
         let pool = Arc::new(Self {
             state: Mutex::new(WorkerState {
@@ -391,6 +403,7 @@ impl WorkerPool {
         pool
     }
 
+    /// Executes a queued worker-pool job and waits for completion.
     fn run(&self, mut job: MatvecJob) {
         job.workers = job.workers.min(self.max_workers).min(job.rows).max(1);
         if job.workers <= 1 || job.rows < job.workers * 8 {
@@ -406,6 +419,7 @@ impl WorkerPool {
         self.run_job(WorkerJob::Matvec(job), job.workers);
     }
 
+    /// Executes a fused Q4_K triple-matvec job and waits for completion.
     fn run_q4k_matvec3(&self, mut job: Q4KMatvec3Job) {
         let rows = job.work_items();
         job.workers = job.workers.min(self.max_workers).min(rows).max(1);
@@ -420,6 +434,7 @@ impl WorkerPool {
         self.run_job(WorkerJob::Q4KMatvec3(job), job.workers);
     }
 
+    /// Publishes a worker job and waits for all selected workers to finish it.
     fn run_job(&self, job: WorkerJob, workers: usize) {
         // Fast spin-wait if previous job is finishing (usually very quick)
         loop {
@@ -458,6 +473,7 @@ impl WorkerPool {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Processes worker-pool jobs on one background thread.
 fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
     let mut last_job_id = 0u64;
     loop {
@@ -483,6 +499,7 @@ fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Returns the lazily initialized global worker pool.
 fn worker_pool() -> &'static WorkerPool {
     static POOL: OnceLock<Arc<WorkerPool>> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -495,6 +512,7 @@ fn worker_pool() -> &'static WorkerPool {
 }
 
 #[inline(always)]
+/// Converts half precision to f32 using portable scalar code.
 fn f16_to_f32_soft(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -526,6 +544,7 @@ fn f16_to_f32_soft(h: u16) -> f32 {
 
 /// f32 dot product of two slices (same length)
 #[inline]
+/// Computes the dot product of two float vectors.
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "aarch64")]
@@ -546,8 +565,9 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// out[i] += alpha * x[i]
+/// Computes `out[i] += alpha * x[i]`.
 #[inline]
+/// Adds a scaled vector into another vector in place.
 pub fn axpy_f32(out: &mut [f32], alpha: f32, x: &[f32]) {
     debug_assert_eq!(out.len(), x.len());
     #[cfg(target_arch = "aarch64")]
@@ -570,8 +590,9 @@ pub fn axpy_f32(out: &mut [f32], alpha: f32, x: &[f32]) {
     }
 }
 
-/// out[i] *= scale
+/// Computes `out[i] *= scale`.
 #[inline]
+/// Scales a float vector in place.
 pub fn scale_f32(out: &mut [f32], scale: f32) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -593,8 +614,9 @@ pub fn scale_f32(out: &mut [f32], scale: f32) {
     }
 }
 
-/// out[i] = out[i] * scale + add[i]
+/// Computes `out[i] = out[i] * scale + add[i]`.
 #[inline]
+/// Scales a vector and adds another vector in place.
 pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     debug_assert_eq!(out.len(), add.len());
     #[cfg(target_arch = "aarch64")]
@@ -619,6 +641,7 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
 
 #[inline]
 #[allow(dead_code)]
+/// Scalar fallback for AXPY.
 fn axpy_f32_scalar(out: &mut [f32], alpha: f32, x: &[f32]) {
     for (o, xi) in out.iter_mut().zip(x.iter()) {
         *o += alpha * *xi;
@@ -627,6 +650,7 @@ fn axpy_f32_scalar(out: &mut [f32], alpha: f32, x: &[f32]) {
 
 #[inline]
 #[allow(dead_code)]
+/// Scalar fallback for vector scaling.
 fn scale_f32_scalar(out: &mut [f32], scale: f32) {
     for o in out.iter_mut() {
         *o *= scale;
@@ -635,6 +659,7 @@ fn scale_f32_scalar(out: &mut [f32], scale: f32) {
 
 #[inline]
 #[allow(dead_code)]
+/// Scalar fallback for fused scale-and-add.
 fn scale_add_f32_scalar(out: &mut [f32], scale: f32, add: &[f32]) {
     for (o, a) in out.iter_mut().zip(add.iter()) {
         *o = *o * scale + *a;
@@ -645,6 +670,7 @@ fn scale_add_f32_scalar(out: &mut [f32], scale: f32, add: &[f32]) {
 /// `qdata` is raw Q8_0 blocks, `x` is f32 input vector
 /// `n` is the number of elements (must be multiple of 32)
 #[inline]
+/// Computes a Q8_0 row dot product against an f32 vector.
 pub fn dot_q8_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 32 == 0);
     #[cfg(target_arch = "aarch64")]
@@ -667,6 +693,7 @@ pub fn dot_q8_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
 /// Fused Q4_0 dot product
 #[inline]
+/// Computes a Q4_0 row dot product against an f32 vector.
 pub fn dot_q4_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 32 == 0);
     #[cfg(target_arch = "aarch64")]
@@ -689,6 +716,7 @@ pub fn dot_q4_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
 /// Fused Q4_K dot product
 #[inline]
+/// Computes a Q4_K row dot product against an f32 vector.
 pub fn dot_q4_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 256 == 0);
     #[cfg(target_arch = "aarch64")]
@@ -703,6 +731,7 @@ pub fn dot_q4_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
 /// Fused Q6_K dot product
 #[inline]
+/// Computes a Q6_K row dot product against an f32 vector.
 pub fn dot_q6_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 256 == 0);
     #[cfg(target_arch = "aarch64")]
@@ -716,6 +745,7 @@ pub fn dot_q6_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 }
 
 #[inline]
+/// Computes an MXFP4 row dot product against an f32 vector.
 pub fn dot_mxfp4_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 32 == 0);
     dot_mxfp4_f32_scalar(qdata, x, n)
@@ -729,6 +759,7 @@ pub fn matvec_f32(weight: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f3
     out
 }
 
+/// Runs a Q8_0 matrix-vector multiply and returns a new vector.
 pub fn matvec_q8_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 32) * 34;
     let needed = row_bytes
@@ -753,6 +784,7 @@ pub fn matvec_q8_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     out
 }
 
+/// Runs a Q4_0 matrix-vector multiply and returns a new vector.
 pub fn matvec_q4_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 32) * 18;
     let needed = row_bytes
@@ -777,6 +809,7 @@ pub fn matvec_q4_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     out
 }
 
+/// Runs a Q4_K matrix-vector multiply and returns a new vector.
 pub fn matvec_q4_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 256) * 144;
     let needed = row_bytes
@@ -797,6 +830,7 @@ pub fn matvec_q4_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     out
 }
 
+/// Runs a Q6_K matrix-vector multiply and returns a new vector.
 pub fn matvec_q6_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 256) * 210;
     let needed = row_bytes
@@ -817,6 +851,7 @@ pub fn matvec_q6_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     out
 }
 
+/// Runs an MXFP4 matrix-vector multiply and returns a new vector.
 pub fn matvec_mxfp4(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 32) * 17;
     let needed = row_bytes
@@ -848,18 +883,21 @@ pub fn matvec_f32_into(weight: &[f32], x: &[f32], rows: usize, cols: usize, out:
     parallel_matvec_f32(out, rows, cols, weight, x);
 }
 
+/// Runs a Q8_0 matrix-vector multiply into a reusable output buffer.
 pub fn matvec_q8_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 34;
     out.resize(rows, 0.0);
     parallel_matvec_u8(MatvecKind::Q8_0, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Runs a Q4_0 matrix-vector multiply into a reusable output buffer.
 pub fn matvec_q4_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 18;
     out.resize(rows, 0.0);
     parallel_matvec_u8(MatvecKind::Q4_0, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Runs a Q4_K matrix-vector multiply into a reusable output buffer.
 pub fn matvec_q4_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 256) * 144;
     out.resize(rows, 0.0);
@@ -870,6 +908,7 @@ pub fn matvec_q4_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out
     parallel_matvec_u8(MatvecKind::Q4K, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Runs three Q4_K projections against the same input vector.
 pub fn matvec_q4_k3_into(
     a: (&[u8], usize, usize),
     b: (&[u8], usize, usize),
@@ -973,6 +1012,7 @@ pub fn matvec_q4_k3_into(
     }
 }
 
+/// Runs two Q4_K projections against the same input vector.
 pub fn matvec_q4_k2_into(
     a: (&[u8], usize, usize),
     b: (&[u8], usize, usize),
@@ -1058,6 +1098,7 @@ pub fn matvec_q4_k2_into(
     }
 }
 
+/// Runs a Q6_K matrix-vector multiply into a reusable output buffer.
 pub fn matvec_q6_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 256) * 210;
     out.resize(rows, 0.0);
@@ -1068,12 +1109,14 @@ pub fn matvec_q6_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out
     parallel_matvec_u8(MatvecKind::Q6K, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Runs an MXFP4 matrix-vector multiply into a reusable output buffer.
 pub fn matvec_mxfp4_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 17;
     out.resize(rows, 0.0);
     parallel_matvec_u8(MatvecKind::Mxfp4, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Dequantizes one Q8_0 row into f32 values.
 pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 32;
     let block_size = 34;
@@ -1088,6 +1131,7 @@ pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantizes one Q4_0 row into f32 values.
 pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 32;
     let block_size = 18;
@@ -1106,6 +1150,7 @@ pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantizes one Q4_K row into f32 values.
 pub fn dequant_row_q4_k(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 256;
     let block_size = 144;
@@ -1144,6 +1189,7 @@ pub fn dequant_row_q4_k(qrow: &[u8], cols: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantizes one Q6_K row into f32 values.
 pub fn dequant_row_q6_k(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 256;
     let block_size = 210;
@@ -1180,6 +1226,7 @@ pub fn dequant_row_q6_k(qrow: &[u8], cols: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantizes one MXFP4 row into f32 values.
 pub fn dequant_row_mxfp4(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 32;
     let block_size = 17;
@@ -1201,6 +1248,7 @@ pub fn dequant_row_mxfp4(qrow: &[u8], cols: usize) -> Vec<f32> {
 // ─── Scalar fallbacks ────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
+/// Portable scalar implementation of f32 dot product.
 fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
     // 4-way unrolled accumulator to exploit ILP
     let n = a.len();
@@ -1226,6 +1274,7 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[allow(dead_code)]
+/// Portable scalar implementation of Q8_0 dot product.
 fn dot_q8_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
     let block_size = 34; // 2 bytes scale (f16) + 32 bytes (i8)
@@ -1245,6 +1294,7 @@ fn dot_q8_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 }
 
 #[allow(dead_code)]
+/// Portable scalar implementation of Q4_0 dot product.
 fn dot_q4_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
     let block_size = 18; // 2 bytes scale + 16 bytes (32 nibbles)
@@ -1268,6 +1318,7 @@ fn dot_q4_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 }
 
 #[inline]
+/// Extracts Q4_K scale and minimum values for one sub-block.
 fn get_scale_min_k4(j: usize, q: &[u8; 12]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
@@ -1359,6 +1410,7 @@ unsafe fn dot_q6_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 }
 
 #[allow(dead_code)]
+/// Portable scalar implementation of Q4_K dot product.
 fn dot_q4_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 256;
     let block_size = 144; // f16 d + f16 dmin + 12-byte scales + 128-byte nibbles
@@ -1539,6 +1591,7 @@ unsafe fn dot_q4_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     vaddvq_f32(sum_acc)
 }
 
+/// Portable scalar implementation of Q6_K dot product.
 fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 256;
     let block_size = 210;
@@ -1576,6 +1629,7 @@ fn dot_q6_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 }
 
 #[inline(always)]
+/// Converts one MXFP4 nibble to its float value.
 fn mxfp4_nibble_to_f32(v: u8) -> f32 {
     const LUT: [f32; 16] = [
         0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -1583,6 +1637,7 @@ fn mxfp4_nibble_to_f32(v: u8) -> f32 {
     LUT[(v & 0x0F) as usize]
 }
 
+/// Portable scalar implementation of MXFP4 dot product.
 fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
     let block_size = 17;
@@ -1979,6 +2034,7 @@ unsafe fn scale_add_f32_avx2(out: &mut [f32], scale: f32, add: &[f32]) {
 mod tests {
     use super::*;
 
+    /// Builds deterministic synthetic Q4_K weights for fused-kernel tests.
     fn make_q4k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
         let row_bytes = (cols / 256) * 144;
         let mut data = vec![0u8; rows * row_bytes];
@@ -2003,6 +2059,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that fused Q4_K two-projection output matches separate projections.
     fn q4k_matvec2_matches_separate_matvecs() {
         set_num_threads(3);
         let cols = 512;
@@ -2032,6 +2089,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that fused Q4_K three-projection output matches separate projections.
     fn q4k_matvec3_matches_separate_matvecs() {
         set_num_threads(3);
         let cols = 512;
@@ -2068,6 +2126,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that fused Q4_K triple projection rejects incompatible shapes.
     fn q4k_matvec3_rejects_incompatible_shapes() {
         let cols = 512;
         let x = vec![0.0f32; cols];

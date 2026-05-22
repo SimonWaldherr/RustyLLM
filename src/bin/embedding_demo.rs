@@ -1,5 +1,6 @@
 use rusty_llm::runtime::{Runner, cosine_similarity};
 
+/// Prints usage for the embedding demo utility.
 fn usage(bin: &str) {
     eprintln!(
         "Usage: {bin} <model.gguf> [text-a] [text-b] [text-c]\n\
@@ -8,6 +9,7 @@ fn usage(bin: &str) {
     );
 }
 
+/// runs the CLI and prints fatal errors.
 fn main() -> Result<(), String> {
     let mut args = std::env::args();
     let bin = args

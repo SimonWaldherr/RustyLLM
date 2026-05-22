@@ -5,16 +5,54 @@
 [![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-RustyLLM is a compact Rust inference runner for local GGUF language models. It
-loads model weights directly from disk, keeps quantized tensors in memory-mapped
-storage on native targets, and exposes the same runner through a CLI, a small
-HTTP server, OpenAI-compatible endpoints, LM Studio-compatible aliases, and a
-library API.
+RustyLLM is a lightweight, educational AI-inference project for developers who
+want to understand how a local language-model runner works. You do not need AI
+experience to read the project: the code is organized as ordinary file parsing,
+arrays, math kernels, state management, and HTTP routing.
 
-The project is intentionally dependency-light. It is useful for experimenting
-with GGUF parsing, tokenizer handling, CPU/SIMD kernels, embeddings, minimal
-OpenAI-compatible serving, and local model tooling without pulling in a larger
-runtime.
+At a high level, RustyLLM reads a `.gguf` model file, converts input text into
+integer token IDs, repeatedly runs those IDs through model weights to predict
+the next token, and converts the chosen output tokens back into text. The
+project is deliberately small enough to read end to end, while still showing the
+complete path from model-file parsing to a command-line tool and a minimal
+OpenAI-compatible HTTP API.
+
+The runner loads model weights directly from disk, keeps quantized tensors in
+memory-mapped storage on native targets, and exposes the same core through a
+CLI, a small HTTP server, LM Studio-compatible aliases, Ollama-compatible routes,
+and a Rust library API.
+
+RustyLLM is best treated as learning-oriented infrastructure: practical enough
+to run small local models, intentionally dependency-light, and transparent enough
+for studying how local inference systems are assembled without first adopting a
+large production runtime.
+
+If the AI terms are new, start with
+[AI inference for non-AI developers](docs/AI_FOR_DEVELOPERS.md). It explains the
+core vocabulary used by the codebase before the module-by-module architecture
+guide.
+
+## Learning Path
+
+If you are reading the code to understand local inference, use this order:
+
+1. `src/gguf.rs` parses the GGUF container, tensor directory, and metadata.
+2. `src/tokenizer.rs` turns text into token IDs and decodes generated tokens.
+3. `src/simd.rs` implements scalar, NEON, AVX2/FMA, and quantized math kernels.
+4. `src/model.rs` loads tensors and runs transformer forward passes.
+5. `src/runtime.rs` wraps the model with generation, chat templates, embeddings,
+   benchmark helpers, and optional session reuse.
+6. `src/server.rs` maps the runner onto the native, OpenAI-compatible,
+   LM Studio-compatible, and Ollama-compatible HTTP routes.
+
+Additional documentation:
+
+- [AI inference for non-AI developers](docs/AI_FOR_DEVELOPERS.md) explains the
+  vocabulary and mental model used by the project.
+- [Architecture guide](docs/ARCHITECTURE.md) explains the inference pipeline and
+  module responsibilities.
+- [Function reference](docs/FUNCTION_REFERENCE.md) documents every non-test Rust
+  function under `src/`.
 
 ## Highlights
 
@@ -657,6 +695,24 @@ make wasm
 
 The release profile uses `opt-level = 3`, fat LTO, one codegen unit, stripping,
 and `panic = "abort"`.
+
+## GitHub Pages WASM Demo
+
+The browser demo lives in `demo/wasm/index.html`. Generated wasm-bindgen output
+is intentionally ignored via `demo/wasm/pkg/` and should not be committed to the
+main branch.
+
+The `Deploy WASM demo` GitHub Actions workflow builds the WASM package in CI,
+assembles a temporary Pages artifact, and deploys it with GitHub Pages. To use
+it, configure the repository's Pages source to **GitHub Actions** in the GitHub
+repository settings. The deployed page contains:
+
+- `index.html` from `demo/wasm/index.html`
+- generated `pkg/rusty_llm.js`
+- generated `pkg/rusty_llm_bg.wasm`
+- generated TypeScript declaration files
+
+No generated WASM binaries are written back to the repository branch.
 
 ## Environment Variables
 

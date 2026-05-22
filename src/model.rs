@@ -39,6 +39,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// Builds the runtime model configuration from GGUF metadata.
     pub fn from_gguf(gguf: &GGUFFile) -> Self {
         let arch = gguf.get_str("general.architecture").unwrap_or("llama");
         let p = arch.to_string();
@@ -97,6 +98,7 @@ pub enum RawTensorData {
 }
 
 impl Clone for RawTensorData {
+    /// Creates an independent handle to the same raw tensor storage.
     fn clone(&self) -> Self {
         match self {
             Self::Owned(data) => Self::Owned(data.clone()),
@@ -114,10 +116,12 @@ unsafe impl Send for RawTensorData {}
 unsafe impl Sync for RawTensorData {}
 
 impl RawTensorData {
+    /// Copies tensor bytes into owned storage for in-memory model loading.
     fn owned(data: &[u8]) -> Self {
         Self::Owned(data.to_vec())
     }
 
+    /// Borrows tensor bytes directly from the mapped GGUF file.
     fn view(data: &[u8]) -> Self {
         Self::View {
             ptr: data.as_ptr(),
@@ -125,6 +129,7 @@ impl RawTensorData {
         }
     }
 
+    /// Returns the tensor bytes regardless of whether they are owned or borrowed.
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(data) => data,
@@ -145,7 +150,7 @@ pub enum Weight {
 }
 
 impl Weight {
-    /// Matrix-vector multiply: self[rows × cols] · x[cols] → out[rows]
+    /// Matrix-vector multiply: `self[rows x cols] * x[cols] -> out[rows]`.
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
         match self {
             Weight::F32(data) => {
@@ -259,6 +264,7 @@ impl Weight {
         }
     }
 
+    /// Returns a borrowed row from an unquantized float weight.
     pub fn row_f32(&self, row: usize, cols: usize) -> &[f32] {
         match self {
             Weight::F32(data) => {
@@ -271,6 +277,7 @@ impl Weight {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Attempts the fused Q4_K triple-projection fast path and reports whether it ran.
 fn try_q4k_matvec3_into(
     wq: &Weight,
     wk: &Weight,
@@ -316,6 +323,7 @@ fn try_q4k_matvec3_into(
 }
 
 #[cfg(target_family = "wasm")]
+/// Attempts the fused Q4_K triple-projection fast path and reports whether it ran.
 fn try_q4k_matvec3_into(
     _wq: &Weight,
     _wk: &Weight,
@@ -329,6 +337,7 @@ fn try_q4k_matvec3_into(
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Attempts the fused Q4_K double-projection fast path and reports whether it ran.
 fn try_q4k_matvec2_into(
     a: &Weight,
     b: &Weight,
@@ -362,6 +371,7 @@ fn try_q4k_matvec2_into(
 }
 
 #[cfg(target_family = "wasm")]
+/// Attempts the fused Q4_K double-projection fast path and reports whether it ran.
 fn try_q4k_matvec2_into(
     _a: &Weight,
     _b: &Weight,
@@ -405,6 +415,7 @@ pub struct ExpertWeight {
 }
 
 impl ExpertWeight {
+    /// Runs one expert matrix from a mixture-of-experts tensor and returns its output.
     pub fn matvec_expert(&self, expert: usize, x: &[f32]) -> Vec<f32> {
         assert!(expert < self.experts, "expert index out of bounds");
         let data = self.data.as_slice();
@@ -419,6 +430,7 @@ impl ExpertWeight {
         }
     }
 
+    /// Runs one expert matrix from a mixture-of-experts tensor into a reusable buffer.
     pub fn matvec_expert_into(&self, expert: usize, x: &[f32], out: &mut Vec<f32>) {
         assert!(expert < self.experts, "expert index out of bounds");
         let data = self.data.as_slice();
@@ -480,6 +492,7 @@ pub struct KVCache {
 }
 
 impl KVCache {
+    /// Allocates per-layer key and value cache buffers for autoregressive decode reuse.
     pub fn new(
         n_layers: usize,
         per_pos_k_dim: usize,
@@ -522,6 +535,7 @@ pub struct DecodeBuffer {
     pub rope_gpt_oss_concentration: f32,
 }
 
+/// Precomputes inverse frequencies for rotary positional embeddings.
 fn build_rope_inv_freq(theta: f32, head_dim: usize, scaling: f32) -> Vec<f32> {
     let pair_count = head_dim / 2;
     let mut inv = vec![0.0f32; pair_count];
@@ -533,6 +547,7 @@ fn build_rope_inv_freq(theta: f32, head_dim: usize, scaling: f32) -> Vec<f32> {
     inv
 }
 
+/// Precomputes GPT-OSS rotary frequencies and attention scaling.
 fn build_rope_inv_freq_gpt_oss(config: &Config) -> (Vec<f32>, f32) {
     let d_half = config.head_dim as f32 / 2.0;
     let mut low = 0.0f32;
@@ -574,6 +589,7 @@ fn build_rope_inv_freq_gpt_oss(config: &Config) -> (Vec<f32>, f32) {
 }
 
 impl DecodeBuffer {
+    /// Allocates all scratch vectors reused by one-token transformer forward passes.
     pub fn new(
         config: &Config,
         max_head_dim: usize,
@@ -822,6 +838,7 @@ fn load_f32_vec(
     }
 }
 
+/// Loads an optional one-dimensional float tensor when present.
 fn load_optional_f32_vec(
     mmap_data: &[u8],
     data_offset: usize,
@@ -837,6 +854,7 @@ fn load_optional_f32_vec(
     }
 }
 
+/// Loads a mixture-of-experts tensor using the naming variants used by GGUF models.
 fn load_expert_weight(
     mmap_data: &[u8],
     data_offset: usize,
@@ -879,6 +897,7 @@ fn load_expert_weight(
     }
 }
 
+/// Loads standard transformer weights from a parsed GGUF file.
 pub fn load_model(
     mmap_data: &[u8],
     gguf: &GGUFFile,
@@ -1157,6 +1176,7 @@ pub fn load_model(
     (config, weights)
 }
 
+/// Loads GPT-OSS-specific weights from a parsed GGUF file.
 pub fn load_gpt_oss_model(
     mmap_data: &[u8],
     gguf: &GGUFFile,
@@ -1405,9 +1425,10 @@ pub fn load_gpt_oss_model(
 
 /// RMS Normalization writing into a pre-allocated output buffer.
 #[inline]
+/// Applies RMSNorm to an activation vector into an output buffer.
 fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
     let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    let ss = simd::dot_f32(x, x) / n as f32;
     let scale = 1.0 / (ss + eps).sqrt();
     out.resize(n, 0.0);
     for i in 0..n {
@@ -1415,36 +1436,59 @@ fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
     }
 }
 
-/// Apply RoPE to q/k vectors
-#[inline]
-fn apply_rope(vec: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, inv_freq: &[f32]) {
+/// Applies the same rotary angles to query and key vectors in one pass.
+fn apply_rope_qk(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    inv_freq: &[f32],
+) {
     debug_assert!(inv_freq.len() >= head_dim / 2);
-    for h in 0..n_heads {
-        let off = h * head_dim;
-        let last = head_dim - (head_dim % 2);
-        for i in (0..last).step_by(2) {
+    let last = head_dim - (head_dim % 2);
+    for i in (0..last).step_by(2) {
+        let angle = pos as f32 * inv_freq[i / 2];
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        for h in 0..n_heads {
+            let off = h * head_dim;
             let idx0 = off + i;
             let idx1 = off + i + 1;
-            if idx1 >= vec.len() {
+            if idx1 >= q.len() {
                 break;
             }
-            let angle = pos as f32 * inv_freq[i / 2];
-            let (sin_a, cos_a) = angle.sin_cos();
-            let v0 = vec[idx0];
-            let v1 = vec[idx1];
-            vec[idx0] = v0 * cos_a - v1 * sin_a;
-            vec[idx1] = v0 * sin_a + v1 * cos_a;
+            let v0 = q[idx0];
+            let v1 = q[idx1];
+            q[idx0] = v0 * cos_a - v1 * sin_a;
+            q[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+
+        for h in 0..n_kv_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + 1;
+            if idx1 >= k.len() {
+                break;
+            }
+            let v0 = k[idx0];
+            let v1 = k[idx1];
+            k[idx0] = v0 * cos_a - v1 * sin_a;
+            k[idx1] = v0 * sin_a + v1 * cos_a;
         }
     }
 }
 
 #[inline]
+/// Checks whether the optional approximate attention exponent path is enabled.
 fn fast_attn_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RUSTY_LLM_FAST_ATTN").is_some())
 }
 
 #[inline(always)]
+/// Computes the exponential used by attention, selecting exact or approximate behavior.
 fn exp_attn(x: f32) -> f32 {
     if fast_attn_enabled() {
         fast_exp_approx(x)
@@ -1454,6 +1498,7 @@ fn exp_attn(x: f32) -> f32 {
 }
 
 #[inline(always)]
+/// Computes a fast approximate exponential for optional attention speed experiments.
 fn fast_exp_approx(x: f32) -> f32 {
     // Schraudolph-style approximation; enable only for aggressive throughput mode.
     let xc = x.clamp(-80.0, 80.0);
@@ -1462,6 +1507,7 @@ fn fast_exp_approx(x: f32) -> f32 {
 }
 
 #[inline]
+/// Runs numerically stable online attention with an additional attention-sink score.
 fn online_attention_with_sink(
     query: &[f32],
     keys: &[f32],
@@ -1508,6 +1554,7 @@ fn online_attention_with_sink(
 }
 
 #[inline]
+/// Runs numerically stable online attention over cached keys and values.
 fn online_attention(
     query: &[f32],
     keys: &[f32],
@@ -1554,17 +1601,20 @@ fn online_attention(
 
 /// SiLU activation
 #[inline(always)]
+/// Computes the SiLU activation.
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
 #[inline(always)]
+/// Computes the GPT-OSS SwiGLU activation variant.
 fn swiglu_gpt_oss(g: f32, u: f32) -> f32 {
     let g = g.min(7.0);
     let u = u.clamp(-7.0, 7.0);
     g * (1.0 / (1.0 + (-1.702 * g).exp())) * (u + 1.0)
 }
 
+/// Applies the GPT-OSS rotary embedding layout to query/key vectors.
 fn apply_rope_gpt_oss(
     q: &mut [f32],
     k: &mut [f32],
@@ -1576,26 +1626,31 @@ fn apply_rope_gpt_oss(
     inv_freq: &[f32],
 ) {
     debug_assert!(inv_freq.len() >= head_dim / 2);
-    let apply = |vec: &mut [f32], n_heads: usize| {
+    for i in (0..head_dim).step_by(2) {
+        let angle = pos as f32 * inv_freq[i / 2];
+        let (sin_a, cos_a) = angle.sin_cos();
+        let cos_a = cos_a * concentration;
+        let sin_a = sin_a * concentration;
+
         for h in 0..n_heads {
             let off = h * head_dim;
-            for i in (0..head_dim).step_by(2) {
-                let angle = pos as f32 * inv_freq[i / 2];
-                let (sin_a, cos_a) = angle.sin_cos();
-                let cos_a = cos_a * concentration;
-                let sin_a = sin_a * concentration;
-                let v0 = vec[off + i];
-                let v1 = vec[off + i + 1];
-                vec[off + i] = v0 * cos_a - v1 * sin_a;
-                vec[off + i + 1] = v0 * sin_a + v1 * cos_a;
-            }
+            let v0 = q[off + i];
+            let v1 = q[off + i + 1];
+            q[off + i] = v0 * cos_a - v1 * sin_a;
+            q[off + i + 1] = v0 * sin_a + v1 * cos_a;
         }
-    };
 
-    apply(q, n_heads);
-    apply(k, n_kv_heads);
+        for h in 0..n_kv_heads {
+            let off = h * head_dim;
+            let v0 = k[off + i];
+            let v1 = k[off + i + 1];
+            k[off + i] = v0 * cos_a - v1 * sin_a;
+            k[off + i + 1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
 }
 
+/// Normalizes selected router logits into probabilities.
 fn softmax_selected_into(values: &[(usize, f32)], out: &mut Vec<f32>) {
     let max = values
         .iter()
@@ -1615,6 +1670,7 @@ fn softmax_selected_into(values: &[(usize, f32)], out: &mut Vec<f32>) {
     }
 }
 
+/// Runs one GPT-OSS decode step and returns logits.
 pub fn forward_gpt_oss(
     config: &Config,
     weights: &GptOssWeights,
@@ -1628,6 +1684,7 @@ pub fn forward_gpt_oss(
     logits
 }
 
+/// Runs one GPT-OSS decode step into a reusable logits buffer.
 pub fn forward_gpt_oss_into(
     config: &Config,
     weights: &GptOssWeights,
@@ -1791,6 +1848,7 @@ pub fn forward(
     logits
 }
 
+/// Runs one standard transformer decode step into a reusable logits buffer.
 pub fn forward_into(
     config: &Config,
     weights: &ModelWeights,
@@ -1832,17 +1890,12 @@ pub fn forward_into(
             buf.v[i] += layer.bv[i];
         }
 
-        apply_rope(
+        apply_rope_qk(
             &mut buf.q,
-            pos,
-            head_dim,
-            config.n_heads,
-            &buf.rope_inv_freq,
-        );
-        apply_rope(
             &mut buf.k,
             pos,
             head_dim,
+            config.n_heads,
             config.n_kv_heads,
             &buf.rope_inv_freq,
         );
@@ -1865,11 +1918,6 @@ pub fn forward_into(
         } else {
             0
         };
-
-        // Zero output buffer before accumulating attention results.
-        for v in buf.attn_out.iter_mut() {
-            *v = 0.0;
-        }
 
         for h in 0..config.n_heads {
             let kv_h = h / kv_mul;
@@ -1941,6 +1989,7 @@ pub fn forward_gemma4(
     logits
 }
 
+/// Runs one Gemma 4 decode step into a reusable logits buffer.
 pub fn forward_gemma4_into(
     config: &Config,
     weights: &Gemma4Weights,
@@ -1981,17 +2030,12 @@ pub fn forward_gemma4_into(
         }
 
         // Apply RoPE using per-head dims
-        apply_rope(
+        apply_rope_qk(
             &mut buf.q,
-            pos,
-            head_dim_l,
-            config.n_heads,
-            &buf.rope_inv_freq,
-        );
-        apply_rope(
             &mut buf.k,
             pos,
             head_dim_l,
+            config.n_heads,
             n_kv_heads_l,
             &buf.rope_inv_freq,
         );
@@ -2013,10 +2057,6 @@ pub fn forward_gemma4_into(
         } else {
             0
         };
-
-        for v in buf.attn_out.iter_mut() {
-            *v = 0.0;
-        }
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
         for h in 0..config.n_heads {
@@ -2794,17 +2834,12 @@ pub fn forward_hidden(
             buf.v[i] += layer.bv[i];
         }
 
-        apply_rope(
+        apply_rope_qk(
             &mut buf.q,
-            pos,
-            head_dim,
-            config.n_heads,
-            &buf.rope_inv_freq,
-        );
-        apply_rope(
             &mut buf.k,
             pos,
             head_dim,
+            config.n_heads,
             config.n_kv_heads,
             &buf.rope_inv_freq,
         );
@@ -2822,10 +2857,6 @@ pub fn forward_hidden(
         } else {
             0
         };
-
-        for v in buf.attn_out.iter_mut() {
-            *v = 0.0;
-        }
 
         for h in 0..config.n_heads {
             let kv_h = h / kv_mul;
@@ -3058,17 +3089,12 @@ pub fn forward_hidden_gemma4(
             buf.v[..kv_size].copy_from_slice(&buf.k[..kv_size]);
         }
 
-        apply_rope(
+        apply_rope_qk(
             &mut buf.q,
-            pos,
-            head_dim_l,
-            config.n_heads,
-            &buf.rope_inv_freq,
-        );
-        apply_rope(
             &mut buf.k,
             pos,
             head_dim_l,
+            config.n_heads,
             n_kv_heads_l,
             &buf.rope_inv_freq,
         );
@@ -3087,10 +3113,6 @@ pub fn forward_hidden_gemma4(
         } else {
             0
         };
-
-        for v in buf.attn_out.iter_mut() {
-            *v = 0.0;
-        }
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
         for h in 0..config.n_heads {

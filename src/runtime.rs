@@ -2,7 +2,6 @@ use crate::gguf::GGUFFile;
 use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight};
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
-use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,6 +28,7 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Constructs a user chat message.
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::User,
@@ -36,6 +36,7 @@ impl ChatMessage {
         }
     }
 
+    /// Constructs an assistant chat message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: ChatRole::Assistant,
@@ -56,6 +57,7 @@ pub struct GenerationOptions {
 }
 
 impl Default for GenerationOptions {
+    /// provides conservative sampling defaults.
     fn default() -> Self {
         Self {
             max_tokens: 256,
@@ -68,6 +70,7 @@ impl Default for GenerationOptions {
 }
 
 impl GenerationOptions {
+    /// Validates generation option ranges before decoding.
     pub fn validate(&self) -> Result<(), String> {
         if self.max_tokens == 0 {
             return Err(String::from("max_tokens must be greater than 0."));
@@ -121,7 +124,10 @@ pub struct KernelBenchRow {
     pub total_ms: f64,
 }
 
+const RECENT_TOKEN_LIMIT: usize = 64;
+
 #[inline]
+/// Mean-pools consecutive token vectors in place.
 fn mean_pool_in_place(values: &mut [f32], sample_count: usize) {
     if sample_count == 0 {
         return;
@@ -132,7 +138,24 @@ fn mean_pool_in_place(values: &mut [f32], sample_count: usize) {
     }
 }
 
+/// Copies the trailing tokens used by the repetition-penalty sampler.
+fn recent_token_tail(tokens: &[u32]) -> Vec<u32> {
+    let start = tokens.len().saturating_sub(RECENT_TOKEN_LIMIT);
+    tokens[start..].to_vec()
+}
+
+/// Appends one token while keeping the repetition-penalty window bounded.
+fn push_recent_token(recent: &mut Vec<u32>, token: u32) {
+    if recent.len() == RECENT_TOKEN_LIMIT {
+        recent.copy_within(1.., 0);
+        *recent.last_mut().expect("recent token buffer is non-empty") = token;
+    } else {
+        recent.push(token);
+    }
+}
+
 #[inline]
+/// Normalizes a vector to unit length when possible.
 fn l2_normalize_in_place(values: &mut [f32]) {
     let norm: f32 = values.iter().map(|&v| v * v).sum::<f32>().sqrt();
     if norm > 1e-8 {
@@ -193,6 +216,7 @@ pub struct Runner {
     mapped_model: Option<crate::mmap::MmapFile>,
 }
 
+/// Reports whether the architecture string maps to a supported loader.
 pub fn architecture_supported(arch: &str) -> bool {
     matches!(
         arch,
@@ -241,6 +265,7 @@ pub fn architecture_supported(arch: &str) -> bool {
 }
 
 impl Runner {
+    /// Loads a runner from GGUF bytes already present in memory.
     pub fn from_gguf_bytes(data: &[u8]) -> Result<Self, String> {
         let gguf = GGUFFile::parse(data)?;
         let arch = gguf
@@ -285,6 +310,7 @@ impl Runner {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    /// Loads a runner by memory-mapping a GGUF file path.
     pub fn from_path(path: &str) -> Result<(Self, LoadInfo), String> {
         let t0 = Instant::now();
         let mmap = crate::mmap::MmapFile::open(path)
@@ -339,26 +365,32 @@ impl Runner {
         ))
     }
 
+    /// Returns the loaded GGUF architecture string.
     pub fn architecture(&self) -> &str {
         &self.arch
     }
 
+    /// Returns the optional model name from GGUF metadata.
     pub fn model_name(&self) -> Option<&str> {
         self.gguf.get_str("general.name")
     }
 
+    /// Returns the tokenizer used by this runner.
     pub fn tokenizer(&self) -> &Tokenizer {
         &self.tok
     }
 
+    /// Returns the parsed GGUF metadata and tensor directory.
     pub fn gguf(&self) -> &GGUFFile {
         &self.gguf
     }
 
+    /// Returns the model configuration used for inference.
     pub fn config(&self) -> &Config {
         &self.config
     }
 
+    /// Benchmarks representative projection kernels for the loaded model.
     pub fn kernel_benchmark(
         &self,
         runs: usize,
@@ -454,6 +486,7 @@ impl Runner {
         Ok((layer, rows))
     }
 
+    /// Generates a complete response for a plain prompt.
     pub fn generate(
         &self,
         prompt: &str,
@@ -463,6 +496,7 @@ impl Runner {
         self.generate_chat(&messages, options)
     }
 
+    /// Generates a complete response for chat messages.
     pub fn generate_chat(
         &self,
         messages: &[ChatMessage],
@@ -471,6 +505,7 @@ impl Runner {
         self.generate_chat_stream(messages, options, |_| {})
     }
 
+    /// Generates a prompt response while streaming decoded text chunks.
     pub fn generate_stream<F>(
         &self,
         prompt: &str,
@@ -484,6 +519,7 @@ impl Runner {
         self.generate_chat_stream(&messages, options, on_token)
     }
 
+    /// Generates a chat response while streaming decoded text chunks.
     pub fn generate_chat_stream<F>(
         &self,
         messages: &[ChatMessage],
@@ -548,9 +584,9 @@ impl Runner {
         // Decode advances one sampled token at a time while reusing the cache.
         let t_decode = Instant::now();
         let mut output = String::new();
-        let mut generated = Vec::new();
+        let mut generated_tokens = 0usize;
         let mut pos = tokens.len();
-        let mut recent: VecDeque<u32> = tokens.iter().copied().collect();
+        let mut recent = recent_token_tail(&tokens);
 
         // Pre-compute the longest stop sequence length so we only scan a small
         // trailing window of `output` on each token instead of the full string.
@@ -566,7 +602,7 @@ impl Runner {
                 &mut logits,
                 &options.sampler,
                 &mut rng,
-                recent.make_contiguous(),
+                recent.as_slice(),
                 &mut buf.sampler_candidates,
             );
 
@@ -594,13 +630,10 @@ impl Runner {
 
             on_token(&text);
 
-            generated.push(token);
-            recent.push_back(token);
-            if recent.len() > 64 {
-                recent.pop_front();
-            }
+            generated_tokens += 1;
+            push_recent_token(&mut recent, token);
 
-            if generated.len() >= options.max_tokens || pos >= cache_len {
+            if generated_tokens >= options.max_tokens || pos >= cache_len {
                 break;
             }
 
@@ -613,7 +646,7 @@ impl Runner {
             text: output,
             stats: GenerationStats {
                 prompt_tokens: tokens.len(),
-                generated_tokens: generated.len(),
+                generated_tokens,
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
@@ -622,6 +655,7 @@ impl Runner {
         })
     }
 
+    /// Dispatches one token through the active model-family forward pass.
     fn forward_token_into(
         &self,
         cache: &mut KVCache,
@@ -710,6 +744,7 @@ impl Runner {
         })
     }
 
+    /// Checks whether a token is a built-in end-of-generation token.
     fn is_stop_token(&self, token: u32) -> bool {
         if self.arch == "gpt-oss" {
             token == self.tok.eos_id || token == 200002 || token == 200007
@@ -718,6 +753,7 @@ impl Runner {
         }
     }
 
+    /// Chooses a chat-template renderer and tokenizes the rendered messages.
     fn render_messages(&self, messages: &[ChatMessage], system_prompt: &str) -> Vec<u32> {
         // Prefer architecture-specific chat formatting when the tokenizer
         // metadata exposes one we know how to mirror.
@@ -732,6 +768,7 @@ impl Runner {
         self.render_plain_messages(messages, system_prompt)
     }
 
+    /// Renders messages with a simple role-prefixed chat format.
     fn render_plain_messages(&self, messages: &[ChatMessage], system_prompt: &str) -> Vec<u32> {
         let mut prompt = String::new();
         if !system_prompt.trim().is_empty() {
@@ -755,6 +792,7 @@ impl Runner {
         self.tok.encode(&prompt)
     }
 
+    /// Renders messages using GPT-OSS harmony-style tokens.
     fn render_gpt_oss_messages(&self, messages: &[ChatMessage], system_prompt: &str) -> Vec<u32> {
         let start = self.tok.special_id("<|start|>").unwrap_or(200006);
         let channel = self.tok.special_id("<|channel|>").unwrap_or(200005);
@@ -812,6 +850,7 @@ impl Runner {
         tokens
     }
 
+    /// Renders messages using header-delimited chat templates.
     fn render_header_chat_messages(
         &self,
         messages: &[ChatMessage],
@@ -858,6 +897,7 @@ impl Runner {
         Some(tokens)
     }
 
+    /// Classifies the loaded tokenizer chat template.
     fn chat_template_kind(&self) -> Option<&'static str> {
         let template = self
             .gguf
@@ -874,6 +914,7 @@ impl Runner {
     // ─── Session-based generation ────────────────────────────────────────────
 
     /// Compute the Longest Common Prefix length between two token sequences.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     fn longest_common_prefix(a: &[u32], b: &[u32]) -> usize {
         a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
     }
@@ -915,11 +956,12 @@ impl Runner {
         }
     }
 
-    /// Create a blank [`Session`] pre-allocated for this model.
+    /// Create a blank [`crate::session::Session`] pre-allocated for this model.
     ///
     /// `max_cached_tokens` caps the KV-cache length at the given token count
     /// (clamped to `config.max_seq_len`).
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    /// Creates a server session with KV cache and decode buffers for this runner.
     pub fn new_session(&self, max_cached_tokens: usize) -> crate::session::Session {
         let cap = max_cached_tokens.min(self.config.max_seq_len).max(1);
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
@@ -929,7 +971,7 @@ impl Runner {
         crate::session::Session::new(kv_cache, decode_buf)
     }
 
-    /// Multi-turn generation that reuses a persistent [`Session`].
+    /// Multi-turn generation that reuses a persistent [`crate::session::Session`].
     ///
     /// On each call the full chat prompt is rendered and tokenised.  A
     /// Longest-Common-Prefix comparison against the session's cached token
@@ -944,6 +986,7 @@ impl Runner {
     /// Falls back to a full prefill when the new prompt exceeds the session's
     /// KV-cache capacity.
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    /// Generates chat text while reusing a session KV cache when possible.
     pub fn generate_chat_with_session<F>(
         &self,
         messages: &[ChatMessage],
@@ -1040,12 +1083,13 @@ impl Runner {
         // ── Decode ───────────────────────────────────────────────────────────
         let t_decode = Instant::now();
         let mut output = String::new();
-        let mut generated = Vec::new();
+        let mut generated_tokens = 0usize;
         let mut pos = prompt_len;
 
-        // Initialise the recent-token ring from the full prompt (same as the
-        // stateless path) so repeat-penalty covers the current turn.
-        let mut recent: VecDeque<u32> = session.cached_tokens.iter().copied().collect();
+        // Initialise the repeat-penalty window from only the prompt tail.  This
+        // keeps sampling work bounded for long prompts and matches the window
+        // used after generation starts.
+        let mut recent = recent_token_tail(&session.cached_tokens);
 
         let max_stop_len = options
             .stop_sequences
@@ -1069,7 +1113,7 @@ impl Runner {
                 &mut logits,
                 &options.sampler,
                 &mut rng,
-                recent.make_contiguous(),
+                recent.as_slice(),
                 &mut session.decode_buf.sampler_candidates,
             );
 
@@ -1093,12 +1137,9 @@ impl Runner {
 
             on_token(&text);
 
-            generated.push(token);
+            generated_tokens += 1;
             session.cached_tokens.push(token);
-            recent.push_back(token);
-            if recent.len() > 64 {
-                recent.pop_front();
-            }
+            push_recent_token(&mut recent, token);
 
             if pos >= cache_limit - 1 {
                 break;
@@ -1117,14 +1158,14 @@ impl Runner {
         // Save logits as the starting point for the next turn's sampling.
         session.last_logits = logits;
         session.recent = recent;
-        session.evaluated_tokens += generated.len();
+        session.evaluated_tokens += generated_tokens;
 
         let decode_time = t_decode.elapsed();
         Ok(GenerationResult {
             text: output,
             stats: GenerationStats {
                 prompt_tokens: prompt_len,
-                generated_tokens: generated.len(),
+                generated_tokens,
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
@@ -1134,6 +1175,7 @@ impl Runner {
     }
 }
 
+/// Measures one matrix-vector kernel and returns timing statistics.
 fn measure_matvec(
     name: &str,
     weight: &Weight,
@@ -1148,6 +1190,7 @@ fn measure_matvec(
     })
 }
 
+/// Runs a benchmark closure repeatedly and summarizes timing.
 fn measure_kernel<F>(
     name: &str,
     weight: &Weight,
@@ -1176,6 +1219,7 @@ where
     }
 }
 
+/// Infers a matrix shape for benchmark display.
 fn weight_shape(weight: &Weight, input_cols: usize) -> (usize, usize) {
     match weight {
         Weight::F32(data) => {
@@ -1186,6 +1230,7 @@ fn weight_shape(weight: &Weight, input_cols: usize) -> (usize, usize) {
     }
 }
 
+/// Returns a display string for a weight data type.
 fn weight_dtype(weight: &Weight) -> String {
     match weight {
         Weight::F32(_) => String::from("F32"),
@@ -1193,6 +1238,7 @@ fn weight_dtype(weight: &Weight) -> String {
     }
 }
 
+/// Builds deterministic input data for repeatable kernel benchmarks.
 fn deterministic_bench_vector(n: usize) -> Vec<f32> {
     let mut out = vec![0.0; n];
     for (i, value) in out.iter_mut().enumerate() {
@@ -1203,9 +1249,13 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cosine_similarity, l2_normalize_in_place, mean_pool_in_place};
+    use super::{
+        RECENT_TOKEN_LIMIT, cosine_similarity, l2_normalize_in_place, mean_pool_in_place,
+        push_recent_token, recent_token_tail,
+    };
 
     #[test]
+    /// Verifies that mean pooling divides accumulated token vectors by sample count.
     fn mean_pool_scales_by_sample_count() {
         let mut v = vec![6.0f32, -3.0, 9.0];
         mean_pool_in_place(&mut v, 3);
@@ -1213,6 +1263,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that L2 normalization produces a unit-length vector.
     fn l2_normalize_produces_unit_vector() {
         let mut v = vec![3.0f32, 4.0];
         l2_normalize_in_place(&mut v);
@@ -1223,6 +1274,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that zero vectors remain stable during L2 normalization.
     fn l2_normalize_keeps_zero_vector_stable() {
         let mut v = vec![0.0f32, 0.0, 0.0];
         l2_normalize_in_place(&mut v);
@@ -1230,6 +1282,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies cosine similarity for identical and orthogonal vectors.
     fn cosine_similarity_for_identical_and_orthogonal_vectors() {
         let a = vec![1.0f32, 2.0, 3.0];
         let b = vec![1.0f32, 2.0, 3.0];
@@ -1241,6 +1294,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies cosine similarity input validation for bad lengths and values.
     fn cosine_similarity_rejects_invalid_inputs() {
         assert!(cosine_similarity(&[], &[]).is_err());
         assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
@@ -1248,6 +1302,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that identical token sequences return their full length as prefix.
     fn longest_common_prefix_identical_sequences() {
         use super::Runner;
         let a = vec![1u32, 2, 3, 4, 5];
@@ -1255,6 +1310,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies prefix length when token sequences diverge after shared tokens.
     fn longest_common_prefix_partial_match() {
         use super::Runner;
         let a = vec![1u32, 2, 3, 4, 5];
@@ -1263,6 +1319,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that unrelated token sequences have no shared prefix.
     fn longest_common_prefix_no_match() {
         use super::Runner;
         let a = vec![1u32, 2, 3];
@@ -1271,10 +1328,31 @@ mod tests {
     }
 
     #[test]
+    /// Verifies prefix handling when one or both token sequences are empty.
     fn longest_common_prefix_empty_inputs() {
         use super::Runner;
         assert_eq!(Runner::longest_common_prefix(&[], &[1u32, 2]), 0);
         assert_eq!(Runner::longest_common_prefix(&[1u32, 2], &[]), 0);
+    }
+
+    #[test]
+    /// Verifies that the repeat-penalty window starts with only the prompt tail.
+    fn recent_token_tail_keeps_only_bounded_suffix() {
+        let tokens: Vec<u32> = (0..100).collect();
+        let recent = recent_token_tail(&tokens);
+        assert_eq!(recent.len(), RECENT_TOKEN_LIMIT);
+        assert_eq!(recent[0], 36);
+        assert_eq!(recent[RECENT_TOKEN_LIMIT - 1], 99);
+    }
+
+    #[test]
+    /// Verifies that appending recent tokens preserves the fixed sampling window.
+    fn push_recent_token_preserves_bounded_window() {
+        let mut recent: Vec<u32> = (0..RECENT_TOKEN_LIMIT as u32).collect();
+        push_recent_token(&mut recent, 999);
+        assert_eq!(recent.len(), RECENT_TOKEN_LIMIT);
+        assert_eq!(recent[0], 1);
+        assert_eq!(recent[RECENT_TOKEN_LIMIT - 1], 999);
     }
 }
 
@@ -1291,16 +1369,19 @@ pub struct WasmRunner {
 #[wasm_bindgen]
 impl WasmRunner {
     #[wasm_bindgen(constructor)]
+    /// Creates a WASM runner from GGUF bytes supplied by JavaScript.
     pub fn new(model_bytes: &[u8]) -> Result<WasmRunner, JsValue> {
         let inner = Runner::from_gguf_bytes(model_bytes).map_err(|err| JsValue::from_str(&err))?;
         Ok(Self { inner })
     }
 
     #[wasm_bindgen(getter)]
+    /// Returns the optional model name from GGUF metadata.
     pub fn model_name(&self) -> String {
         self.inner.model_name().unwrap_or("unknown").to_string()
     }
 
+    /// Generates a complete response for a plain prompt.
     pub fn generate(&self, prompt: &str, max_tokens: usize, temp: f32) -> Result<String, JsValue> {
         let mut options = GenerationOptions::default();
         options.max_tokens = max_tokens.max(1);
