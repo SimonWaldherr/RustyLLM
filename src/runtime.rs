@@ -285,7 +285,7 @@ fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
                 return Err(format!(
                     "Tensor '{}' uses unsupported quantization type {:?}. \
                      Please re-quantize the model using a supported format: \
-                     F16, Q8_0, Q4_0, Q4_K_M, Q6_K, or Q5_K_M.",
+                     F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, or Q6_K.",
                     tensor.name, unsupported
                 ));
             }
