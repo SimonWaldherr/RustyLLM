@@ -16,6 +16,7 @@
       --text:     #e8eaf0;
       --muted:    #7a7f9a;
       --success:  #4caf82;
+      --danger:   #e05555;
       --radius:   10px;
       --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", monospace;
     }
@@ -82,7 +83,23 @@
       padding: 24px;
     }
 
-    .loader-card h2 { font-size: 0.9rem; font-weight: 600; margin-bottom: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    .loader-card h2 {
+      font-size: 0.9rem; font-weight: 600; margin-bottom: 14px;
+      color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em;
+    }
+
+    .loader-tabs {
+      display: flex; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+    }
+    .loader-tab {
+      background: none; border: none; border-bottom: 2px solid transparent;
+      color: var(--muted); cursor: pointer; font-size: 0.83rem; font-weight: 500;
+      padding: 8px 16px; margin-bottom: -1px; transition: color 0.15s, border-color 0.15s;
+    }
+    .loader-tab:hover { color: var(--text); }
+    .loader-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+    .loader-panel { display: none; }
+    .loader-panel.active { display: block; }
 
     .drop-zone {
       border: 2px dashed var(--border);
@@ -93,201 +110,128 @@
       transition: border-color 0.2s, background 0.2s;
       position: relative;
     }
-
     .drop-zone:hover, .drop-zone.drag-over {
       border-color: var(--accent);
       background: rgba(224,92,46,0.05);
     }
-
     .drop-zone input[type=file] {
       position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
     }
-
     .drop-zone p { color: var(--muted); font-size: 0.88rem; line-height: 1.6; }
     .drop-zone strong { color: var(--text); }
 
+    .url-row { display: flex; gap: 10px; }
+    .url-row input { flex: 1; }
+    .url-row button { flex-shrink: 0; }
+    .url-hint { font-size: 0.75rem; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+    .url-hint a { color: var(--accent2); text-decoration: none; }
+    .url-hint a:hover { text-decoration: underline; }
+
     .model-info {
-      display: none;
-      align-items: center;
-      gap: 12px;
-      margin-top: 14px;
-      padding: 12px 16px;
-      background: rgba(76,175,130,0.08);
-      border: 1px solid rgba(76,175,130,0.25);
-      border-radius: 8px;
+      display: none; align-items: center; gap: 12px; margin-top: 14px;
+      padding: 12px 16px; background: rgba(76,175,130,0.08);
+      border: 1px solid rgba(76,175,130,0.25); border-radius: 8px;
     }
-
     .model-info.visible { display: flex; }
-
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
-
     .model-info span { font-size: 0.85rem; }
     .model-info .model-name { font-family: var(--font-mono); color: var(--success); font-size: 0.82rem; }
 
     /* ── Progress bar ── */
     .progress-wrap { margin-top: 14px; display: none; }
     .progress-wrap.visible { display: block; }
-    .progress-label { font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; }
+    .progress-label {
+      font-size: 0.8rem; color: var(--muted); margin-bottom: 6px;
+      display: flex; justify-content: space-between;
+    }
     .progress-bar { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
     .progress-fill { height: 100%; background: var(--accent); border-radius: 2px; width: 0%; transition: width 0.3s; }
 
     /* ── Tabs ── */
     .tabs { display: none; flex-direction: column; gap: 0; }
     .tabs.visible { display: flex; }
-
-    .tab-bar {
-      display: flex;
-      gap: 0;
-      border-bottom: 1px solid var(--border);
-    }
-
+    .tab-bar { display: flex; border-bottom: 1px solid var(--border); }
     .tab-btn {
-      background: none;
-      border: none;
-      border-bottom: 2px solid transparent;
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 0.88rem;
-      font-weight: 500;
-      padding: 12px 20px;
-      margin-bottom: -1px;
-      transition: color 0.15s, border-color 0.15s;
+      background: none; border: none; border-bottom: 2px solid transparent;
+      color: var(--muted); cursor: pointer; font-size: 0.88rem; font-weight: 500;
+      padding: 12px 20px; margin-bottom: -1px; transition: color 0.15s, border-color 0.15s;
     }
-
     .tab-btn:hover { color: var(--text); }
     .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); }
-
     .tab-panel { display: none; padding-top: 24px; }
     .tab-panel.active { display: block; }
 
     /* ── Cards ── */
     .card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 22px;
-      margin-bottom: 16px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 22px; margin-bottom: 16px;
     }
-
     .card:last-child { margin-bottom: 0; }
 
     label {
-      display: block;
-      font-size: 0.78rem;
-      font-weight: 600;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      margin-bottom: 8px;
+      display: block; font-size: 0.78rem; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px;
     }
 
-    textarea, input[type=text], input[type=number] {
-      width: 100%;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      color: var(--text);
-      font-size: 0.9rem;
-      padding: 10px 14px;
-      outline: none;
-      transition: border-color 0.15s;
-      font-family: inherit;
+    textarea, input[type=text], input[type=number], input[type=url] {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); font-size: 0.9rem;
+      padding: 10px 14px; outline: none; transition: border-color 0.15s; font-family: inherit;
     }
-
     textarea { resize: vertical; min-height: 80px; }
-
-    textarea:focus, input[type=text]:focus, input[type=number]:focus {
-      border-color: var(--accent);
-    }
-
-    .row { display: flex; gap: 12px; }
-    .row > * { flex: 1; }
+    textarea:focus, input:focus { border-color: var(--accent); }
 
     button.primary {
-      background: var(--accent);
-      border: none;
-      border-radius: 8px;
-      color: #fff;
-      cursor: pointer;
-      font-size: 0.88rem;
-      font-weight: 600;
-      padding: 10px 22px;
-      transition: opacity 0.15s;
-      white-space: nowrap;
+      background: var(--accent); border: none; border-radius: 8px; color: #fff;
+      cursor: pointer; font-size: 0.88rem; font-weight: 600;
+      padding: 10px 22px; transition: opacity 0.15s; white-space: nowrap;
     }
-
     button.primary:hover { opacity: 0.88; }
     button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    /* ── Similarity table ── */
+    button.secondary {
+      background: none; border: 1px solid var(--border); border-radius: 8px;
+      color: var(--muted); cursor: pointer; font-size: 0.83rem; font-weight: 500;
+      padding: 8px 16px; transition: border-color 0.15s, color 0.15s; white-space: nowrap;
+    }
+    button.secondary:hover { border-color: var(--text); color: var(--text); }
+
+    /* ── Text entries ── */
     .texts-grid { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
-
-    .text-entry {
-      display: flex;
-      gap: 10px;
-      align-items: flex-start;
-    }
-
+    .text-entry { display: flex; gap: 10px; align-items: flex-start; }
     .text-entry .label-bubble {
-      background: rgba(92,141,238,0.15);
-      border: 1px solid rgba(92,141,238,0.3);
-      color: var(--accent2);
-      border-radius: 6px;
-      padding: 6px 10px;
-      font-size: 0.78rem;
-      font-weight: 700;
-      font-family: var(--font-mono);
-      flex-shrink: 0;
-      margin-top: 8px;
-      min-width: 34px;
-      text-align: center;
+      background: rgba(92,141,238,0.15); border: 1px solid rgba(92,141,238,0.3);
+      color: var(--accent2); border-radius: 6px; padding: 6px 10px;
+      font-size: 0.78rem; font-weight: 700; font-family: var(--font-mono);
+      flex-shrink: 0; margin-top: 8px; min-width: 34px; text-align: center;
     }
-
     .text-entry textarea { flex: 1; min-height: 60px; }
+    .remove-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      font-size: 1.2rem; padding: 4px 6px; margin-top: 8px; border-radius: 4px;
+      line-height: 1; flex-shrink: 0; transition: color 0.15s, background 0.15s;
+    }
+    .remove-btn:hover:not(:disabled) { color: var(--danger); background: rgba(220,85,85,0.1); }
+    .remove-btn:disabled { opacity: 0.2; cursor: default; }
 
+    .text-entry-footer {
+      display: flex; justify-content: space-between; align-items: center;
+    }
     .add-text-btn {
-      background: none;
-      border: 1px dashed var(--border);
-      border-radius: 8px;
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 0.83rem;
-      padding: 8px 16px;
-      width: 100%;
-      transition: border-color 0.2s, color 0.2s;
+      background: none; border: 1px dashed var(--border); border-radius: 8px;
+      color: var(--muted); cursor: pointer; font-size: 0.83rem;
+      padding: 8px 16px; transition: border-color 0.2s, color 0.2s;
     }
+    .add-text-btn:hover:not(:disabled) { border-color: var(--accent2); color: var(--accent2); }
+    .add-text-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-    .add-text-btn:hover { border-color: var(--accent2); color: var(--accent2); }
-
-    .sim-matrix {
-      overflow-x: auto;
-      margin-top: 16px;
-    }
-
-    table {
-      border-collapse: collapse;
-      width: 100%;
-      font-size: 0.83rem;
-    }
-
-    th, td {
-      padding: 8px 14px;
-      text-align: center;
-      border: 1px solid var(--border);
-    }
-
-    th {
-      background: var(--bg);
-      color: var(--muted);
-      font-weight: 600;
-      font-family: var(--font-mono);
-    }
-
+    /* ── Similarity matrix ── */
+    .sim-matrix { overflow-x: auto; margin-top: 16px; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.83rem; }
+    th, td { padding: 8px 14px; text-align: center; border: 1px solid var(--border); }
+    th { background: var(--bg); color: var(--muted); font-weight: 600; font-family: var(--font-mono); }
     td { font-family: var(--font-mono); }
-
-    td.self { color: var(--muted); }
-
-    /* colour coded similarity */
+    td.self { color: var(--muted); background: rgba(255,255,255,0.03); }
     td.sim-high   { color: #4caf82; }
     td.sim-medium { color: #e0b02e; }
     td.sim-low    { color: var(--muted); }
@@ -297,56 +241,52 @@
     .gen-controls > div { flex: 1; }
     .gen-controls > div:last-child { flex: 0; }
 
-    .output-box {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 14px;
-      min-height: 120px;
-      font-size: 0.88rem;
-      line-height: 1.7;
-      white-space: pre-wrap;
-      font-family: var(--font-mono);
-      color: var(--text);
+    .output-header {
+      display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
     }
+    .output-actions { display: flex; gap: 8px; }
 
+    .output-box {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 14px; min-height: 120px; font-size: 0.88rem; line-height: 1.7;
+      white-space: pre-wrap; font-family: var(--font-mono); color: var(--text);
+    }
     .output-box.placeholder { color: var(--muted); font-style: italic; font-family: inherit; }
 
-    .stats-bar {
-      display: flex;
-      gap: 20px;
-      margin-top: 10px;
-      flex-wrap: wrap;
-    }
-
+    .stats-bar { display: flex; gap: 20px; margin-top: 10px; flex-wrap: wrap; }
     .stat { font-size: 0.78rem; color: var(--muted); }
     .stat strong { color: var(--text); font-family: var(--font-mono); }
 
-    /* ── Spinner ── */
+    /* ── Misc ── */
     .spinner {
-      display: inline-block;
-      width: 14px; height: 14px;
-      border: 2px solid rgba(255,255,255,0.2);
-      border-top-color: #fff;
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-      vertical-align: middle;
-      margin-right: 6px;
+      display: inline-block; width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,0.2); border-top-color: #fff;
+      border-radius: 50%; animation: spin 0.7s linear infinite;
+      vertical-align: middle; margin-right: 6px;
     }
-
     @keyframes spin { to { transform: rotate(360deg); } }
 
     .error-msg {
-      background: rgba(220,60,60,0.1);
-      border: 1px solid rgba(220,60,60,0.3);
-      border-radius: 8px;
-      color: #e06060;
-      font-size: 0.83rem;
-      padding: 10px 14px;
-      margin-top: 12px;
-      display: none;
+      background: rgba(220,60,60,0.1); border: 1px solid rgba(220,60,60,0.3);
+      border-radius: 8px; color: #e06060; font-size: 0.83rem;
+      padding: 10px 14px; margin-top: 12px; display: none;
     }
     .error-msg.visible { display: block; }
+
+    .kbd {
+      display: inline-block; background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.15); border-radius: 4px;
+      padding: 1px 5px; font-size: 0.72rem; font-family: var(--font-mono);
+      color: var(--muted); vertical-align: middle;
+    }
+
+    .copy-toast {
+      position: fixed; bottom: 24px; right: 24px; background: var(--success);
+      color: #fff; padding: 8px 16px; border-radius: 8px; font-size: 0.83rem;
+      font-weight: 600; opacity: 0; transform: translateY(8px);
+      transition: opacity 0.2s, transform 0.2s; pointer-events: none;
+    }
+    .copy-toast.show { opacity: 1; transform: translateY(0); }
   </style>
 </head>
 <body>
@@ -368,13 +308,33 @@
   <!-- Model loader -->
   <div class="loader-card">
     <h2>Load Model</h2>
-    <div class="drop-zone" id="dropZone">
-      <input type="file" id="fileInput" accept=".gguf">
-      <p><strong>Drop a GGUF file here</strong> or click to browse<br>
-      <span style="font-size:0.78rem">Recommended for embedding: nomic-embed-text, all-MiniLM-L6-v2 (&lt;500 MB)</span></p>
+    <div class="loader-tabs">
+      <button class="loader-tab active" data-ltab="file">Local file</button>
+      <button class="loader-tab" data-ltab="url">From URL</button>
     </div>
+
+    <div class="loader-panel active" id="ltab-file">
+      <div class="drop-zone" id="dropZone">
+        <input type="file" id="fileInput" accept=".gguf">
+        <p><strong>Drop a GGUF file here</strong> or click to browse<br>
+        <span style="font-size:0.78rem">Recommended: nomic-embed-text, all-MiniLM-L6-v2 (&lt;500 MB)</span></p>
+      </div>
+    </div>
+
+    <div class="loader-panel" id="ltab-url">
+      <div class="url-row">
+        <input type="url" id="urlInput" placeholder="https://…/model.gguf">
+        <button class="primary" id="urlLoadBtn">Load</button>
+      </div>
+      <p class="url-hint">The server must send <code>Access-Control-Allow-Origin: *</code>.<br>
+        Many models on <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a> GGUF CDN support CORS.</p>
+    </div>
+
     <div class="progress-wrap" id="progressWrap">
-      <div class="progress-label" id="progressLabel">Loading…</div>
+      <div class="progress-label">
+        <span id="progressLabel">Loading…</span>
+        <span id="progressPct"></span>
+      </div>
       <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
     <div class="model-info" id="modelInfo">
@@ -400,20 +360,27 @@
           <div class="text-entry">
             <div class="label-bubble">A</div>
             <textarea placeholder="Albert Einstein was a theoretical physicist."></textarea>
+            <button class="remove-btn" title="Remove">×</button>
           </div>
           <div class="text-entry">
             <div class="label-bubble">B</div>
             <textarea placeholder="Einstein developed the theory of relativity."></textarea>
+            <button class="remove-btn" title="Remove">×</button>
           </div>
           <div class="text-entry">
             <div class="label-bubble">C</div>
             <textarea placeholder="A banana is a tropical fruit."></textarea>
+            <button class="remove-btn" title="Remove">×</button>
           </div>
         </div>
-        <button class="add-text-btn" id="addTextBtn">+ Add text</button>
+        <div class="text-entry-footer">
+          <button class="add-text-btn" id="addTextBtn">+ Add text</button>
+          <span class="stat" id="textCount"></span>
+        </div>
       </div>
 
-      <div style="display:flex; justify-content:flex-end; margin-bottom:16px;">
+      <div style="display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-bottom:16px;">
+        <span class="stat"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
         <button class="primary" id="embedBtn" disabled>Compute embeddings</button>
       </div>
 
@@ -440,14 +407,21 @@
             <label>Temperature</label>
             <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.05">
           </div>
-          <div>
+          <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
+            <span class="stat"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
             <button class="primary" id="generateBtn" disabled>Generate</button>
           </div>
         </div>
       </div>
 
       <div class="card" id="genOutputCard" style="display:none">
-        <label>Output</label>
+        <div class="output-header">
+          <label style="margin-bottom:0">Output</label>
+          <div class="output-actions">
+            <button class="secondary" id="copyBtn">Copy</button>
+            <button class="secondary" id="clearBtn">Clear</button>
+          </div>
+        </div>
         <div class="output-box" id="genOutput"></div>
         <div class="stats-bar" id="genStats"></div>
       </div>
@@ -457,22 +431,27 @@
 
 </main>
 
+<div class="copy-toast" id="copyToast">Copied!</div>
+
 <script type="module">
   import init, { WasmRunner } from './pkg/rusty_llm.js';
 
   await init();
 
   let runner = null;
+  const embedCache = new Map(); // text -> Float32Array
 
-  // ── Drag & drop ──────────────────────────────────────────────────────────────
-  const dropZone   = document.getElementById('dropZone');
-  const fileInput  = document.getElementById('fileInput');
+  // ── Loader sub-tabs ───────────────────────────────────────────────────────────
+  document.querySelectorAll('.loader-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.loader-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.loader-panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('ltab-' + tab.dataset.ltab).classList.add('active');
+    });
+  });
 
-  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-  dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('drag-over'); loadFile(e.dataTransfer.files[0]); });
-  fileInput.addEventListener('change', () => fileInput.files[0] && loadFile(fileInput.files[0]));
-
+  // ── Helpers ───────────────────────────────────────────────────────────────────
   function showError(id, msg) {
     const el = document.getElementById(id);
     el.textContent = msg;
@@ -483,56 +462,53 @@
     document.getElementById(id).classList.remove('visible');
   }
 
-  async function loadFile(file) {
-    if (!file) return;
-    hideError('loaderError');
-    const progress  = document.getElementById('progressWrap');
-    const fill      = document.getElementById('progressFill');
-    const label     = document.getElementById('progressLabel');
-    const modelInfo = document.getElementById('modelInfo');
+  function setProgress(pct, label, right = '') {
+    document.getElementById('progressFill').style.width = pct + '%';
+    document.getElementById('progressLabel').textContent = label;
+    document.getElementById('progressPct').textContent = right;
+  }
 
-    progress.classList.add('visible');
+  // ── Model loading ─────────────────────────────────────────────────────────────
+  async function loadBytes(fetchFn, displayName) {
+    hideError('loaderError');
+    embedCache.clear();
+    const progressWrap = document.getElementById('progressWrap');
+    const modelInfo    = document.getElementById('modelInfo');
+
+    progressWrap.classList.add('visible');
     modelInfo.classList.remove('visible');
-    label.textContent = `Reading ${file.name} (${(file.size / 1e6).toFixed(0)} MB)…`;
-    fill.style.width = '5%';
+    setProgress(2, `Reading ${displayName}…`);
 
     let bytes;
     try {
-      bytes = await readWithProgress(file, pct => {
-        fill.style.width = (5 + pct * 0.6) + '%';
-        label.textContent = `Reading… ${pct.toFixed(0)}%`;
-      });
+      bytes = await fetchFn(pct => setProgress(2 + pct * 0.65, 'Reading…', `${pct.toFixed(0)}%`));
     } catch (e) {
-      progress.classList.remove('visible');
+      progressWrap.classList.remove('visible');
       showError('loaderError', `Failed to read file: ${e}`);
       return;
     }
 
-    fill.style.width = '70%';
-    label.textContent = 'Parsing model weights…';
-
+    setProgress(70, 'Parsing model weights…', '');
     try {
       runner = new WasmRunner(bytes);
     } catch (e) {
-      progress.classList.remove('visible');
+      progressWrap.classList.remove('visible');
       showError('loaderError', `Failed to load model: ${e}`);
       return;
     }
 
-    fill.style.width = '100%';
-    label.textContent = 'Done!';
-    setTimeout(() => progress.classList.remove('visible'), 800);
+    setProgress(100, 'Done!', '');
+    setTimeout(() => progressWrap.classList.remove('visible'), 800);
 
     document.getElementById('modelName').textContent = runner.model_name;
     modelInfo.classList.add('visible');
-
     document.getElementById('embedBtn').disabled    = false;
     document.getElementById('generateBtn').disabled = false;
     document.getElementById('tabs').classList.add('visible');
   }
 
-  function readWithProgress(file, onProgress) {
-    return new Promise((resolve, reject) => {
+  function readFile(file) {
+    return onProgress => new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total * 100); };
       reader.onload    = e => resolve(new Uint8Array(e.target.result));
@@ -541,7 +517,51 @@
     });
   }
 
-  // ── Tabs ─────────────────────────────────────────────────────────────────────
+  async function fetchWithProgress(url, onProgress) {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+    const total  = parseInt(resp.headers.get('Content-Length') || '0', 10);
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+      if (total > 0) onProgress(loaded / total * 100);
+    }
+    const out = new Uint8Array(loaded);
+    let off = 0;
+    for (const chunk of chunks) { out.set(chunk, off); off += chunk.length; }
+    return out;
+  }
+
+  // ── Drag & drop ───────────────────────────────────────────────────────────────
+  const dropZone  = document.getElementById('dropZone');
+  const fileInput = document.getElementById('fileInput');
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0];
+    if (f) loadBytes(readFile(f), f.name);
+  });
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files[0];
+    if (f) loadBytes(readFile(f), f.name);
+  });
+
+  document.getElementById('urlLoadBtn').addEventListener('click', () => {
+    const url = document.getElementById('urlInput').value.trim();
+    if (!url) return;
+    const name = url.split('/').pop() || 'model.gguf';
+    loadBytes(onProgress => fetchWithProgress(url, onProgress), name);
+  });
+
+  // ── Main tabs ─────────────────────────────────────────────────────────────────
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -551,30 +571,56 @@
     });
   });
 
-  // ── Add text entries ──────────────────────────────────────────────────────────
-  const labels = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  // ── Text entries ──────────────────────────────────────────────────────────────
+  const LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+  function syncTextUI() {
+    const entries = [...document.querySelectorAll('#textsGrid .text-entry')];
+    entries.forEach((entry, i) => {
+      entry.querySelector('.label-bubble').textContent = LABELS[i];
+      const btn = entry.querySelector('.remove-btn');
+      btn.disabled = entries.length <= 2;
+    });
+    document.getElementById('textCount').textContent = `${entries.length} / 8`;
+    document.getElementById('addTextBtn').disabled = entries.length >= 8;
+  }
+
+  function attachRemove(btn) {
+    btn.addEventListener('click', () => {
+      const entries = document.querySelectorAll('#textsGrid .text-entry');
+      if (entries.length <= 2) return;
+      btn.closest('.text-entry').remove();
+      syncTextUI();
+    });
+  }
+
+  document.querySelectorAll('#textsGrid .remove-btn').forEach(attachRemove);
+  syncTextUI();
 
   document.getElementById('addTextBtn').addEventListener('click', () => {
     const grid  = document.getElementById('textsGrid');
-    const count = grid.children.length;
-    if (count >= 8) return;
+    if (grid.children.length >= 8) return;
     const entry = document.createElement('div');
     entry.className = 'text-entry';
     entry.innerHTML = `
-      <div class="label-bubble">${labels[count]}</div>
-      <textarea placeholder="Enter text…"></textarea>`;
+      <div class="label-bubble"></div>
+      <textarea placeholder="Enter text…"></textarea>
+      <button class="remove-btn" title="Remove">×</button>`;
     grid.appendChild(entry);
+    attachRemove(entry.querySelector('.remove-btn'));
+    syncTextUI();
+    entry.querySelector('textarea').focus();
   });
 
   // ── Embedding ─────────────────────────────────────────────────────────────────
-  document.getElementById('embedBtn').addEventListener('click', async () => {
+  async function runEmbedding() {
     hideError('embedError');
-    const btn   = document.getElementById('embedBtn');
+    const btn = document.getElementById('embedBtn');
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Computing…';
 
-    const textareas = document.querySelectorAll('#textsGrid textarea');
-    const texts = [...textareas].map(t => t.value.trim()).filter(Boolean);
+    const texts = [...document.querySelectorAll('#textsGrid textarea')]
+      .map(t => t.value.trim()).filter(Boolean);
 
     if (texts.length < 2) {
       showError('embedError', 'Please enter at least 2 texts.');
@@ -586,7 +632,12 @@
     const t0 = performance.now();
     let embeddings;
     try {
-      embeddings = texts.map(t => runner.embed(t));
+      embeddings = texts.map(text => {
+        if (embedCache.has(text)) return embedCache.get(text);
+        const vec = runner.embed(text);
+        embedCache.set(text, vec);
+        return vec;
+      });
     } catch (e) {
       showError('embedError', `Embedding failed: ${e}`);
       btn.disabled = false;
@@ -595,17 +646,14 @@
     }
     const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
 
-    // Build similarity matrix
     const n = texts.length;
-    const sims = Array.from({length: n}, (_, i) =>
-      Array.from({length: n}, (_, j) => {
-        if (i === j) return null;
-        return WasmRunner.cosine_similarity(embeddings[i], embeddings[j]);
-      })
-    );
+    // Compute upper triangle, mirror lower
+    const sims = Array.from({length: n}, () => new Array(n).fill(null));
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++)
+        sims[i][j] = sims[j][i] = WasmRunner.cosine_similarity(embeddings[i], embeddings[j]);
 
-    // Render table
-    const labelList = labels.slice(0, n).split('');
+    const labelList = LABELS.slice(0, n).split('');
     let html = '<table><thead><tr><th></th>';
     labelList.forEach(l => { html += `<th>${l}</th>`; });
     html += '</tr></thead><tbody>';
@@ -617,7 +665,8 @@
         } else {
           const v = sims[i][j];
           const cls = v > 0.7 ? 'sim-high' : v > 0.4 ? 'sim-medium' : 'sim-low';
-          html += `<td class="${cls}">${v.toFixed(4)}</td>`;
+          const alpha = (Math.max(0, v) * 0.25).toFixed(2);
+          html += `<td class="${cls}" style="background:rgba(76,175,130,${alpha})">${v.toFixed(4)}</td>`;
         }
       }
       html += '</tr>';
@@ -629,16 +678,18 @@
       `<span class="stat">Texts: <strong>${n}</strong></span>` +
       `<span class="stat">Dim: <strong>${embeddings[0].length}</strong></span>` +
       `<span class="stat">Time: <strong>${elapsed}s</strong></span>`;
-
     document.getElementById('simCard').style.display = 'block';
+
     btn.disabled = false;
     btn.textContent = 'Compute embeddings';
-  });
+  }
+
+  document.getElementById('embedBtn').addEventListener('click', runEmbedding);
 
   // ── Generation ────────────────────────────────────────────────────────────────
-  document.getElementById('generateBtn').addEventListener('click', () => {
+  function runGeneration() {
     hideError('genError');
-    const btn   = document.getElementById('generateBtn');
+    const btn    = document.getElementById('generateBtn');
     const prompt = document.getElementById('promptInput').value.trim();
     if (!prompt) { showError('genError', 'Please enter a prompt.'); return; }
 
@@ -650,12 +701,12 @@
 
     const t0 = performance.now();
 
-    // Run in a microtask so the UI updates first
+    // Yield to the browser so the spinner renders before blocking computation
     setTimeout(() => {
       let result, elapsed;
       try {
         result  = runner.generate(prompt, maxTokens, temp);
-        elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+        elapsed = (performance.now() - t0) / 1000;
       } catch (e) {
         showError('genError', `Generation failed: ${e}`);
         btn.disabled = false;
@@ -667,15 +718,58 @@
       outEl.textContent = result;
       outEl.classList.remove('placeholder');
 
-      const tokenCount = result.split(/\s+/).filter(Boolean).length;
+      const wordCount = result.split(/\s+/).filter(Boolean).length;
+      const tokPerSec = (wordCount / elapsed).toFixed(1);
       document.getElementById('genStats').innerHTML =
-        `<span class="stat">Time: <strong>${elapsed}s</strong></span>` +
-        `<span class="stat">~Words: <strong>${tokenCount}</strong></span>`;
+        `<span class="stat">Time: <strong>${elapsed.toFixed(2)}s</strong></span>` +
+        `<span class="stat">~Words: <strong>${wordCount}</strong></span>` +
+        `<span class="stat">~Tok/s: <strong>${tokPerSec}</strong></span>`;
 
       document.getElementById('genOutputCard').style.display = 'block';
+      try { sessionStorage.setItem('lastPrompt', prompt); } catch {}
+
       btn.disabled = false;
       btn.textContent = 'Generate';
     }, 20);
+  }
+
+  document.getElementById('generateBtn').addEventListener('click', runGeneration);
+
+  // Restore last prompt
+  try {
+    const saved = sessionStorage.getItem('lastPrompt');
+    if (saved) document.getElementById('promptInput').value = saved;
+  } catch {}
+
+  // ── Copy / Clear ──────────────────────────────────────────────────────────────
+  document.getElementById('copyBtn').addEventListener('click', async () => {
+    const text = document.getElementById('genOutput').textContent;
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      const toast = document.getElementById('copyToast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 1800);
+    } catch {}
+  });
+
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    document.getElementById('genOutput').textContent = '';
+    document.getElementById('genStats').innerHTML = '';
+    document.getElementById('genOutputCard').style.display = 'none';
+  });
+
+  // ── Keyboard shortcuts ────────────────────────────────────────────────────────
+  document.addEventListener('keydown', e => {
+    if (!(e.ctrlKey || e.metaKey) || e.key !== 'Enter') return;
+    const activeTab = document.querySelector('.tab-btn.active')?.dataset.tab;
+    if (activeTab === 'embedding' && !document.getElementById('embedBtn').disabled) {
+      e.preventDefault();
+      runEmbedding();
+    } else if (activeTab === 'generation' && !document.getElementById('generateBtn').disabled) {
+      e.preventDefault();
+      runGeneration();
+    }
   });
 </script>
 
