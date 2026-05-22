@@ -118,7 +118,7 @@ impl SessionStore {
                         .unwrap_or_else(|_| {
                             Instant::now()
                                 .checked_sub(std::time::Duration::from_secs(u32::MAX as u64))
-                                .unwrap_or_else(|| Instant::now())
+                                .unwrap_or_else(Instant::now)
                         })
                 })
                 .map(|(k, _)| k.clone());
