@@ -977,9 +977,8 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                         conv_id.as_deref(),
                         |_| {},
                     )
-                    .map(|r| {
+                    .inspect(|_| {
                         history_messages = messages;
-                        r
                     }),
                     Err(err) => Err(err),
                 }
