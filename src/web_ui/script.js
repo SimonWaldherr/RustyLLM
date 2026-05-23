@@ -537,21 +537,224 @@ function initExpert() {
    ════════════════════════════════ */
 
 function initChat() {
-  const form          = document.getElementById("form");
-  const promptEl      = document.getElementById("prompt");
-  const messagesEl    = document.getElementById("messages");
-  const emptyEl       = document.getElementById("empty");
-  const statusEl      = document.getElementById("status");
-  const sendEl        = document.getElementById("send");
-  const stopEl        = document.getElementById("stop");
-  const maxTokensEl   = document.getElementById("maxTokens");
-  const temperatureEl = document.getElementById("temperature");
-  const tempValueEl   = document.getElementById("tempValue");
-  const scrollEl      = document.getElementById("scroll");
+  const form             = document.getElementById("form");
+  const promptEl         = document.getElementById("prompt");
+  const messagesEl       = document.getElementById("messages");
+  const emptyEl          = document.getElementById("empty");
+  const statusEl         = document.getElementById("status");
+  const sendEl           = document.getElementById("send");
+  const stopEl           = document.getElementById("stop");
+  const newChatEl        = document.getElementById("new-chat");
+  const historyToggleEl  = document.getElementById("history-toggle");
+  const historyPanelEl   = document.getElementById("history-panel");
+  const historyListEl    = document.getElementById("history-list");
+  const maxTokensEl      = document.getElementById("maxTokens");
+  const temperatureEl    = document.getElementById("temperature");
+  const tempValueEl      = document.getElementById("tempValue");
+  const scrollEl         = document.getElementById("scroll");
+  const statsEl          = document.getElementById("stats");
+  const scrollBtnEl      = document.getElementById("scroll-btn");
+  const announceEl       = document.getElementById("announce");
 
   const history = [];
   let controller = null;
   let activeTurn = 0;
+  let currentSessionId = genId();
+
+  function genId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  }
+
+  function announce(text) {
+    announceEl.textContent = "";
+    requestAnimationFrame(() => { announceEl.textContent = text; });
+  }
+
+  function updateStats(text) {
+    statsEl.textContent = text || "";
+  }
+
+  /* ── Preferences persistence ── */
+  const PREFS_KEY = "rustyllm_chat_prefs";
+  function loadPrefs() {
+    try {
+      const p = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
+      if (p.maxTokens) maxTokensEl.value = p.maxTokens;
+      if (p.temperature !== undefined) {
+        temperatureEl.value = p.temperature;
+        tempValueEl.textContent = Number(p.temperature).toFixed(2);
+      }
+    } catch (_) {}
+  }
+  function savePrefs() {
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify({ maxTokens: maxTokensEl.value, temperature: temperatureEl.value })); } catch (_) {}
+  }
+  loadPrefs();
+  maxTokensEl.addEventListener("change", savePrefs);
+  temperatureEl.addEventListener("change", savePrefs);
+
+  /* ── Session / history storage ── */
+  const SESSIONS_KEY = "rustyllm_sessions";
+
+  function loadSessions() {
+    try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]"); } catch (_) { return []; }
+  }
+
+  function writeSessions(sessions) {
+    try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions)); } catch (_) {}
+  }
+
+  function saveCurrentSession() {
+    if (history.length === 0) return;
+    const sessions = loadSessions();
+    const idx = sessions.findIndex((s) => s.id === currentSessionId);
+    const title = (history[0]?.content || "Chat").slice(0, 80);
+    const session = { id: currentSessionId, title, messages: [...history], updatedAt: Date.now() };
+    if (idx >= 0) sessions[idx] = session;
+    else sessions.unshift(session);
+    while (sessions.length > 100) sessions.pop();
+    writeSessions(sessions);
+  }
+
+  function deleteSession(id) {
+    writeSessions(loadSessions().filter((s) => s.id !== id));
+  }
+
+  function formatDate(ts) {
+    const d = new Date(ts);
+    const diffDays = Math.floor((Date.now() - ts) / 86400000);
+    if (diffDays === 0) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays < 7) return d.toLocaleDateString([], { weekday: "short" });
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+
+  function renderHistoryList() {
+    const sessions = loadSessions();
+    historyListEl.innerHTML = "";
+    if (sessions.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "No previous chats yet.";
+      historyListEl.appendChild(empty);
+      return;
+    }
+    for (const s of sessions) {
+      const item = document.createElement("div");
+      item.className = "history-item" + (s.id === currentSessionId ? " active" : "");
+      item.setAttribute("role", "listitem");
+      item.title = s.title;
+
+      const info = document.createElement("div");
+      info.className = "history-item-info";
+
+      const titleEl = document.createElement("div");
+      titleEl.className = "history-item-title";
+      titleEl.textContent = s.title;
+
+      const dateEl = document.createElement("div");
+      dateEl.className = "history-item-date";
+      dateEl.textContent = formatDate(s.updatedAt);
+
+      const delBtn = document.createElement("button");
+      delBtn.className = "history-item-del";
+      delBtn.type = "button";
+      delBtn.textContent = "×";
+      delBtn.setAttribute("aria-label", "Delete conversation");
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteSession(s.id);
+        if (s.id === currentSessionId) startNew(false);
+        else renderHistoryList();
+      });
+
+      info.appendChild(titleEl);
+      info.appendChild(dateEl);
+      item.appendChild(info);
+      item.appendChild(delBtn);
+      item.addEventListener("click", () => loadSession(s));
+      historyListEl.appendChild(item);
+    }
+  }
+
+  function renderSession(messages) {
+    messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
+    emptyEl.hidden = messages.length > 0;
+    for (const msg of messages) {
+      const el = document.createElement("div");
+      el.className = "msg " + msg.role;
+      el.dataset.raw = msg.content;
+      if (msg.role === "assistant") {
+        el.innerHTML = renderMarkdown(msg.content);
+      } else {
+        el.textContent = msg.content;
+      }
+      attachCopyButton(el);
+      messagesEl.appendChild(el);
+    }
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+  }
+
+  function loadSession(session) {
+    saveCurrentSession();
+    currentSessionId = session.id;
+    history.length = 0;
+    history.push(...session.messages);
+    renderSession(session.messages);
+    updateStats("");
+    renderHistoryList();
+    promptEl.focus();
+  }
+
+  function startNew(save = true) {
+    if (save) saveCurrentSession();
+    currentSessionId = genId();
+    history.length = 0;
+    renderSession([]);
+    updateStats("");
+    renderHistoryList();
+    promptEl.focus();
+    announce("New chat started");
+  }
+
+  /* ── Restore last session on load ── */
+  (function restoreLatest() {
+    const sessions = loadSessions();
+    if (sessions.length === 0) return;
+    const latest = sessions[0];
+    currentSessionId = latest.id;
+    history.push(...latest.messages);
+    renderSession(latest.messages);
+  })();
+
+  /* ── History panel toggle ── */
+  historyToggleEl.addEventListener("click", () => {
+    const opening = historyPanelEl.hidden;
+    historyPanelEl.hidden = !opening;
+    historyToggleEl.setAttribute("aria-expanded", String(opening));
+    if (opening) renderHistoryList();
+  });
+
+  newChatEl.addEventListener("click", () => startNew());
+
+  /* ── Scroll-to-bottom button ── */
+  scrollEl.addEventListener("scroll", () => {
+    const nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 80;
+    scrollBtnEl.hidden = nearBottom;
+  });
+  scrollBtnEl.addEventListener("click", () => {
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+    scrollBtnEl.hidden = true;
+  });
+
+  /* ── Suggestion buttons ── */
+  messagesEl.querySelectorAll(".suggestion").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      promptEl.value = btn.textContent;
+      promptEl.dispatchEvent(new Event("input"));
+      promptEl.focus();
+    });
+  });
 
   function setBusy(busy) {
     sendEl.disabled = busy;
@@ -612,10 +815,14 @@ function initChat() {
     if (!text || controller) return;
 
     promptEl.value = "";
+    promptEl.style.height = "";
+    updateStats("");
     addMessage("user", text);
     const userMessage = { role: "user", content: text };
     const assistantEl = addMessage("assistant", "");
     let assistantText = "";
+    let tokenCount = 0;
+    const startTime = Date.now();
     const turn = beginTurn();
 
     try {
@@ -652,23 +859,36 @@ function initChat() {
           const token = JSON.parse(data).choices?.[0]?.delta?.content || "";
           if (token) {
             assistantText += token;
+            tokenCount++;
             appendText(assistantEl, token);
+            const elapsed = (Date.now() - startTime) / 1000;
+            if (elapsed > 0.3) updateStats((tokenCount / elapsed).toFixed(1) + " tok/s");
           }
         }
       }
+      const elapsed = (Date.now() - startTime) / 1000;
+      if (tokenCount > 0 && elapsed > 0) {
+        updateStats(tokenCount + " tokens · " + (tokenCount / elapsed).toFixed(1) + " tok/s");
+      }
       if (turn.id === activeTurn) {
         history.push(userMessage, { role: "assistant", content: assistantText });
+        saveCurrentSession();
+        if (!historyPanelEl.hidden) renderHistoryList();
       }
     } catch (err) {
       if (err.name === "AbortError") {
         appendText(assistantEl, "\n[stopped]");
+        announce("Generation stopped");
         if (assistantText && turn.id === activeTurn) {
           history.push(userMessage, { role: "assistant", content: assistantText });
+          saveCurrentSession();
+          if (!historyPanelEl.hidden) renderHistoryList();
         }
       } else {
         assistantEl.dataset.raw = "Error: " + err.message;
         assistantEl.textContent = "Error: " + err.message;
         statusEl.textContent = "Error";
+        announce("Error: " + err.message);
       }
     } finally {
       finishTurn(turn);
