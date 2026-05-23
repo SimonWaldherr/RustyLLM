@@ -320,7 +320,7 @@ impl Weight {
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Attempts the fused Q4_K triple-projection fast path and reports whether it ran.
+/// Attempts fused K-quant triple-projection fast paths and reports whether one ran.
 fn try_q4k_matvec3_into(
     wq: &Weight,
     wk: &Weight,
@@ -361,12 +361,72 @@ fn try_q4k_matvec3_into(
                 v,
             )
         }
+        (
+            Weight::Quantized {
+                data: q_data,
+                dtype: GGMLType::Q5_K,
+                rows: q_rows,
+                cols: q_cols,
+            },
+            Weight::Quantized {
+                data: k_data,
+                dtype: GGMLType::Q5_K,
+                rows: k_rows,
+                cols: k_cols,
+            },
+            Weight::Quantized {
+                data: v_data,
+                dtype: GGMLType::Q5_K,
+                rows: v_rows,
+                cols: v_cols,
+            },
+        ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
+            crate::simd::matvec_q5_k3_into(
+                (q_data.as_slice(), *q_rows, *q_cols),
+                (k_data.as_slice(), *k_rows, *k_cols),
+                (v_data.as_slice(), *v_rows, *v_cols),
+                x,
+                q,
+                k,
+                v,
+            )
+        }
+        (
+            Weight::Quantized {
+                data: q_data,
+                dtype: GGMLType::Q6_K,
+                rows: q_rows,
+                cols: q_cols,
+            },
+            Weight::Quantized {
+                data: k_data,
+                dtype: GGMLType::Q6_K,
+                rows: k_rows,
+                cols: k_cols,
+            },
+            Weight::Quantized {
+                data: v_data,
+                dtype: GGMLType::Q6_K,
+                rows: v_rows,
+                cols: v_cols,
+            },
+        ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
+            crate::simd::matvec_q6_k3_into(
+                (q_data.as_slice(), *q_rows, *q_cols),
+                (k_data.as_slice(), *k_rows, *k_cols),
+                (v_data.as_slice(), *v_rows, *v_cols),
+                x,
+                q,
+                k,
+                v,
+            )
+        }
         _ => false,
     }
 }
 
 #[cfg(target_family = "wasm")]
-/// Attempts the fused Q4_K triple-projection fast path and reports whether it ran.
+/// Attempts fused K-quant triple-projection fast paths and reports whether one ran.
 fn try_q4k_matvec3_into(
     _wq: &Weight,
     _wk: &Weight,
@@ -380,7 +440,7 @@ fn try_q4k_matvec3_into(
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Attempts the fused Q4_K double-projection fast path and reports whether it ran.
+/// Attempts fused K-quant double-projection fast paths and reports whether one ran.
 fn try_q4k_matvec2_into(
     a: &Weight,
     b: &Weight,
@@ -409,12 +469,52 @@ fn try_q4k_matvec2_into(
             out_a,
             out_b,
         ),
+        (
+            Weight::Quantized {
+                data: a_data,
+                dtype: GGMLType::Q5_K,
+                rows: a_rows,
+                cols: a_cols,
+            },
+            Weight::Quantized {
+                data: b_data,
+                dtype: GGMLType::Q5_K,
+                rows: b_rows,
+                cols: b_cols,
+            },
+        ) if *a_cols == *b_cols && *a_cols == x.len() => crate::simd::matvec_q5_k2_into(
+            (a_data.as_slice(), *a_rows, *a_cols),
+            (b_data.as_slice(), *b_rows, *b_cols),
+            x,
+            out_a,
+            out_b,
+        ),
+        (
+            Weight::Quantized {
+                data: a_data,
+                dtype: GGMLType::Q6_K,
+                rows: a_rows,
+                cols: a_cols,
+            },
+            Weight::Quantized {
+                data: b_data,
+                dtype: GGMLType::Q6_K,
+                rows: b_rows,
+                cols: b_cols,
+            },
+        ) if *a_cols == *b_cols && *a_cols == x.len() => crate::simd::matvec_q6_k2_into(
+            (a_data.as_slice(), *a_rows, *a_cols),
+            (b_data.as_slice(), *b_rows, *b_cols),
+            x,
+            out_a,
+            out_b,
+        ),
         _ => false,
     }
 }
 
 #[cfg(target_family = "wasm")]
-/// Attempts the fused Q4_K double-projection fast path and reports whether it ran.
+/// Attempts fused K-quant double-projection fast paths and reports whether one ran.
 fn try_q4k_matvec2_into(
     _a: &Weight,
     _b: &Weight,
@@ -532,6 +632,7 @@ pub struct KVCache {
     pub per_pos_k_dim: usize,
     pub per_pos_v_dim: usize,
     pub max_len: usize,
+    pub sliding_window: Option<usize>,
 }
 
 impl KVCache {
@@ -548,8 +649,14 @@ impl KVCache {
             per_pos_k_dim,
             per_pos_v_dim,
             max_len,
+            sliding_window: None,
         }
     }
+}
+
+#[inline]
+fn active_sliding_window(config: &Config, cache: &KVCache) -> usize {
+    cache.sliding_window.unwrap_or(config.sliding_window)
 }
 
 // ─── Per-token decode scratch buffers (reused across tokens) ─────────────────
@@ -2016,8 +2123,9 @@ pub fn forward_gpt_oss_into(
             *value = 0.0;
         }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
-        let attn_window = if l % 2 == 0 && config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if l % 2 == 0 && sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };
@@ -2188,8 +2296,9 @@ pub fn forward_into(
         let scale = 1.0 / (head_dim as f32).sqrt();
         // Models with sliding-window attention should ignore cache entries that
         // fall outside the active local context.
-        let attn_window = if config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };
@@ -2327,8 +2436,9 @@ pub fn forward_gemma4_into(
 
         // Multi-head attention with GQA
         let scale = 1.0 / (head_dim_l as f32).sqrt();
-        let attn_window = if config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };
@@ -3127,8 +3237,9 @@ pub fn forward_hidden<'a>(
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let attn_window = if config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };
@@ -3241,8 +3352,9 @@ pub fn forward_hidden_gpt_oss<'a>(
             *value = 0.0;
         }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
-        let attn_window = if l % 2 == 0 && config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if l % 2 == 0 && sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };
@@ -3383,8 +3495,9 @@ pub fn forward_hidden_gemma4<'a>(
         cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
 
         let scale = 1.0 / (head_dim_l as f32).sqrt();
-        let attn_window = if config.sliding_window > 0 {
-            pos.saturating_sub(config.sliding_window)
+        let sliding_window = active_sliding_window(config, cache);
+        let attn_window = if sliding_window > 0 {
+            pos.saturating_sub(sliding_window)
         } else {
             0
         };

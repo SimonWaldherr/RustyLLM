@@ -10,10 +10,12 @@ build = "build.rs"
 crate-type = ["rlib", "cdylib"]
 
 [features]
-default = ["cli", "server", "tls"]
+default = ["full"]
+full = ["cli", "server", "tls", "metal"]
 cli = ["dep:serde_json"]
 server = ["dep:serde", "dep:serde_json"]
 tls = ["server", "dep:rustls", "dep:rustls-pemfile"]
+metal = []
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
 
 [dependencies]

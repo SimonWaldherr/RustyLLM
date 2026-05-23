@@ -51,9 +51,114 @@ pub struct GenerationOptions {
     pub sampler: SamplerConfig,
     pub seed: u64,
     pub system_prompt: String,
+    pub speculative: SpeculativeConfig,
+    pub runtime: RuntimeOptConfig,
     /// Stop generation when any of these strings appears in the output.
     /// The matched sequence is not included in the returned text.
     pub stop_sequences: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SpeculativeConfig {
+    pub enabled: bool,
+    pub assistant_path: Option<String>,
+    pub max_draft_tokens: usize,
+    pub adaptive: bool,
+    pub min_accept_rate: f32,
+}
+
+impl Default for SpeculativeConfig {
+    /// Uses conservative speculative decoding defaults.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            assistant_path: None,
+            max_draft_tokens: 4,
+            adaptive: true,
+            min_accept_rate: 0.5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCacheDType {
+    Auto,
+    F32,
+    Bf16,
+    Q8,
+}
+
+impl KvCacheDType {
+    /// Parses a CLI/API KV-cache dtype name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "f32" | "float32" => Some(Self::F32),
+            "bf16" | "bfloat16" => Some(Self::Bf16),
+            "q8" | "q8_0" | "q8-kv" => Some(Self::Q8),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable display name used in boot logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::F32 => "f32",
+            Self::Bf16 => "bf16",
+            Self::Q8 => "q8",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeProfile {
+    Auto,
+    Mistral,
+    Gemma,
+}
+
+impl RuntimeProfile {
+    /// Parses a runtime optimization profile name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "mistral" | "ministral" => Some(Self::Mistral),
+            "gemma" | "gemma4" => Some(Self::Gemma),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable display name used in boot logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Mistral => "mistral",
+            Self::Gemma => "gemma",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeOptConfig {
+    pub kv_cache_dtype: KvCacheDType,
+    pub flash_attention: bool,
+    pub sliding_window_size: Option<usize>,
+    pub max_context: Option<usize>,
+    pub profile: RuntimeProfile,
+}
+
+impl Default for RuntimeOptConfig {
+    /// Uses runtime options that preserve existing model behavior.
+    fn default() -> Self {
+        Self {
+            kv_cache_dtype: KvCacheDType::Auto,
+            flash_attention: true,
+            sliding_window_size: None,
+            max_context: None,
+            profile: RuntimeProfile::Auto,
+        }
+    }
 }
 
 impl Default for GenerationOptions {
@@ -64,6 +169,8 @@ impl Default for GenerationOptions {
             sampler: SamplerConfig::default(),
             seed: 0,
             system_prompt: String::from("You are a helpful assistant."),
+            speculative: SpeculativeConfig::default(),
+            runtime: RuntimeOptConfig::default(),
             stop_sequences: Vec::new(),
         }
     }
@@ -85,6 +192,23 @@ impl GenerationOptions {
         if !self.sampler.repeat_penalty.is_finite() || self.sampler.repeat_penalty <= 0.0 {
             return Err(String::from("repeat_penalty must be a finite number > 0."));
         }
+        if self.speculative.max_draft_tokens == 0 && self.speculative.assistant_path.is_some() {
+            return Err(String::from("--mtp-tokens must be greater than 0."));
+        }
+        if !self.speculative.min_accept_rate.is_finite()
+            || self.speculative.min_accept_rate < 0.0
+            || self.speculative.min_accept_rate > 1.0
+        {
+            return Err(String::from(
+                "speculative min_accept_rate must be in the range [0, 1].",
+            ));
+        }
+        if matches!(self.runtime.max_context, Some(0)) {
+            return Err(String::from("--max-context must be greater than 0."));
+        }
+        if matches!(self.runtime.sliding_window_size, Some(0)) {
+            return Err(String::from("--sliding-window must be greater than 0."));
+        }
         Ok(())
     }
 }
@@ -99,6 +223,32 @@ pub struct GenerationStats {
     /// Number of prompt tokens that were served from the KV cache without
     /// re-evaluation.  Always 0 for stateless (non-session) generation.
     pub cached_tokens: usize,
+    pub speculative: Option<SpeculativeStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SpeculativeStats {
+    pub drafted_tokens: usize,
+    pub accepted_tokens: usize,
+    pub rejected_tokens: usize,
+    pub draft_time: Duration,
+    pub disabled: bool,
+}
+
+impl SpeculativeStats {
+    /// Returns accepted / drafted tokens.
+    pub fn accept_rate(&self) -> f32 {
+        if self.drafted_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f32 / self.drafted_tokens as f32
+        }
+    }
+
+    /// Returns assistant draft throughput.
+    pub fn draft_tok_s(&self) -> f32 {
+        self.drafted_tokens as f32 / self.draft_time.as_secs_f32().max(0.001)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +304,19 @@ fn push_recent_token(recent: &mut Vec<u32>, token: u32) {
     }
 }
 
+/// Returns the highest finite-logit token ID, falling back to 0.
+fn argmax_finite_token(logits: &[f32]) -> u32 {
+    let mut best_idx = 0usize;
+    let mut best = f32::NEG_INFINITY;
+    for (idx, &value) in logits.iter().enumerate() {
+        if value.is_finite() && value > best {
+            best = value;
+            best_idx = idx;
+        }
+    }
+    best_idx as u32
+}
+
 #[inline]
 /// Normalizes a vector to unit length when possible.
 fn l2_normalize_in_place(values: &mut [f32]) {
@@ -201,12 +364,32 @@ enum LoadedWeights {
     Gemma4(crate::model::Gemma4Weights),
 }
 
+struct SpeculativeState<'a> {
+    assistant: &'a Runner,
+    cache: KVCache,
+    buf: DecodeBuffer,
+    logits: Vec<f32>,
+    draft_limit: usize,
+    max_draft_tokens: usize,
+    adaptive: bool,
+    min_accept_rate: f32,
+    stats: SpeculativeStats,
+    enabled: bool,
+}
+
+enum DecodeFlow {
+    Continue,
+    Stop,
+    Fallback,
+}
+
 pub struct Runner {
     gguf: GGUFFile,
     arch: String,
     tok: Tokenizer,
     config: Config,
     weights: LoadedWeights,
+    speculative_assistant: Option<Box<Runner>>,
     /// Serialises concurrent generation calls.
     /// The worker pool's job slot is single-entry; two simultaneous
     /// forward passes would race on it and produce corrupted output.
@@ -406,7 +589,7 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
         let k = format!("{}attn_k.weight", prefix);
         let v = format!("{}attn_v.weight", prefix);
         let qkv = format!("{}attn_qkv.weight", prefix);
-        if !(has(&q) && has(&k) && has(&v)) && !has(&qkv) {
+        if !(has(&qkv) || has(&q) && has(&k) && has(&v)) {
             report.missing_tensors.push(format!(
                 "{}attn_q/attn_k/attn_v.weight or attn_qkv.weight",
                 prefix
@@ -513,6 +696,7 @@ impl Runner {
             tok,
             config,
             weights,
+            speculative_assistant: None,
             generation_lock: Mutex::new(()),
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
@@ -560,6 +744,7 @@ impl Runner {
             tok,
             config,
             weights,
+            speculative_assistant: None,
             generation_lock: Mutex::new(()),
             mapped_model: Some(mmap),
         };
@@ -596,6 +781,138 @@ impl Runner {
     /// Returns the model configuration used for inference.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Attaches a verified assistant checkpoint for greedy speculative decoding.
+    pub fn attach_speculative_assistant(&mut self, mut assistant: Runner) -> Result<(), String> {
+        assistant.speculative_assistant = None;
+        self.verify_speculative_assistant(&assistant)?;
+        self.speculative_assistant = Some(Box::new(assistant));
+        Ok(())
+    }
+
+    /// Returns whether a speculative assistant checkpoint is available.
+    pub fn has_speculative_assistant(&self) -> bool {
+        self.speculative_assistant.is_some()
+    }
+
+    /// Describes runtime optimizations that can affect generation behavior.
+    pub fn optimization_summary(&self, options: &GenerationOptions) -> Vec<String> {
+        let mut items = Vec::new();
+        items.push(format!("profile={}", options.runtime.profile.as_str()));
+        items.push(match options.runtime.kv_cache_dtype {
+            KvCacheDType::Auto => String::from("kv-cache=f32(auto)"),
+            KvCacheDType::F32 => String::from("kv-cache=f32"),
+            requested => format!(
+                "kv-cache=f32(requested {} pending-bench)",
+                requested.as_str()
+            ),
+        });
+        if options.runtime.flash_attention {
+            items.push(String::from("flash-attn=online-softmax"));
+        } else {
+            items.push(String::from("flash-attn=off"));
+        }
+        if let Some(window) = self.effective_sliding_window(options) {
+            items.push(format!("sliding-window={} tokens", window));
+        }
+        items.push(format!(
+            "max-context={} tokens",
+            self.effective_max_context(options)
+        ));
+        if options.speculative.enabled && self.speculative_assistant.is_some() {
+            items.push(format!(
+                "mtp=greedy assistant={} draft_tokens={} adaptive={}",
+                options
+                    .speculative
+                    .assistant_path
+                    .as_deref()
+                    .unwrap_or("attached"),
+                options.speculative.max_draft_tokens,
+                options.speculative.adaptive
+            ));
+        } else {
+            items.push(String::from("mtp=off"));
+        }
+        items
+    }
+
+    /// Emits conservative runtime warnings for known long-context pitfalls.
+    pub fn optimization_warnings(&self, options: &GenerationOptions) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let profile = self.effective_profile(options);
+        if profile == RuntimeProfile::Mistral && self.config.max_seq_len >= 131_072 {
+            warnings.push(format!(
+                "Ministral context metadata advertises {} tokens; default runtime cap is {} unless --max-context overrides it.",
+                self.config.max_seq_len,
+                self.effective_max_context(options)
+            ));
+        }
+        if matches!(
+            options.runtime.kv_cache_dtype,
+            KvCacheDType::Bf16 | KvCacheDType::Q8
+        ) {
+            warnings.push(String::from(
+                "Requested compressed KV cache is not activated yet; f32 KV is kept until BF16/Q8 improves measured throughput.",
+            ));
+        } else if options.runtime.kv_cache_dtype == KvCacheDType::Auto
+            && self.effective_max_context(options) > 16_384
+        {
+            warnings.push(String::from(
+                "Compressed KV cache requested/eligible, but f32 KV remains active until a benchmark proves BF16/Q8 is faster on this backend.",
+            ));
+        }
+        warnings
+    }
+
+    fn verify_speculative_assistant(&self, assistant: &Runner) -> Result<(), String> {
+        if self.tok.vocab_size() != assistant.tok.vocab_size() {
+            return Err(format!(
+                "MTP assistant tokenizer mismatch: target vocab={} assistant vocab={}.",
+                self.tok.vocab_size(),
+                assistant.tok.vocab_size()
+            ));
+        }
+        if self.tok.bos_id != assistant.tok.bos_id || self.tok.eos_id != assistant.tok.eos_id {
+            return Err(format!(
+                "MTP assistant BOS/EOS mismatch: target BOS/EOS={}/{} assistant BOS/EOS={}/{}.",
+                self.tok.bos_id, self.tok.eos_id, assistant.tok.bos_id, assistant.tok.eos_id
+            ));
+        }
+        if assistant.config.max_seq_len < 2 {
+            return Err(String::from(
+                "MTP assistant context is too small for speculative decoding.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn effective_profile(&self, options: &GenerationOptions) -> RuntimeProfile {
+        if options.runtime.profile != RuntimeProfile::Auto {
+            return options.runtime.profile;
+        }
+        match self.arch.as_str() {
+            "mistral" | "mistral3" | "ministral" => RuntimeProfile::Mistral,
+            "gemma" | "gemma2" | "gemma4" => RuntimeProfile::Gemma,
+            _ => RuntimeProfile::Auto,
+        }
+    }
+
+    fn effective_max_context(&self, options: &GenerationOptions) -> usize {
+        if let Some(max_context) = options.runtime.max_context {
+            return max_context.min(self.config.max_seq_len).max(1);
+        }
+        if self.effective_profile(options) == RuntimeProfile::Mistral {
+            return self.config.max_seq_len.clamp(1, 8192);
+        }
+        self.config.max_seq_len.max(1)
+    }
+
+    fn effective_sliding_window(&self, options: &GenerationOptions) -> Option<usize> {
+        options
+            .runtime
+            .sliding_window_size
+            .or_else(|| (self.config.sliding_window > 0).then_some(self.config.sliding_window))
     }
 
     /// Benchmarks representative projection kernels for the loaded model.
@@ -753,10 +1070,8 @@ impl Runner {
             return Err(String::from("Prompt rendered to zero tokens."));
         }
 
-        let cache_len = std::cmp::min(
-            self.config.max_seq_len,
-            tokens.len() + options.max_tokens + 1,
-        );
+        let runtime_context = self.effective_max_context(options);
+        let cache_len = std::cmp::min(runtime_context, tokens.len() + options.max_tokens + 1);
 
         // For architectures with per-layer layouts (Gemma-4), compute the
         // maximum per-layer head/value sizes so we can allocate buffers and
@@ -764,6 +1079,7 @@ impl Runner {
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
 
         let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
+        cache.sliding_window = self.effective_sliding_window(options);
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         let mut rng = if options.seed == 0 {
             let t = std::time::SystemTime::now()
@@ -789,6 +1105,8 @@ impl Runner {
         }
         let prefill_time = t_prefill.elapsed();
 
+        let mut speculative = self.prepare_speculative_state(options, &tokens, cache_len);
+
         // Decode advances one sampled token at a time while reusing the cache.
         let t_decode = Instant::now();
         let mut output = String::new();
@@ -805,7 +1123,36 @@ impl Runner {
             .max()
             .unwrap_or(0);
 
-        'decode: for _ in 0..options.max_tokens {
+        'decode: while generated_tokens < options.max_tokens {
+            if let Some(state) = speculative.as_mut() {
+                if options.sampler.temperature == 0.0
+                    && state.enabled
+                    && options.speculative.enabled
+                    && pos < cache_len
+                {
+                    let outcome = self.verify_batch(
+                        state,
+                        &mut cache,
+                        &mut buf,
+                        &mut logits,
+                        &mut output,
+                        &mut on_token,
+                        &options.stop_sequences,
+                        max_stop_len,
+                        &mut recent,
+                        &mut generated_tokens,
+                        &mut pos,
+                        cache_len,
+                        options.max_tokens,
+                    );
+                    match outcome {
+                        DecodeFlow::Continue => continue,
+                        DecodeFlow::Stop => break 'decode,
+                        DecodeFlow::Fallback => {}
+                    }
+                }
+            }
+
             let token = sampling::sample_with_scratch(
                 &mut logits,
                 &options.sampler,
@@ -850,6 +1197,7 @@ impl Runner {
         }
 
         let decode_time = t_decode.elapsed();
+        let speculative_stats = speculative.map(|state| state.stats);
         Ok(GenerationResult {
             text: output,
             stats: GenerationStats {
@@ -859,8 +1207,217 @@ impl Runner {
                 decode_time,
                 total_time: total_start.elapsed(),
                 cached_tokens: 0,
+                speculative: speculative_stats,
             },
         })
+    }
+
+    fn prepare_speculative_state<'a>(
+        &'a self,
+        options: &GenerationOptions,
+        tokens: &[u32],
+        target_cache_len: usize,
+    ) -> Option<SpeculativeState<'a>> {
+        if !options.speculative.enabled || options.speculative.max_draft_tokens == 0 {
+            return None;
+        }
+        let assistant = self.speculative_assistant.as_deref()?;
+        if options.sampler.temperature != 0.0 {
+            eprintln!("MTP: disabled for non-greedy sampling; set --temp 0 for Greedy-MTP.");
+            return None;
+        }
+        let assistant_cache_len = target_cache_len.min(assistant.effective_max_context(options));
+        if tokens.len() >= assistant_cache_len {
+            eprintln!(
+                "MTP: disabled because prompt needs {} tokens but assistant context is {}.",
+                tokens.len(),
+                assistant_cache_len
+            );
+            return None;
+        }
+
+        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = assistant.kv_dims();
+        let mut cache = KVCache::new(
+            assistant.config.n_layers,
+            kv_k_dim,
+            kv_v_dim,
+            assistant_cache_len,
+        );
+        cache.sliding_window = assistant.effective_sliding_window(options);
+        let mut buf = DecodeBuffer::new(
+            &assistant.config,
+            max_head_dim,
+            max_n_kv_heads,
+            max_value_dim,
+        );
+        let mut logits = Vec::new();
+        let last_prompt_pos = tokens.len() - 1;
+        let t_draft = Instant::now();
+        for (pos, &tok_id) in tokens.iter().enumerate() {
+            if pos == last_prompt_pos {
+                assistant.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);
+            } else {
+                let _ = assistant.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
+            }
+        }
+
+        Some(SpeculativeState {
+            assistant,
+            cache,
+            buf,
+            logits,
+            draft_limit: options.speculative.max_draft_tokens.clamp(1, 2),
+            max_draft_tokens: options.speculative.max_draft_tokens,
+            adaptive: options.speculative.adaptive,
+            min_accept_rate: options.speculative.min_accept_rate,
+            stats: SpeculativeStats {
+                draft_time: t_draft.elapsed(),
+                ..SpeculativeStats::default()
+            },
+            enabled: true,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch<F>(
+        &self,
+        state: &mut SpeculativeState<'_>,
+        cache: &mut KVCache,
+        buf: &mut DecodeBuffer,
+        logits: &mut Vec<f32>,
+        output: &mut String,
+        on_token: &mut F,
+        stop_sequences: &[String],
+        max_stop_len: usize,
+        recent: &mut Vec<u32>,
+        generated_tokens: &mut usize,
+        pos: &mut usize,
+        cache_len: usize,
+        max_tokens: usize,
+    ) -> DecodeFlow
+    where
+        F: FnMut(&str),
+    {
+        let limit = state
+            .draft_limit
+            .min(max_tokens.saturating_sub(*generated_tokens))
+            .min(cache_len.saturating_sub(*pos))
+            .min(state.cache.max_len.saturating_sub(*pos));
+        if limit == 0 {
+            return DecodeFlow::Fallback;
+        }
+
+        let mut draft = Vec::with_capacity(limit);
+        let t_draft = Instant::now();
+        for i in 0..limit {
+            let token = argmax_finite_token(&state.logits);
+            draft.push(token);
+            if self.is_stop_token(token) || i + 1 == limit {
+                break;
+            }
+            state.assistant.forward_token_into(
+                &mut state.cache,
+                &mut state.buf,
+                token,
+                *pos + i,
+                &mut state.logits,
+            );
+        }
+        state.stats.draft_time += t_draft.elapsed();
+        state.stats.drafted_tokens += draft.len();
+
+        if draft.is_empty() {
+            return DecodeFlow::Fallback;
+        }
+
+        let mut accepted_in_batch = 0usize;
+        for (idx, &draft_token) in draft.iter().enumerate() {
+            let target_token = argmax_finite_token(logits);
+            let accepted = target_token == draft_token;
+            let token = if accepted {
+                state.stats.accepted_tokens += 1;
+                accepted_in_batch += 1;
+                draft_token
+            } else {
+                state.stats.rejected_tokens += draft.len() - idx;
+                target_token
+            };
+
+            if self.is_stop_token(token) {
+                return DecodeFlow::Stop;
+            }
+
+            if self.emit_token_text(token, output, on_token, stop_sequences, max_stop_len) {
+                return DecodeFlow::Stop;
+            }
+
+            *generated_tokens += 1;
+            push_recent_token(recent, token);
+
+            if *generated_tokens >= max_tokens || *pos >= cache_len {
+                return DecodeFlow::Stop;
+            }
+
+            self.forward_token_into(cache, buf, token, *pos, logits);
+
+            if !accepted {
+                if *pos < state.cache.max_len {
+                    state.assistant.forward_token_into(
+                        &mut state.cache,
+                        &mut state.buf,
+                        token,
+                        *pos,
+                        &mut state.logits,
+                    );
+                }
+                *pos += 1;
+                break;
+            }
+
+            *pos += 1;
+        }
+
+        if state.stats.drafted_tokens >= 16 && state.stats.accept_rate() < state.min_accept_rate {
+            state.enabled = false;
+            state.stats.disabled = true;
+        } else if state.adaptive {
+            if accepted_in_batch == draft.len() {
+                state.draft_limit = (state.draft_limit + 1).min(state.max_draft_tokens);
+            } else {
+                state.draft_limit = state.draft_limit.saturating_sub(1).max(1);
+            }
+        }
+
+        DecodeFlow::Continue
+    }
+
+    fn emit_token_text<F>(
+        &self,
+        token: u32,
+        output: &mut String,
+        on_token: &mut F,
+        stop_sequences: &[String],
+        max_stop_len: usize,
+    ) -> bool
+    where
+        F: FnMut(&str),
+    {
+        let text = self.tok.decode_token(token);
+        output.push_str(&text);
+
+        if max_stop_len > 0 {
+            let window_start = output.len().saturating_sub(max_stop_len + text.len());
+            let window = &output[window_start..];
+            for stop in stop_sequences {
+                if let Some(rel_idx) = window.find(stop.as_str()) {
+                    output.truncate(window_start + rel_idx);
+                    return true;
+                }
+            }
+        }
+
+        on_token(&text);
+        false
     }
 
     /// Dispatches one token through the active model-family forward pass.
@@ -1223,6 +1780,7 @@ impl Runner {
             return Err(String::from("Prompt rendered to zero tokens."));
         }
 
+        session.kv_cache.sliding_window = self.effective_sliding_window(options);
         let cache_limit = session.kv_cache.max_len;
 
         // If the prompt alone already exceeds the KV-cache capacity, reset the
@@ -1378,6 +1936,7 @@ impl Runner {
                 decode_time,
                 total_time: total_start.elapsed(),
                 cached_tokens: reused,
+                speculative: None,
             },
         })
     }

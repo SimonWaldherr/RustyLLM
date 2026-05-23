@@ -1,0 +1,4 @@
+-P ubuntu-latest=catthehacker/ubuntu:act-latest
+-P macos-latest=catthehacker/ubuntu:act-latest
+--env ACT=true
+--container-architecture linux/amd64

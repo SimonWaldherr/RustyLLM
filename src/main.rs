@@ -6,7 +6,10 @@ use rusty_llm::gguf::GGUFFile;
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::metal;
 use rusty_llm::model::Config;
-use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner, compatibility_report};
+use rusty_llm::runtime::{
+    ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
+    compatibility_report,
+};
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
@@ -59,6 +62,14 @@ fn print_usage(name: &str) {
     eprintln!("  --repeat-penalty <F>      Repetition penalty (default: 1.1)");
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
+    eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");
+    eprintln!("  --mtp-tokens <N>          Max speculative draft tokens (default: 4)");
+    eprintln!("  --no-speculative          Disable speculative decoding");
+    eprintln!("  --kv-cache-dtype <T>      KV cache dtype: auto, f32, bf16, q8");
+    eprintln!("  --max-context <N>         Cap runtime context/KV-cache length");
+    eprintln!("  --profile <name>          Runtime profile: auto, mistral, gemma");
+    eprintln!("  --sliding-window <N>      Override sliding-window size for runtime planning");
+    eprintln!("  --no-flash-attn           Disable online-softmax attention optimization marker");
     eprintln!("  --system-prompt <T>       Override the default system prompt");
     eprintln!("  --stop <text>             Stop generation when this string appears");
     eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
@@ -250,6 +261,41 @@ fn run() -> Result<(), String> {
             "--threads" => {
                 threads_override = Some(parse_arg::<usize>(&args, &mut i, "--threads")?);
             }
+            "--mtp-assistant" => {
+                options.speculative.assistant_path =
+                    Some(parse_arg::<String>(&args, &mut i, "--mtp-assistant")?);
+            }
+            "--mtp-tokens" => {
+                options.speculative.max_draft_tokens =
+                    parse_arg::<usize>(&args, &mut i, "--mtp-tokens")?;
+            }
+            "--no-speculative" => {
+                options.speculative.enabled = false;
+            }
+            "--kv-cache-dtype" => {
+                let value = parse_arg::<String>(&args, &mut i, "--kv-cache-dtype")?;
+                options.runtime.kv_cache_dtype = KvCacheDType::parse(&value)
+                    .ok_or_else(|| format!("Invalid --kv-cache-dtype value '{}'.", value))?;
+            }
+            "--max-context" => {
+                options.runtime.max_context =
+                    Some(parse_arg::<usize>(&args, &mut i, "--max-context")?);
+            }
+            "--profile" => {
+                let value = parse_arg::<String>(&args, &mut i, "--profile")?;
+                options.runtime.profile = RuntimeProfile::parse(&value)
+                    .ok_or_else(|| format!("Invalid --profile value '{}'.", value))?;
+            }
+            "--sliding-window" => {
+                options.runtime.sliding_window_size =
+                    Some(parse_arg::<usize>(&args, &mut i, "--sliding-window")?);
+            }
+            "--flash-attn" => {
+                options.runtime.flash_attention = true;
+            }
+            "--no-flash-attn" => {
+                options.runtime.flash_attention = false;
+            }
             "--system-prompt" => {
                 options.system_prompt = parse_arg::<String>(&args, &mut i, "--system-prompt")?;
             }
@@ -267,7 +313,6 @@ fn run() -> Result<(), String> {
             "--bench-json" | "—bench-json" => {
                 bench_mode = true;
                 bench_json = true;
-                bench_output = true;
             }
             "--bench-output" => {
                 bench_output = true;
@@ -396,7 +441,7 @@ fn run() -> Result<(), String> {
     let model_path_str = model_path
         .to_str()
         .ok_or_else(|| format!("Non-UTF-8 model path: {}", model_path.display()))?;
-    let (runner, load_info) = Runner::from_path(model_path_str)?;
+    let (mut runner, load_info) = Runner::from_path(model_path_str)?;
     let file_mb = load_info.file_size_bytes as f64 / (1024.0 * 1024.0);
     eprintln!("File size: {:.1} MB", file_mb);
     if let Some(name) = runner.model_name() {
@@ -414,6 +459,26 @@ fn run() -> Result<(), String> {
         load_info.load_time.as_secs_f32(),
         file_mb / load_info.load_time.as_secs_f64()
     );
+
+    if options.speculative.enabled {
+        if let Some(assistant_path) = options.speculative.assistant_path.as_deref() {
+            eprintln!("Loading MTP assistant: {}", assistant_path);
+            let (assistant, assistant_info) = Runner::from_path(assistant_path)?;
+            runner.attach_speculative_assistant(assistant)?;
+            eprintln!(
+                "MTP assistant loaded in {:.2}s",
+                assistant_info.load_time.as_secs_f32()
+            );
+        }
+    }
+    eprintln!(
+        "Optimizations: {}",
+        runner.optimization_summary(&options).join(", ")
+    );
+    for warning in runner.optimization_warnings(&options) {
+        eprintln!("Warning: {}", warning);
+    }
+    eprintln!();
     io::stderr().flush().map_err(|err| err.to_string())?;
 
     if list_tensors {
@@ -593,6 +658,18 @@ fn run() -> Result<(), String> {
         result.stats.decode_time.as_secs_f32(),
         result.stats.generated_tokens as f32 / result.stats.decode_time.as_secs_f32().max(0.001)
     );
+    if let Some(spec) = &result.stats.speculative {
+        eprintln!(
+            "MTP: accept_rate={:.2}, drafted={}, accepted={}, draft={:.2} tok/s, effective={:.2} tok/s{}",
+            spec.accept_rate(),
+            spec.drafted_tokens,
+            spec.accepted_tokens,
+            spec.draft_tok_s(),
+            result.stats.generated_tokens as f32
+                / result.stats.decode_time.as_secs_f32().max(0.001),
+            if spec.disabled { " (disabled)" } else { "" }
+        );
+    }
     eprintln!("Total: {:.2}s", result.stats.total_time.as_secs_f32());
 
     Ok(())
@@ -706,7 +783,7 @@ fn run_benchmark(
     println!("max_tokens={}", options.max_tokens);
     println!();
     println!(
-        "run,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s"
+        "run,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s,mtp_accept_rate,mtp_draft_tok_s"
     );
 
     let mut total_prompt_tokens = 0usize;
@@ -728,8 +805,21 @@ fn run_benchmark(
         let decode_tok_s = result.stats.generated_tokens as f64
             / result.stats.decode_time.as_secs_f64().max(0.001);
 
+        let mtp_accept_rate = result
+            .stats
+            .speculative
+            .as_ref()
+            .map(|s| s.accept_rate())
+            .unwrap_or(0.0);
+        let mtp_draft_tok_s = result
+            .stats
+            .speculative
+            .as_ref()
+            .map(|s| s.draft_tok_s())
+            .unwrap_or(0.0);
+
         println!(
-            "{},{},{},{},{},{},{},{:.2}",
+            "{},{},{},{},{},{},{},{:.2},{:.2},{:.2}",
             run + 1,
             result.stats.prompt_tokens,
             result.stats.generated_tokens,
@@ -737,7 +827,9 @@ fn run_benchmark(
             result.stats.decode_time.as_millis(),
             result.stats.total_time.as_millis(),
             wall.as_millis(),
-            decode_tok_s
+            decode_tok_s,
+            mtp_accept_rate,
+            mtp_draft_tok_s
         );
         if output {
             println!("run {} output: {}", run + 1, result.text);
@@ -826,6 +918,18 @@ fn run_benchmark_json(
             "prefill_tok_s": prefill_tok_s,
             "decode_tok_s": decode_tok_s,
         });
+        if let Some(spec) = &result.stats.speculative {
+            run_value["speculative"] = serde_json::json!({
+                "drafted_tokens": spec.drafted_tokens,
+                "accepted_tokens": spec.accepted_tokens,
+                "rejected_tokens": spec.rejected_tokens,
+                "accept_rate": spec.accept_rate(),
+                "draft_ms": spec.draft_time.as_millis(),
+                "draft_tok_s": spec.draft_tok_s(),
+                "effective_tok_s": decode_tok_s,
+                "disabled": spec.disabled,
+            });
+        }
         if output {
             run_value["text"] = serde_json::json!(result.text);
         }
@@ -861,6 +965,20 @@ fn run_benchmark_json(
             "repeat_penalty": options.sampler.repeat_penalty,
             "seed": options.seed,
             "stop_sequences": options.stop_sequences,
+            "speculative": {
+                "enabled": options.speculative.enabled && runner.has_speculative_assistant(),
+                "assistant": options.speculative.assistant_path.as_deref(),
+                "max_draft_tokens": options.speculative.max_draft_tokens,
+                "adaptive": options.speculative.adaptive,
+                "min_accept_rate": options.speculative.min_accept_rate,
+            },
+            "runtime": {
+                "profile": options.runtime.profile.as_str(),
+                "kv_cache_dtype": options.runtime.kv_cache_dtype.as_str(),
+                "flash_attention": options.runtime.flash_attention,
+                "sliding_window_size": options.runtime.sliding_window_size,
+                "max_context": options.runtime.max_context,
+            },
         },
         "results": run_values,
         "summary": {

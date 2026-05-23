@@ -677,10 +677,13 @@ fn main() -> Result<(), String> {
 
 Default Cargo features:
 
+- `full`: enables the default native application feature set.
 - `cli`: builds the CLI binaries and enables JSON helpers for command-line
   tools.
 - `server`: enables the HTTP server.
 - `tls`: enables HTTPS serving through `rustls`.
+- `metal`: compiles the optional macOS Metal backend when Xcode command line
+  tools are available. Runtime use still requires `RUSTY_LLM_METAL=1`.
 
 Optional feature:
 
@@ -690,8 +693,9 @@ Optional feature:
 Examples:
 
 ```bash
-cargo build --release --all-features
-cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+cargo build --release --features full
+cargo check --no-default-features --features cli,server,tls
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown --lib
 make wasm
 ```
 
@@ -721,7 +725,8 @@ No generated WASM binaries are written back to the repository branch.
 - `RUSTY_LLM_MODEL_DIR`: default directory used by model discovery.
 - `RUSTY_LLM_FAST_ATTN`: enables the approximate fast attention path when set.
 - `RUSTY_LLM_METAL`: enables the experimental macOS Metal Q4_K path when set
-  and when the backend was compiled successfully.
+  and when the binary was built with the `metal` feature and the backend was
+  compiled successfully.
 
 Leave `RUSTY_LLM_METAL` unset to use the CPU path.
 
@@ -731,12 +736,21 @@ Useful checks:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo check --no-default-features --features wasm --target wasm32-unknown-unknown
+cargo clippy --all-targets --features full -- -D warnings
+cargo test --features full
+cargo check --no-default-features --features wasm --target wasm32-unknown-unknown --lib
 ```
 
-The CI workflow runs these checks on Ubuntu and macOS.
+The CI workflow runs the full native check set on Ubuntu, a focused Metal build
+smoke check on macOS, and the no-default-features WASM library check. Local
+GitHub Actions runs are supported with `act`:
+
+```bash
+act pull_request
+```
+
+The repository includes `.actrc` runner mappings and skips GitHub-hosted-only
+deployment/cache steps when `ACT=true`.
 
 Focused embedding tests:
 

@@ -8,6 +8,9 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    if env::var_os("CARGO_FEATURE_METAL").is_none() {
+        return;
+    }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set"));
     let obj = out_dir.join("metal_backend.o");

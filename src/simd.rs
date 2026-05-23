@@ -263,6 +263,7 @@ impl MatvecJob {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct Q4KMatvec3Job {
+    kind: MatvecKind,
     a_data: *const u8,
     b_data: *const u8,
     c_data: *const u8,
@@ -298,6 +299,7 @@ impl Q4KMatvec3Job {
 
         let (a_start, a_end) = clipped_range(start, end, 0, self.rows_a);
         q4k_matvec3_rows(
+            self.kind,
             self.a_data,
             self.x,
             self.out_a,
@@ -310,6 +312,7 @@ impl Q4KMatvec3Job {
         let b_offset = self.rows_a;
         let (b_start, b_end) = clipped_range(start, end, b_offset, self.rows_b);
         q4k_matvec3_rows(
+            self.kind,
             self.b_data,
             self.x,
             self.out_b,
@@ -322,6 +325,7 @@ impl Q4KMatvec3Job {
         let c_offset = self.rows_a + self.rows_b;
         let (c_start, c_end) = clipped_range(start, end, c_offset, self.rows_c);
         q4k_matvec3_rows(
+            self.kind,
             self.c_data,
             self.x,
             self.out_c,
@@ -335,6 +339,7 @@ impl Q4KMatvec3Job {
 
 #[cfg(not(target_family = "wasm"))]
 #[inline]
+#[allow(clippy::too_many_arguments)]
 /// Clips a worker row range to an output slice range.
 fn clipped_range(start: usize, end: usize, offset: usize, len: usize) -> (usize, usize) {
     let local_start = start.saturating_sub(offset).min(len);
@@ -348,7 +353,9 @@ fn clipped_range(start: usize, end: usize, offset: usize, len: usize) -> (usize,
 
 #[cfg(not(target_family = "wasm"))]
 #[inline]
+#[allow(clippy::too_many_arguments)]
 unsafe fn q4k_matvec3_rows(
+    kind: MatvecKind,
     data: *const u8,
     x: *const f32,
     out: *mut f32,
@@ -358,7 +365,7 @@ unsafe fn q4k_matvec3_rows(
     end: usize,
 ) {
     for row in start..end {
-        *out.add(row) = dot_row(MatvecKind::Q4K, data, x, row, cols, row_span);
+        *out.add(row) = dot_row(kind, data, x, row, cols, row_span);
     }
 }
 
@@ -786,7 +793,14 @@ pub fn dot_q4_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[inline]
 pub fn dot_q5_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 256 == 0);
-    dot_q5_k_f32_scalar(qdata, x, n)
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_q5_k_f32_neon(qdata, x, n) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_q5_k_f32_scalar(qdata, x, n)
+    }
 }
 
 /// Fused Q6_K dot product
@@ -1206,6 +1220,7 @@ pub fn matvec_q4_k3_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind: MatvecKind::Q4K,
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
@@ -1292,6 +1307,7 @@ pub fn matvec_q4_k2_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind: MatvecKind::Q4K,
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
@@ -1308,6 +1324,256 @@ pub fn matvec_q4_k2_into(
         });
         true
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matvec_k3_into(
+    kind: MatvecKind,
+    row_bytes: usize,
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (weights_a, rows_a, cols_a) = a;
+    let (weights_b, rows_b, cols_b) = b;
+    let (weights_c, rows_c, cols_c) = c;
+    if cols_a == 0 || cols_a % 256 != 0 || cols_a != cols_b || cols_a != cols_c || cols_a != x.len()
+    {
+        return false;
+    }
+    let needed_a = match row_bytes.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_c = match row_bytes.checked_mul(rows_c) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b || weights_c.len() < needed_c {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+    out_c.resize(rows_c, 0.0);
+
+    #[cfg(target_family = "wasm")]
+    {
+        for row in 0..rows_a {
+            out_a[row] = dot_row_from_kind(
+                kind,
+                &weights_a[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_row_from_kind(
+                kind,
+                &weights_b[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_c {
+            out_c[row] = dot_row_from_kind(
+                kind,
+                &weights_c[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b + rows_c;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind,
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_c.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_c.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c,
+            cols: cols_a,
+            row_span: row_bytes,
+            workers,
+        });
+        true
+    }
+}
+
+fn matvec_k2_into(
+    kind: MatvecKind,
+    row_bytes: usize,
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (weights_a, rows_a, cols_a) = a;
+    let (weights_b, rows_b, cols_b) = b;
+    if cols_a == 0 || cols_a % 256 != 0 || cols_a != cols_b || cols_a != x.len() {
+        return false;
+    }
+    let needed_a = match row_bytes.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+
+    #[cfg(target_family = "wasm")]
+    {
+        for row in 0..rows_a {
+            out_a[row] = dot_row_from_kind(
+                kind,
+                &weights_a[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_row_from_kind(
+                kind,
+                &weights_b[row * row_bytes..(row + 1) * row_bytes],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind,
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_b.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_b.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c: 0,
+            cols: cols_a,
+            row_span: row_bytes,
+            workers,
+        });
+        true
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn dot_row_from_kind(kind: MatvecKind, row: &[u8], x: &[f32], cols: usize) -> f32 {
+    match kind {
+        MatvecKind::Q4K => dot_q4_k_f32(row, x, cols),
+        MatvecKind::Q5K => dot_q5_k_f32(row, x, cols),
+        MatvecKind::Q6K => dot_q6_k_f32(row, x, cols),
+        _ => 0.0,
+    }
+}
+
+/// Runs three Q5_K projections against the same input vector.
+pub fn matvec_q5_k3_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    matvec_k3_into(
+        MatvecKind::Q5K,
+        (a.2 / 256) * 176,
+        a,
+        b,
+        c,
+        x,
+        out_a,
+        out_b,
+        out_c,
+    )
+}
+
+/// Runs two Q5_K projections against the same input vector.
+pub fn matvec_q5_k2_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    matvec_k2_into(MatvecKind::Q5K, (a.2 / 256) * 176, a, b, x, out_a, out_b)
+}
+
+/// Runs three Q6_K projections against the same input vector.
+pub fn matvec_q6_k3_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    matvec_k3_into(
+        MatvecKind::Q6K,
+        (a.2 / 256) * 210,
+        a,
+        b,
+        c,
+        x,
+        out_a,
+        out_b,
+        out_c,
+    )
+}
+
+/// Runs two Q6_K projections against the same input vector.
+pub fn matvec_q6_k2_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    matvec_k2_into(MatvecKind::Q6K, (a.2 / 256) * 210, a, b, x, out_a, out_b)
 }
 
 /// Runs a Q6_K matrix-vector multiply into a reusable output buffer.
@@ -1943,6 +2209,7 @@ fn dot_q4_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     sum
 }
 
+#[allow(dead_code)]
 /// Portable scalar implementation of Q5_K dot product.
 fn dot_q5_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 256;
@@ -2000,6 +2267,99 @@ fn dot_q5_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
 
     sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_q5_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    let n_blocks = n / 256;
+    let mask_low = vdupq_n_u8(0x0F);
+    let high_bit = vdupq_n_u8(16);
+    let zero = vdupq_n_u8(0);
+    let mut total = vdupq_n_f32(0.0);
+
+    for b in 0..n_blocks {
+        let block = qdata.as_ptr().add(b * 176);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q5_k scales size");
+        let qh = block.add(16);
+        let qs = block.add(48);
+        let xbase = x.as_ptr().add(b * 256);
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for chunk in 0..4usize {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = vdupq_n_f32(d * sc1 as f32);
+            let min1 = vdupq_n_f32(dmin * m1 as f32);
+            let d2 = vdupq_n_f32(d * sc2 as f32);
+            let min2 = vdupq_n_f32(dmin * m2 as f32);
+            let u1v = vdupq_n_u8(u1);
+            let u2v = vdupq_n_u8(u2);
+
+            let qchunk = qs.add(chunk * 32);
+            let x1 = xbase.add(chunk * 64);
+            let x2 = x1.add(32);
+
+            let mut qacc1 = vdupq_n_f32(0.0);
+            let mut qacc2 = vdupq_n_f32(0.0);
+            let mut xsum1 = vdupq_n_f32(0.0);
+            let mut xsum2 = vdupq_n_f32(0.0);
+
+            for lane in (0..32usize).step_by(16) {
+                let packed = vld1q_u8(qchunk.add(lane));
+                let high = vld1q_u8(qh.add(lane));
+                let lo_high = vandq_u8(vcgtq_u8(vandq_u8(high, u1v), zero), high_bit);
+                let hi_high = vandq_u8(vcgtq_u8(vandq_u8(high, u2v), zero), high_bit);
+                let lo = vorrq_u8(vandq_u8(packed, mask_low), lo_high);
+                let hi = vorrq_u8(vshrq_n_u8(packed, 4), hi_high);
+
+                macro_rules! accumulate_u8x16 {
+                    ($q:expr, $xptr:expr, $qacc:ident, $xsum:ident) => {{
+                        let q16 = vmovl_u8(vget_low_u8($q));
+                        let q32a = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q16)));
+                        let q32b = vcvtq_f32_u32(vmovl_u16(vget_high_u16(q16)));
+                        let xa = vld1q_f32($xptr);
+                        let xb = vld1q_f32($xptr.add(4));
+                        $qacc = vmlaq_f32($qacc, q32a, xa);
+                        $qacc = vmlaq_f32($qacc, q32b, xb);
+                        $xsum = vaddq_f32($xsum, xa);
+                        $xsum = vaddq_f32($xsum, xb);
+
+                        let q16 = vmovl_u8(vget_high_u8($q));
+                        let q32a = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q16)));
+                        let q32b = vcvtq_f32_u32(vmovl_u16(vget_high_u16(q16)));
+                        let xa = vld1q_f32($xptr.add(8));
+                        let xb = vld1q_f32($xptr.add(12));
+                        $qacc = vmlaq_f32($qacc, q32a, xa);
+                        $qacc = vmlaq_f32($qacc, q32b, xb);
+                        $xsum = vaddq_f32($xsum, xa);
+                        $xsum = vaddq_f32($xsum, xb);
+                    }};
+                }
+
+                accumulate_u8x16!(lo, x1.add(lane), qacc1, xsum1);
+                accumulate_u8x16!(hi, x2.add(lane), qacc2, xsum2);
+            }
+
+            let part1 = vsubq_f32(vmulq_f32(qacc1, d1), vmulq_f32(xsum1, min1));
+            let part2 = vsubq_f32(vmulq_f32(qacc2, d2), vmulq_f32(xsum2, min2));
+            total = vaddq_f32(total, vaddq_f32(part1, part2));
+
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+
+    vaddvq_f32(total)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2135,6 +2495,32 @@ fn mxfp4_nibble_to_f32(v: u8) -> f32 {
     LUT[(v & 0x0F) as usize]
 }
 
+#[inline(always)]
+/// Converts one MXFP4 block scale byte to `f32`.
+fn mxfp4_scale_to_f32(v: u8) -> f32 {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        mxfp4_scale_lookup()[v as usize]
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        2.0f32.powi(v as i32 - 127)
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Returns the lazily initialized MXFP4 scale lookup table.
+fn mxfp4_scale_lookup() -> &'static [f32; 256] {
+    static MXFP4_SCALE_LOOKUP: OnceLock<[f32; 256]> = OnceLock::new();
+    MXFP4_SCALE_LOOKUP.get_or_init(|| {
+        let mut table = [0.0f32; 256];
+        for (i, value) in table.iter_mut().enumerate() {
+            *value = 2.0f32.powi(i as i32 - 127);
+        }
+        table
+    })
+}
+
 /// Portable scalar implementation of MXFP4 dot product.
 fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
@@ -2143,7 +2529,7 @@ fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
     for b in 0..n_blocks {
         let block = &qdata[b * block_size..(b + 1) * block_size];
-        let scale = 2.0f32.powi(block[16] as i32 - 127);
+        let scale = mxfp4_scale_to_f32(block[16]);
         for i in 0..16 {
             let byte = block[i];
             sum += mxfp4_nibble_to_f32(byte & 0x0F) * scale * x[b * 32 + i * 2];
@@ -2556,6 +2942,62 @@ mod tests {
         data
     }
 
+    /// Builds deterministic synthetic Q5_K weights for scalar/SIMD parity tests.
+    fn make_q5k_blocks(blocks: usize, seed: u8) -> Vec<u8> {
+        let mut data = vec![0u8; blocks * 176];
+        for block in 0..blocks {
+            let base = block * 176;
+            data[base] = 0x00;
+            data[base + 1] = 0x3c; // f16 1.0
+            data[base + 2] = 0x00;
+            data[base + 3] = 0x38; // f16 0.5 dmin
+            for i in 0..12 {
+                data[base + 4 + i] = seed.wrapping_add((block * 11 + i * 7) as u8) & 0x3f;
+            }
+            for i in 0..32 {
+                data[base + 16 + i] = seed.wrapping_add((block * 13 + i * 5) as u8);
+            }
+            for i in 0..128 {
+                data[base + 48 + i] = seed.wrapping_add((block * 17 + i * 3) as u8);
+            }
+        }
+        data
+    }
+
+    /// Builds deterministic synthetic Q5_K matrix weights.
+    fn make_q5k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+        let row_bytes = (cols / 256) * 176;
+        let mut data = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            let row_data = make_q5k_blocks(cols / 256, seed.wrapping_add(row as u8));
+            data[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(&row_data);
+        }
+        data
+    }
+
+    /// Builds deterministic synthetic Q6_K matrix weights.
+    fn make_q6k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+        let row_bytes = (cols / 256) * 210;
+        let mut data = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..(cols / 256) {
+                let base = row * row_bytes + block * 210;
+                for i in 0..128 {
+                    data[base + i] = seed.wrapping_add((row * 7 + block * 13 + i * 3) as u8);
+                }
+                for i in 0..64 {
+                    data[base + 128 + i] = seed.wrapping_add((row * 11 + block * 17 + i * 5) as u8);
+                }
+                for i in 0..16 {
+                    data[base + 192 + i] = 1 + ((seed.wrapping_add(i as u8)) & 0x07);
+                }
+                data[base + 208] = 0x00;
+                data[base + 209] = 0x3c; // f16 1.0
+            }
+        }
+        data
+    }
+
     #[test]
     /// Verifies Q5_0 high-bit unpacking against explicit expected values.
     fn q5_0_dequant_and_dot_unpack_high_bits() {
@@ -2623,6 +3065,29 @@ mod tests {
         assert_eq!(dot_q5_k_f32(&row, &x, 256), 16.0 * 64.0);
         let deq = dequant_row_q5_k(&row, 256);
         assert_eq!(deq.iter().sum::<f32>(), 16.0 * 64.0);
+    }
+
+    #[test]
+    /// Verifies optimized Q5_K dot products preserve scalar output.
+    fn q5k_dot_matches_scalar_reference() {
+        let n = 512;
+        let row = make_q5k_blocks(n / 256, 23);
+        let x: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.013).sin() * 0.75) + ((i % 17) as f32 * 0.01))
+            .collect();
+
+        let expected = dot_q5_k_f32_scalar(&row, &x, n);
+        let actual = dot_q5_k_f32(&row, &x, n);
+        let tolerance = expected.abs().max(1.0) * 1e-5;
+        assert!((actual - expected).abs() <= tolerance);
+    }
+
+    #[test]
+    /// Verifies MXFP4 scale decoding uses the same exponent mapping as the scalar formula.
+    fn mxfp4_scale_lookup_matches_power_formula() {
+        for scale in [1u8, 64, 127, 128, 191, 254] {
+            assert_eq!(mxfp4_scale_to_f32(scale), 2.0f32.powi(scale as i32 - 127));
+        }
     }
 
     #[test]
@@ -2713,5 +3178,68 @@ mod tests {
             &mut out_b,
             &mut out_c
         ));
+    }
+
+    #[test]
+    /// Verifies fused Q5_K projections match separate projections.
+    fn q5k_matvec_fusion_matches_separate_matvecs() {
+        let cols = 512;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.019).sin() * 0.25) + ((i % 13) as f32 * 0.02))
+            .collect();
+        let a = make_q5k_weights(4, cols, 5);
+        let b = make_q5k_weights(6, cols, 17);
+        let c = make_q5k_weights(3, cols, 29);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        let mut exp_c = Vec::new();
+        matvec_q5_k_into(&a, &x, 4, cols, &mut exp_a);
+        matvec_q5_k_into(&b, &x, 6, cols, &mut exp_b);
+        matvec_q5_k_into(&c, &x, 3, cols, &mut exp_c);
+
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+        let mut out_c = Vec::new();
+        assert!(matvec_q5_k3_into(
+            (&a, 4, cols),
+            (&b, 6, cols),
+            (&c, 3, cols),
+            &x,
+            &mut out_a,
+            &mut out_b,
+            &mut out_c
+        ));
+        assert_eq!(out_a, exp_a);
+        assert_eq!(out_b, exp_b);
+        assert_eq!(out_c, exp_c);
+    }
+
+    #[test]
+    /// Verifies fused Q6_K projections match separate projections.
+    fn q6k_matvec_fusion_matches_separate_matvecs() {
+        let cols = 512;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.023).cos() * 0.2) + ((i % 7) as f32 * 0.03))
+            .collect();
+        let a = make_q6k_weights(4, cols, 7);
+        let b = make_q6k_weights(5, cols, 19);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        matvec_q6_k_into(&a, &x, 4, cols, &mut exp_a);
+        matvec_q6_k_into(&b, &x, 5, cols, &mut exp_b);
+
+        let mut out_a = Vec::new();
+        let mut out_b = Vec::new();
+        assert!(matvec_q6_k2_into(
+            (&a, 4, cols),
+            (&b, 5, cols),
+            &x,
+            &mut out_a,
+            &mut out_b
+        ));
+        assert_eq!(out_a, exp_a);
+        assert_eq!(out_b, exp_b);
     }
 }

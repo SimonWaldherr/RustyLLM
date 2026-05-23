@@ -1,300 +1,615 @@
 #!/usr/bin/env bash
-# RustyLLM — sequential model compatibility & speed benchmark
+# RustyLLM - model compatibility and backend speed benchmark.
 #
 # Usage:
-#   ./bench_models.sh                   # scan ~/.cache/lm-studio/models
-#   MODEL_DIR=/path/to/models ./bench_models.sh
+#   ./bench_models.sh
+#   BENCH_PROFILES=cpu ./bench_models.sh
+#   BENCH_PROFILES="cpu metal" MODEL_DIR=/path/to/models ./bench_models.sh
+#   MODEL_FILTER=phi MODEL_LIMIT=2 MAX_TOKENS=16 WAIT_SECS=0 ./bench_models.sh
 #
 # Output:
-#   BENCHMARK.md          updated in-place (created if absent)
-#   README.md             a link line is added once if not already present
-#   raw JSON per model    stored next to this script as bench_raw_<name>.json
+#   BENCHMARK.md              readable benchmark report
+#   .bench_raw/<profile>/     inspect/bench JSON for each model
 #
 set -euo pipefail
 
 BINARY="${BINARY:-./target/release/rusty-llm}"
 MODEL_DIR="${MODEL_DIR:-$HOME/.cache/lm-studio/models}"
+BENCH_PROFILES="${BENCH_PROFILES:-cpu metal}"
+MODEL_FILTER="${MODEL_FILTER:-}"
+MODEL_LIMIT="${MODEL_LIMIT:-0}"
 WAIT_SECS="${WAIT_SECS:-8}"
 BENCH_RUNS="${BENCH_RUNS:-2}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
+PROMPT="${PROMPT:-Explain local LLM inference performance in one concise paragraph.}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-600}"
 README="${README:-README.md}"
 BENCHMARK_MD="${BENCHMARK_MD:-BENCHMARK.md}"
 RAW_DIR="${RAW_DIR:-.bench_raw}"
 
-mkdir -p "$RAW_DIR"
+RESULTS_TSV="$RAW_DIR/results.tsv"
+PROFILES_TSV="$RAW_DIR/profiles.tsv"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+mkdir -p "$RAW_DIR"
+: > "$RESULTS_TSV"
+: > "$PROFILES_TSV"
+
 log() { printf '%s\n' "$1"; }
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'error: required command not found: %s\n' "$1" >&2
+    exit 1
+  fi
+}
+
+clean_field() {
+  printf '%s' "$1" | tr '\t\r\n' '   '
+}
+
+append_tsv() {
+  local IFS=$'\t'
+  printf '%s\n' "$*" >> "$RESULTS_TSV"
+}
+
+append_profile_tsv() {
+  local IFS=$'\t'
+  printf '%s\n' "$*" >> "$PROFILES_TSV"
+}
+
+slugify() {
+  printf '%s' "${1%.gguf}" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
 extract_json() {
-  # Extract the outermost JSON object from mixed stdout/stderr output
+  # Extract the outermost JSON object from mixed stdout/stderr output.
   python3 -c "
-import sys, json
+import sys
 raw = sys.stdin.read()
 start = raw.find('{')
-if start < 0: print('{}'); sys.exit(0)
+if start < 0:
+    print('{}')
+    sys.exit(0)
 depth = 0
+in_string = False
+escape = False
 for i, c in enumerate(raw[start:], start):
-    if c == '{': depth += 1
+    if in_string:
+        if escape:
+            escape = False
+        elif c == '\\\\':
+            escape = True
+        elif c == '\"':
+            in_string = False
+        continue
+    if c == '\"':
+        in_string = True
+    elif c == '{':
+        depth += 1
     elif c == '}':
         depth -= 1
-        if depth == 0: print(raw[start:i+1]); sys.exit(0)
+        if depth == 0:
+            print(raw[start:i + 1])
+            sys.exit(0)
 print('{}')
 " 2>/dev/null || echo "{}"
 }
 
-# ── collect models ─────────────────────────────────────────────────────────────
-mapfile -t MODELS < <(find "$MODEL_DIR" -name "*.gguf" | grep -iv mmproj | sort)
-TOTAL=${#MODELS[@]}
+note_from_inspect() {
+  jq -r '
+    if ((.gguf.unsupported_layouts // []) | length) > 0 then
+      (.gguf.unsupported_layouts[0])
+    elif ((.gguf.missing_tensor_examples // []) | length) > 0 then
+      "missing tensor: " + (.gguf.missing_tensor_examples[0])
+    elif ((.gguf.unsupported_tensor_examples // []) | length) > 0 then
+      "unsupported tensor: " + (.gguf.unsupported_tensor_examples[0])
+    elif (.model.supported_architecture // false) == false then
+      "unsupported architecture"
+    else
+      "not loadable"
+    end
+  ' 2>/dev/null || echo "not loadable"
+}
 
-log "RustyLLM Model Benchmark — $(date)"
-log "  Binary : $BINARY"
-log "  Models : $TOTAL  (from $MODEL_DIR)"
-log "  Runs   : ${BENCH_RUNS} × ${MAX_TOKENS} tokens each"
-log "  Pause  : ${WAIT_SECS}s between models"
-log "================================================================"
+profile_config() {
+  local key
+  key=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$key" in
+    cpu|off|0)
+      printf 'cpu\tCPU\t0\n'
+      ;;
+    metal|gpu|on|1)
+      printf 'metal\tMetal GPU\t1\n'
+      ;;
+    *)
+      printf 'error: unknown BENCH_PROFILES entry: %s\n' "$1" >&2
+      exit 1
+      ;;
+  esac
+}
 
-# ── per-model loop ─────────────────────────────────────────────────────────────
-# Results stored as parallel arrays (bash 3 compat via indexed arrays)
-declare -a R_FILE R_NAME R_ARCH R_STATUS R_MB R_LOAD R_DECODE R_PREFILL R_NOTE
+require_cmd python3
+require_cmd jq
+require_cmd timeout
 
-idx=0
-for MODEL_PATH in "${MODELS[@]}"; do
-  MODEL_FILE=$(basename "$MODEL_PATH")
-  SLUG="${MODEL_FILE%.gguf}"
-  log ""
-  log "[$((idx+1))/$TOTAL] ── $MODEL_FILE"
+if [ ! -x "$BINARY" ]; then
+  log "Binary not found or not executable: $BINARY"
+  log "Building release binary first..."
+  cargo build --release
+fi
 
-  # ── inspect ──────────────────────────────────────────────────────────────
-  # Run separately from extract_json so a non-zero exit doesn't abort via pipefail
-  INSPECT_RAW=$(timeout 30 "$BINARY" "$MODEL_PATH" --inspect 2>&1) || true
-  INSPECT_JSON=$(printf '%s' "$INSPECT_RAW" | extract_json)
-  echo "$INSPECT_JSON" > "$RAW_DIR/${SLUG}_inspect.json"
-
-  STATUS=$(echo "$INSPECT_JSON"  | jq -r '.status              // "unknown"' 2>/dev/null || echo "unknown")
-  ARCH=$(echo "$INSPECT_JSON"    | jq -r '.model.architecture  // "unknown"' 2>/dev/null || echo "unknown")
-  MODEL_NAME=$(echo "$INSPECT_JSON" | jq -r '.model.name       // ""'        2>/dev/null || echo "")
-  FILE_MB=$(echo "$INSPECT_JSON" | jq -r '(.file_size_bytes // 0) / 1048576 | floor' 2>/dev/null || echo "0")
-  UNSUPPORTED=$(echo "$INSPECT_JSON" | jq -r '.gguf.unsupported_tensor_count // 0' 2>/dev/null || echo "0")
-  [ -z "$MODEL_NAME" ] && MODEL_NAME="$MODEL_FILE"
-
-  log "  arch=$ARCH  status=$STATUS  size=${FILE_MB}MB  unsupported_tensors=$UNSUPPORTED"
-
-  R_FILE[$idx]="$MODEL_FILE"
-  R_NAME[$idx]="$MODEL_NAME"
-  R_ARCH[$idx]="$ARCH"
-  R_MB[$idx]="$FILE_MB"
-
-  if [ "$STATUS" != "supported" ]; then
-    log "  ⚠  Not supported — skipping benchmark"
-    NOTE=$(echo "$INSPECT_JSON" | jq -r '
-      if ((.gguf.unsupported_layouts // []) | length) > 0 then
-        (.gguf.unsupported_layouts[0])
-      elif ((.gguf.missing_tensor_examples // []) | length) > 0 then
-        "missing tensor: " + (.gguf.missing_tensor_examples[0])
-      elif ((.gguf.unsupported_tensor_examples // []) | length) > 0 then
-        "unsupported tensor: " + (.gguf.unsupported_tensor_examples[0])
-      elif (.model.supported_architecture // false) == false then
-        "unsupported architecture"
-      else
-        "not loadable"
-      end
-    ' 2>/dev/null || echo "not loadable")
-    R_STATUS[$idx]="unsupported"
-    R_LOAD[$idx]="—"
-    R_DECODE[$idx]="—"
-    R_PREFILL[$idx]="—"
-    R_NOTE[$idx]="${NOTE:0:120}"
-    idx=$((idx+1))
-    log "  Waiting ${WAIT_SECS}s…"
-    sleep "$WAIT_SECS"
+# Collect text GGUF models. Projector files are skipped because they are not
+# standalone language models.
+declare -a MODELS
+MODELS=()
+while IFS= read -r model_path; do
+  model_file=$(basename "$model_path")
+  case "$model_file" in
+    *mmproj*|*MMProj*|*MMPROJ*) continue ;;
+  esac
+  if [ -n "$MODEL_FILTER" ] && ! printf '%s\n' "$model_path" | grep -qi "$MODEL_FILTER"; then
     continue
   fi
-
-  # ── benchmark ────────────────────────────────────────────────────────────
-  log "  Running ${BENCH_RUNS} runs × ${MAX_TOKENS} tokens…"
-  BENCH_RAW=$(timeout "$TIMEOUT_SECS" "$BINARY" "$MODEL_PATH" \
-    --bench-json --bench-runs "$BENCH_RUNS" --max-tokens "$MAX_TOKENS" 2>&1) \
-    && BENCH_EXIT=0 || BENCH_EXIT=$?
-
-  BENCH_JSON=$(echo "$BENCH_RAW" | extract_json)
-  echo "$BENCH_JSON" > "$RAW_DIR/${SLUG}_bench.json"
-
-  if [ "$BENCH_EXIT" -ne 0 ] || [ "$BENCH_JSON" = "{}" ]; then
-    ERR=$(echo "$BENCH_RAW" | grep -i "error\|panic\|failed\|unsupported" | head -1 \
-          | tr '\t' ' ' || echo "bench failed (exit $BENCH_EXIT)")
-    log "  ✗  Benchmark failed: $ERR"
-    R_STATUS[$idx]="bench_failed"
-    R_LOAD[$idx]="—"
-    R_DECODE[$idx]="—"
-    R_PREFILL[$idx]="—"
-    R_NOTE[$idx]="${ERR:0:80}"
-  else
-    LOAD_MS=$(echo "$BENCH_JSON"  | jq -r '.load_ms                          // 0' 2>/dev/null || echo "0")
-    DECODE=$(echo "$BENCH_JSON"   | jq -r '.summary.aggregate_decode_tok_s   // 0' 2>/dev/null || echo "0")
-    PREFILL=$(echo "$BENCH_JSON"  | jq -r '.summary.aggregate_prefill_tok_s  // 0' 2>/dev/null || echo "0")
-    DF=$(printf "%.1f" "$DECODE"  2>/dev/null || echo "$DECODE")
-    PF=$(printf "%.1f" "$PREFILL" 2>/dev/null || echo "$PREFILL")
-    log "  ✓  load=${LOAD_MS}ms  decode=${DF} tok/s  prefill=${PF} tok/s"
-    R_STATUS[$idx]="supported"
-    R_LOAD[$idx]="$LOAD_MS"
-    R_DECODE[$idx]="$DECODE"
-    R_PREFILL[$idx]="$PREFILL"
-    R_NOTE[$idx]=""
+  MODELS+=("$model_path")
+  if [ "$MODEL_LIMIT" -gt 0 ] && [ "${#MODELS[@]}" -ge "$MODEL_LIMIT" ]; then
+    break
   fi
+done < <(find "$MODEL_DIR" -name "*.gguf" -print | sort)
 
-  idx=$((idx+1))
-  log "  Waiting ${WAIT_SECS}s to free memory…"
-  sleep "$WAIT_SECS"
+TOTAL=${#MODELS[@]}
+if [ "$TOTAL" -eq 0 ]; then
+  log "No GGUF text models found in $MODEL_DIR"
+  exit 1
+fi
+
+PROFILE_WORDS=${BENCH_PROFILES//,/ }
+read -r -a PROFILE_INPUTS <<< "$PROFILE_WORDS"
+
+RUN_DATE=$(date "+%Y-%m-%d %H:%M %Z")
+
+log "RustyLLM Model Benchmark - $(date)"
+log "  Binary   : $BINARY"
+log "  Models   : $TOTAL  (from $MODEL_DIR)"
+log "  Profiles : ${PROFILE_INPUTS[*]}"
+log "  Runs     : ${BENCH_RUNS} x ${MAX_TOKENS} tokens each"
+log "  Pause    : ${WAIT_SECS}s between models"
+log "================================================================"
+
+for profile_input in "${PROFILE_INPUTS[@]}"; do
+  IFS=$'\t' read -r PROFILE_KEY PROFILE_LABEL METAL_ENV < <(profile_config "$profile_input")
+  RAW_PROFILE_DIR="$RAW_DIR/$PROFILE_KEY"
+  mkdir -p "$RAW_PROFILE_DIR"
+  PROFILE_RUNTIME="not observed"
+
+  log ""
+  log "Profile: $PROFILE_LABEL (RUSTY_LLM_METAL=$METAL_ENV)"
+  log "----------------------------------------------------------------"
+
+  idx=0
+  for MODEL_PATH in "${MODELS[@]}"; do
+    MODEL_FILE=$(basename "$MODEL_PATH")
+    RAW_BASE=$(printf '%02d_%s' "$((idx + 1))" "$(slugify "$MODEL_FILE")")
+    log ""
+    log "[$((idx + 1))/$TOTAL][$PROFILE_KEY] $MODEL_FILE"
+
+    INSPECT_RAW=$(RUSTY_LLM_METAL="$METAL_ENV" timeout 30 "$BINARY" "$MODEL_PATH" --inspect 2>&1) || true
+    INSPECT_JSON=$(printf '%s' "$INSPECT_RAW" | extract_json)
+    printf '%s\n' "$INSPECT_JSON" > "$RAW_PROFILE_DIR/${RAW_BASE}_inspect.json"
+
+    METAL_LINE=$(printf '%s\n' "$INSPECT_RAW" | grep -m1 '^Metal:' || true)
+    if [ -n "$METAL_LINE" ]; then
+      PROFILE_RUNTIME="$METAL_LINE"
+    fi
+
+    STATUS=$(printf '%s' "$INSPECT_JSON" | jq -r '.status // "unknown"' 2>/dev/null || echo "unknown")
+    ARCH=$(printf '%s' "$INSPECT_JSON" | jq -r '.model.architecture // "unknown"' 2>/dev/null || echo "unknown")
+    MODEL_NAME=$(printf '%s' "$INSPECT_JSON" | jq -r '.model.name // ""' 2>/dev/null || echo "")
+    FILE_MB=$(printf '%s' "$INSPECT_JSON" | jq -r '(.file_size_bytes // 0) / 1048576 | floor' 2>/dev/null || echo "0")
+    UNSUPPORTED=$(printf '%s' "$INSPECT_JSON" | jq -r '.gguf.unsupported_tensor_count // 0' 2>/dev/null || echo "0")
+    [ -z "$MODEL_NAME" ] || [ "$MODEL_NAME" = "null" ] && MODEL_NAME="$MODEL_FILE"
+
+    log "  arch=$ARCH  status=$STATUS  size=${FILE_MB}MB  unsupported_tensors=$UNSUPPORTED"
+
+    if [ "$STATUS" != "supported" ]; then
+      NOTE=$(printf '%s' "$INSPECT_JSON" | note_from_inspect)
+      [ -z "$NOTE" ] || [ "$NOTE" = "null" ] && NOTE="not loadable"
+      log "  skip: $NOTE"
+      append_tsv \
+        "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" "$((idx + 1))" \
+        "$(clean_field "$MODEL_PATH")" "$(clean_field "$MODEL_FILE")" \
+        "$(clean_field "$MODEL_NAME")" "$(clean_field "$ARCH")" \
+        "$(clean_field "$STATUS")" "$FILE_MB" "—" "—" "—" "$(clean_field "$NOTE")"
+      idx=$((idx + 1))
+      log "  Waiting ${WAIT_SECS}s..."
+      sleep "$WAIT_SECS"
+      continue
+    fi
+
+    log "  Running ${BENCH_RUNS} runs x ${MAX_TOKENS} tokens..."
+    BENCH_RAW=$(RUSTY_LLM_METAL="$METAL_ENV" timeout "$TIMEOUT_SECS" "$BINARY" "$MODEL_PATH" \
+      --bench-json --bench-runs "$BENCH_RUNS" --max-tokens "$MAX_TOKENS" --prompt "$PROMPT" 2>&1) \
+      && BENCH_EXIT=0 || BENCH_EXIT=$?
+
+    BENCH_JSON=$(printf '%s' "$BENCH_RAW" | extract_json)
+    printf '%s\n' "$BENCH_JSON" > "$RAW_PROFILE_DIR/${RAW_BASE}_bench.json"
+
+    if [ "$BENCH_EXIT" -ne 0 ] || [ "$BENCH_JSON" = "{}" ]; then
+      ERR=$(printf '%s\n' "$BENCH_RAW" | { grep -i "error\|panic\|failed\|unsupported" || true; } | head -1 | tr '\t' ' ')
+      [ -z "$ERR" ] && ERR="bench failed (exit $BENCH_EXIT)"
+      log "  failed: $ERR"
+      append_tsv \
+        "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" "$((idx + 1))" \
+        "$(clean_field "$MODEL_PATH")" "$(clean_field "$MODEL_FILE")" \
+        "$(clean_field "$MODEL_NAME")" "$(clean_field "$ARCH")" \
+        "bench_failed" "$FILE_MB" "—" "—" "—" "$(clean_field "$ERR")"
+    else
+      LOAD_MS=$(printf '%s' "$BENCH_JSON" | jq -r '.load_ms // 0' 2>/dev/null || echo "0")
+      DECODE=$(printf '%s' "$BENCH_JSON" | jq -r '.summary.aggregate_decode_tok_s // 0' 2>/dev/null || echo "0")
+      PREFILL=$(printf '%s' "$BENCH_JSON" | jq -r '.summary.aggregate_prefill_tok_s // 0' 2>/dev/null || echo "0")
+      DF=$(printf "%.1f" "$DECODE" 2>/dev/null || echo "$DECODE")
+      PF=$(printf "%.1f" "$PREFILL" 2>/dev/null || echo "$PREFILL")
+      log "  ok: load=${LOAD_MS}ms  decode=${DF} tok/s  prefill=${PF} tok/s"
+      append_tsv \
+        "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" "$((idx + 1))" \
+        "$(clean_field "$MODEL_PATH")" "$(clean_field "$MODEL_FILE")" \
+        "$(clean_field "$MODEL_NAME")" "$(clean_field "$ARCH")" \
+        "supported" "$FILE_MB" "$LOAD_MS" "$DECODE" "$PREFILL" ""
+    fi
+
+    idx=$((idx + 1))
+    log "  Waiting ${WAIT_SECS}s to free memory..."
+    sleep "$WAIT_SECS"
+  done
+
+  append_profile_tsv \
+    "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" \
+    "$(clean_field "$RAW_PROFILE_DIR")" "$(clean_field "$PROFILE_RUNTIME")"
 done
 
-# ── system info ───────────────────────────────────────────────────────────────
-CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null \
-      || grep -m1 "^model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs \
-      || uname -m)
-CORES=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo "?")
-RAM_GB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+HW_INFO=$(system_profiler SPHardwareDataType 2>/dev/null || true)
+CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)
+if [ -z "$CPU" ]; then
+  CPU=$(printf '%s\n' "$HW_INFO" | awk -F': ' '/Chip:/ { print $2; exit }')
+fi
+if [ -z "$CPU" ]; then
+  CPU=$(grep -m1 "^model name" /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || true)
+fi
+if [ -z "$CPU" ]; then
+  case "$(uname -m)" in
+    arm64|aarch64) CPU="Apple Silicon ($(uname -m))" ;;
+    *) CPU="$(uname -m)" ;;
+  esac
+fi
+
+CORES=$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo "?")
+
+RAM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+if [ "$RAM_BYTES" -gt 0 ] 2>/dev/null; then
+  RAM_DISPLAY="$(( RAM_BYTES / 1073741824 )) GB"
+else
+  RAM_DISPLAY=$(printf '%s\n' "$HW_INFO" | awk -F': ' '/Memory:/ { print $2; exit }')
+  [ -z "$RAM_DISPLAY" ] && RAM_DISPLAY="unknown"
+fi
 OS_NAME=$(sw_vers -productName 2>/dev/null || uname -s)
 OS_VER=$(sw_vers -productVersion 2>/dev/null || uname -r)
 RUST_VER=$(rustc --version 2>/dev/null || echo "unknown")
-# Detect SIMD and Metal from a quick probe run (inspect is cheap — no weights loaded)
-PROBE=$("$BINARY" --help 2>&1 | head -5 || true)
-SIMD=$(echo "$PROBE" | grep -o "SIMD:.*" | head -1 | xargs || echo "unknown")
-METAL_STATUS="disabled (RUSTY_LLM_METAL not set)"
-if [ -n "${RUSTY_LLM_METAL:-}" ]; then
-  METAL_STATUS="enabled (RUSTY_LLM_METAL=1)"
-fi
-RUN_DATE=$(date "+%Y-%m-%d %H:%M %Z")
+MACHINE=$(uname -m)
+case "$MACHINE" in
+  arm64|aarch64) SIMD="ARM NEON (native)" ;;
+  x86_64) SIMD="x86 runtime detection" ;;
+  *) SIMD="runtime dependent" ;;
+esac
 
-# ── build BENCHMARK.md ────────────────────────────────────────────────────────
 log ""
-log "Writing $BENCHMARK_MD …"
+log "Writing $BENCHMARK_MD ..."
 
-{
-cat <<HEADER
-# RustyLLM Benchmark Results
+RESULTS_TSV="$RESULTS_TSV" \
+PROFILES_TSV="$PROFILES_TSV" \
+MODEL_DIR="$MODEL_DIR" \
+RUN_DATE="$RUN_DATE" \
+BENCH_RUNS="$BENCH_RUNS" \
+MAX_TOKENS="$MAX_TOKENS" \
+WAIT_SECS="$WAIT_SECS" \
+PROMPT="$PROMPT" \
+CPU="$CPU" \
+CORES="$CORES" \
+RAM_DISPLAY="$RAM_DISPLAY" \
+OS_NAME="$OS_NAME" \
+OS_VER="$OS_VER" \
+RUST_VER="$RUST_VER" \
+SIMD="$SIMD" \
+python3 <<'PYEOF' > "$BENCHMARK_MD"
+import csv
+import os
+import statistics
+from collections import defaultdict
 
-> **Prompt:** *"Explain local LLM inference performance in one concise paragraph."*
-> **Runs:** ${BENCH_RUNS} runs × ${MAX_TOKENS} tokens per model, CPU-only (no GPU)
-> **Date:** ${RUN_DATE}
 
-## Hardware
+def read_tsv(path, fields):
+    rows = []
+    with open(path, newline="") as handle:
+        for row in csv.reader(handle, delimiter="\t"):
+            if not row:
+                continue
+            row += [""] * (len(fields) - len(row))
+            rows.append(dict(zip(fields, row)))
+    return rows
 
-| | |
-|---|---|
-| **CPU** | ${CPU} |
-| **Logical cores** | ${CORES} |
-| **RAM** | ${RAM_GB} GB |
-| **OS** | ${OS_NAME} ${OS_VER} |
-| **Rust** | ${RUST_VER} |
-| **SIMD** | ${SIMD} |
-| **Metal GPU** | ${METAL_STATUS} |
 
-## Model Results
+def md(text):
+    return str(text).replace("|", "\\|").replace("\n", " ").strip()
 
-| # | Model file | Architecture | Compat | Size (MB) | Load (ms) | Decode (tok/s) | Prefill (tok/s) |
-|--:|-----------|:---:|:---:|---:|---:|---:|---:|
-HEADER
 
-for ((i=0; i<idx; i++)); do
-  case "${R_STATUS[$i]}" in
-    supported)    ICON="✅" ;;
-    bench_failed) ICON="⚠️" ;;
-    *)            ICON="❌" ;;
-  esac
+def code(text):
+    return "`" + md(text).replace("`", "\\`") + "`"
 
-  if [[ "${R_DECODE[$i]}" =~ ^[0-9] ]]; then
-    DF=$(printf "%.1f" "${R_DECODE[$i]}" 2>/dev/null || echo "${R_DECODE[$i]}")
-    PF=$(printf "%.1f" "${R_PREFILL[$i]}" 2>/dev/null || echo "${R_PREFILL[$i]}")
-  else
-    DF="${R_DECODE[$i]}"
-    PF="${R_PREFILL[$i]}"
-  fi
 
-  NOTE=""
-  [ -n "${R_NOTE[$i]:-}" ] && NOTE=" <!-- ${R_NOTE[$i]} -->"
+def as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
-  printf "| %d | \`%s\` | %s | %s | %s | %s | %s | %s |%s\n" \
-    "$((i+1))" "${R_FILE[$i]}" "${R_ARCH[$i]}" "$ICON" \
-    "${R_MB[$i]}" "${R_LOAD[$i]}" "$DF" "$PF" "$NOTE"
-done
 
-echo ""
-echo "## Speed Ranking"
-echo ""
-echo "Decode throughput (tok/s), supported models only, fastest first."
-echo ""
-echo "| Rank | Model file | Architecture | Decode (tok/s) | Prefill (tok/s) | Size (MB) |"
-echo "|:---:|-----------|:---:|---:|---:|---:|"
+def fmt_speed(value):
+    number = as_float(value)
+    if number is None:
+        return "—"
+    return f"{number:.1f}"
 
-# Build temp file for sorting
-TMP_RANK=$(mktemp)
-for ((i=0; i<idx; i++)); do
-  [[ "${R_DECODE[$i]}" =~ ^[0-9] ]] || continue
-  printf "%s\t%s\t%s\t%s\t%s\n" \
-    "${R_DECODE[$i]}" "${R_FILE[$i]}" "${R_ARCH[$i]}" "${R_PREFILL[$i]}" "${R_MB[$i]}" \
-    >> "$TMP_RANK"
-done
-sort -t$'\t' -k1 -rn "$TMP_RANK" | awk -F'\t' '{
-  rank++
-  df = sprintf("%.1f", $1)
-  pf = sprintf("%.1f", $4)
-  printf "| %d | `%s` | %s | %s | %s | %s |\n", rank, $2, $3, df, pf, $5
-}'
-rm -f "$TMP_RANK"
 
-cat <<FOOTER
+def fmt_int(value):
+    number = as_float(value)
+    if number is None:
+        return "—"
+    return str(int(number))
 
----
 
-*Re-run \`bench_models.sh\` to refresh. Raw JSON per model is stored in \`.bench_raw/\`.*
-*Numbers reflect single-socket CPU inference; results vary with thermal state and OS load.*
-*Ollama and LM Studio are typically faster due to GPU offload and llama.cpp kernels.*
-FOOTER
-} > "$BENCHMARK_MD"
+def status_text(status):
+    if status == "supported":
+        return "ok"
+    if status == "bench_failed":
+        return "failed"
+    if status == "partially-supported":
+        return "partial"
+    return "skip"
 
-log "✓  $BENCHMARK_MD written."
 
-# ── ensure README.md has a link ───────────────────────────────────────────────
-LINK_LINE="→ **[Benchmark results](BENCHMARK.md)** — compatibility and speed for all tested models."
+def short_note(note, limit=92):
+    note = md(note)
+    if len(note) <= limit:
+        return note
+    return note[: limit - 1].rstrip() + "…"
 
+
+result_fields = [
+    "profile",
+    "profile_label",
+    "metal_env",
+    "index",
+    "path",
+    "file",
+    "name",
+    "arch",
+    "status",
+    "mb",
+    "load",
+    "decode",
+    "prefill",
+    "note",
+]
+profile_fields = ["profile", "profile_label", "metal_env", "raw_dir", "runtime"]
+
+results = read_tsv(os.environ["RESULTS_TSV"], result_fields)
+profiles = read_tsv(os.environ["PROFILES_TSV"], profile_fields)
+
+for row in results:
+    row["index_num"] = int(row["index"] or 0)
+
+profile_order = [row["profile"] for row in profiles]
+rows_by_profile = defaultdict(list)
+rows_by_key = {}
+model_order = {}
+for row in results:
+    rows_by_profile[row["profile"]].append(row)
+    rows_by_key[(row["profile"], row["path"])] = row
+    model_order.setdefault(row["path"], row)
+
+print("# RustyLLM Benchmark Results")
+print()
+print(f"Updated: **{md(os.environ['RUN_DATE'])}**")
+print()
+print(
+    "This report compares the CPU path with the optional Apple Metal GPU path. "
+    "Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend."
+)
+print()
+print("## Run Configuration")
+print()
+print("| Setting | Value |")
+print("|---|---|")
+print(f"| Model directory | {code(os.environ['MODEL_DIR'])} |")
+print(f"| Prompt | {md(os.environ['PROMPT'])} |")
+print(f"| Runs | {md(os.environ['BENCH_RUNS'])} x {md(os.environ['MAX_TOKENS'])} generated tokens per model |")
+print(f"| Pause | {md(os.environ['WAIT_SECS'])} seconds between models |")
+print(f"| Raw JSON | {code('.bench_raw/<profile>/')} |")
+print()
+print("## Hardware")
+print()
+print("| Component | Value |")
+print("|---|---|")
+print(f"| CPU | {md(os.environ['CPU'])} |")
+print(f"| Logical cores | {md(os.environ['CORES'])} |")
+print(f"| RAM | {md(os.environ['RAM_DISPLAY'])} |")
+print(f"| OS | {md(os.environ['OS_NAME'])} {md(os.environ['OS_VER'])} |")
+print(f"| Rust | {md(os.environ['RUST_VER'])} |")
+print(f"| SIMD | {md(os.environ['SIMD'])} |")
+print()
+print("## Backend Profiles")
+print()
+print("| Profile | Env | Runtime report | Raw JSON |")
+print("|---|---|---|---|")
+for profile in profiles:
+    print(
+        f"| {md(profile['profile_label'])} | "
+        f"{code('RUSTY_LLM_METAL=' + profile['metal_env'])} | "
+        f"{md(profile['runtime']) or 'not observed'} | "
+        f"{code(profile['raw_dir'] + '/')} |"
+    )
+print()
+print("## Summary")
+print()
+print("| Profile | Ok | Failed | Skipped/partial | Best decode | Median decode |")
+print("|---|---:|---:|---:|---:|---:|")
+for profile in profiles:
+    rows = rows_by_profile[profile["profile"]]
+    ok = [row for row in rows if row["status"] == "supported"]
+    failed = [row for row in rows if row["status"] == "bench_failed"]
+    skipped = len(rows) - len(ok) - len(failed)
+    speeds = [as_float(row["decode"]) for row in ok if as_float(row["decode"]) is not None]
+    best = max(speeds) if speeds else None
+    median = statistics.median(speeds) if speeds else None
+    print(
+        f"| {md(profile['profile_label'])} | {len(ok)} | {len(failed)} | {skipped} | "
+        f"{fmt_speed(best)} | {fmt_speed(median)} |"
+    )
+print()
+
+if "cpu" in profile_order and "metal" in profile_order:
+    print("## CPU vs Metal")
+    print()
+    print("Each speed cell is `decode / prefill` in tokens per second. Speedup uses decode throughput.")
+    print()
+    print("| # | Model | Arch | Size | CPU | Metal | Metal/CPU | Result |")
+    print("|---:|---|:---:|---:|---:|---:|---:|---|")
+    for path, first in sorted(model_order.items(), key=lambda item: item[1]["index_num"]):
+        cpu = rows_by_key.get(("cpu", path))
+        metal = rows_by_key.get(("metal", path))
+        if not cpu or not metal:
+            continue
+
+        def speed_pair(row):
+            if row["status"] != "supported":
+                return status_text(row["status"])
+            return f"{fmt_speed(row['decode'])} / {fmt_speed(row['prefill'])}"
+
+        cpu_decode = as_float(cpu["decode"]) if cpu["status"] == "supported" else None
+        metal_decode = as_float(metal["decode"]) if metal["status"] == "supported" else None
+        if cpu_decode and metal_decode and cpu_decode > 0:
+            ratio = metal_decode / cpu_decode
+            speedup = f"{ratio:.2f}x"
+            if ratio > 1.05:
+                result = "Metal faster"
+            elif ratio < 0.95:
+                result = "CPU faster"
+            else:
+                result = "similar"
+        else:
+            speedup = "—"
+            notes = []
+            for row in (cpu, metal):
+                if row["status"] != "supported" and row["note"]:
+                    notes.append(short_note(row["note"], 44))
+            result = "; ".join(dict.fromkeys(notes)) or "not comparable"
+
+        print(
+            f"| {first['index_num']} | {code(first['file'])} | {md(first['arch'])} | "
+            f"{fmt_int(first['mb'])} | {speed_pair(cpu)} | {speed_pair(metal)} | "
+            f"{speedup} | {md(result)} |"
+        )
+    print()
+
+issues = [row for row in results if row["status"] != "supported"]
+if issues:
+    print("## Support Issues")
+    print()
+    print("| Profile | Model | Arch | Status | Reason |")
+    print("|---|---|:---:|---|---|")
+    for row in issues:
+        print(
+            f"| {md(row['profile_label'])} | {code(row['file'])} | {md(row['arch'])} | "
+            f"{md(status_text(row['status']))} | {md(short_note(row['note']))} |"
+        )
+    print()
+
+print("## Profile Details")
+print()
+for profile in profiles:
+    rows = sorted(rows_by_profile[profile["profile"]], key=lambda row: row["index_num"])
+    print(f"### {md(profile['profile_label'])}")
+    print()
+    print("| # | Model | Arch | Status | Size | Load | Decode | Prefill | Note |")
+    print("|---:|---|:---:|---|---:|---:|---:|---:|---|")
+    for row in rows:
+        print(
+            f"| {row['index_num']} | {code(row['file'])} | {md(row['arch'])} | "
+            f"{md(status_text(row['status']))} | {fmt_int(row['mb'])} | "
+            f"{fmt_int(row['load'])} | {fmt_speed(row['decode'])} | "
+            f"{fmt_speed(row['prefill'])} | {md(short_note(row['note']))} |"
+        )
+    print()
+
+    ranking = [
+        row for row in rows
+        if row["status"] == "supported" and as_float(row["decode"]) is not None
+    ]
+    ranking.sort(key=lambda row: as_float(row["decode"]) or 0.0, reverse=True)
+    if ranking:
+        print(f"### {md(profile['profile_label'])} Decode Ranking")
+        print()
+        print("| Rank | Model | Decode | Prefill | Load |")
+        print("|---:|---|---:|---:|---:|")
+        for rank, row in enumerate(ranking, 1):
+            print(
+                f"| {rank} | {code(row['file'])} | {fmt_speed(row['decode'])} | "
+                f"{fmt_speed(row['prefill'])} | {fmt_int(row['load'])} |"
+            )
+        print()
+
+print("---")
+print()
+print("Re-run `bench_models.sh` to refresh this report. Use `BENCH_PROFILES=cpu` or `BENCH_PROFILES=metal` for a single backend run.")
+PYEOF
+
+log "Benchmark report written: $BENCHMARK_MD"
+
+LINK_LINE="-> **[Benchmark results](BENCHMARK.md)** - CPU and Metal compatibility/speed for tested models."
 if [ -f "$README" ]; then
   if grep -qF "BENCHMARK.md" "$README"; then
-    log "✓  README.md already links to BENCHMARK.md — no change needed."
+    log "README.md already links to BENCHMARK.md."
   else
-    # Insert after the first paragraph (after the first blank line following content)
     python3 - "$README" "$LINK_LINE" <<'PYEOF'
 import sys
-path, link = sys.argv[1], sys.argv[2]
-with open(path) as f:
-    lines = f.readlines()
 
-# Find first blank line that follows at least one non-blank, non-heading line
+path, link = sys.argv[1], sys.argv[2]
+with open(path) as handle:
+    lines = handle.readlines()
+
 insert_at = len(lines)
 saw_content = False
 for i, line in enumerate(lines):
     stripped = line.strip()
-    if stripped and not stripped.startswith('#') and not stripped.startswith('[!['):
+    if stripped and not stripped.startswith("#") and not stripped.startswith("[!["):
         saw_content = True
-    if saw_content and stripped == '':
+    if saw_content and stripped == "":
         insert_at = i + 1
         break
 
-lines.insert(insert_at, '\n')
-lines.insert(insert_at, link + '\n')
-lines.insert(insert_at, '\n')
-with open(path, 'w') as f:
-    f.writelines(lines)
+lines.insert(insert_at, "\n")
+lines.insert(insert_at, link + "\n")
+lines.insert(insert_at, "\n")
+with open(path, "w") as handle:
+    handle.writelines(lines)
 PYEOF
-    log "✓  README.md: link to BENCHMARK.md inserted."
+    log "README.md link inserted."
   fi
 else
-  log "⚠  README.md not found — skipping link insertion."
+  log "README.md not found; link insertion skipped."
 fi
 
 log ""
 log "================================================================"
 log "Done."
 log "  BENCHMARK.md : $BENCHMARK_MD"
-log "  Raw JSON     : $RAW_DIR/"
+log "  Raw JSON     : $RAW_DIR/<profile>/"
 log "================================================================"
