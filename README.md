@@ -5,6 +5,8 @@
 [![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
+→ **[Benchmark results](BENCHMARK.md)** — compatibility and speed for 19 tested models on Apple M2 Max.
+
 RustyLLM is a lightweight, educational AI-inference project for developers who
 want to understand how a local language-model runner works. You do not need AI
 experience to read the project: the code is organized as ordinary file parsing,
