@@ -264,9 +264,190 @@ pub fn architecture_supported(arch: &str) -> bool {
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct CompatibilityReport {
+    pub supported_architecture: bool,
+    pub unsupported_tensor_types: Vec<String>,
+    pub missing_tensors: Vec<String>,
+    pub unsupported_layouts: Vec<String>,
+}
+
+impl CompatibilityReport {
+    /// Returns true when the model can be loaded by the current runtime.
+    pub fn is_supported(&self) -> bool {
+        self.supported_architecture
+            && self.unsupported_tensor_types.is_empty()
+            && self.missing_tensors.is_empty()
+            && self.unsupported_layouts.is_empty()
+    }
+
+    /// Returns a compact status string for CLI/catalog reporting.
+    pub fn status(&self) -> &'static str {
+        if self.is_supported() {
+            "supported"
+        } else if self.supported_architecture
+            && (!self.unsupported_tensor_types.is_empty()
+                || !self.missing_tensors.is_empty()
+                || !self.unsupported_layouts.is_empty())
+        {
+            "partially-supported"
+        } else {
+            "unsupported"
+        }
+    }
+
+    fn first_error(&self, arch: &str) -> String {
+        if !self.supported_architecture {
+            return format!(
+                "Unsupported architecture: {}. Please ensure you are using a supported GGUF architecture.",
+                arch
+            );
+        }
+        if let Some(name) = self.unsupported_tensor_types.first() {
+            return format!(
+                "Tensor '{}' uses an unsupported quantization type. Please re-quantize the model using F16, Q8_0/Q8_1, Q4_0/Q4_1, Q5_0/Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
+                name
+            );
+        }
+        if let Some(name) = self.missing_tensors.first() {
+            return format!("Model layout is not supported: missing tensor '{}'.", name);
+        }
+        if let Some(reason) = self.unsupported_layouts.first() {
+            return format!("Model layout is not supported: {}.", reason);
+        }
+        String::from("Model is not supported by this runtime.")
+    }
+}
+
+/// Builds a compatibility report for the parsed GGUF metadata and tensor layout.
+pub fn compatibility_report(gguf: &GGUFFile) -> CompatibilityReport {
+    let arch = gguf.get_str("general.architecture").unwrap_or("unknown");
+    let mut report = CompatibilityReport {
+        supported_architecture: architecture_supported(arch),
+        unsupported_tensor_types: Vec::new(),
+        missing_tensors: Vec::new(),
+        unsupported_layouts: Vec::new(),
+    };
+
+    for tensor in &gguf.tensors {
+        match tensor.dtype {
+            GGMLType::F32
+            | GGMLType::F16
+            | GGMLType::Q4_0
+            | GGMLType::Q4_1
+            | GGMLType::Q5_0
+            | GGMLType::Q5_1
+            | GGMLType::Q8_0
+            | GGMLType::Q8_1
+            | GGMLType::Q4_K
+            | GGMLType::Q5_K
+            | GGMLType::Q6_K
+            | GGMLType::MXFP4 => {}
+            _ => report.unsupported_tensor_types.push(tensor.name.clone()),
+        }
+    }
+
+    if report.supported_architecture {
+        validate_tensor_layout(gguf, arch, &mut report);
+    }
+
+    report
+}
+
+fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+    let config = Config::from_gguf(gguf);
+
+    match arch {
+        "gpt-oss" | "gemma" | "gemma2" | "gemma4" => return,
+        "deepseek2" | "deepseek-v2" => {
+            if has("blk.0.attn_kv_a_mqa.weight") || has("blk.0.attn_kv_b.weight") {
+                report.unsupported_layouts.push(String::from(
+                    "DeepSeek2 MLA attention tensors are present, but the runtime does not yet implement MLA",
+                ));
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    if config.dim == 0 || config.n_layers == 0 || config.n_heads == 0 || config.n_kv_heads == 0 {
+        report
+            .unsupported_layouts
+            .push(String::from("missing required transformer metadata"));
+        return;
+    }
+
+    for name in ["token_embd.weight", "output_norm.weight"] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+
+    let q_rows = config.n_heads * config.head_dim;
+    let k_rows = config.n_kv_heads * config.head_dim;
+    let v_rows = config.n_kv_heads * config.value_dim;
+
+    for layer in 0..config.n_layers {
+        let prefix = format!("blk.{}.", layer);
+        for suffix in [
+            "attn_norm.weight",
+            "attn_output.weight",
+            "ffn_norm.weight",
+            "ffn_down.weight",
+        ] {
+            let name = format!("{}{}", prefix, suffix);
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+
+        let q = format!("{}attn_q.weight", prefix);
+        let k = format!("{}attn_k.weight", prefix);
+        let v = format!("{}attn_v.weight", prefix);
+        let qkv = format!("{}attn_qkv.weight", prefix);
+        if !(has(&q) && has(&k) && has(&v)) && !has(&qkv) {
+            report.missing_tensors.push(format!(
+                "{}attn_q/attn_k/attn_v.weight or attn_qkv.weight",
+                prefix
+            ));
+        } else if has(&qkv) {
+            validate_row_count(gguf, &qkv, q_rows + k_rows + v_rows, report);
+        }
+
+        let gate = format!("{}ffn_gate.weight", prefix);
+        let up = format!("{}ffn_up.weight", prefix);
+        if !has(&gate) {
+            if !has(&up) {
+                report.missing_tensors.push(gate);
+            } else {
+                validate_row_count(gguf, &up, config.hidden_dim * 2, report);
+            }
+        }
+    }
+}
+
+fn validate_row_count(
+    gguf: &GGUFFile,
+    name: &str,
+    required_rows: usize,
+    report: &mut CompatibilityReport,
+) {
+    if let Some(tensor) = gguf.tensors.iter().find(|tensor| tensor.name == name) {
+        let rows = tensor.dims.get(1).copied().unwrap_or(0) as usize;
+        if rows < required_rows {
+            report.unsupported_layouts.push(format!(
+                "{} has {} rows, expected at least {}",
+                name, rows, required_rows
+            ));
+        }
+    }
+}
+
 /// Checks that every tensor in `gguf` uses a quantization type that the
 /// inference kernels support.  Returns a descriptive error for any tensor
 /// whose dtype would cause a panic inside `load_weight`.
+#[allow(dead_code)]
 fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
     for tensor in &gguf.tensors {
         match tensor.dtype {
@@ -279,13 +460,14 @@ fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
             | GGMLType::Q8_0
             | GGMLType::Q8_1
             | GGMLType::Q4_K
+            | GGMLType::Q5_K
             | GGMLType::Q6_K
             | GGMLType::MXFP4 => {}
             unsupported => {
                 return Err(format!(
                     "Tensor '{}' uses unsupported quantization type {:?}. \
-                     Please re-quantize the model using a supported format: \
-                     F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, or Q6_K.",
+	                     Please re-quantize the model using a supported format: \
+	                     F16, Q8_0, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
                     tensor.name, unsupported
                 ));
             }
@@ -303,14 +485,10 @@ impl Runner {
             .unwrap_or("llama")
             .to_string();
 
-        if !architecture_supported(&arch) {
-            return Err(format!(
-                "Unsupported architecture: {}. Please ensure you are using a supported GGUF architecture.",
-                arch
-            ));
+        let compatibility = compatibility_report(&gguf);
+        if !compatibility.is_supported() {
+            return Err(compatibility.first_error(&arch));
         }
-
-        validate_tensor_dtypes(&gguf)?;
 
         let tok = Tokenizer::from_metadata(&gguf.metadata);
         let (config, weights) = match arch.as_str() {
@@ -354,14 +532,10 @@ impl Runner {
             .unwrap_or("llama")
             .to_string();
 
-        if !architecture_supported(&arch) {
-            return Err(format!(
-                "Unsupported architecture: {}. Please ensure you are using a supported GGUF architecture.",
-                arch
-            ));
+        let compatibility = compatibility_report(&gguf);
+        if !compatibility.is_supported() {
+            return Err(compatibility.first_error(&arch));
         }
-
-        validate_tensor_dtypes(&gguf)?;
 
         let tok = Tokenizer::from_metadata(&gguf.metadata);
         let (config, weights) = match arch.as_str() {

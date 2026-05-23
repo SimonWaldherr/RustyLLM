@@ -1,5 +1,5 @@
 use crate::gguf::GGUFFile;
-use crate::runtime::architecture_supported;
+use crate::runtime::compatibility_report;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -244,10 +244,7 @@ fn inspect_model(root: &Path, path: &Path) -> Result<ModelEntry, String> {
             .as_deref()
             .map(|arch| arch.eq_ignore_ascii_case("clip"))
             .unwrap_or(false);
-    let is_supported = architecture
-        .as_deref()
-        .map(architecture_supported)
-        .unwrap_or(false);
+    let is_supported = compatibility_report(&gguf).is_supported();
 
     Ok(ModelEntry {
         id,
@@ -348,7 +345,7 @@ mod tests {
             architecture: Some(arch.to_string()),
             model_name: None,
             is_projector,
-            is_supported: architecture_supported(arch),
+            is_supported: crate::runtime::architecture_supported(arch),
         }
     }
 

@@ -2,13 +2,11 @@
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,
 };
-use rusty_llm::gguf::{GGMLType, GGUFFile};
+use rusty_llm::gguf::GGUFFile;
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::metal;
 use rusty_llm::model::Config;
-use rusty_llm::runtime::{
-    ChatMessage, GenerationOptions, LoadInfo, Runner, architecture_supported,
-};
+use rusty_llm::runtime::{ChatMessage, GenerationOptions, LoadInfo, Runner, compatibility_report};
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, ServeOptions};
 use rusty_llm::simd;
@@ -612,18 +610,11 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
     let metadata_count = gguf.metadata.len();
     let tensor_count = gguf.tensors.len();
     let mut dtype_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut unsupported_tensor_types = Vec::new();
 
     for tensor in &gguf.tensors {
         *dtype_counts
             .entry(format!("{:?}", tensor.dtype))
             .or_insert(0) += 1;
-        if matches!(
-            tensor.dtype,
-            GGMLType::Q2_K | GGMLType::Q3_K | GGMLType::Q5_K | GGMLType::Q8_K | GGMLType::Unknown
-        ) {
-            unsupported_tensor_types.push(tensor.name.clone());
-        }
     }
 
     let tokenizer_vocab = gguf
@@ -635,14 +626,9 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
     let file_size_bytes = std::fs::metadata(path)
         .map_err(|err| err.to_string())?
         .len();
-    let supported_architecture = architecture_supported(arch);
-    let status = if supported_architecture && unsupported_tensor_types.is_empty() {
-        "supported"
-    } else if supported_architecture {
-        "partially-supported"
-    } else {
-        "unsupported"
-    };
+    let compatibility = compatibility_report(&gguf);
+    let supported_architecture = compatibility.supported_architecture;
+    let status = compatibility.status();
 
     let report = serde_json::json!({
         "type": "rusty-llm.inspect",
@@ -680,8 +666,11 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
             "tensors": tensor_count,
             "data_offset": gguf.data_offset,
             "tensor_types": dtype_counts,
-            "unsupported_tensor_examples": unsupported_tensor_types.iter().take(16).collect::<Vec<_>>(),
-            "unsupported_tensor_count": unsupported_tensor_types.len(),
+            "unsupported_tensor_examples": compatibility.unsupported_tensor_types.iter().take(16).collect::<Vec<_>>(),
+            "unsupported_tensor_count": compatibility.unsupported_tensor_types.len(),
+            "missing_tensor_examples": compatibility.missing_tensors.iter().take(16).collect::<Vec<_>>(),
+            "missing_tensor_count": compatibility.missing_tensors.len(),
+            "unsupported_layouts": compatibility.unsupported_layouts,
         },
         "api_compatibility": {
             "openai": ["/v1/models", "/v1/completions", "/v1/chat/completions", "/v1/embeddings"],
@@ -856,6 +845,12 @@ fn run_benchmark_json(
         "architecture": runner.architecture(),
         "load_ms": load_info.load_time.as_millis(),
         "file_size_bytes": load_info.file_size_bytes,
+        "metal": {
+            "available": metal::available(),
+            "enabled": metal::enabled(),
+            "q4_k": metal::enabled(),
+            "q6_k": metal::q6k_enabled(),
+        },
         "runs": runs,
         "prompt": prompt,
         "options": {

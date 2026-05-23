@@ -48,11 +48,24 @@ impl Config {
         let n_heads = gguf.get_u32(&format!("{}.attention.head_count", p), 0) as usize;
         let n_kv_heads =
             gguf.get_u32(&format!("{}.attention.head_count_kv", p), n_heads as u32) as usize;
-        let head_dim = gguf
-            .get_u32(&format!("{}.attention.key_length", p), 0)
-            .max((dim / n_heads) as u32) as usize;
+        let rope_dim = gguf.get_u32(&format!("{}.rope.dimension_count", p), 0) as usize;
+        let default_head_dim = if dim > 0 && n_heads > 0 {
+            dim / n_heads
+        } else {
+            rope_dim
+        };
+        let head_dim = gguf.get_u32(
+            &format!("{}.attention.key_length", p),
+            default_head_dim as u32,
+        ) as usize;
         let value_dim =
             gguf.get_u32(&format!("{}.attention.value_length", p), head_dim as u32) as usize;
+        let kv_dim = value_dim.saturating_mul(n_kv_heads);
+        let kv_mul = if n_kv_heads > 0 {
+            n_heads / n_kv_heads
+        } else {
+            0
+        };
 
         let vocab_size = gguf.get_u32(&format!("{}.vocab_size", p), 0).max(
             gguf.metadata
@@ -74,8 +87,8 @@ impl Config {
             rope_theta: gguf.get_f32(&format!("{}.rope.freq_base", p), 10000.0),
             rms_norm_eps: gguf.get_f32(&format!("{}.attention.layer_norm_rms_epsilon", p), 1e-5),
             head_dim,
-            kv_dim: value_dim * n_kv_heads,
-            kv_mul: n_heads / n_kv_heads,
+            kv_dim,
+            kv_mul,
             value_dim,
             sliding_window: gguf.get_u32(&format!("{}.attention.sliding_window", p), 0) as usize,
             expert_count: gguf.get_u32(&format!("{}.expert_count", p), 0) as usize,
@@ -167,8 +180,13 @@ impl Weight {
                 let data = data.as_slice();
                 match dtype {
                     GGMLType::Q8_0 => simd::matvec_q8_0(data, x, *rows, *cols),
+                    GGMLType::Q8_1 => simd::matvec_q8_1(data, x, *rows, *cols),
                     GGMLType::Q4_0 => simd::matvec_q4_0(data, x, *rows, *cols),
+                    GGMLType::Q4_1 => simd::matvec_q4_1(data, x, *rows, *cols),
+                    GGMLType::Q5_0 => simd::matvec_q5_0(data, x, *rows, *cols),
+                    GGMLType::Q5_1 => simd::matvec_q5_1(data, x, *rows, *cols),
                     GGMLType::Q4_K => simd::matvec_q4_k(data, x, *rows, *cols),
+                    GGMLType::Q5_K => simd::matvec_q5_k(data, x, *rows, *cols),
                     GGMLType::Q6_K => simd::matvec_q6_k(data, x, *rows, *cols),
                     GGMLType::MXFP4 => simd::matvec_mxfp4(data, x, *rows, *cols),
                     _ => panic!("Unsupported quantized matvec: {:?}", dtype),
@@ -196,8 +214,13 @@ impl Weight {
                 out.resize(*rows, 0.0);
                 match dtype {
                     GGMLType::Q8_0 => simd::matvec_q8_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q8_1 => simd::matvec_q8_1_into(data, x, *rows, *cols, out),
                     GGMLType::Q4_0 => simd::matvec_q4_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q4_1 => simd::matvec_q4_1_into(data, x, *rows, *cols, out),
+                    GGMLType::Q5_0 => simd::matvec_q5_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q5_1 => simd::matvec_q5_1_into(data, x, *rows, *cols, out),
                     GGMLType::Q4_K => simd::matvec_q4_k_into(data, x, *rows, *cols, out),
+                    GGMLType::Q5_K => simd::matvec_q5_k_into(data, x, *rows, *cols, out),
                     GGMLType::Q6_K => simd::matvec_q6_k_into(data, x, *rows, *cols, out),
                     GGMLType::MXFP4 => simd::matvec_mxfp4_into(data, x, *rows, *cols, out),
                     _ => panic!("Unsupported quantized matvec: {:?}", dtype),
@@ -227,13 +250,33 @@ impl Weight {
                         let row_bytes = (cols / 32) * 34;
                         simd::dequant_row_q8_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
                     }
+                    GGMLType::Q8_1 => {
+                        let row_bytes = (cols / 32) * 36;
+                        simd::dequant_row_q8_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
+                    }
                     GGMLType::Q4_0 => {
                         let row_bytes = (cols / 32) * 18;
                         simd::dequant_row_q4_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
                     }
+                    GGMLType::Q4_1 => {
+                        let row_bytes = (cols / 32) * 20;
+                        simd::dequant_row_q4_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
+                    }
+                    GGMLType::Q5_0 => {
+                        let row_bytes = (cols / 32) * 22;
+                        simd::dequant_row_q5_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
+                    }
+                    GGMLType::Q5_1 => {
+                        let row_bytes = (cols / 32) * 24;
+                        simd::dequant_row_q5_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
+                    }
                     GGMLType::Q4_K => {
                         let row_bytes = (cols / 256) * 144;
                         simd::dequant_row_q4_k(&data[row * row_bytes..(row + 1) * row_bytes], cols)
+                    }
+                    GGMLType::Q5_K => {
+                        let row_bytes = (cols / 256) * 176;
+                        simd::dequant_row_q5_k(&data[row * row_bytes..(row + 1) * row_bytes], cols)
                     }
                     GGMLType::Q6_K => {
                         let row_bytes = (cols / 256) * 210;
@@ -625,6 +668,47 @@ impl DecodeBuffer {
 
 // ─── Loading ─────────────────────────────────────────────────────────────────
 
+fn quantized_row_bytes(dtype: GGMLType, cols: usize) -> Option<usize> {
+    match dtype {
+        GGMLType::Q4_0 => Some(cols.div_ceil(32) * 18),
+        GGMLType::Q4_1 => Some(cols.div_ceil(32) * 20),
+        GGMLType::Q5_0 => Some(cols.div_ceil(32) * 22),
+        GGMLType::Q5_1 => Some(cols.div_ceil(32) * 24),
+        GGMLType::Q8_0 => Some(cols.div_ceil(32) * 34),
+        GGMLType::Q8_1 => Some(cols.div_ceil(32) * 36),
+        GGMLType::Q4_K => Some(cols.div_ceil(256) * 144),
+        GGMLType::Q5_K => Some(cols.div_ceil(256) * 176),
+        GGMLType::Q6_K => Some(cols.div_ceil(256) * 210),
+        GGMLType::MXFP4 => Some(cols.div_ceil(32) * 17),
+        _ => None,
+    }
+}
+
+fn dequantize_tensor_rows(dtype: GGMLType, raw: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = quantized_row_bytes(dtype, cols)
+        .unwrap_or_else(|| panic!("Unsupported quantized dequantization: {:?}", dtype));
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        let start = row * row_bytes;
+        let end = start + row_bytes;
+        let values = match dtype {
+            GGMLType::Q4_0 => simd::dequant_row_q4_0(&raw[start..end], cols),
+            GGMLType::Q4_1 => simd::dequant_row_q4_1(&raw[start..end], cols),
+            GGMLType::Q5_0 => simd::dequant_row_q5_0(&raw[start..end], cols),
+            GGMLType::Q5_1 => simd::dequant_row_q5_1(&raw[start..end], cols),
+            GGMLType::Q8_0 => simd::dequant_row_q8_0(&raw[start..end], cols),
+            GGMLType::Q8_1 => simd::dequant_row_q8_1(&raw[start..end], cols),
+            GGMLType::Q4_K => simd::dequant_row_q4_k(&raw[start..end], cols),
+            GGMLType::Q5_K => simd::dequant_row_q5_k(&raw[start..end], cols),
+            GGMLType::Q6_K => simd::dequant_row_q6_k(&raw[start..end], cols),
+            GGMLType::MXFP4 => simd::dequant_row_mxfp4(&raw[start..end], cols),
+            _ => unreachable!(),
+        };
+        out.extend_from_slice(&values);
+    }
+    out
+}
+
 /// Load a tensor as either f32 or quantized raw bytes. If the naive
 /// byte-size (based on dtype × numel) would overflow the mmap, we fall back
 /// to an inferred size provided in `inferred_sizes` which is computed from
@@ -702,9 +786,7 @@ fn load_weight(
         raw_slice
     };
 
-    // Treat Q5 variants as needing dequantization into f32 for now
-    // (SIMD kernels for Q5 aren't implemented yet).
-    let effective_force_f32 = force_f32 || matches!(info.dtype, GGMLType::Q5_0 | GGMLType::Q5_1);
+    let effective_force_f32 = force_f32;
 
     match info.dtype {
         GGMLType::F32 => {
@@ -738,6 +820,7 @@ fn load_weight(
         GGMLType::Q8_0
         | GGMLType::Q4_0
         | GGMLType::Q4_K
+        | GGMLType::Q5_K
         | GGMLType::Q6_K
         | GGMLType::MXFP4
         | GGMLType::Q8_1
@@ -745,52 +828,13 @@ fn load_weight(
         | GGMLType::Q5_0
         | GGMLType::Q5_1 => {
             if effective_force_f32 {
-                if matches!(
-                    info.dtype,
-                    GGMLType::Q4_K | GGMLType::Q6_K | GGMLType::MXFP4
-                ) {
-                    panic!(
-                        "{:?} force_f32 dequantization not implemented for {}",
-                        info.dtype, name
-                    );
-                }
-                // Dequantize into f32 vector
-                let mut data_f = vec![0.0f32; numel];
-                if matches!(
-                    info.dtype,
-                    GGMLType::Q8_0 | GGMLType::Q8_1 | GGMLType::Q5_0 | GGMLType::Q5_1
-                ) {
-                    let block_size = 34; // 2 bytes scale + 32 i8
-                    let n_blocks = numel / 32;
-                    for b in 0..n_blocks {
-                        let base = b * block_size;
-                        let scale = simd::f16_to_f32(u16::from_le_bytes([
-                            raw_view[base],
-                            raw_view[base + 1],
-                        ]));
-                        for i in 0..32 {
-                            data_f[b * 32 + i] = scale * (raw_view[base + 2 + i] as i8) as f32;
-                        }
-                    }
+                let rows = if info.dims.len() >= 2 {
+                    info.dims[1..].iter().map(|d| *d as usize).product()
                 } else {
-                    // Q4_0 / Q4_1
-                    let block_size = 18; // 2 bytes scale + 16 bytes (32 nibbles)
-                    let n_blocks = numel / 32;
-                    for b in 0..n_blocks {
-                        let base = b * block_size;
-                        let scale = simd::f16_to_f32(u16::from_le_bytes([
-                            raw_view[base],
-                            raw_view[base + 1],
-                        ]));
-                        for i in 0..16 {
-                            let byte = raw_view[base + 2 + i];
-                            let lo = ((byte & 0x0F) as i32 - 8) as f32;
-                            let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-                            data_f[b * 32 + i * 2] = scale * lo;
-                            data_f[b * 32 + i * 2 + 1] = scale * hi;
-                        }
-                    }
-                }
+                    1
+                };
+                let cols = info.dims[0] as usize;
+                let data_f = dequantize_tensor_rows(info.dtype, raw_view, rows, cols);
                 Weight::F32(data_f)
             } else {
                 // Keep quantized — use fused SIMD dot products
@@ -813,6 +857,91 @@ fn load_weight(
             }
         }
         _ => panic!("Unsupported tensor type for {}: {:?}", name, info.dtype),
+    }
+}
+
+fn load_weight_rows(
+    mmap_data: &[u8],
+    data_offset: usize,
+    name: &str,
+    tensors: &HashMap<String, &crate::gguf::TensorInfo>,
+    inferred_sizes: &HashMap<String, usize>,
+    start_row: usize,
+    rows: usize,
+    cols: usize,
+    borrow_quantized: bool,
+) -> Weight {
+    let info = tensors
+        .get(name)
+        .unwrap_or_else(|| panic!("Missing tensor: {}", name));
+    if info.dims.len() < 2 || info.dims[0] as usize != cols {
+        panic!(
+            "Tensor {} cannot be row-split as {} columns; dims={:?}",
+            name, cols, info.dims
+        );
+    }
+    let total_rows: usize = info.dims[1..].iter().map(|d| *d as usize).product();
+    let end_row = start_row
+        .checked_add(rows)
+        .unwrap_or_else(|| panic!("Tensor {} row slice overflows usize", name));
+    if end_row > total_rows {
+        panic!(
+            "Tensor {} row slice {}..{} exceeds {} rows",
+            name, start_row, end_row, total_rows
+        );
+    }
+
+    match info.dtype {
+        GGMLType::F32 => {
+            let offset = data_offset + info.offset as usize + start_row * cols * 4;
+            let byte_size = rows * cols * 4;
+            let raw = &mmap_data[offset..offset + byte_size];
+            let mut data = vec![0.0f32; rows * cols];
+            for i in 0..data.len() {
+                data[i] = f32::from_le_bytes([
+                    raw[i * 4],
+                    raw[i * 4 + 1],
+                    raw[i * 4 + 2],
+                    raw[i * 4 + 3],
+                ]);
+            }
+            Weight::F32(data)
+        }
+        GGMLType::F16 => {
+            let offset = data_offset + info.offset as usize + start_row * cols * 2;
+            let byte_size = rows * cols * 2;
+            let raw = &mmap_data[offset..offset + byte_size];
+            let mut data = vec![0.0f32; rows * cols];
+            for i in 0..data.len() {
+                data[i] = simd::f16_to_f32(u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]));
+            }
+            Weight::F32(data)
+        }
+        dtype => {
+            let row_bytes = quantized_row_bytes(dtype, cols)
+                .unwrap_or_else(|| panic!("Unsupported tensor type for {}: {:?}", name, dtype));
+            let offset = data_offset + info.offset as usize + start_row * row_bytes;
+            let byte_size = rows * row_bytes;
+            let raw_end = offset + byte_size;
+            if raw_end > mmap_data.len() {
+                let inferred = inferred_sizes.get(name).copied().unwrap_or(0);
+                panic!(
+                    "Tensor {} row slice exceeds mmap length (offset {}, byte_size {}, inferred full {})",
+                    name, offset, byte_size, inferred
+                );
+            }
+            let raw = &mmap_data[offset..raw_end];
+            Weight::Quantized {
+                data: if borrow_quantized {
+                    RawTensorData::view(raw)
+                } else {
+                    RawTensorData::owned(raw)
+                },
+                dtype,
+                rows,
+                cols,
+            }
+        }
     }
 }
 
@@ -849,6 +978,23 @@ fn load_optional_f32_vec(
 ) -> Vec<f32> {
     if tensors.contains_key(name) {
         load_f32_vec(mmap_data, data_offset, name, tensors, inferred_sizes)
+    } else {
+        vec![0.0; len]
+    }
+}
+
+fn load_optional_f32_slice(
+    mmap_data: &[u8],
+    data_offset: usize,
+    name: &str,
+    tensors: &HashMap<String, &crate::gguf::TensorInfo>,
+    inferred_sizes: &HashMap<String, usize>,
+    start: usize,
+    len: usize,
+) -> Vec<f32> {
+    if tensors.contains_key(name) {
+        let values = load_f32_vec(mmap_data, data_offset, name, tensors, inferred_sizes);
+        values[start..start + len].to_vec()
     } else {
         vec![0.0; len]
     }
@@ -1058,6 +1204,196 @@ pub fn load_model(
     let k_rows = config.n_kv_heads * config.head_dim;
     let v_rows = config.n_kv_heads * config.value_dim;
     for l in 0..config.n_layers {
+        let q_name = format!("blk.{}.attn_q.weight", l);
+        let k_name = format!("blk.{}.attn_k.weight", l);
+        let v_name = format!("blk.{}.attn_v.weight", l);
+        let qkv_name = format!("blk.{}.attn_qkv.weight", l);
+        let q_bias_name = format!("blk.{}.attn_q.bias", l);
+        let k_bias_name = format!("blk.{}.attn_k.bias", l);
+        let v_bias_name = format!("blk.{}.attn_v.bias", l);
+        let qkv_bias_name = format!("blk.{}.attn_qkv.bias", l);
+
+        let (wq, bq, wk, bk, wv, bv) = if tensor_idx.contains_key(&q_name) {
+            (
+                load_weight(
+                    mmap_data,
+                    data_offset,
+                    &q_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &q_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    q_rows,
+                ),
+                load_weight(
+                    mmap_data,
+                    data_offset,
+                    &k_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &k_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    k_rows,
+                ),
+                load_weight(
+                    mmap_data,
+                    data_offset,
+                    &v_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &v_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    v_rows,
+                ),
+            )
+        } else if tensor_idx.contains_key(&qkv_name) {
+            (
+                load_weight_rows(
+                    mmap_data,
+                    data_offset,
+                    &qkv_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    0,
+                    q_rows,
+                    config.dim,
+                    borrow_quantized,
+                ),
+                load_optional_f32_slice(
+                    mmap_data,
+                    data_offset,
+                    &qkv_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    0,
+                    q_rows,
+                ),
+                load_weight_rows(
+                    mmap_data,
+                    data_offset,
+                    &qkv_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    q_rows,
+                    k_rows,
+                    config.dim,
+                    borrow_quantized,
+                ),
+                load_optional_f32_slice(
+                    mmap_data,
+                    data_offset,
+                    &qkv_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    q_rows,
+                    k_rows,
+                ),
+                load_weight_rows(
+                    mmap_data,
+                    data_offset,
+                    &qkv_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    q_rows + k_rows,
+                    v_rows,
+                    config.dim,
+                    borrow_quantized,
+                ),
+                load_optional_f32_slice(
+                    mmap_data,
+                    data_offset,
+                    &qkv_bias_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    q_rows + k_rows,
+                    v_rows,
+                ),
+            )
+        } else {
+            panic!("Missing tensor: {} (or {})", q_name, qkv_name);
+        };
+
+        let gate_name = format!("blk.{}.ffn_gate.weight", l);
+        let up_name = format!("blk.{}.ffn_up.weight", l);
+        let (w1, w3) = if tensor_idx.contains_key(&gate_name) {
+            (
+                load_weight(
+                    mmap_data,
+                    data_offset,
+                    &gate_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                load_weight(
+                    mmap_data,
+                    data_offset,
+                    &up_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+            )
+        } else {
+            let info = tensor_idx
+                .get(&up_name)
+                .unwrap_or_else(|| panic!("Missing tensor: {} (or {})", gate_name, up_name));
+            let up_rows = info.dims.get(1).copied().unwrap_or(0) as usize;
+            if up_rows < config.hidden_dim * 2 {
+                panic!(
+                    "Missing tensor: {} and {} is not a fused gate/up projection",
+                    gate_name, up_name
+                );
+            }
+            (
+                load_weight_rows(
+                    mmap_data,
+                    data_offset,
+                    &up_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    0,
+                    config.hidden_dim,
+                    config.dim,
+                    borrow_quantized,
+                ),
+                load_weight_rows(
+                    mmap_data,
+                    data_offset,
+                    &up_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    config.hidden_dim,
+                    config.hidden_dim,
+                    config.dim,
+                    borrow_quantized,
+                ),
+            )
+        };
+
         let layer = LayerWeights {
             attn_norm: load_f32_vec(
                 mmap_data,
@@ -1066,57 +1402,12 @@ pub fn load_model(
                 &tensor_idx,
                 &inferred_sizes,
             ),
-            wq: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_q.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
-            bq: load_optional_f32_vec(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_q.bias", l),
-                &tensor_idx,
-                &inferred_sizes,
-                q_rows,
-            ),
-            wk: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_k.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
-            bk: load_optional_f32_vec(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_k.bias", l),
-                &tensor_idx,
-                &inferred_sizes,
-                k_rows,
-            ),
-            wv: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_v.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
-            bv: load_optional_f32_vec(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.attn_v.bias", l),
-                &tensor_idx,
-                &inferred_sizes,
-                v_rows,
-            ),
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
             wo: load_weight(
                 mmap_data,
                 data_offset,
@@ -1133,15 +1424,7 @@ pub fn load_model(
                 &tensor_idx,
                 &inferred_sizes,
             ),
-            w1: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.ffn_gate.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
+            w1,
             w2: load_weight(
                 mmap_data,
                 data_offset,
@@ -1151,15 +1434,7 @@ pub fn load_model(
                 false,
                 borrow_quantized,
             ),
-            w3: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.ffn_up.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
+            w3,
         };
         layers.push(layer);
         if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {

@@ -92,8 +92,13 @@ fn f16_lookup() -> &'static [f32] {
 enum MatvecKind {
     F32,
     Q8_0,
+    Q8_1,
     Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
     Q4K,
+    Q5K,
     Q6K,
     Mxfp4,
 }
@@ -186,13 +191,33 @@ unsafe fn dot_row(
             let row = std::slice::from_raw_parts(row_ptr, row_span);
             dot_q8_0_f32(row, x, cols)
         }
+        MatvecKind::Q8_1 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q8_1_f32(row, x, cols)
+        }
         MatvecKind::Q4_0 => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
             dot_q4_0_f32(row, x, cols)
         }
+        MatvecKind::Q4_1 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q4_1_f32(row, x, cols)
+        }
+        MatvecKind::Q5_0 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q5_0_f32(row, x, cols)
+        }
+        MatvecKind::Q5_1 => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q5_1_f32(row, x, cols)
+        }
         MatvecKind::Q4K => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
             dot_q4_k_f32(row, x, cols)
+        }
+        MatvecKind::Q5K => {
+            let row = std::slice::from_raw_parts(row_ptr, row_span);
+            dot_q5_k_f32(row, x, cols)
         }
         MatvecKind::Q6K => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
@@ -691,6 +716,13 @@ pub fn dot_q8_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
 }
 
+/// Computes a Q8_1 row dot product against an f32 vector.
+#[inline]
+pub fn dot_q8_1_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert!(n % 32 == 0);
+    dot_q8_1_f32_scalar(qdata, x, n)
+}
+
 /// Fused Q4_0 dot product
 #[inline]
 /// Computes a Q4_0 row dot product against an f32 vector.
@@ -714,6 +746,27 @@ pub fn dot_q4_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
 }
 
+/// Computes a Q4_1 row dot product against an f32 vector.
+#[inline]
+pub fn dot_q4_1_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert!(n % 32 == 0);
+    dot_q4_1_f32_scalar(qdata, x, n)
+}
+
+/// Computes a Q5_0 row dot product against an f32 vector.
+#[inline]
+pub fn dot_q5_0_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert!(n % 32 == 0);
+    dot_q5_0_f32_scalar(qdata, x, n)
+}
+
+/// Computes a Q5_1 row dot product against an f32 vector.
+#[inline]
+pub fn dot_q5_1_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert!(n % 32 == 0);
+    dot_q5_1_f32_scalar(qdata, x, n)
+}
+
 /// Fused Q4_K dot product
 #[inline]
 /// Computes a Q4_K row dot product against an f32 vector.
@@ -727,6 +780,13 @@ pub fn dot_q4_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     {
         dot_q4_k_f32_scalar(qdata, x, n)
     }
+}
+
+/// Computes a Q5_K row dot product against an f32 vector.
+#[inline]
+pub fn dot_q5_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    debug_assert!(n % 256 == 0);
+    dot_q5_k_f32_scalar(qdata, x, n)
 }
 
 /// Fused Q6_K dot product
@@ -784,6 +844,31 @@ pub fn matvec_q8_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     out
 }
 
+/// Runs a Q8_1 matrix-vector multiply and returns a new vector.
+pub fn matvec_q8_1(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = (cols / 32) * 36;
+    let needed = row_bytes
+        .checked_mul(rows)
+        .expect("matvec_q8_1: rows*row_bytes overflow");
+    assert!(
+        qweight.len() >= needed,
+        "matvec_q8_1: buffer too small (need {}, got {})",
+        needed,
+        qweight.len()
+    );
+    let mut out = vec![0.0f32; rows];
+    parallel_matvec_u8(
+        MatvecKind::Q8_1,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
+    out
+}
+
 /// Runs a Q4_0 matrix-vector multiply and returns a new vector.
 pub fn matvec_q4_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = (cols / 32) * 18;
@@ -799,6 +884,81 @@ pub fn matvec_q4_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
     let mut out = vec![0.0f32; rows];
     parallel_matvec_u8(
         MatvecKind::Q4_0,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
+    out
+}
+
+/// Runs a Q4_1 matrix-vector multiply and returns a new vector.
+pub fn matvec_q4_1(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = (cols / 32) * 20;
+    let needed = row_bytes
+        .checked_mul(rows)
+        .expect("matvec_q4_1: rows*row_bytes overflow");
+    assert!(
+        qweight.len() >= needed,
+        "matvec_q4_1: buffer too small (need {}, got {})",
+        needed,
+        qweight.len()
+    );
+    let mut out = vec![0.0f32; rows];
+    parallel_matvec_u8(
+        MatvecKind::Q4_1,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
+    out
+}
+
+/// Runs a Q5_0 matrix-vector multiply and returns a new vector.
+pub fn matvec_q5_0(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = (cols / 32) * 22;
+    let needed = row_bytes
+        .checked_mul(rows)
+        .expect("matvec_q5_0: rows*row_bytes overflow");
+    assert!(
+        qweight.len() >= needed,
+        "matvec_q5_0: buffer too small (need {}, got {})",
+        needed,
+        qweight.len()
+    );
+    let mut out = vec![0.0f32; rows];
+    parallel_matvec_u8(
+        MatvecKind::Q5_0,
+        &mut out,
+        rows,
+        cols,
+        row_bytes,
+        qweight,
+        x,
+    );
+    out
+}
+
+/// Runs a Q5_1 matrix-vector multiply and returns a new vector.
+pub fn matvec_q5_1(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = (cols / 32) * 24;
+    let needed = row_bytes
+        .checked_mul(rows)
+        .expect("matvec_q5_1: rows*row_bytes overflow");
+    assert!(
+        qweight.len() >= needed,
+        "matvec_q5_1: buffer too small (need {}, got {})",
+        needed,
+        qweight.len()
+    );
+    let mut out = vec![0.0f32; rows];
+    parallel_matvec_u8(
+        MatvecKind::Q5_1,
         &mut out,
         rows,
         cols,
@@ -827,6 +987,23 @@ pub fn matvec_q4_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f
         return out;
     }
     parallel_matvec_u8(MatvecKind::Q4K, &mut out, rows, cols, row_bytes, qweight, x);
+    out
+}
+
+/// Runs a Q5_K matrix-vector multiply and returns a new vector.
+pub fn matvec_q5_k(qweight: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let row_bytes = (cols / 256) * 176;
+    let needed = row_bytes
+        .checked_mul(rows)
+        .expect("matvec_q5_k: rows*row_bytes overflow");
+    assert!(
+        qweight.len() >= needed,
+        "matvec_q5_k: buffer too small (need {}, got {})",
+        needed,
+        qweight.len()
+    );
+    let mut out = vec![0.0f32; rows];
+    parallel_matvec_u8(MatvecKind::Q5K, &mut out, rows, cols, row_bytes, qweight, x);
     out
 }
 
@@ -890,11 +1067,39 @@ pub fn matvec_q8_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out
     parallel_matvec_u8(MatvecKind::Q8_0, out, rows, cols, row_bytes, qweight, x);
 }
 
+/// Runs a Q8_1 matrix-vector multiply into a reusable output buffer.
+pub fn matvec_q8_1_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let row_bytes = (cols / 32) * 36;
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(MatvecKind::Q8_1, out, rows, cols, row_bytes, qweight, x);
+}
+
 /// Runs a Q4_0 matrix-vector multiply into a reusable output buffer.
 pub fn matvec_q4_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
     let row_bytes = (cols / 32) * 18;
     out.resize(rows, 0.0);
     parallel_matvec_u8(MatvecKind::Q4_0, out, rows, cols, row_bytes, qweight, x);
+}
+
+/// Runs a Q4_1 matrix-vector multiply into a reusable output buffer.
+pub fn matvec_q4_1_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let row_bytes = (cols / 32) * 20;
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(MatvecKind::Q4_1, out, rows, cols, row_bytes, qweight, x);
+}
+
+/// Runs a Q5_0 matrix-vector multiply into a reusable output buffer.
+pub fn matvec_q5_0_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let row_bytes = (cols / 32) * 22;
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(MatvecKind::Q5_0, out, rows, cols, row_bytes, qweight, x);
+}
+
+/// Runs a Q5_1 matrix-vector multiply into a reusable output buffer.
+pub fn matvec_q5_1_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let row_bytes = (cols / 32) * 24;
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(MatvecKind::Q5_1, out, rows, cols, row_bytes, qweight, x);
 }
 
 /// Runs a Q4_K matrix-vector multiply into a reusable output buffer.
@@ -906,6 +1111,13 @@ pub fn matvec_q4_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out
         return;
     }
     parallel_matvec_u8(MatvecKind::Q4K, out, rows, cols, row_bytes, qweight, x);
+}
+
+/// Runs a Q5_K matrix-vector multiply into a reusable output buffer.
+pub fn matvec_q5_k_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut Vec<f32>) {
+    let row_bytes = (cols / 256) * 176;
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(MatvecKind::Q5K, out, rows, cols, row_bytes, qweight, x);
 }
 
 /// Runs three Q4_K projections against the same input vector.
@@ -1131,6 +1343,21 @@ pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantizes one Q8_1 row into f32 values.
+pub fn dequant_row_q8_1(qrow: &[u8], cols: usize) -> Vec<f32> {
+    let n_blocks = cols / 32;
+    let block_size = 36;
+    let mut out = vec![0.0f32; cols];
+    for b in 0..n_blocks {
+        let block = &qrow[b * block_size..(b + 1) * block_size];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for i in 0..32 {
+            out[b * 32 + i] = scale * (block[4 + i] as i8) as f32;
+        }
+    }
+    out
+}
+
 /// Dequantizes one Q4_0 row into f32 values.
 pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
     let n_blocks = cols / 32;
@@ -1145,6 +1372,71 @@ pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
             let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
             out[b * 32 + i * 2] = scale * lo;
             out[b * 32 + i * 2 + 1] = scale * hi;
+        }
+    }
+    out
+}
+
+/// Dequantizes one Q4_1 row into f32 values.
+pub fn dequant_row_q4_1(qrow: &[u8], cols: usize) -> Vec<f32> {
+    let n_blocks = cols / 32;
+    let block_size = 20;
+    let mut out = vec![0.0f32; cols];
+    for b in 0..n_blocks {
+        let block = &qrow[b * block_size..(b + 1) * block_size];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        for i in 0..16 {
+            let byte = block[4 + i];
+            out[b * 32 + i * 2] = scale * (byte & 0x0F) as f32 + min;
+            out[b * 32 + i * 2 + 1] = scale * (byte >> 4) as f32 + min;
+        }
+    }
+    out
+}
+
+/// Dequantizes one Q5_0 row into f32 values.
+pub fn dequant_row_q5_0(qrow: &[u8], cols: usize) -> Vec<f32> {
+    let n_blocks = cols / 32;
+    let block_size = 22;
+    let mut out = vec![0.0f32; cols];
+    for b in 0..n_blocks {
+        let block = &qrow[b * block_size..(b + 1) * block_size];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+        for i in 0..16 {
+            let byte = qs[i];
+            let lo_hi = if ((qh >> i) & 1) != 0 { 16 } else { 0 };
+            let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
+            let lo = (((byte & 0x0F) | lo_hi) as i32 - 16) as f32;
+            let hi = (((byte >> 4) | hi_hi) as i32 - 16) as f32;
+            out[b * 32 + i * 2] = scale * lo;
+            out[b * 32 + i * 2 + 1] = scale * hi;
+        }
+    }
+    out
+}
+
+/// Dequantizes one Q5_1 row into f32 values.
+pub fn dequant_row_q5_1(qrow: &[u8], cols: usize) -> Vec<f32> {
+    let n_blocks = cols / 32;
+    let block_size = 24;
+    let mut out = vec![0.0f32; cols];
+    for b in 0..n_blocks {
+        let block = &qrow[b * block_size..(b + 1) * block_size];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let qs = &block[8..24];
+        for i in 0..16 {
+            let byte = qs[i];
+            let lo_hi = if ((qh >> i) & 1) != 0 { 16 } else { 0 };
+            let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
+            let lo = ((byte & 0x0F) | lo_hi) as f32;
+            let hi = ((byte >> 4) | hi_hi) as f32;
+            out[b * 32 + i * 2] = scale * lo + min;
+            out[b * 32 + i * 2 + 1] = scale * hi + min;
         }
     }
     out
@@ -1183,6 +1475,51 @@ pub fn dequant_row_q4_k(qrow: &[u8], cols: usize) -> Vec<f32> {
 
             q = &q[32..];
             is += 2;
+        }
+    }
+
+    out
+}
+
+/// Dequantizes one Q5_K row into f32 values.
+pub fn dequant_row_q5_k(qrow: &[u8], cols: usize) -> Vec<f32> {
+    let n_blocks = cols / 256;
+    let block_size = 176;
+    let mut out = vec![0.0f32; cols];
+
+    for b in 0..n_blocks {
+        let block = &qrow[b * block_size..(b + 1) * block_size];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales: &[u8; 12] = block[4..16].try_into().expect("q5_k scales size");
+        let qh = &block[16..48];
+        let mut qs = &block[48..176];
+        let yoff = b * 256;
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in (0..256).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = dmin * m1 as f32;
+
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let min2 = dmin * m2 as f32;
+
+            for l in 0..32 {
+                let byte = qs[l];
+                let hi0 = if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let hi1 = if (qh[l] & u2) != 0 { 16 } else { 0 };
+                out[yoff + j + l] = d1 * ((byte & 0x0F) | hi0) as f32 - min1;
+                out[yoff + j + 32 + l] = d2 * ((byte >> 4) | hi1) as f32 - min2;
+            }
+
+            qs = &qs[32..];
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 
@@ -1314,6 +1651,108 @@ fn dot_q4_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         }
         sum += scale * block_sum;
     }
+    sum
+}
+
+/// Portable scalar implementation of Q8_1 dot product.
+fn dot_q8_1_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    let n_blocks = n / 32;
+    let block_size = 36;
+    let mut sum = 0.0f32;
+
+    for b in 0..n_blocks {
+        let block = &qdata[b * block_size..];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let mut block_sum = 0.0f32;
+        for i in 0..32 {
+            block_sum += (block[4 + i] as i8) as f32 * x[b * 32 + i];
+        }
+        sum += scale * block_sum;
+    }
+
+    sum
+}
+
+/// Portable scalar implementation of Q4_1 dot product.
+fn dot_q4_1_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    let n_blocks = n / 32;
+    let block_size = 20;
+    let mut sum = 0.0f32;
+
+    for b in 0..n_blocks {
+        let block = &qdata[b * block_size..];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let mut qsum = 0.0f32;
+        let mut xsum = 0.0f32;
+        for i in 0..16 {
+            let byte = block[4 + i];
+            let x0 = x[b * 32 + i * 2];
+            let x1 = x[b * 32 + i * 2 + 1];
+            qsum += (byte & 0x0F) as f32 * x0;
+            qsum += (byte >> 4) as f32 * x1;
+            xsum += x0 + x1;
+        }
+        sum += scale * qsum + min * xsum;
+    }
+
+    sum
+}
+
+/// Portable scalar implementation of Q5_0 dot product.
+fn dot_q5_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    let n_blocks = n / 32;
+    let block_size = 22;
+    let mut sum = 0.0f32;
+
+    for b in 0..n_blocks {
+        let block = &qdata[b * block_size..];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+        let mut block_sum = 0.0f32;
+        for i in 0..16 {
+            let byte = qs[i];
+            let lo_hi = if ((qh >> i) & 1) != 0 { 16 } else { 0 };
+            let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
+            let lo = (((byte & 0x0F) | lo_hi) as i32 - 16) as f32;
+            let hi = (((byte >> 4) | hi_hi) as i32 - 16) as f32;
+            block_sum += lo * x[b * 32 + i * 2];
+            block_sum += hi * x[b * 32 + i * 2 + 1];
+        }
+        sum += scale * block_sum;
+    }
+
+    sum
+}
+
+/// Portable scalar implementation of Q5_1 dot product.
+fn dot_q5_1_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    let n_blocks = n / 32;
+    let block_size = 24;
+    let mut sum = 0.0f32;
+
+    for b in 0..n_blocks {
+        let block = &qdata[b * block_size..];
+        let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+        let qs = &block[8..24];
+        let mut qsum = 0.0f32;
+        let mut xsum = 0.0f32;
+        for i in 0..16 {
+            let byte = qs[i];
+            let lo_hi = if ((qh >> i) & 1) != 0 { 16 } else { 0 };
+            let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
+            let x0 = x[b * 32 + i * 2];
+            let x1 = x[b * 32 + i * 2 + 1];
+            qsum += ((byte & 0x0F) | lo_hi) as f32 * x0;
+            qsum += ((byte >> 4) | hi_hi) as f32 * x1;
+            xsum += x0 + x1;
+        }
+        sum += scale * qsum + min * xsum;
+    }
+
     sum
 }
 
@@ -1498,6 +1937,65 @@ fn dot_q4_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
             q = &q[32..];
             is += 2;
+        }
+    }
+
+    sum
+}
+
+/// Portable scalar implementation of Q5_K dot product.
+fn dot_q5_k_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    let n_blocks = n / 256;
+    let block_size = 176;
+    let mut sum = 0.0f32;
+
+    for b in 0..n_blocks {
+        let block = &qdata[b * block_size..(b + 1) * block_size];
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales: &[u8; 12] = block[4..16].try_into().expect("q5_k scales size");
+        let qh = &block[16..48];
+        let mut qs = &block[48..176];
+        let xoff = b * 256;
+
+        let mut is = 0usize;
+        let mut u1 = 1u8;
+        let mut u2 = 2u8;
+        for j in (0..256).step_by(64) {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = dmin * m1 as f32;
+
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d2 = d * sc2 as f32;
+            let min2 = dmin * m2 as f32;
+
+            let mut qdot1 = 0.0f32;
+            let mut qdot2 = 0.0f32;
+            let mut xsum1 = 0.0f32;
+            let mut xsum2 = 0.0f32;
+
+            for l in 0..32 {
+                let byte = qs[l];
+                let idx1 = j + l;
+                let idx2 = j + 32 + l;
+                let hi1 = if (qh[l] & u1) != 0 { 16 } else { 0 };
+                let hi2 = if (qh[l] & u2) != 0 { 16 } else { 0 };
+                let x1 = x[xoff + idx1];
+                let x2 = x[xoff + idx2];
+                qdot1 += ((byte & 0x0F) | hi1) as f32 * x1;
+                qdot2 += ((byte >> 4) | hi2) as f32 * x2;
+                xsum1 += x1;
+                xsum2 += x2;
+            }
+
+            sum += d1 * qdot1 - min1 * xsum1;
+            sum += d2 * qdot2 - min2 * xsum2;
+
+            qs = &qs[32..];
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 
@@ -2056,6 +2554,75 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    /// Verifies Q5_0 high-bit unpacking against explicit expected values.
+    fn q5_0_dequant_and_dot_unpack_high_bits() {
+        let mut row = vec![0u8; 22];
+        row[0] = 0x00;
+        row[1] = 0x3c; // f16 1.0
+        let qh = (1u32 << 0) | (1u32 << 15) | (1u32 << 16) | (1u32 << 31);
+        row[2..6].copy_from_slice(&qh.to_le_bytes());
+        for i in 0..16 {
+            row[6 + i] = (i as u8 & 0x0f) | ((15 - i as u8) << 4);
+        }
+
+        let deq = dequant_row_q5_0(&row, 32);
+        assert_eq!(deq[0], 0.0);
+        assert_eq!(deq[1], 15.0);
+        assert_eq!(deq[30], 15.0);
+        assert_eq!(deq[31], 0.0);
+
+        let x = vec![1.0f32; 32];
+        let expected: f32 = deq.iter().sum();
+        assert_eq!(dot_q5_0_f32(&row, &x, 32), expected);
+    }
+
+    #[test]
+    /// Verifies Q5_1 high-bit unpacking and min handling.
+    fn q5_1_dequant_and_dot_unpack_high_bits() {
+        let mut row = vec![0u8; 24];
+        row[0] = 0x00;
+        row[1] = 0x3c; // f16 1.0
+        row[2] = 0x00;
+        row[3] = 0x38; // f16 0.5
+        let qh = (1u32 << 0) | (1u32 << 16);
+        row[4..8].copy_from_slice(&qh.to_le_bytes());
+        for i in 0..16 {
+            row[8 + i] = (i as u8 & 0x0f) | ((i as u8 & 0x0f) << 4);
+        }
+
+        let deq = dequant_row_q5_1(&row, 32);
+        assert_eq!(deq[0], 16.5);
+        assert_eq!(deq[1], 16.5);
+        assert_eq!(deq[2], 1.5);
+        assert_eq!(deq[3], 1.5);
+
+        let x = vec![0.25f32; 32];
+        let expected: f32 = deq.iter().map(|v| v * 0.25).sum();
+        assert_eq!(dot_q5_1_f32(&row, &x, 32), expected);
+    }
+
+    #[test]
+    /// Verifies Q5_K reads one high-bit slot per quantized value.
+    fn q5k_dot_uses_high_bit_plane() {
+        let mut row = vec![0u8; 176];
+        row[0] = 0x00;
+        row[1] = 0x3c; // f16 1.0
+        row[2] = 0x00;
+        row[3] = 0x00; // f16 0.0 dmin
+        for scale in &mut row[4..16] {
+            *scale = 1;
+        }
+        for high in &mut row[16..48] {
+            *high = 0x03;
+        }
+
+        let x = vec![1.0f32; 256];
+        assert_eq!(dot_q5_k_f32(&row, &x, 256), 16.0 * 64.0);
+        let deq = dequant_row_q5_k(&row, 256);
+        assert_eq!(deq.iter().sum::<f32>(), 16.0 * 64.0);
     }
 
     #[test]

@@ -58,9 +58,16 @@ impl GGMLType {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
-            Self::Q4_0 | Self::Q4_1 => 18, // 2 (f16 scale) + 16 (32 nibbles)
-            Self::Q8_0 | Self::Q8_1 => 34, // 2 (f16 scale) + 32 (i8 quants)
-            Self::Q5_0 | Self::Q5_1 => 34, // treat like Q8 layout for now
+            Self::Q4_0 => 18, // f16 scale + 16 packed nibbles
+            Self::Q4_1 => 20, // f16 scale + f16 min + 16 packed nibbles
+            Self::Q5_0 => 22, // f16 scale + 32 high bits + 16 packed nibbles
+            Self::Q5_1 => 24, // f16 scale + f16 min + 32 high bits + 16 nibbles
+            Self::Q8_0 => 34, // f16 scale + 32 i8 quants
+            Self::Q8_1 => 36, // f16 scale + f16 sum + 32 i8 quants
+            Self::Q4_K => 144,
+            Self::Q5_K => 176,
+            Self::Q6_K => 210,
+            Self::MXFP4 => 17,
             _ => panic!("Unsupported: {:?}", self),
         }
     }
@@ -69,6 +76,7 @@ impl GGMLType {
     pub fn block_size(&self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
+            Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
             _ => 32,
         }
     }
@@ -78,13 +86,21 @@ impl GGMLType {
         match self {
             Self::F32 => Some(n * 4),
             Self::F16 => Some(n * 2),
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => {
-                Some((n / self.block_size()) * self.block_bytes())
+            Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_0
+            | Self::Q5_1
+            | Self::Q8_0
+            | Self::Q8_1
+            | Self::MXFP4 => {
+                let blocks = n.div_ceil(self.block_size());
+                Some(blocks * self.block_bytes())
             }
             // K-quant variants use a different super-block size.
-            Self::Q4_K => Some((n / 256) * 144),
-            Self::Q6_K => Some((n / 256) * 210),
-            Self::MXFP4 => Some((n / 32) * 17),
+            Self::Q4_K | Self::Q5_K | Self::Q6_K => {
+                let blocks = n.div_ceil(self.block_size());
+                Some(blocks * self.block_bytes())
+            }
             _ => None,
         }
     }
