@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
+
 #[cfg(all(target_os = "macos", rusty_metal))]
 mod ffi {
     unsafe extern "C" {
@@ -107,7 +109,7 @@ pub fn q6k_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < 2048 {
+    if !enabled() || rows < Q6K_MIN_METAL_ROWS {
         return false;
     }
     out.resize(rows, 0.0);

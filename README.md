@@ -53,6 +53,8 @@ Additional documentation:
   vocabulary and mental model used by the project.
 - [Architecture guide](docs/ARCHITECTURE.md) explains the inference pipeline and
   module responsibilities.
+- [MTP usage guide](docs/MTP.md) explains greedy assistant-based speculative
+  decoding, benchmark comparison, and troubleshooting.
 - [Function reference](docs/FUNCTION_REFERENCE.md) documents every non-test Rust
   function under `src/`.
 
@@ -240,6 +242,13 @@ Generation options:
 - `--stop <text>` stops generation when the text appears. The flag can be
   repeated.
 - `--threads <N>` overrides the SIMD worker thread count.
+- `--mtp-assistant <path>` loads a smaller assistant GGUF for greedy
+  speculative decoding.
+- `--mtp-tokens <N>` sets the maximum speculative draft tokens.
+- `--mtp-min-accept-rate <F>` disables MTP when the acceptance rate drops below
+  this threshold. The default is `0.5`.
+- `--no-mtp-adaptive` keeps the MTP draft length fixed instead of adapting it.
+- `--no-speculative` disables MTP/speculative decoding.
 
 Server options:
 

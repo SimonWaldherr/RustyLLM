@@ -64,6 +64,8 @@ fn print_usage(name: &str) {
     eprintln!("  --threads <N>             Override thread count");
     eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");
     eprintln!("  --mtp-tokens <N>          Max speculative draft tokens (default: 4)");
+    eprintln!("  --mtp-min-accept-rate <F> Disable MTP below this accept rate (default: 0.5)");
+    eprintln!("  --no-mtp-adaptive         Keep --mtp-tokens fixed instead of adapting it");
     eprintln!("  --no-speculative          Disable speculative decoding");
     eprintln!("  --kv-cache-dtype <T>      KV cache dtype: auto, f32, bf16, q8");
     eprintln!("  --max-context <N>         Cap runtime context/KV-cache length");
@@ -269,6 +271,13 @@ fn run() -> Result<(), String> {
                 options.speculative.max_draft_tokens =
                     parse_arg::<usize>(&args, &mut i, "--mtp-tokens")?;
             }
+            "--mtp-min-accept-rate" => {
+                options.speculative.min_accept_rate =
+                    parse_arg::<f32>(&args, &mut i, "--mtp-min-accept-rate")?;
+            }
+            "--no-mtp-adaptive" => {
+                options.speculative.adaptive = false;
+            }
             "--no-speculative" => {
                 options.speculative.enabled = false;
             }
@@ -465,10 +474,21 @@ fn run() -> Result<(), String> {
             eprintln!("Loading MTP assistant: {}", assistant_path);
             let (assistant, assistant_info) = Runner::from_path(assistant_path)?;
             runner.attach_speculative_assistant(assistant)?;
+            let assistant_mb = assistant_info.file_size_bytes as f64 / (1024.0 * 1024.0);
+            let assistant_ratio =
+                assistant_info.file_size_bytes as f64 / load_info.file_size_bytes.max(1) as f64;
             eprintln!(
-                "MTP assistant loaded in {:.2}s",
-                assistant_info.load_time.as_secs_f32()
+                "MTP assistant loaded in {:.2}s ({:.1} MB, {:.0}% of target size)",
+                assistant_info.load_time.as_secs_f32(),
+                assistant_mb,
+                assistant_ratio * 100.0
             );
+            if assistant_ratio >= 0.75 {
+                eprintln!(
+                    "Warning: MTP assistant is {:.0}% of target size; speculative decoding usually helps only with a much smaller assistant.",
+                    assistant_ratio * 100.0
+                );
+            }
         }
     }
     eprintln!(
@@ -660,14 +680,19 @@ fn run() -> Result<(), String> {
     );
     if let Some(spec) = &result.stats.speculative {
         eprintln!(
-            "MTP: accept_rate={:.2}, drafted={}, accepted={}, draft={:.2} tok/s, effective={:.2} tok/s{}",
+            "MTP: accept_rate={:.2}, drafted={}, accepted={}, draft={:.2} tok/s, effective={:.2} tok/s{}{}",
             spec.accept_rate(),
             spec.drafted_tokens,
             spec.accepted_tokens,
             spec.draft_tok_s(),
             result.stats.generated_tokens as f32
                 / result.stats.decode_time.as_secs_f32().max(0.001),
-            if spec.disabled { " (disabled)" } else { "" }
+            if spec.disabled { " (disabled)" } else { "" },
+            if spec.accept_rate() < options.speculative.min_accept_rate {
+                " recommendation=disable"
+            } else {
+                ""
+            }
         );
     }
     eprintln!("Total: {:.2}s", result.stats.total_time.as_secs_f32());
@@ -1039,7 +1064,7 @@ fn run_kernel_benchmark(
                 "enabled": metal::enabled(),
                 "q4_k": metal::enabled(),
                 "q6_k": metal::q6k_enabled(),
-                "q6_k_min_rows": 32768,
+                "q6_k_min_rows": metal::Q6K_MIN_METAL_ROWS,
             },
             "layer": layer,
             "runs": runs,
@@ -1056,11 +1081,12 @@ fn run_kernel_benchmark(
         layer, runs
     );
     println!(
-        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows=32768",
+        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows={}",
         metal::available(),
         metal::enabled(),
         metal::enabled(),
-        metal::q6k_enabled()
+        metal::q6k_enabled(),
+        metal::Q6K_MIN_METAL_ROWS
     );
     for row in rows {
         println!(

@@ -124,7 +124,7 @@ impl RuntimeProfile {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "mistral" | "ministral" => Some(Self::Mistral),
-            "gemma" | "gemma4" => Some(Self::Gemma),
+            "gemma" | "gemma4" | "gemma4-assistant" => Some(Self::Gemma),
             _ => None,
         }
     }
@@ -416,6 +416,7 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "gemma"
             | "gemma2"
             | "gemma4"
+            | "gemma4-assistant"
             | "granite"
             | "granite3"
             | "granite4"
@@ -542,7 +543,7 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
     let config = Config::from_gguf(gguf);
 
     match arch {
-        "gpt-oss" | "gemma" | "gemma2" | "gemma4" => return,
+        "gpt-oss" | "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => return,
         "deepseek2" | "deepseek-v2" => {
             if has("blk.0.attn_kv_a_mqa.weight") || has("blk.0.attn_kv_b.weight") {
                 report.unsupported_layouts.push(String::from(
@@ -679,7 +680,7 @@ impl Runner {
                 let (config, weights) = model::load_gpt_oss_model(data, &gguf, false);
                 (config, LoadedWeights::GptOss(weights))
             }
-            "gemma" | "gemma2" | "gemma4" => {
+            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
                 (config, LoadedWeights::Gemma4(weights))
             }
@@ -727,7 +728,7 @@ impl Runner {
                 let (config, weights) = model::load_gpt_oss_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::GptOss(weights))
             }
-            "gemma" | "gemma2" | "gemma4" => {
+            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => {
                 let (config, weights) = model::load_gemma4_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::Gemma4(weights))
             }
@@ -822,14 +823,15 @@ impl Runner {
         ));
         if options.speculative.enabled && self.speculative_assistant.is_some() {
             items.push(format!(
-                "mtp=greedy assistant={} draft_tokens={} adaptive={}",
+                "mtp=greedy assistant={} draft_tokens={} adaptive={} min_accept_rate={:.2}",
                 options
                     .speculative
                     .assistant_path
                     .as_deref()
                     .unwrap_or("attached"),
                 options.speculative.max_draft_tokens,
-                options.speculative.adaptive
+                options.speculative.adaptive,
+                options.speculative.min_accept_rate
             ));
         } else {
             items.push(String::from("mtp=off"));
@@ -846,6 +848,14 @@ impl Runner {
                 "Ministral context metadata advertises {} tokens; default runtime cap is {} unless --max-context overrides it.",
                 self.config.max_seq_len,
                 self.effective_max_context(options)
+            ));
+        }
+        if options.speculative.enabled
+            && self.speculative_assistant.is_some()
+            && options.sampler.temperature != 0.0
+        {
+            warnings.push(String::from(
+                "MTP assistant is loaded, but MTP is greedy-only and will stay disabled unless --temp 0 is used.",
             ));
         }
         if matches!(
@@ -884,6 +894,37 @@ impl Runner {
                 "MTP assistant context is too small for speculative decoding.",
             ));
         }
+        // Detect DeepSeek/Gemma-style "NextN" MTP heads, which are *not* standalone
+        // draft models: they share the target's hidden state via a `nextn.*`
+        // projection and typically ship without per-layer attn_k / attn_v weights.
+        // Running them through the standard speculative decoder produces gibberish
+        // drafts (acceptance rate ~0), so refuse to attach with a clear message.
+        let has_nextn = assistant
+            .gguf
+            .tensors
+            .iter()
+            .any(|t| t.name.starts_with("nextn.") || t.name.contains(".nextn."));
+        let has_any_attn_k = assistant
+            .gguf
+            .tensors
+            .iter()
+            .any(|t| t.name.ends_with(".attn_k.weight"));
+        if has_nextn || !has_any_attn_k {
+            return Err(format!(
+                "MTP assistant '{}' is a NextN/MTP-head checkpoint (nextn.* projection{}), \
+                 not a standalone draft model. RustyLLM's speculative decoder needs a \
+                 separately-trained small LM with full attn_k/attn_v weights. \
+                 Use a small standalone model (e.g. a 1B/3B sibling) as --mtp-assistant instead.",
+                assistant
+                    .model_name()
+                    .unwrap_or(assistant.architecture()),
+                if has_any_attn_k {
+                    ""
+                } else {
+                    ", missing attn_k weights"
+                }
+            ));
+        }
         Ok(())
     }
 
@@ -893,7 +934,7 @@ impl Runner {
         }
         match self.arch.as_str() {
             "mistral" | "mistral3" | "ministral" => RuntimeProfile::Mistral,
-            "gemma" | "gemma2" | "gemma4" => RuntimeProfile::Gemma,
+            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => RuntimeProfile::Gemma,
             _ => RuntimeProfile::Auto,
         }
     }

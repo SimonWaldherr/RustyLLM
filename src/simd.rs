@@ -103,6 +103,33 @@ enum MatvecKind {
     Mxfp4,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KQuantMatvecKind {
+    Q4K,
+    Q5K,
+    Q6K,
+}
+
+impl KQuantMatvecKind {
+    #[inline]
+    fn matvec_kind(self) -> MatvecKind {
+        match self {
+            Self::Q4K => MatvecKind::Q4K,
+            Self::Q5K => MatvecKind::Q5K,
+            Self::Q6K => MatvecKind::Q6K,
+        }
+    }
+
+    #[inline]
+    fn row_bytes(self, cols: usize) -> usize {
+        match self {
+            Self::Q4K => (cols / 256) * 144,
+            Self::Q5K => (cols / 256) * 176,
+            Self::Q6K => (cols / 256) * 210,
+        }
+    }
+}
+
 /// Runs an f32 matrix-vector job through the worker pool.
 fn parallel_matvec_f32(out: &mut [f32], rows: usize, cols: usize, data: &[f32], x: &[f32]) {
     parallel_matvec(
@@ -263,7 +290,9 @@ impl MatvecJob {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct Q4KMatvec3Job {
-    kind: MatvecKind,
+    kind_a: MatvecKind,
+    kind_b: MatvecKind,
+    kind_c: MatvecKind,
     a_data: *const u8,
     b_data: *const u8,
     c_data: *const u8,
@@ -275,7 +304,9 @@ struct Q4KMatvec3Job {
     rows_b: usize,
     rows_c: usize,
     cols: usize,
-    row_span: usize,
+    row_span_a: usize,
+    row_span_b: usize,
+    row_span_c: usize,
     workers: usize,
 }
 
@@ -299,12 +330,12 @@ impl Q4KMatvec3Job {
 
         let (a_start, a_end) = clipped_range(start, end, 0, self.rows_a);
         q4k_matvec3_rows(
-            self.kind,
+            self.kind_a,
             self.a_data,
             self.x,
             self.out_a,
             self.cols,
-            self.row_span,
+            self.row_span_a,
             a_start,
             a_end,
         );
@@ -312,12 +343,12 @@ impl Q4KMatvec3Job {
         let b_offset = self.rows_a;
         let (b_start, b_end) = clipped_range(start, end, b_offset, self.rows_b);
         q4k_matvec3_rows(
-            self.kind,
+            self.kind_b,
             self.b_data,
             self.x,
             self.out_b,
             self.cols,
-            self.row_span,
+            self.row_span_b,
             b_start,
             b_end,
         );
@@ -325,12 +356,12 @@ impl Q4KMatvec3Job {
         let c_offset = self.rows_a + self.rows_b;
         let (c_start, c_end) = clipped_range(start, end, c_offset, self.rows_c);
         q4k_matvec3_rows(
-            self.kind,
+            self.kind_c,
             self.c_data,
             self.x,
             self.out_c,
             self.cols,
-            self.row_span,
+            self.row_span_c,
             c_start,
             c_end,
         );
@@ -1220,7 +1251,9 @@ pub fn matvec_q4_k3_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
-            kind: MatvecKind::Q4K,
+            kind_a: MatvecKind::Q4K,
+            kind_b: MatvecKind::Q4K,
+            kind_c: MatvecKind::Q4K,
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
@@ -1232,7 +1265,9 @@ pub fn matvec_q4_k3_into(
             rows_b,
             rows_c,
             cols: cols_a,
-            row_span: row_bytes,
+            row_span_a: row_bytes,
+            row_span_b: row_bytes,
+            row_span_c: row_bytes,
             workers,
         });
         true
@@ -1307,7 +1342,9 @@ pub fn matvec_q4_k2_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
-            kind: MatvecKind::Q4K,
+            kind_a: MatvecKind::Q4K,
+            kind_b: MatvecKind::Q4K,
+            kind_c: MatvecKind::Q4K,
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
@@ -1319,7 +1356,9 @@ pub fn matvec_q4_k2_into(
             rows_b,
             rows_c: 0,
             cols: cols_a,
-            row_span: row_bytes,
+            row_span_a: row_bytes,
+            row_span_b: row_bytes,
+            row_span_c: row_bytes,
             workers,
         });
         true
@@ -1327,33 +1366,34 @@ pub fn matvec_q4_k2_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn matvec_k3_into(
-    kind: MatvecKind,
-    row_bytes: usize,
-    a: (&[u8], usize, usize),
-    b: (&[u8], usize, usize),
-    c: (&[u8], usize, usize),
+pub fn matvec_kquant3_into(
+    a: (KQuantMatvecKind, &[u8], usize, usize),
+    b: (KQuantMatvecKind, &[u8], usize, usize),
+    c: (KQuantMatvecKind, &[u8], usize, usize),
     x: &[f32],
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
     out_c: &mut Vec<f32>,
 ) -> bool {
-    let (weights_a, rows_a, cols_a) = a;
-    let (weights_b, rows_b, cols_b) = b;
-    let (weights_c, rows_c, cols_c) = c;
+    let (kind_a, weights_a, rows_a, cols_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b) = b;
+    let (kind_c, weights_c, rows_c, cols_c) = c;
     if cols_a == 0 || cols_a % 256 != 0 || cols_a != cols_b || cols_a != cols_c || cols_a != x.len()
     {
         return false;
     }
-    let needed_a = match row_bytes.checked_mul(rows_a) {
+    let row_bytes_a = kind_a.row_bytes(cols_a);
+    let row_bytes_b = kind_b.row_bytes(cols_b);
+    let row_bytes_c = kind_c.row_bytes(cols_c);
+    let needed_a = match row_bytes_a.checked_mul(rows_a) {
         Some(v) => v,
         None => return false,
     };
-    let needed_b = match row_bytes.checked_mul(rows_b) {
+    let needed_b = match row_bytes_b.checked_mul(rows_b) {
         Some(v) => v,
         None => return false,
     };
-    let needed_c = match row_bytes.checked_mul(rows_c) {
+    let needed_c = match row_bytes_c.checked_mul(rows_c) {
         Some(v) => v,
         None => return false,
     };
@@ -1367,26 +1407,29 @@ fn matvec_k3_into(
 
     #[cfg(target_family = "wasm")]
     {
+        let kind_a = kind_a.matvec_kind();
+        let kind_b = kind_b.matvec_kind();
+        let kind_c = kind_c.matvec_kind();
         for row in 0..rows_a {
             out_a[row] = dot_row_from_kind(
-                kind,
-                &weights_a[row * row_bytes..(row + 1) * row_bytes],
+                kind_a,
+                &weights_a[row * row_bytes_a..(row + 1) * row_bytes_a],
                 x,
                 cols_a,
             );
         }
         for row in 0..rows_b {
             out_b[row] = dot_row_from_kind(
-                kind,
-                &weights_b[row * row_bytes..(row + 1) * row_bytes],
+                kind_b,
+                &weights_b[row * row_bytes_b..(row + 1) * row_bytes_b],
                 x,
                 cols_a,
             );
         }
         for row in 0..rows_c {
             out_c[row] = dot_row_from_kind(
-                kind,
-                &weights_c[row * row_bytes..(row + 1) * row_bytes],
+                kind_c,
+                &weights_c[row * row_bytes_c..(row + 1) * row_bytes_c],
                 x,
                 cols_a,
             );
@@ -1402,7 +1445,9 @@ fn matvec_k3_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
-            kind,
+            kind_a: kind_a.matvec_kind(),
+            kind_b: kind_b.matvec_kind(),
+            kind_c: kind_c.matvec_kind(),
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
@@ -1414,11 +1459,42 @@ fn matvec_k3_into(
             rows_b,
             rows_c,
             cols: cols_a,
-            row_span: row_bytes,
+            row_span_a: row_bytes_a,
+            row_span_b: row_bytes_b,
+            row_span_c: row_bytes_c,
             workers,
         });
         true
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matvec_k3_into(
+    kind: MatvecKind,
+    _row_bytes: usize,
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let kkind = match kind {
+        MatvecKind::Q4K => KQuantMatvecKind::Q4K,
+        MatvecKind::Q5K => KQuantMatvecKind::Q5K,
+        MatvecKind::Q6K => KQuantMatvecKind::Q6K,
+        _ => return false,
+    };
+    matvec_kquant3_into(
+        (kkind, a.0, a.1, a.2),
+        (kkind, b.0, b.1, b.2),
+        (kkind, c.0, c.1, c.2),
+        x,
+        out_a,
+        out_b,
+        out_c,
+    )
 }
 
 fn matvec_k2_into(
@@ -1479,7 +1555,9 @@ fn matvec_k2_into(
         }
         let workers = num_threads().min(total_rows);
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
-            kind,
+            kind_a: kind,
+            kind_b: kind,
+            kind_c: kind,
             a_data: weights_a.as_ptr(),
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
@@ -1491,7 +1569,9 @@ fn matvec_k2_into(
             rows_b,
             rows_c: 0,
             cols: cols_a,
-            row_span: row_bytes,
+            row_span_a: row_bytes,
+            row_span_b: row_bytes,
+            row_span_c: row_bytes,
             workers,
         });
         true
@@ -3241,5 +3321,40 @@ mod tests {
         ));
         assert_eq!(out_a, exp_a);
         assert_eq!(out_b, exp_b);
+    }
+
+    #[test]
+    /// Verifies mixed K-quant fusion covers Ministral-style Q4/Q4/Q6 attention.
+    fn mixed_kquant_matvec3_matches_separate_matvecs() {
+        let cols = 512;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.031).sin() * 0.2) + ((i % 5) as f32 * 0.04))
+            .collect();
+        let q = make_q4k_weights(4, cols, 3);
+        let k = make_q4k_weights(2, cols, 13);
+        let v = make_q6k_weights(2, cols, 23);
+
+        let mut exp_q = Vec::new();
+        let mut exp_k = Vec::new();
+        let mut exp_v = Vec::new();
+        matvec_q4_k_into(&q, &x, 4, cols, &mut exp_q);
+        matvec_q4_k_into(&k, &x, 2, cols, &mut exp_k);
+        matvec_q6_k_into(&v, &x, 2, cols, &mut exp_v);
+
+        let mut out_q = Vec::new();
+        let mut out_k = Vec::new();
+        let mut out_v = Vec::new();
+        assert!(matvec_kquant3_into(
+            (KQuantMatvecKind::Q4K, &q, 4, cols),
+            (KQuantMatvecKind::Q4K, &k, 2, cols),
+            (KQuantMatvecKind::Q6K, &v, 2, cols),
+            &x,
+            &mut out_q,
+            &mut out_k,
+            &mut out_v
+        ));
+        assert_eq!(out_q, exp_q);
+        assert_eq!(out_k, exp_k);
+        assert_eq!(out_v, exp_v);
     }
 }

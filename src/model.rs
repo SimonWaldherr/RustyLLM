@@ -421,6 +421,45 @@ fn try_q4k_matvec3_into(
                 v,
             )
         }
+        (
+            Weight::Quantized {
+                data: q_data,
+                dtype: q_dtype,
+                rows: q_rows,
+                cols: q_cols,
+            },
+            Weight::Quantized {
+                data: k_data,
+                dtype: k_dtype,
+                rows: k_rows,
+                cols: k_cols,
+            },
+            Weight::Quantized {
+                data: v_data,
+                dtype: v_dtype,
+                rows: v_rows,
+                cols: v_cols,
+            },
+        ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
+            let Some(q_kind) = kquant_matvec_kind(*q_dtype) else {
+                return false;
+            };
+            let Some(k_kind) = kquant_matvec_kind(*k_dtype) else {
+                return false;
+            };
+            let Some(v_kind) = kquant_matvec_kind(*v_dtype) else {
+                return false;
+            };
+            crate::simd::matvec_kquant3_into(
+                (q_kind, q_data.as_slice(), *q_rows, *q_cols),
+                (k_kind, k_data.as_slice(), *k_rows, *k_cols),
+                (v_kind, v_data.as_slice(), *v_rows, *v_cols),
+                x,
+                q,
+                k,
+                v,
+            )
+        }
         _ => false,
     }
 }
@@ -510,6 +549,16 @@ fn try_q4k_matvec2_into(
             out_b,
         ),
         _ => false,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn kquant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::KQuantMatvecKind> {
+    match dtype {
+        GGMLType::Q4_K => Some(crate::simd::KQuantMatvecKind::Q4K),
+        GGMLType::Q5_K => Some(crate::simd::KQuantMatvecKind::Q5K),
+        GGMLType::Q6_K => Some(crate::simd::KQuantMatvecKind::Q6K),
+        _ => None,
     }
 }
 
@@ -1909,29 +1958,32 @@ fn online_attention_with_sink(
 
     for t in start_t..=end_t {
         let k_off = t * key_stride;
-        let score = simd::dot_f32(query, &keys[k_off..k_off + key_head_dim]) * scale;
+        let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
+        let score = simd::dot_f32(query, keys_sub) * scale;
         let v_off = t * value_stride;
-        let value_row = &values[v_off..v_off + value_head_dim];
+        let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
         if score > max_score {
             let old_scale = if max_score.is_finite() {
                 exp_attn(max_score - score)
             } else {
                 0.0
             };
-            simd::scale_add_f32(&mut out[..value_head_dim], old_scale, value_row);
+            simd::scale_add_f32(out_sub, old_scale, value_row);
             denom = denom * old_scale + 1.0;
             max_score = score;
         } else {
             let weight = exp_attn(score - max_score);
-            simd::axpy_f32(&mut out[..value_head_dim], weight, value_row);
+            simd::axpy_f32(out_sub, weight, value_row);
             denom += weight;
         }
     }
 
     if denom > 0.0 {
         let inv = 1.0 / denom;
-        simd::scale_f32(&mut out[..value_head_dim], inv);
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
+        simd::scale_f32(out_sub, inv);
     }
 }
 
@@ -1955,29 +2007,32 @@ fn online_attention(
 
     for t in start_t..=end_t {
         let k_off = t * key_stride;
-        let score = simd::dot_f32(query, &keys[k_off..k_off + key_head_dim]) * scale;
+        let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
+        let score = simd::dot_f32(query, keys_sub) * scale;
         let v_off = t * value_stride;
-        let value_row = &values[v_off..v_off + value_head_dim];
+        let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
         if score > max_score {
             let old_scale = if max_score.is_finite() {
                 exp_attn(max_score - score)
             } else {
                 0.0
             };
-            simd::scale_add_f32(&mut out[..value_head_dim], old_scale, value_row);
+            simd::scale_add_f32(out_sub, old_scale, value_row);
             denom = denom * old_scale + 1.0;
             max_score = score;
         } else {
             let weight = exp_attn(score - max_score);
-            simd::axpy_f32(&mut out[..value_head_dim], weight, value_row);
+            simd::axpy_f32(out_sub, weight, value_row);
             denom += weight;
         }
     }
 
     if denom > 0.0 {
         let inv = 1.0 / denom;
-        simd::scale_f32(&mut out[..value_head_dim], inv);
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
+        simd::scale_f32(out_sub, inv);
     }
 }
 
@@ -2750,9 +2805,10 @@ pub fn load_gemma4_model(
                 if !k.starts_with(&prefix) || !k.ends_with(".weight") {
                     continue;
                 }
+                let rest = &k[prefix.len()..];
                 let mut ok = true;
                 for s in subs.iter() {
-                    if !k.contains(s) {
+                    if !rest.contains(s) {
                         ok = false;
                         break;
                     }
