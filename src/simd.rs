@@ -1632,6 +1632,10 @@ pub fn matvec_q6_k3_into(
     out_b: &mut Vec<f32>,
     out_c: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q6k_matvec3_into(a, b, c, x, out_a, out_b, out_c) {
+        return true;
+    }
     matvec_k3_into(
         MatvecKind::Q6K,
         (a.2 / 256) * 210,
@@ -1653,6 +1657,10 @@ pub fn matvec_q6_k2_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
+    #[cfg(not(target_family = "wasm"))]
+    if crate::metal::q6k_matvec2_into(a, b, x, out_a, out_b) {
+        return true;
+    }
     matvec_k2_into(MatvecKind::Q6K, (a.2 / 256) * 210, a, b, x, out_a, out_b)
 }
 

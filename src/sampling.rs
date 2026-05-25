@@ -117,7 +117,7 @@ pub fn sample_with_scratch(
         return sample_top_k(logits, config.top_k, config.top_p, rng, candidates);
     }
 
-    // Softmax
+    // Convert logits into positive sampling weights.
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in logits.iter_mut() {
@@ -132,53 +132,45 @@ pub fn sample_with_scratch(
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
     }
-    let inv_sum = 1.0 / sum;
-    for v in logits.iter_mut() {
-        *v *= inv_sum;
-    }
 
     // Top-P (nucleus sampling)
     if config.top_p < 1.0 {
-        let mut sorted: Vec<(usize, f32)> = logits.iter().cloned().enumerate().collect();
-        sorted.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        candidates.clear();
+        if candidates.capacity() < n {
+            candidates.reserve(n - candidates.capacity());
+        }
+        candidates.extend(logits.iter().copied().enumerate());
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut cumsum = 0.0f32;
-        let mut cutoff_idx = sorted.len();
-        for (i, &(_, p)) in sorted.iter().enumerate() {
-            cumsum += p;
-            if cumsum > config.top_p {
+        let mut cutoff_idx = candidates.len();
+        let threshold = config.top_p * sum;
+        for (i, &(_, weight)) in candidates.iter().enumerate() {
+            cumsum += weight;
+            if cumsum > threshold {
                 cutoff_idx = i + 1;
                 break;
             }
         }
 
-        // Zero out tokens below cutoff
-        let mut keep = vec![false; n];
-        for &(idx, _) in &sorted[..cutoff_idx] {
-            keep[idx] = true;
-        }
-        let mut new_sum = 0.0f32;
-        for i in 0..n {
-            if !keep[i] {
-                logits[i] = 0.0;
-            } else {
-                new_sum += logits[i];
+        if cumsum.is_finite() && cumsum > 0.0 {
+            let r = rng.next_f32() * cumsum;
+            let mut seen = 0.0f32;
+            for &(idx, p) in &candidates[..cutoff_idx] {
+                seen += p;
+                if seen > r {
+                    return idx as u32;
+                }
             }
-        }
-        // Renormalize
-        if new_sum > 0.0 {
-            let inv = 1.0 / new_sum;
-            for v in logits.iter_mut() {
-                *v *= inv;
-            }
+            return candidates[cutoff_idx - 1].0 as u32;
         }
     }
 
     // Sample from distribution
-    let r = rng.next_f32();
+    let r = rng.next_f32() * sum;
     let mut cumsum = 0.0f32;
-    for (i, &p) in logits.iter().enumerate() {
-        cumsum += p;
+    for (i, &weight) in logits.iter().enumerate() {
+        cumsum += weight;
         if cumsum > r {
             return i as u32;
         }
@@ -196,6 +188,10 @@ fn sample_top_k(
     rng: &mut Rng,
     candidates: &mut Vec<(usize, f32)>,
 ) -> u32 {
+    if top_k == 1 {
+        return argmax_token(logits);
+    }
+
     candidates.clear();
     if candidates.capacity() < top_k {
         candidates.reserve(top_k - candidates.capacity());
@@ -220,42 +216,37 @@ fn sample_top_k(
 
     let max = candidates[0].1;
     let mut sum = 0.0f32;
-    for (_, prob) in candidates.iter_mut() {
-        *prob = (*prob - max).exp();
-        sum += *prob;
+    for (_, weight) in candidates.iter_mut() {
+        *weight = (*weight - max).exp();
+        sum += *weight;
     }
     if !sum.is_finite() || sum <= 0.0 {
         return candidates[0].0 as u32;
     }
-    let inv_sum = 1.0 / sum;
-    for (_, prob) in candidates.iter_mut() {
-        *prob *= inv_sum;
-    }
 
     let mut cutoff = candidates.len();
+    let mut kept_sum = sum;
     if top_p < 1.0 {
         let mut cumsum = 0.0f32;
-        for (i, &(_, prob)) in candidates.iter().enumerate() {
-            cumsum += prob;
-            if cumsum > top_p {
+        let threshold = top_p * sum;
+        for (i, &(_, weight)) in candidates.iter().enumerate() {
+            cumsum += weight;
+            if cumsum > threshold {
                 cutoff = i + 1;
+                kept_sum = cumsum;
                 break;
             }
         }
-
-        let kept_sum: f32 = candidates[..cutoff].iter().map(|&(_, prob)| prob).sum();
-        if kept_sum > 0.0 {
-            let inv = 1.0 / kept_sum;
-            for (_, prob) in candidates[..cutoff].iter_mut() {
-                *prob *= inv;
-            }
-        }
     }
 
-    let r = rng.next_f32();
+    if !kept_sum.is_finite() || kept_sum <= 0.0 {
+        return candidates[0].0 as u32;
+    }
+
+    let r = rng.next_f32() * kept_sum;
     let mut cumsum = 0.0f32;
-    for &(idx, prob) in &candidates[..cutoff] {
-        cumsum += prob;
+    for &(idx, weight) in &candidates[..cutoff] {
+        cumsum += weight;
         if cumsum > r {
             return idx as u32;
         }
@@ -360,6 +351,23 @@ mod tests {
             temperature: 1.0,
             top_p: 0.6,
             top_k: 2,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        for _ in 0..64 {
+            let mut logits = vec![10.0, 9.0, 0.0, -1.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert_eq!(token, 0);
+        }
+    }
+
+    #[test]
+    /// Verifies that nucleus sampling also truncates the full vocabulary path.
+    fn top_p_truncates_without_top_k() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 0.6,
+            top_k: 0,
             repeat_penalty: 1.0,
         };
         let mut rng = Rng::new(42);

@@ -785,3 +785,20 @@ cargo test runtime::tests
   the exact local model name.
 - Multimodal request bodies are accepted for API compatibility, but images are
   represented as text placeholders rather than processed by a vision encoder.
+
+## Alternatives
+
+RustyLLM is intentionally small and learning-oriented. If you need production
+throughput, GPU offloading, a polished GUI, or broader model and quantization
+coverage, one of the following projects is likely a better fit.
+
+| Project | Language | Focus |
+|---|---|---|
+| [llama.cpp](https://github.com/ggerganov/llama.cpp) | C/C++ | Reference implementation for GGUF inference; the origin of the GGUF format, quantization schemes, and most SIMD/GPU kernels used across the ecosystem. Highest raw throughput for CPU and GPU inference. |
+| [Ollama](https://ollama.com) | Go + llama.cpp | User-friendly CLI and REST API wrapping llama.cpp; pulls models automatically and exposes the same `/api/` routes that RustyLLM emulates. Best choice when you want a local model running in one command. |
+| [LM Studio](https://lmstudio.ai) | Electron + llama.cpp | Desktop GUI for discovering, downloading, and chatting with local GGUF models; includes an OpenAI-compatible local server. Best for non-developers or when a visual interface matters. |
+| [mistral.rs](https://github.com/EricLBuehler/mistral.rs) | Rust | Production-grade Rust inference engine with CUDA/Metal GPU support, speculative decoding, vision models, and a Python/HTTP API. The Rust alternative to RustyLLM for real workloads. |
+| [candle](https://github.com/huggingface/candle) | Rust | Hugging Face's minimalist Rust ML framework. Runs many model families from Safetensors or GGUF; designed as a library rather than a standalone runner. |
+| [llamafile](https://github.com/Mozilla-Ocho/llamafile) | C/C++ | Packages a model and the llama.cpp runtime into a single cross-platform executable. Useful when you want to distribute a self-contained model binary. |
+| [GPT4All](https://gpt4all.io) | C++ + Qt | Cross-platform desktop application with a chat UI and a local model store; targets end users rather than developers. |
+| [koboldcpp](https://github.com/LostRuins/koboldcpp) | Python + llama.cpp | llama.cpp frontend focused on creative writing and role-play; includes a web UI and KoboldAI-compatible API routes. |

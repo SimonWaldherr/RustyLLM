@@ -1117,8 +1117,14 @@ impl Runner {
         // the KV cache with safe upper bounds.
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
 
-        let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
-        cache.sliding_window = self.effective_sliding_window(options);
+        let sliding_window = self.effective_sliding_window(options);
+        let mut cache = KVCache::with_sliding_window(
+            self.config.n_layers,
+            kv_k_dim,
+            kv_v_dim,
+            cache_len,
+            sliding_window,
+        );
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         let mut rng = if options.seed == 0 {
             let t = std::time::SystemTime::now()
@@ -1276,13 +1282,14 @@ impl Runner {
         }
 
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = assistant.kv_dims();
-        let mut cache = KVCache::new(
+        let sliding_window = assistant.effective_sliding_window(options);
+        let mut cache = KVCache::with_sliding_window(
             assistant.config.n_layers,
             kv_k_dim,
             kv_v_dim,
             assistant_cache_len,
+            sliding_window,
         );
-        cache.sliding_window = assistant.effective_sliding_window(options);
         let mut buf = DecodeBuffer::new(
             &assistant.config,
             max_head_dim,
@@ -1769,7 +1776,14 @@ impl Runner {
     pub fn new_session(&self, max_cached_tokens: usize) -> crate::session::Session {
         let cap = max_cached_tokens.min(self.config.max_seq_len).max(1);
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
-        let kv_cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cap);
+        let sliding_window = (self.config.sliding_window > 0).then_some(self.config.sliding_window);
+        let kv_cache = KVCache::with_sliding_window(
+            self.config.n_layers,
+            kv_k_dim,
+            kv_v_dim,
+            cap,
+            sliding_window,
+        );
         let decode_buf =
             DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         crate::session::Session::new(kv_cache, decode_buf)
@@ -1819,7 +1833,12 @@ impl Runner {
             return Err(String::from("Prompt rendered to zero tokens."));
         }
 
-        session.kv_cache.sliding_window = self.effective_sliding_window(options);
+        if session
+            .kv_cache
+            .set_sliding_window(self.effective_sliding_window(options))
+        {
+            session.reset();
+        }
         let cache_limit = session.kv_cache.max_len;
 
         // If the prompt alone already exceeds the KV-cache capacity, reset the

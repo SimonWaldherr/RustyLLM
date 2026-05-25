@@ -16,9 +16,10 @@ pub struct Tokenizer {
     vocab: Vec<String>,
     scores: Vec<f32>,
     token_to_id: HashMap<String, u32>,
-    merge_ranks: HashMap<(String, String), usize>,
-    byte_encoder: HashMap<u8, char>,
+    bpe_merges: HashMap<(u32, u32), (usize, u32)>,
+    byte_encoder: [char; 256],
     byte_decoder: HashMap<char, u8>,
+    byte_token_ids: [Option<u32>; 256],
     mode: TokenizerMode,
     add_bos_token: bool,
     pub bos_id: u32,
@@ -43,14 +44,23 @@ impl Tokenizer {
             token_to_id.insert(tok.clone(), i as u32);
         }
 
-        let mut merge_ranks = HashMap::new();
+        let mut bpe_merges = HashMap::new();
         if let Some(merges) = metadata
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_string_array())
         {
             for (rank, merge) in merges.iter().enumerate() {
                 if let Some((left, right)) = merge.split_once(' ') {
-                    merge_ranks.insert((left.to_string(), right.to_string()), rank);
+                    let mut merged = String::with_capacity(left.len() + right.len());
+                    merged.push_str(left);
+                    merged.push_str(right);
+                    if let (Some(&left_id), Some(&right_id), Some(&merged_id)) = (
+                        token_to_id.get(left),
+                        token_to_id.get(right),
+                        token_to_id.get(&merged),
+                    ) {
+                        bpe_merges.insert((left_id, right_id), (rank, merged_id));
+                    }
                 }
             }
         }
@@ -66,9 +76,10 @@ impl Tokenizer {
 
         // GGUF tokenizer metadata is not fully standardized across model
         // families, so mode selection uses a few conservative hints.
+        let pre_lower = pre.to_ascii_lowercase();
         let mode = if model.eq_ignore_ascii_case("gpt2")
-            || pre.to_ascii_lowercase().contains("qwen")
-            || pre.to_ascii_lowercase().contains("gpt")
+            || pre_lower.contains("qwen")
+            || pre_lower.contains("gpt")
         {
             TokenizerMode::Gpt2Bpe
         } else {
@@ -76,6 +87,11 @@ impl Tokenizer {
         };
 
         let (byte_encoder, byte_decoder) = build_byte_maps();
+        let mut byte_token_ids = [None; 256];
+        for byte in 0u16..=255 {
+            let byte_tok = format!("<0x{:02X}>", byte);
+            byte_token_ids[byte as usize] = token_to_id.get(&byte_tok).copied();
+        }
 
         let bos_id = metadata
             .get("tokenizer.ggml.bos_token_id")
@@ -98,9 +114,10 @@ impl Tokenizer {
             vocab,
             scores,
             token_to_id,
-            merge_ranks,
+            bpe_merges,
             byte_encoder,
             byte_decoder,
+            byte_token_ids,
             mode,
             add_bos_token,
             bos_id,
@@ -175,12 +192,19 @@ impl Tokenizer {
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         // SentencePiece models encode word starts with U+2581, so we inject a
         // leading space before splitting to preserve first-token behavior.
-        let processed = format!(" {}", text);
-        let processed = processed.replace(' ', "\u{2581}");
-        let current_tokens = self.encode_from_pieces(processed.chars().map(|ch| ch.to_string()));
+        let mut current_tokens = Vec::with_capacity(text.len() + 1);
+        self.encode_piece("\u{2581}", &mut current_tokens);
+        for ch in text.chars() {
+            if ch == ' ' {
+                self.encode_piece("\u{2581}", &mut current_tokens);
+            } else {
+                let mut buf = [0u8; 4];
+                self.encode_piece(ch.encode_utf8(&mut buf), &mut current_tokens);
+            }
+        }
 
         // Iterative BPE merge: find best adjacent pair by score, merge it
-        let mut current_tokens = current_tokens;
+        let mut merged = String::new();
         loop {
             if current_tokens.len() < 2 {
                 break;
@@ -191,12 +215,10 @@ impl Tokenizer {
             let mut best_id = 0u32;
 
             for i in 0..current_tokens.len() - 1 {
-                let merged = format!(
-                    "{}{}",
-                    self.decode_raw(current_tokens[i]),
-                    self.decode_raw(current_tokens[i + 1])
-                );
-                if let Some(&id) = self.token_to_id.get(&merged) {
+                merged.clear();
+                merged.push_str(self.decode_raw(current_tokens[i]));
+                merged.push_str(self.decode_raw(current_tokens[i + 1]));
+                if let Some(&id) = self.token_to_id.get(merged.as_str()) {
                     let score = if (id as usize) < self.scores.len() {
                         self.scores[id as usize]
                     } else {
@@ -226,63 +248,55 @@ impl Tokenizer {
         for piece in pretokenize_gpt2(text) {
             // GPT-2 style BPE operates on a reversible byte-level alphabet
             // before merge ranks are applied.
-            let mut encoded = String::with_capacity(piece.len());
+            let mut symbols = Vec::with_capacity(piece.len());
             for &byte in piece.as_bytes() {
-                if let Some(&ch) = self.byte_encoder.get(&byte) {
-                    encoded.push(ch);
+                let ch = self.byte_encoder[byte as usize];
+                let mut buf = [0u8; 4];
+                let symbol = ch.encode_utf8(&mut buf);
+                if let Some(&id) = self.token_to_id.get(symbol) {
+                    symbols.push(id);
+                } else {
+                    self.encode_piece(symbol, &mut symbols);
                 }
             }
 
-            let mut symbols: Vec<String> = encoded.chars().map(|ch| ch.to_string()).collect();
             while symbols.len() > 1 {
                 let mut best_rank = usize::MAX;
                 let mut best_idx = None;
+                let mut best_id = 0u32;
                 for i in 0..symbols.len() - 1 {
-                    let pair = (symbols[i].clone(), symbols[i + 1].clone());
-                    if let Some(&rank) = self.merge_ranks.get(&pair) {
+                    if let Some(&(rank, merged_id)) =
+                        self.bpe_merges.get(&(symbols[i], symbols[i + 1]))
+                    {
                         if rank < best_rank {
                             best_rank = rank;
                             best_idx = Some(i);
+                            best_id = merged_id;
                         }
                     }
                 }
 
                 let Some(i) = best_idx else { break };
-                let merged = format!("{}{}", symbols[i], symbols[i + 1]);
-                symbols[i] = merged;
+                symbols[i] = best_id;
                 symbols.remove(i + 1);
             }
 
-            for symbol in symbols {
-                if let Some(&id) = self.token_to_id.get(&symbol) {
-                    out.push(id);
-                } else {
-                    out.extend(self.encode_from_pieces([symbol]));
-                }
-            }
+            out.extend(symbols);
         }
         out
     }
 
     /// Maps token pieces to IDs, falling back to byte tokens when needed.
-    fn encode_from_pieces<I>(&self, pieces: I) -> Vec<u32>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        let mut out = Vec::new();
-        for piece in pieces {
-            if let Some(&id) = self.token_to_id.get(&piece) {
-                out.push(id);
-            } else {
-                for byte in piece.as_bytes() {
-                    let byte_tok = format!("<0x{:02X}>", byte);
-                    if let Some(&id) = self.token_to_id.get(&byte_tok) {
-                        out.push(id);
-                    }
+    fn encode_piece(&self, piece: &str, out: &mut Vec<u32>) {
+        if let Some(&id) = self.token_to_id.get(piece) {
+            out.push(id);
+        } else {
+            for &byte in piece.as_bytes() {
+                if let Some(id) = self.byte_token_ids[byte as usize] {
+                    out.push(id);
                 }
             }
         }
-        out
     }
 
     /// Decodes GPT-2 byte-level token text back to UTF-8 where possible.
@@ -292,7 +306,8 @@ impl Tokenizer {
             if let Some(&b) = self.byte_decoder.get(&ch) {
                 bytes.push(b);
             } else {
-                bytes.extend_from_slice(ch.to_string().as_bytes());
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             }
         }
         String::from_utf8_lossy(&bytes).into_owned()
@@ -300,59 +315,84 @@ impl Tokenizer {
 }
 
 /// Splits text into GPT-2 BPE pre-token chunks.
-fn pretokenize_gpt2(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
+fn pretokenize_gpt2(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut i = 0usize;
 
     // This is a lightweight approximation of GPT-2's regex pre-tokenizer:
     // group leading whitespace with the following token and split runs of
     // letters, digits, and punctuation separately.
-    while i < chars.len() {
+    while i < text.len() {
         let start = i;
         let mut had_space = false;
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < text.len() {
+            let ch = text[i..]
+                .chars()
+                .next()
+                .expect("byte index is on a char boundary");
+            if !ch.is_whitespace() {
+                break;
+            }
             had_space = true;
-            i += 1;
+            i += ch.len_utf8();
         }
 
-        if i >= chars.len() {
+        if i >= text.len() {
             if had_space {
-                pieces.push(chars[start..i].iter().collect());
+                pieces.push(&text[start..i]);
             }
             break;
         }
 
-        let mut j = i;
-        let c = chars[i];
+        let token_start = i;
+        let c = text[i..]
+            .chars()
+            .next()
+            .expect("byte index is on a char boundary");
         if c.is_alphabetic() {
-            while j < chars.len() && chars[j].is_alphabetic() {
-                j += 1;
+            while i < text.len() {
+                let ch = text[i..]
+                    .chars()
+                    .next()
+                    .expect("byte index is on a char boundary");
+                if !ch.is_alphabetic() {
+                    break;
+                }
+                i += ch.len_utf8();
             }
         } else if c.is_numeric() {
-            while j < chars.len() && chars[j].is_numeric() {
-                j += 1;
+            while i < text.len() {
+                let ch = text[i..]
+                    .chars()
+                    .next()
+                    .expect("byte index is on a char boundary");
+                if !ch.is_numeric() {
+                    break;
+                }
+                i += ch.len_utf8();
             }
         } else {
-            while j < chars.len()
-                && !chars[j].is_whitespace()
-                && !chars[j].is_alphabetic()
-                && !chars[j].is_numeric()
-            {
-                j += 1;
+            while i < text.len() {
+                let ch = text[i..]
+                    .chars()
+                    .next()
+                    .expect("byte index is on a char boundary");
+                if ch.is_whitespace() || ch.is_alphabetic() || ch.is_numeric() {
+                    break;
+                }
+                i += ch.len_utf8();
             }
         }
 
-        let piece_start = if had_space { start } else { i };
-        pieces.push(chars[piece_start..j].iter().collect());
-        i = j;
+        let piece_start = if had_space { start } else { token_start };
+        pieces.push(&text[piece_start..i]);
     }
 
     pieces
 }
 
 /// Builds reversible GPT-2 byte encoder and decoder tables.
-fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
+fn build_byte_maps() -> ([char; 256], HashMap<char, u8>) {
     // Mirrors GPT-2's bytes_to_unicode table so arbitrary byte sequences can
     // flow through BPE merges without losing reversibility.
     let mut bs: Vec<u32> = (b'!'..=b'~').map(|b| b as u32).collect();
@@ -369,11 +409,11 @@ fn build_byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
         }
     }
 
-    let mut enc = HashMap::with_capacity(256);
+    let mut enc = ['\0'; 256];
     let mut dec = HashMap::with_capacity(256);
     for (b, c) in bs.into_iter().zip(cs.into_iter()) {
         if let Some(ch) = char::from_u32(c) {
-            enc.insert(b as u8, ch);
+            enc[b as usize] = ch;
             dec.insert(ch, b as u8);
         }
     }

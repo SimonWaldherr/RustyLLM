@@ -213,9 +213,17 @@ impl Weight {
                 let data = data.as_slice();
                 out.resize(*rows, 0.0);
                 match dtype {
-                    GGMLType::Q8_0 => simd::matvec_q8_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q8_0 => {
+                        if !crate::metal::q8_0_matvec_into(data, x, *rows, *cols, out) {
+                            simd::matvec_q8_0_into(data, x, *rows, *cols, out);
+                        }
+                    }
                     GGMLType::Q8_1 => simd::matvec_q8_1_into(data, x, *rows, *cols, out),
-                    GGMLType::Q4_0 => simd::matvec_q4_0_into(data, x, *rows, *cols, out),
+                    GGMLType::Q4_0 => {
+                        if !crate::metal::q4_0_matvec_into(data, x, *rows, *cols, out) {
+                            simd::matvec_q4_0_into(data, x, *rows, *cols, out);
+                        }
+                    }
                     GGMLType::Q4_1 => simd::matvec_q4_1_into(data, x, *rows, *cols, out),
                     GGMLType::Q5_0 => simd::matvec_q5_0_into(data, x, *rows, *cols, out),
                     GGMLType::Q5_1 => simd::matvec_q5_1_into(data, x, *rows, *cols, out),
@@ -676,11 +684,12 @@ pub struct GptOssWeights {
 // ─── KV Cache ────────────────────────────────────────────────────────────────
 
 pub struct KVCache {
-    pub k: Vec<Vec<f32>>, // [layer][pos * per_pos_k_dim ..]
+    pub k: Vec<Vec<f32>>, // [layer][slot * per_pos_k_dim ..]
     pub v: Vec<Vec<f32>>,
     pub per_pos_k_dim: usize,
     pub per_pos_v_dim: usize,
     pub max_len: usize,
+    pub storage_len: usize,
     pub sliding_window: Option<usize>,
 }
 
@@ -692,20 +701,126 @@ impl KVCache {
         per_pos_v_dim: usize,
         max_len: usize,
     ) -> Self {
+        Self::with_sliding_window(n_layers, per_pos_k_dim, per_pos_v_dim, max_len, None)
+    }
+
+    /// Allocates a KV cache, using a ring buffer when sliding-window attention is active.
+    pub fn with_sliding_window(
+        n_layers: usize,
+        per_pos_k_dim: usize,
+        per_pos_v_dim: usize,
+        max_len: usize,
+        sliding_window: Option<usize>,
+    ) -> Self {
+        let max_len = max_len.max(1);
+        let storage_len = Self::storage_len_for(max_len, sliding_window);
         Self {
-            k: vec![vec![0.0; max_len * per_pos_k_dim]; n_layers],
-            v: vec![vec![0.0; max_len * per_pos_v_dim]; n_layers],
+            k: vec![vec![0.0; storage_len * per_pos_k_dim]; n_layers],
+            v: vec![vec![0.0; storage_len * per_pos_v_dim]; n_layers],
             per_pos_k_dim,
             per_pos_v_dim,
             max_len,
-            sliding_window: None,
+            storage_len,
+            sliding_window,
         }
+    }
+
+    /// Updates the active sliding window and resizes storage if the ring size changed.
+    pub fn set_sliding_window(&mut self, sliding_window: Option<usize>) -> bool {
+        let storage_len = Self::storage_len_for(self.max_len, sliding_window);
+        let changed = self.sliding_window != sliding_window || self.storage_len != storage_len;
+        self.sliding_window = sliding_window;
+        if storage_len != self.storage_len {
+            self.storage_len = storage_len;
+            for layer in &mut self.k {
+                layer.resize(storage_len * self.per_pos_k_dim, 0.0);
+            }
+            for layer in &mut self.v {
+                layer.resize(storage_len * self.per_pos_v_dim, 0.0);
+            }
+        }
+        changed
+    }
+
+    #[inline]
+    fn storage_len_for(max_len: usize, sliding_window: Option<usize>) -> usize {
+        sliding_window
+            .filter(|window| *window > 0)
+            .map(|window| window.min(max_len.max(1)))
+            .unwrap_or(max_len.max(1))
+    }
+
+    #[inline]
+    fn slot_for_pos(&self, pos: usize) -> usize {
+        if self.sliding_window.filter(|window| *window > 0).is_some() {
+            pos % self.storage_len
+        } else {
+            pos
+        }
+    }
+
+    #[inline]
+    pub fn k_offset(&self, pos: usize) -> usize {
+        self.slot_for_pos(pos) * self.per_pos_k_dim
+    }
+
+    #[inline]
+    pub fn v_offset(&self, pos: usize) -> usize {
+        self.slot_for_pos(pos) * self.per_pos_v_dim
     }
 }
 
 #[inline]
 fn active_sliding_window(config: &Config, cache: &KVCache) -> usize {
     cache.sliding_window.unwrap_or(config.sliding_window)
+}
+
+#[inline]
+fn attention_start_pos(pos: usize, sliding_window: usize) -> usize {
+    if sliding_window > 0 {
+        // Match the Mistral/Hugging Face sliding causal mask: the lower bound
+        // is exclusive, so the current token plus visible history totals
+        // exactly `sliding_window` positions.
+        pos.saturating_add(1).saturating_sub(sliding_window)
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KVCache, attention_start_pos};
+
+    #[test]
+    fn sliding_attention_start_keeps_exact_window_width() {
+        assert_eq!(attention_start_pos(0, 2), 0);
+        assert_eq!(attention_start_pos(1, 2), 0);
+        assert_eq!(attention_start_pos(2, 2), 1);
+        assert_eq!(attention_start_pos(3, 2), 2);
+    }
+
+    #[test]
+    fn sliding_attention_start_zero_disables_windowing() {
+        assert_eq!(attention_start_pos(0, 0), 0);
+        assert_eq!(attention_start_pos(128, 0), 0);
+    }
+
+    #[test]
+    fn sliding_kv_cache_uses_ring_storage_without_lowering_context_limit() {
+        let mut cache = KVCache::with_sliding_window(2, 4, 6, 128, Some(8));
+        assert_eq!(cache.max_len, 128);
+        assert_eq!(cache.storage_len, 8);
+        assert_eq!(cache.k[0].len(), 32);
+        assert_eq!(cache.v[0].len(), 48);
+        assert_eq!(cache.k_offset(9), 4);
+        assert_eq!(cache.v_offset(9), 6);
+
+        assert!(cache.set_sliding_window(None));
+        assert_eq!(cache.max_len, 128);
+        assert_eq!(cache.storage_len, 128);
+        assert_eq!(cache.k_offset(9), 36);
+        assert_eq!(cache.v_offset(9), 54);
+    }
 }
 
 // ─── Per-token decode scratch buffers (reused across tokens) ─────────────────
@@ -1945,6 +2060,7 @@ fn online_attention_with_sink(
     values: &[f32],
     key_stride: usize,
     value_stride: usize,
+    slot_count: usize,
     key_head_dim: usize,
     value_head_dim: usize,
     start_t: usize,
@@ -1957,10 +2073,11 @@ fn online_attention_with_sink(
     let mut denom = 1.0f32;
 
     for t in start_t..=end_t {
-        let k_off = t * key_stride;
+        let slot = t % slot_count;
+        let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
-        let v_off = t * value_stride;
+        let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
         let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
@@ -1995,6 +2112,7 @@ fn online_attention(
     values: &[f32],
     key_stride: usize,
     value_stride: usize,
+    slot_count: usize,
     key_head_dim: usize,
     value_head_dim: usize,
     start_t: usize,
@@ -2006,10 +2124,11 @@ fn online_attention(
     let mut denom = 0.0f32;
 
     for t in start_t..=end_t {
-        let k_off = t * key_stride;
+        let slot = t % slot_count;
+        let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
-        let v_off = t * value_stride;
+        let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
         let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
@@ -2107,6 +2226,36 @@ fn softmax_selected_into(values: &[(usize, f32)], out: &mut Vec<f32>) {
     }
 }
 
+/// Keeps only the highest router logits without sorting the full expert list.
+fn select_top_logits_into(logits: &[f32], k: usize, out: &mut Vec<(usize, f32)>) {
+    out.clear();
+    if k == 0 {
+        return;
+    }
+    if out.capacity() < k {
+        out.reserve(k - out.capacity());
+    }
+
+    for (idx, &value) in logits.iter().enumerate() {
+        if out.len() < k {
+            out.push((idx, value));
+            bubble_up_router_last(out);
+        } else if value.total_cmp(&out[out.len() - 1].1).is_gt() {
+            let last = out.len() - 1;
+            out[last] = (idx, value);
+            bubble_up_router_last(out);
+        }
+    }
+}
+
+fn bubble_up_router_last(values: &mut [(usize, f32)]) {
+    let mut i = values.len() - 1;
+    while i > 0 && values[i].1.total_cmp(&values[i - 1].1).is_gt() {
+        values.swap(i, i - 1);
+        i -= 1;
+    }
+}
+
 /// Runs one GPT-OSS decode step and returns logits.
 pub fn forward_gpt_oss(
     config: &Config,
@@ -2169,8 +2318,8 @@ pub fn forward_gpt_oss_into(
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
@@ -2179,8 +2328,8 @@ pub fn forward_gpt_oss_into(
         }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if l % 2 == 0 && sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
+        let attn_window = if l % 2 == 0 {
+            attention_start_pos(pos, sliding_window)
         } else {
             0
         };
@@ -2195,6 +2344,7 @@ pub fn forward_gpt_oss_into(
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
                 kv_v_dim,
+                cache.storage_len,
                 config.head_dim,
                 config.value_dim,
                 attn_window,
@@ -2221,11 +2371,11 @@ pub fn forward_gpt_oss_into(
             buf.router_logits[i] += layer.gate_inp_bias[i];
         }
 
-        buf.top_experts.clear();
-        buf.top_experts
-            .extend(buf.router_logits.iter().copied().enumerate());
-        buf.top_experts.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        buf.top_experts.truncate(config.expert_used_count);
+        select_top_logits_into(
+            &buf.router_logits,
+            config.expert_used_count,
+            &mut buf.top_experts,
+        );
         softmax_selected_into(&buf.top_experts, &mut buf.expert_probs);
 
         // Evaluate only the routed experts, then accumulate their weighted
@@ -2341,8 +2491,8 @@ pub fn forward_into(
         // Store KV (keys and values may have different per-head dims)
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         // debug log removed
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
@@ -2352,11 +2502,7 @@ pub fn forward_into(
         // Models with sliding-window attention should ignore cache entries that
         // fall outside the active local context.
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
-        } else {
-            0
-        };
+        let attn_window = attention_start_pos(pos, sliding_window);
 
         for h in 0..config.n_heads {
             let kv_h = h / kv_mul;
@@ -2368,6 +2514,7 @@ pub fn forward_into(
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
                 kv_v_dim,
+                cache.storage_len,
                 head_dim,
                 config.value_dim,
                 attn_window,
@@ -2484,19 +2631,15 @@ pub fn forward_gemma4_into(
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;
 
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
         cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
 
         // Multi-head attention with GQA
         let scale = 1.0 / (head_dim_l as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
-        } else {
-            0
-        };
+        let attn_window = attention_start_pos(pos, sliding_window);
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
         for h in 0..config.n_heads {
@@ -2509,6 +2652,7 @@ pub fn forward_gemma4_into(
                 &cache.v[l][kv_h * value_dim_l..],
                 cache.per_pos_k_dim,
                 cache.per_pos_v_dim,
+                cache.storage_len,
                 head_dim_l,
                 value_dim_l,
                 attn_window,
@@ -3287,18 +3431,14 @@ pub fn forward_hidden<'a>(
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
-        } else {
-            0
-        };
+        let attn_window = attention_start_pos(pos, sliding_window);
 
         for h in 0..config.n_heads {
             let kv_h = h / kv_mul;
@@ -3310,6 +3450,7 @@ pub fn forward_hidden<'a>(
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
                 kv_v_dim,
+                cache.storage_len,
                 head_dim,
                 config.value_dim,
                 attn_window,
@@ -3399,8 +3540,8 @@ pub fn forward_hidden_gpt_oss<'a>(
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
@@ -3409,8 +3550,8 @@ pub fn forward_hidden_gpt_oss<'a>(
         }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if l % 2 == 0 && sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
+        let attn_window = if l % 2 == 0 {
+            attention_start_pos(pos, sliding_window)
         } else {
             0
         };
@@ -3425,6 +3566,7 @@ pub fn forward_hidden_gpt_oss<'a>(
                 &cache.v[l][kv_h * config.value_dim..],
                 kv_k_dim,
                 kv_v_dim,
+                cache.storage_len,
                 config.head_dim,
                 config.value_dim,
                 attn_window,
@@ -3451,11 +3593,11 @@ pub fn forward_hidden_gpt_oss<'a>(
             buf.router_logits[i] += layer.gate_inp_bias[i];
         }
 
-        buf.top_experts.clear();
-        buf.top_experts
-            .extend(buf.router_logits.iter().copied().enumerate());
-        buf.top_experts.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        buf.top_experts.truncate(config.expert_used_count);
+        select_top_logits_into(
+            &buf.router_logits,
+            config.expert_used_count,
+            &mut buf.top_experts,
+        );
         softmax_selected_into(&buf.top_experts, &mut buf.expert_probs);
 
         for value in buf.moe.iter_mut() {
@@ -3545,18 +3687,14 @@ pub fn forward_hidden_gemma4<'a>(
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;
 
-        let kv_k_start = pos * cache.per_pos_k_dim;
-        let kv_v_start = pos * cache.per_pos_v_dim;
+        let kv_k_start = cache.k_offset(pos);
+        let kv_v_start = cache.v_offset(pos);
         cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
         cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
 
         let scale = 1.0 / (head_dim_l as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = if sliding_window > 0 {
-            pos.saturating_sub(sliding_window)
-        } else {
-            0
-        };
+        let attn_window = attention_start_pos(pos, sliding_window);
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
         for h in 0..config.n_heads {
@@ -3569,6 +3707,7 @@ pub fn forward_hidden_gemma4<'a>(
                 &cache.v[l][kv_h * value_dim_l..],
                 cache.per_pos_k_dim,
                 cache.per_pos_v_dim,
+                cache.storage_len,
                 head_dim_l,
                 value_dim_l,
                 attn_window,
