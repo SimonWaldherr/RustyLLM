@@ -1,3 +1,13 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop,
+    clippy::manual_checked_ops,
+    clippy::manual_is_multiple_of,
+    clippy::unnecessary_unwrap,
+    clippy::useless_conversion
+)]
+
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,

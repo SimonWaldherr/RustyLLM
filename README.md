@@ -102,7 +102,7 @@ types, tokenizer metadata, and API compatibility.
 
 ## Requirements
 
-- Rust 1.85 or newer. The repository pins `1.85.0` in
+- Rust 1.95 or newer. The repository pins `1.95.0` in
   [rust-toolchain.toml](rust-toolchain.toml).
 - A GGUF model file. The runner does not download models.
 - macOS or Linux for native memory-mapped execution.
@@ -750,9 +750,8 @@ cargo test --features full
 cargo check --no-default-features --features wasm --target wasm32-unknown-unknown --lib
 ```
 
-The CI workflow runs the full native check set on Ubuntu, a focused Metal build
-smoke check on macOS, and the no-default-features WASM library check. Local
-GitHub Actions runs are supported with `act`:
+The CI workflow runs the full native check set and the no-default-features WASM
+library check on Ubuntu. Local GitHub Actions runs are supported with `act`:
 
 ```bash
 act pull_request

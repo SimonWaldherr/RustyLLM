@@ -915,9 +915,7 @@ impl Runner {
                  not a standalone draft model. RustyLLM's speculative decoder needs a \
                  separately-trained small LM with full attn_k/attn_v weights. \
                  Use a small standalone model (e.g. a 1B/3B sibling) as --mtp-assistant instead.",
-                assistant
-                    .model_name()
-                    .unwrap_or(assistant.architecture()),
+                assistant.model_name().unwrap_or(assistant.architecture()),
                 if has_any_attn_k {
                     ""
                 } else {

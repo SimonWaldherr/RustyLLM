@@ -15,6 +15,16 @@
 //! 4. [`model`] for weight loading and transformer forward passes.
 //! 5. [`runtime`] for generation, chat rendering, embeddings, and sessions.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop,
+    clippy::manual_checked_ops,
+    clippy::manual_is_multiple_of,
+    clippy::unnecessary_unwrap,
+    clippy::useless_conversion
+)]
+
 #[cfg(not(target_family = "wasm"))]
 pub mod catalog;
 pub mod gguf;

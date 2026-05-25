@@ -1,3 +1,13 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::explicit_counter_loop,
+    clippy::manual_checked_ops,
+    clippy::manual_is_multiple_of,
+    clippy::unnecessary_unwrap,
+    clippy::useless_conversion
+)]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
