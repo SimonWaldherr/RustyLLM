@@ -3,3 +3,4 @@ Cargo.lock
 demo/wasm/pkg/*wasm
 .bench_raw
 model_benchmark_202*
+/models
