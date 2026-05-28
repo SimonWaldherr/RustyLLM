@@ -66,8 +66,9 @@ Additional documentation:
 - Quantized inference paths for `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K`, and `MXFP4`
   tensors.
 - SIMD kernels for Apple Silicon NEON and x86_64 AVX2/FMA, with scalar fallback.
-- Optional experimental Metal acceleration for Q4_K matrix-vector work on macOS
-  when the Objective-C shim builds and `RUSTY_LLM_METAL` is set.
+- Metal acceleration for Q4_K/Q6_K matrix-vector work on macOS, enabled by
+  default when the Objective-C shim builds and the GPU backend is available.
+  Set `RUSTY_LLM_METAL=0` to force the CPU path.
 - One-shot generation, interactive REPL mode, benchmark mode, JSON benchmark
   output, and append-only chat history logging.
 - OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`, and
@@ -692,7 +693,8 @@ Default Cargo features:
 - `server`: enables the HTTP server.
 - `tls`: enables HTTPS serving through `rustls`.
 - `metal`: compiles the optional macOS Metal backend when Xcode command line
-  tools are available. Runtime use still requires `RUSTY_LLM_METAL=1`.
+  tools are available. When compiled and the GPU backend is available, it is
+  used by default at runtime (set `RUSTY_LLM_METAL=0` to opt out).
 
 Optional feature:
 
@@ -733,11 +735,10 @@ No generated WASM binaries are written back to the repository branch.
 
 - `RUSTY_LLM_MODEL_DIR`: default directory used by model discovery.
 - `RUSTY_LLM_FAST_ATTN`: enables the approximate fast attention path when set.
-- `RUSTY_LLM_METAL`: enables the experimental macOS Metal Q4_K path when set
-  and when the binary was built with the `metal` feature and the backend was
-  compiled successfully.
-
-Leave `RUSTY_LLM_METAL` unset to use the CPU path.
+- `RUSTY_LLM_METAL`: controls the macOS Metal Q4_K/Q6_K GPU path. When the
+  binary was built with the `metal` feature and the backend compiled and is
+  available, Metal is used by default. Set `RUSTY_LLM_METAL=0` to force the CPU
+  path; `RUSTY_LLM_METAL=1` keeps it explicit.
 
 ## Development
 

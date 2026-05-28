@@ -1724,8 +1724,9 @@ pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
             let byte = block[2 + i];
             let lo = ((byte & 0x0F) as i32 - 8) as f32;
             let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-            out[b * 32 + i * 2] = scale * lo;
-            out[b * 32 + i * 2 + 1] = scale * hi;
+            // ggml Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
+            out[b * 32 + i] = scale * lo;
+            out[b * 32 + i + 16] = scale * hi;
         }
     }
     out
@@ -2000,8 +2001,9 @@ fn dot_q4_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
             let byte = block[2 + i];
             let lo = ((byte & 0x0F) as i32 - 8) as f32;
             let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-            block_sum += lo * x[b * 32 + i * 2];
-            block_sum += hi * x[b * 32 + i * 2 + 1];
+            // ggml Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
+            block_sum += lo * x[b * 32 + i];
+            block_sum += hi * x[b * 32 + i + 16];
         }
         sum += scale * block_sum;
     }
@@ -2689,7 +2691,7 @@ unsafe fn dot_q8_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[inline]
 unsafe fn dot_q4_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     // Q4_0 layout per block (18 bytes): [f16 scale | 16 nibble bytes]
-    // byte[i] lo nibble → weight for x[2i], hi nibble → weight for x[2i+1]
+    // ggml split layout: lo nibble of byte i → weight[i], hi nibble → weight[i+16].
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
     let mut sum_acc = vdupq_n_f32(0.0);
@@ -2703,37 +2705,36 @@ unsafe fn dot_q4_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
         // Load 16 nibble bytes
         let nib = vld1q_u8(block.add(2));
-        // lo nibbles (bits[3:0]): each nibble i → x[2i]
+        // lo nibbles (bits[3:0]): byte i → weight[i]      (weights 0..16)
         let lo_i8 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(nib, mask_low), eight));
-        // hi nibbles (bits[7:4]): each nibble i → x[2i+1]
+        // hi nibbles (bits[7:4]): byte i → weight[i+16]   (weights 16..32)
         let hi_i8 = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(nib, 4), eight));
 
-        // Widen to i16 (8 each per half)
-        let lo_lo16 = vmovl_s8(vget_low_s8(lo_i8)); // lo nibbles 0..8  → i16x8
-        let lo_hi16 = vmovl_s8(vget_high_s8(lo_i8)); // lo nibbles 8..16 → i16x8
-        let hi_lo16 = vmovl_s8(vget_low_s8(hi_i8)); // hi nibbles 0..8  → i16x8
-        let hi_hi16 = vmovl_s8(vget_high_s8(hi_i8)); // hi nibbles 8..16 → i16x8
+        // Widen to i16 (8 each per half), preserving weight order.
+        let w0_8 = vmovl_s8(vget_low_s8(lo_i8)); // weights 0..8
+        let w8_16 = vmovl_s8(vget_high_s8(lo_i8)); // weights 8..16
+        let w16_24 = vmovl_s8(vget_low_s8(hi_i8)); // weights 16..24
+        let w24_32 = vmovl_s8(vget_high_s8(hi_i8)); // weights 24..32
 
         let xp = x.as_ptr().add(b * 32);
         let mut bacc = vdupq_n_f32(0.0);
 
-        // Each "chunk" processes 4 lo+hi nibbles with 8 x values (even=lo, odd=hi)
-        // using vuzp1q/vuzp2q to deinterleave x into even and odd lanes.
+        // Each chunk multiplies 4 contiguous weights by 4 contiguous x values.
         macro_rules! chunk {
-            ($lo4:expr, $hi4:expr, $xoff:expr) => {{
-                let lof = vcvtq_f32_s32(vmovl_s16($lo4));
-                let hif = vcvtq_f32_s32(vmovl_s16($hi4));
-                let xa = vld1q_f32(xp.add($xoff));
-                let xb = vld1q_f32(xp.add($xoff + 4));
-                // deinterleave: even lanes = lo weight positions, odd = hi
-                bacc = vmlaq_f32(bacc, lof, vuzp1q_f32(xa, xb));
-                bacc = vmlaq_f32(bacc, hif, vuzp2q_f32(xa, xb));
+            ($w4:expr, $xoff:expr) => {{
+                let wf = vcvtq_f32_s32(vmovl_s16($w4));
+                let xv = vld1q_f32(xp.add($xoff));
+                bacc = vmlaq_f32(bacc, wf, xv);
             }};
         }
-        chunk!(vget_low_s16(lo_lo16), vget_low_s16(hi_lo16), 0);
-        chunk!(vget_high_s16(lo_lo16), vget_high_s16(hi_lo16), 8);
-        chunk!(vget_low_s16(lo_hi16), vget_low_s16(hi_hi16), 16);
-        chunk!(vget_high_s16(lo_hi16), vget_high_s16(hi_hi16), 24);
+        chunk!(vget_low_s16(w0_8), 0);
+        chunk!(vget_high_s16(w0_8), 4);
+        chunk!(vget_low_s16(w8_16), 8);
+        chunk!(vget_high_s16(w8_16), 12);
+        chunk!(vget_low_s16(w16_24), 16);
+        chunk!(vget_high_s16(w16_24), 20);
+        chunk!(vget_low_s16(w24_32), 24);
+        chunk!(vget_high_s16(w24_32), 28);
 
         sum_acc = vmlaq_f32(sum_acc, bacc, scale_v);
     }
@@ -2896,8 +2897,7 @@ unsafe fn dot_q8_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     // Q4_0 per block: [f16 scale | 16 nibble bytes]
-    // byte[i]: lo=bits[3:0]→x[2i], hi=bits[7:4]→x[2i+1]
-    // Strategy: interleave lo/hi nibbles so the reconstructed weights align with x[0..32].
+    // ggml split layout: lo nibble of byte i → weight[i], hi nibble → weight[i+16].
     use std::arch::x86_64::*;
     let n_blocks = n / 32;
     let mut acc = _mm256_setzero_ps();
@@ -2912,16 +2912,10 @@ unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
         // Load 16 nibble bytes
         let nib = _mm_loadu_si128(block.add(2) as *const __m128i);
-        // lo nibbles: byte & 0x0F
+        // lo nibbles (byte & 0x0F): bytes 0..16 → weights 0..16
         let lo = _mm_and_si128(nib, mask_0f);
-        // hi nibbles: (byte >> 4) & 0x0F  — epi16 shift is safe here (see comments)
+        // hi nibbles ((byte >> 4) & 0x0F): bytes 0..16 → weights 16..32
         let hi = _mm_and_si128(_mm_srli_epi16(nib, 4), mask_0f);
-
-        // Interleave lo and hi into weight order matching x[0..32]:
-        //   lo0,hi0,lo1,hi1,...,lo7,hi7  →  q[0..16]
-        //   lo8,hi8,...,lo15,hi15         →  q[16..32]
-        let q_lo16 = _mm_unpacklo_epi8(lo, hi); // q[0..16]
-        let q_hi16 = _mm_unpackhi_epi8(lo, hi); // q[16..32]
 
         // cvtepu8_epi32 uses lower 8 bytes of __m128i → 8 × i32 (unsigned zero-extend)
         // Then subtract 8.0 in f32 to recover signed values in [-8, 7].
@@ -2932,10 +2926,10 @@ unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
                 acc = _mm256_fmadd_ps(_mm256_mul_ps(sv, qf), xv, acc);
             }};
         }
-        process8!(q_lo16, 0); // q[0..8]  · x[0..8]
-        process8!(_mm_srli_si128(q_lo16, 8), 8); // q[8..16] · x[8..16]
-        process8!(q_hi16, 16); // q[16..24]· x[16..24]
-        process8!(_mm_srli_si128(q_hi16, 8), 24); // q[24..32]· x[24..32]
+        process8!(lo, 0); // weights 0..8   · x[0..8]
+        process8!(_mm_srli_si128(lo, 8), 8); // weights 8..16  · x[8..16]
+        process8!(hi, 16); // weights 16..24 · x[16..24]
+        process8!(_mm_srli_si128(hi, 8), 24); // weights 24..32 · x[24..32]
     }
     hsum_avx(acc)
 }
@@ -3005,6 +2999,54 @@ unsafe fn scale_add_f32_avx2(out: &mut [f32], scale: f32, add: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds one Q4_0 block (18 bytes) with scale 1.0 and byte[i] = lo|(hi<<4),
+    /// where lo = i and hi = 15 - i for i in 0..16.
+    fn make_q4_0_block_known() -> Vec<u8> {
+        let mut block = vec![0u8; 18];
+        // f16 1.0 = 0x3c00, little-endian
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        for i in 0..16usize {
+            let lo = i as u8; // 0..=15
+            let hi = (15 - i) as u8; // 15..=0
+            block[2 + i] = (hi << 4) | lo;
+        }
+        block
+    }
+
+    #[test]
+    fn q4_0_dequant_uses_split_layout() {
+        // ggml Q4_0 split layout: lo nibble of byte i → weight[i],
+        // hi nibble of byte i → weight[i+16]. Scale = 1.0.
+        let block = make_q4_0_block_known();
+        let got = dequant_row_q4_0(&block, 32);
+
+        let mut expected = [0.0f32; 32];
+        for i in 0..16usize {
+            expected[i] = i as f32 - 8.0; // lo nibble: -8, -7, ..., 7
+            expected[i + 16] = (15 - i) as f32 - 8.0; // hi nibble: 7, 6, ..., -8
+        }
+        for k in 0..32 {
+            assert_eq!(got[k], expected[k], "weight[{k}] mismatch");
+        }
+    }
+
+    #[test]
+    fn q4_0_dot_matches_reference_dequant() {
+        // The fused dot kernel must equal dequant-then-dot for an arbitrary x.
+        let block = make_q4_0_block_known();
+        let weights = dequant_row_q4_0(&block, 32);
+
+        let x: Vec<f32> = (0..32).map(|k| (k as f32) * 0.5 - 7.0).collect();
+        let reference: f32 = weights.iter().zip(&x).map(|(w, xv)| w * xv).sum();
+
+        let fused = dot_q4_0_f32(&block, &x, 32);
+        assert!(
+            (fused - reference).abs() < 1e-3,
+            "fused {fused} vs reference {reference}"
+        );
+    }
 
     /// Builds deterministic synthetic Q4_K weights for fused-kernel tests.
     fn make_q4k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {

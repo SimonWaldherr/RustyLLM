@@ -118,10 +118,14 @@ pub fn available() -> bool {
     false
 }
 
-/// Reports whether Metal acceleration is both requested and available.
+/// Reports whether Metal acceleration is active.
+///
+/// On macOS the GPU backend is enabled by default whenever it is available,
+/// since it is a large decode-throughput win on unified-memory Apple Silicon.
+/// Set `RUSTY_LLM_METAL=0` to force the CPU path.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| requested() == Some(true) && available())
+    *ENABLED.get_or_init(|| requested() != Some(false) && available())
 }
 
 /// Reads the environment flag that requests Metal acceleration.
