@@ -74,11 +74,24 @@ impl Config {
                 .map(|v| v.len() as u32)
                 .unwrap_or(0),
         ) as usize;
+        let hidden_dim = match gguf.metadata.get(&format!("{}.feed_forward_length", p)) {
+            Some(value) => value
+                .as_u32()
+                .or_else(|| {
+                    if let crate::gguf::MetaValue::Array(values) = value {
+                        values.iter().filter_map(|v| v.as_u32()).max()
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0),
+            None => 0,
+        } as usize;
 
         Config {
             arch: p.clone(),
             dim,
-            hidden_dim: gguf.get_u32(&format!("{}.feed_forward_length", p), 0) as usize,
+            hidden_dim,
             n_layers: gguf.get_u32(&format!("{}.block_count", p), 0) as usize,
             n_heads,
             n_kv_heads,
@@ -329,7 +342,7 @@ impl Weight {
 
 #[cfg(not(target_family = "wasm"))]
 /// Attempts fused K-quant triple-projection fast paths and reports whether one ran.
-fn try_q4k_matvec3_into(
+fn try_quant_matvec3_into(
     wq: &Weight,
     wk: &Weight,
     wv: &Weight,
@@ -449,16 +462,23 @@ fn try_q4k_matvec3_into(
                 cols: v_cols,
             },
         ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
-            let Some(q_kind) = kquant_matvec_kind(*q_dtype) else {
+            let Some(q_kind) = quant_matvec_kind(*q_dtype) else {
                 return false;
             };
-            let Some(k_kind) = kquant_matvec_kind(*k_dtype) else {
+            let Some(k_kind) = quant_matvec_kind(*k_dtype) else {
                 return false;
             };
-            let Some(v_kind) = kquant_matvec_kind(*v_dtype) else {
+            let Some(v_kind) = quant_matvec_kind(*v_dtype) else {
                 return false;
             };
-            crate::simd::matvec_kquant3_into(
+            if crate::metal::enabled()
+                && (quant_kind_prefers_single_metal(q_kind)
+                    || quant_kind_prefers_single_metal(k_kind)
+                    || quant_kind_prefers_single_metal(v_kind))
+            {
+                return false;
+            }
+            crate::simd::matvec_quant3_into(
                 (q_kind, q_data.as_slice(), *q_rows, *q_cols),
                 (k_kind, k_data.as_slice(), *k_rows, *k_cols),
                 (v_kind, v_data.as_slice(), *v_rows, *v_cols),
@@ -474,7 +494,7 @@ fn try_q4k_matvec3_into(
 
 #[cfg(target_family = "wasm")]
 /// Attempts fused K-quant triple-projection fast paths and reports whether one ran.
-fn try_q4k_matvec3_into(
+fn try_quant_matvec3_into(
     _wq: &Weight,
     _wk: &Weight,
     _wv: &Weight,
@@ -488,7 +508,7 @@ fn try_q4k_matvec3_into(
 
 #[cfg(not(target_family = "wasm"))]
 /// Attempts fused K-quant double-projection fast paths and reports whether one ran.
-fn try_q4k_matvec2_into(
+fn try_quant_matvec2_into(
     a: &Weight,
     b: &Weight,
     x: &[f32],
@@ -556,23 +576,72 @@ fn try_q4k_matvec2_into(
             out_a,
             out_b,
         ),
+        (
+            Weight::Quantized {
+                data: a_data,
+                dtype: a_dtype,
+                rows: a_rows,
+                cols: a_cols,
+            },
+            Weight::Quantized {
+                data: b_data,
+                dtype: b_dtype,
+                rows: b_rows,
+                cols: b_cols,
+            },
+        ) if *a_cols == *b_cols && *a_cols == x.len() => {
+            let Some(a_kind) = quant_matvec_kind(*a_dtype) else {
+                return false;
+            };
+            let Some(b_kind) = quant_matvec_kind(*b_dtype) else {
+                return false;
+            };
+            if crate::metal::enabled()
+                && (quant_kind_prefers_single_metal(a_kind)
+                    || quant_kind_prefers_single_metal(b_kind))
+            {
+                return false;
+            }
+            crate::simd::matvec_quant2_into(
+                (a_kind, a_data.as_slice(), *a_rows, *a_cols),
+                (b_kind, b_data.as_slice(), *b_rows, *b_cols),
+                x,
+                out_a,
+                out_b,
+            )
+        }
         _ => false,
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn kquant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::KQuantMatvecKind> {
+fn quant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::QuantMatvecKind> {
     match dtype {
-        GGMLType::Q4_K => Some(crate::simd::KQuantMatvecKind::Q4K),
-        GGMLType::Q5_K => Some(crate::simd::KQuantMatvecKind::Q5K),
-        GGMLType::Q6_K => Some(crate::simd::KQuantMatvecKind::Q6K),
+        GGMLType::Q8_0 => Some(crate::simd::QuantMatvecKind::Q8_0),
+        GGMLType::Q8_1 => Some(crate::simd::QuantMatvecKind::Q8_1),
+        GGMLType::Q4_0 => Some(crate::simd::QuantMatvecKind::Q4_0),
+        GGMLType::Q4_1 => Some(crate::simd::QuantMatvecKind::Q4_1),
+        GGMLType::Q5_0 => Some(crate::simd::QuantMatvecKind::Q5_0),
+        GGMLType::Q5_1 => Some(crate::simd::QuantMatvecKind::Q5_1),
+        GGMLType::Q4_K => Some(crate::simd::QuantMatvecKind::Q4K),
+        GGMLType::Q5_K => Some(crate::simd::QuantMatvecKind::Q5K),
+        GGMLType::Q6_K => Some(crate::simd::QuantMatvecKind::Q6K),
+        GGMLType::MXFP4 => Some(crate::simd::QuantMatvecKind::Mxfp4),
         _ => None,
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn quant_kind_prefers_single_metal(kind: crate::simd::QuantMatvecKind) -> bool {
+    matches!(
+        kind,
+        crate::simd::QuantMatvecKind::Q4_0 | crate::simd::QuantMatvecKind::Q8_0
+    )
+}
+
 #[cfg(target_family = "wasm")]
 /// Attempts fused K-quant double-projection fast paths and reports whether one ran.
-fn try_q4k_matvec2_into(
+fn try_quant_matvec2_into(
     _a: &Weight,
     _b: &Weight,
     _x: &[f32],
@@ -789,7 +858,9 @@ fn attention_start_pos(pos: usize, sliding_window: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{KVCache, attention_start_pos};
+    use super::{
+        KVCache, apply_rope_qk_neox, attention_start_pos, build_rope_inv_freq_with_factors,
+    };
 
     #[test]
     fn sliding_attention_start_keeps_exact_window_width() {
@@ -821,6 +892,29 @@ mod tests {
         assert_eq!(cache.k_offset(9), 36);
         assert_eq!(cache.v_offset(9), 54);
     }
+
+    #[test]
+    fn rope_freq_factors_can_disable_rotation_pairs() {
+        let inv = build_rope_inv_freq_with_factors(10_000.0, 4, 1.0, Some(&[1.0, 1e30]));
+        assert!((inv[0] - 1.0).abs() < 1e-6);
+        assert!(inv[1] < 1e-30);
+    }
+
+    #[test]
+    fn neox_rope_rotates_across_head_halves() {
+        let mut q = vec![1.0, 2.0, 3.0, 4.0];
+        let mut k = vec![5.0, 6.0, 7.0, 8.0];
+        let inv = vec![std::f32::consts::FRAC_PI_2, 0.0];
+
+        apply_rope_qk_neox(&mut q, &mut k, 1, 4, 1, 1, &inv);
+
+        assert!((q[0] + 3.0).abs() < 1e-5);
+        assert!((q[1] - 2.0).abs() < 1e-5);
+        assert!((q[2] - 1.0).abs() < 1e-5);
+        assert!((q[3] - 4.0).abs() < 1e-5);
+        assert!((k[0] + 7.0).abs() < 1e-5);
+        assert!((k[2] - 5.0).abs() < 1e-5);
+    }
 }
 
 // ─── Per-token decode scratch buffers (reused across tokens) ─────────────────
@@ -840,6 +934,9 @@ pub struct DecodeBuffer {
     pub up: Vec<f32>,       // FFN up projection (hidden_dim)
     pub hidden: Vec<f32>,   // FFN hidden (hidden_dim)
     pub moe: Vec<f32>,      // MoE residual contribution (dim)
+    pub ple_inputs: Vec<f32>,
+    pub ple_proj: Vec<f32>,
+    pub ple_gate: Vec<f32>,
     pub router_logits: Vec<f32>,
     pub top_experts: Vec<(usize, f32)>,
     pub expert_probs: Vec<f32>,
@@ -851,12 +948,29 @@ pub struct DecodeBuffer {
 
 /// Precomputes inverse frequencies for rotary positional embeddings.
 fn build_rope_inv_freq(theta: f32, head_dim: usize, scaling: f32) -> Vec<f32> {
+    build_rope_inv_freq_with_factors(theta, head_dim, scaling, None)
+}
+
+fn build_rope_inv_freq_with_factors(
+    theta: f32,
+    head_dim: usize,
+    scaling: f32,
+    freq_factors: Option<&[f32]>,
+) -> Vec<f32> {
     let pair_count = head_dim / 2;
     let mut inv = vec![0.0f32; pair_count];
     for (pair, slot) in inv.iter_mut().enumerate() {
         let i = (pair * 2) as f32;
         let base_freq = theta.powf(i / head_dim as f32);
-        *slot = 1.0 / (scaling * base_freq);
+        let factor = freq_factors
+            .and_then(|factors| factors.get(pair))
+            .copied()
+            .unwrap_or(1.0);
+        *slot = if factor == 0.0 {
+            0.0
+        } else {
+            1.0 / (scaling * base_freq * factor)
+        };
     }
     inv
 }
@@ -926,6 +1040,9 @@ impl DecodeBuffer {
             up: vec![0.0; config.hidden_dim],
             hidden: vec![0.0; config.hidden_dim],
             moe: vec![0.0; config.dim],
+            ple_inputs: Vec::new(),
+            ple_proj: Vec::new(),
+            ple_gate: Vec::new(),
             router_logits: vec![0.0; config.expert_count],
             top_experts: Vec::with_capacity(config.expert_count.max(config.expert_used_count)),
             expert_probs: Vec::with_capacity(config.expert_used_count),
@@ -1035,7 +1152,7 @@ fn load_weight(
     let padded;
     let raw_view: &[u8] = if available < byte_size {
         match info.dtype {
-            GGMLType::F32 | GGMLType::F16 => {
+            GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 => {
                 panic!(
                     "Tensor {}: offset {} + byte_size {} exceeds mmap length {}",
                     name,
@@ -1085,6 +1202,14 @@ fn load_weight(
             for i in 0..numel {
                 data[i] =
                     simd::f16_to_f32(u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]));
+            }
+            Weight::F32(data)
+        }
+        GGMLType::BF16 => {
+            let mut data = vec![0.0f32; numel];
+            for i in 0..numel {
+                let bits = u16::from_le_bytes([raw_view[i * 2], raw_view[i * 2 + 1]]);
+                data[i] = f32::from_bits((bits as u32) << 16);
             }
             Weight::F32(data)
         }
@@ -1188,6 +1313,17 @@ fn load_weight_rows(
             }
             Weight::F32(data)
         }
+        GGMLType::BF16 => {
+            let offset = data_offset + info.offset as usize + start_row * cols * 2;
+            let byte_size = rows * cols * 2;
+            let raw = &mmap_data[offset..offset + byte_size];
+            let mut data = vec![0.0f32; rows * cols];
+            for i in 0..data.len() {
+                let bits = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                data[i] = f32::from_bits((bits as u32) << 16);
+            }
+            Weight::F32(data)
+        }
         dtype => {
             let row_bytes = quantized_row_bytes(dtype, cols)
                 .unwrap_or_else(|| panic!("Unsupported tensor type for {}: {:?}", name, dtype));
@@ -1268,6 +1404,32 @@ fn load_optional_f32_slice(
         values[start..start + len].to_vec()
     } else {
         Vec::new()
+    }
+}
+
+fn validate_global_shape(name: &str, w: &Weight, exp_rows: usize, exp_cols: usize) {
+    match w {
+        Weight::F32(v) => {
+            let expected = exp_rows.checked_mul(exp_cols).unwrap_or(0);
+            if v.len() != expected {
+                panic!(
+                    "Shape mismatch for {}: f32 elements {} != expected {} ({}x{})",
+                    name,
+                    v.len(),
+                    expected,
+                    exp_rows,
+                    exp_cols
+                );
+            }
+        }
+        Weight::Quantized { rows, cols, .. } => {
+            if *rows != exp_rows || *cols != exp_cols {
+                panic!(
+                    "Shape mismatch for {}: quantized shape {}x{} != expected {}x{}",
+                    name, rows, cols, exp_rows, exp_cols
+                );
+            }
+        }
     }
 }
 
@@ -1410,7 +1572,6 @@ pub fn load_model(
         eprintln!("Note: output tied to embeddings");
         token_embd.clone()
     };
-
     // Infer attention head/value dimensions from tensor shapes when GGUF
     // metadata appears inconsistent. We examine available blk.* attn_q/attn_v
     // tensors and prefer derived shapes over possibly-misleading metadata.
@@ -1983,6 +2144,40 @@ pub(crate) fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f
 }
 
 #[inline]
+/// Applies per-head RMSNorm in place, using the same weight vector for each head.
+fn rms_norm_heads_in_place(
+    x: &mut [f32],
+    head_dim: usize,
+    heads: usize,
+    weight: Option<&[f32]>,
+    eps: f32,
+) {
+    if head_dim == 0 || heads == 0 {
+        return;
+    }
+    debug_assert!(x.len() >= head_dim * heads);
+    if let Some(weight) = weight {
+        debug_assert_eq!(weight.len(), head_dim);
+    }
+    for h in 0..heads {
+        let start = h * head_dim;
+        let end = start + head_dim;
+        let head = &mut x[start..end];
+        let ss = simd::dot_f32(head, head) / head_dim as f32;
+        let scale = 1.0 / (ss + eps).sqrt();
+        if let Some(weight) = weight {
+            for i in 0..head_dim {
+                head[i] *= scale * weight[i];
+            }
+        } else {
+            for value in head {
+                *value *= scale;
+            }
+        }
+    }
+}
+
+#[inline]
 /// Adds an optional projection bias when the model stores one.
 fn add_bias_if_present(out: &mut [f32], bias: &[f32]) {
     if bias.is_empty() {
@@ -2034,6 +2229,79 @@ pub(crate) fn apply_rope_qk(
             let v1 = k[idx1];
             k[idx0] = v0 * cos_a - v1 * sin_a;
             k[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+/// Applies NeoX-style RoPE where each pair spans the first and second half of a head.
+pub(crate) fn apply_rope_qk_neox(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    inv_freq: &[f32],
+) {
+    let half = head_dim / 2;
+    debug_assert!(inv_freq.len() >= half);
+    for i in 0..half {
+        let angle = pos as f32 * inv_freq[i];
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        for h in 0..n_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + half;
+            if idx1 >= q.len() {
+                break;
+            }
+            let v0 = q[idx0];
+            let v1 = q[idx1];
+            q[idx0] = v0 * cos_a - v1 * sin_a;
+            q[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+
+        for h in 0..n_kv_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + half;
+            if idx1 >= k.len() {
+                break;
+            }
+            let v0 = k[idx0];
+            let v1 = k[idx1];
+            k[idx0] = v0 * cos_a - v1 * sin_a;
+            k[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+/// Applies NeoX-style RoPE to one query/key tensor.
+pub(crate) fn apply_rope_neox(
+    x: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    heads: usize,
+    inv_freq: &[f32],
+) {
+    let half = head_dim / 2;
+    debug_assert!(inv_freq.len() >= half);
+    for i in 0..half {
+        let angle = pos as f32 * inv_freq[i];
+        let (sin_a, cos_a) = angle.sin_cos();
+
+        for h in 0..heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + half;
+            if idx1 >= x.len() {
+                break;
+            }
+            let v0 = x[idx0];
+            let v1 = x[idx1];
+            x[idx0] = v0 * cos_a - v1 * sin_a;
+            x[idx1] = v0 * sin_a + v1 * cos_a;
         }
     }
 }
@@ -2175,6 +2443,13 @@ pub(crate) fn silu(x: f32) -> f32 {
 }
 
 #[inline(always)]
+/// Computes the tanh-approximate GELU activation used by Gemma feed-forward blocks.
+fn gelu(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+#[inline(always)]
 /// Computes the GPT-OSS SwiGLU activation variant.
 fn swiglu_gpt_oss(g: f32, u: f32) -> f32 {
     let g = g.min(7.0);
@@ -2300,7 +2575,7 @@ pub fn forward_gpt_oss_into(
         let layer = &weights.layers[l];
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
-        if !try_q4k_matvec3_into(
+        if !try_quant_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
         ) {
             layer.wq.matvec_into(&buf.xn, &mut buf.q);
@@ -2483,14 +2758,13 @@ pub fn forward_into(
 
     // Token embedding
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
-
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
         // ── Attention ──
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        if !try_q4k_matvec3_into(
+        if !try_quant_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
         ) {
             layer.wq.matvec_into(&buf.xn, &mut buf.q);
@@ -2574,7 +2848,7 @@ pub fn forward_into(
         // ── FFN (SwiGLU) ──
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        if !try_q4k_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
+        if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
             layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
             layer.w3.matvec_into(&buf.xn2, &mut buf.up);
         }
@@ -2616,6 +2890,100 @@ pub fn forward_gemma4(
     logits
 }
 
+fn prepare_gemma4_per_layer_inputs(
+    config: &Config,
+    weights: &Gemma4Weights,
+    buf: &mut DecodeBuffer,
+    token: u32,
+) -> bool {
+    let per_layer_dim = weights.per_layer_dim;
+    if per_layer_dim == 0 {
+        return false;
+    }
+    let Some(per_layer_token_embd) = &weights.per_layer_token_embd else {
+        return false;
+    };
+    let Some(per_layer_model_proj) = &weights.per_layer_model_proj else {
+        return false;
+    };
+    if weights.per_layer_proj_norm.len() != per_layer_dim {
+        return false;
+    }
+
+    let per_layer_len = per_layer_dim * config.n_layers;
+    per_layer_token_embd.row_into(token as usize, per_layer_len, &mut buf.ple_inputs);
+    let token_scale = (per_layer_dim as f32).sqrt();
+
+    per_layer_model_proj.matvec_into(&buf.x, &mut buf.ple_proj);
+    if buf.ple_proj.len() != per_layer_len {
+        return false;
+    }
+    let proj_scale = 1.0 / (config.dim as f32).sqrt();
+    for value in &mut buf.ple_proj {
+        *value *= proj_scale;
+    }
+
+    let input_scale = 1.0 / 2.0f32.sqrt();
+    for layer_idx in 0..config.n_layers {
+        let start = layer_idx * per_layer_dim;
+        let end = start + per_layer_dim;
+        rms_norm_into(
+            &buf.ple_proj[start..end],
+            &weights.per_layer_proj_norm,
+            config.rms_norm_eps,
+            &mut buf.ple_gate,
+        );
+        for i in 0..per_layer_dim {
+            buf.ple_inputs[start + i] =
+                (buf.ple_inputs[start + i] * token_scale + buf.ple_gate[i]) * input_scale;
+        }
+    }
+
+    true
+}
+
+fn apply_gemma4_per_layer_residual(
+    config: &Config,
+    layer: &Gemma4LayerWeights,
+    buf: &mut DecodeBuffer,
+    layer_idx: usize,
+    per_layer_dim: usize,
+) {
+    if per_layer_dim == 0 {
+        return;
+    }
+    let (Some(inp_gate), Some(proj)) = (&layer.per_layer_inp_gate, &layer.per_layer_proj) else {
+        return;
+    };
+    if layer.per_layer_post_norm.len() != config.dim {
+        return;
+    }
+    let start = layer_idx * per_layer_dim;
+    let end = start + per_layer_dim;
+    if end > buf.ple_inputs.len() {
+        return;
+    }
+
+    inp_gate.matvec_into(&buf.x, &mut buf.ple_gate);
+    if buf.ple_gate.len() < per_layer_dim {
+        return;
+    }
+    for i in 0..per_layer_dim {
+        buf.ple_gate[i] = gelu(buf.ple_gate[i]) * buf.ple_inputs[start + i];
+    }
+
+    proj.matvec_into(&buf.ple_gate[..per_layer_dim], &mut buf.proj);
+    rms_norm_into(
+        &buf.proj,
+        &layer.per_layer_post_norm,
+        config.rms_norm_eps,
+        &mut buf.xn2,
+    );
+    for i in 0..config.dim {
+        buf.x[i] += buf.xn2[i];
+    }
+}
+
 /// Runs one Gemma 4 decode step into a reusable logits buffer.
 pub fn forward_gemma4_into(
     config: &Config,
@@ -2633,6 +3001,11 @@ pub fn forward_gemma4_into(
 
     // Token embedding
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
+    let emb_scale = (dim as f32).sqrt();
+    for value in &mut buf.x {
+        *value *= emb_scale;
+    }
+    let has_per_layer_inputs = prepare_gemma4_per_layer_inputs(config, weights, buf, token);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
@@ -2640,89 +3013,197 @@ pub fn forward_gemma4_into(
         // Standard attention path (or K=V reuse when attn_v is missing)
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
-        layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
-
-        // If has_attn_v is false, V = K (K=V reuse)
         let head_dim_l = layer.head_dim;
         let n_kv_heads_l = layer.n_kv_heads;
         let value_dim_l = layer.value_dim;
+        let shared_kv_source_layer = layer.shared_kv_source_layer;
+        let kv_cache_layer = shared_kv_source_layer.unwrap_or(l);
 
-        if layer.has_attn_v {
-            layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+        if shared_kv_source_layer.is_some() {
+            layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+        } else if layer.has_attn_v {
+            if !try_quant_matvec3_into(
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &buf.xn,
+                &mut buf.q,
+                &mut buf.k,
+                &mut buf.v,
+            ) {
+                layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+                layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+                layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+            }
         } else {
-            // K=V reuse: copy only the relevant portion of k into v
+            if !try_quant_matvec2_into(
+                &layer.attn_q,
+                &layer.attn_k,
+                &buf.xn,
+                &mut buf.q,
+                &mut buf.k,
+            ) {
+                layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+                layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+            }
             let kv_size = n_kv_heads_l * head_dim_l;
             buf.v[..kv_size].copy_from_slice(&buf.k[..kv_size]);
         }
 
-        // Apply RoPE using per-head dims
-        apply_rope_qk(
-            &mut buf.q,
-            &mut buf.k,
-            pos,
-            head_dim_l,
-            config.n_heads,
-            n_kv_heads_l,
-            &buf.rope_inv_freq,
-        );
-
-        // Store KV into per-pos slots (cache uses fixed per-pos stride)
-        // Important: only write the relevant portion based on per-layer dims
+        let q_len = config.n_heads * head_dim_l;
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;
+        rms_norm_heads_in_place(
+            &mut buf.q[..q_len],
+            head_dim_l,
+            config.n_heads,
+            Some(&layer.attn_q_norm),
+            config.rms_norm_eps,
+        );
+        if shared_kv_source_layer.is_some() {
+            apply_rope_neox(
+                &mut buf.q[..q_len],
+                pos,
+                head_dim_l,
+                config.n_heads,
+                &layer.rope_inv_freq,
+            );
+        } else {
+            rms_norm_heads_in_place(
+                &mut buf.k[..kv_k_size],
+                head_dim_l,
+                n_kv_heads_l,
+                Some(&layer.attn_k_norm),
+                config.rms_norm_eps,
+            );
+            rms_norm_heads_in_place(
+                &mut buf.v[..kv_v_size],
+                value_dim_l,
+                n_kv_heads_l,
+                None,
+                config.rms_norm_eps,
+            );
 
-        let kv_k_start = cache.k_offset(pos);
-        let kv_v_start = cache.v_offset(pos);
-        cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
-        cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+            // Gemma 4 uses HF/GGML NeoX-style rotate_half layout.
+            apply_rope_qk_neox(
+                &mut buf.q,
+                &mut buf.k,
+                pos,
+                head_dim_l,
+                config.n_heads,
+                n_kv_heads_l,
+                &layer.rope_inv_freq,
+            );
+
+            // Store KV into per-pos slots (cache uses fixed per-pos stride)
+            // Important: only write the relevant portion based on per-layer dims
+            let kv_k_start = cache.k_offset(pos);
+            let kv_v_start = cache.v_offset(pos);
+            cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
+            cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+        }
 
         // Multi-head attention with GQA
-        let scale = 1.0 / (head_dim_l as f32).sqrt();
+        // Gemma 4 applies Q/K normalization before attention and uses a raw
+        // attention scale of 1.0 rather than the usual 1/sqrt(head_dim).
+        let scale = 1.0;
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = attention_start_pos(pos, sliding_window);
+        let attn_window = if layer.is_swa {
+            attention_start_pos(pos, sliding_window)
+        } else {
+            0
+        };
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
-        for h in 0..config.n_heads {
-            let kv_h = h / kv_mul_l;
-            let q_off = h * head_dim_l;
-            let out_off = h * value_dim_l;
-            online_attention(
-                &buf.q[q_off..q_off + head_dim_l],
-                &cache.k[l][kv_h * head_dim_l..],
-                &cache.v[l][kv_h * value_dim_l..],
-                cache.per_pos_k_dim,
-                cache.per_pos_v_dim,
-                cache.storage_len,
-                head_dim_l,
-                value_dim_l,
-                attn_window,
-                pos,
-                scale,
-                &mut buf.attn_out[out_off..out_off + value_dim_l],
-            );
+        let attn_out_len = config.n_heads * value_dim_l;
+        if !crate::metal::attention_into(
+            &buf.q[..config.n_heads * head_dim_l],
+            &cache.k[kv_cache_layer],
+            &cache.v[kv_cache_layer],
+            &mut buf.attn_out[..attn_out_len],
+            config.n_heads,
+            kv_mul_l,
+            head_dim_l,
+            value_dim_l,
+            cache.per_pos_k_dim,
+            cache.per_pos_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for h in 0..config.n_heads {
+                let kv_h = h / kv_mul_l;
+                let q_off = h * head_dim_l;
+                let out_off = h * value_dim_l;
+                online_attention(
+                    &buf.q[q_off..q_off + head_dim_l],
+                    &cache.k[kv_cache_layer][kv_h * head_dim_l..],
+                    &cache.v[kv_cache_layer][kv_h * value_dim_l..],
+                    cache.per_pos_k_dim,
+                    cache.per_pos_v_dim,
+                    cache.storage_len,
+                    head_dim_l,
+                    value_dim_l,
+                    attn_window,
+                    pos,
+                    scale,
+                    &mut buf.attn_out[out_off..out_off + value_dim_l],
+                );
+            }
         }
 
         // Output projection + residual
-        layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
+        layer
+            .attn_output
+            .matvec_into(&buf.attn_out[..attn_out_len], &mut buf.proj);
+        rms_norm_into(
+            &buf.proj,
+            &layer.post_attn_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
         for i in 0..dim {
-            buf.x[i] += buf.proj[i];
+            buf.x[i] += buf.xn2[i];
         }
 
         // ── FFN (SwiGLU-like) ──
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
-        layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+        if !try_quant_matvec2_into(
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &buf.xn2,
+            &mut buf.gate,
+            &mut buf.up,
+        ) {
+            layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+            layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+        }
 
-        buf.hidden.resize(config.hidden_dim, 0.0);
-        for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
+        let ffn_hidden_dim = layer.ffn_hidden_dim;
+        buf.hidden.resize(ffn_hidden_dim, 0.0);
+        for i in 0..ffn_hidden_dim {
+            buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
         }
 
         layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+        rms_norm_into(
+            &buf.proj,
+            &layer.post_ffw_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
         for i in 0..dim {
-            buf.x[i] += buf.proj[i];
+            buf.x[i] += buf.xn2[i];
+        }
+        if has_per_layer_inputs {
+            apply_gemma4_per_layer_residual(config, layer, buf, l, weights.per_layer_dim);
+        }
+        if let Some(&scale) = layer.layer_output_scale.first() {
+            for value in &mut buf.x {
+                *value *= scale;
+            }
         }
     }
 
@@ -2734,6 +3215,12 @@ pub fn forward_gemma4_into(
         &mut buf.xn,
     );
     weights.output.matvec_into(&buf.xn, logits);
+    if weights.final_logit_softcap.is_finite() && weights.final_logit_softcap > 0.0 {
+        let cap = weights.final_logit_softcap;
+        for logit in logits {
+            *logit = (*logit / cap).tanh() * cap;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2742,16 +3229,27 @@ pub struct Gemma4LayerWeights {
     pub attn_q: Weight,
     pub attn_k: Weight,
     pub attn_v: Weight,
+    pub attn_q_norm: Vec<f32>,
+    pub attn_k_norm: Vec<f32>,
     pub attn_output: Weight,
+    pub post_attn_norm: Vec<f32>,
     pub ffn_norm: Vec<f32>,
     pub ffn_down: Weight,
     pub ffn_up: Weight,
     pub ffn_gate: Weight,
+    pub post_ffw_norm: Vec<f32>,
+    pub layer_output_scale: Vec<f32>,
+    pub rope_inv_freq: Vec<f32>,
+    pub per_layer_inp_gate: Option<Weight>,
+    pub per_layer_proj: Option<Weight>,
+    pub per_layer_post_norm: Vec<f32>,
     pub head_dim: usize,
     pub n_kv_heads: usize,
     pub value_dim: usize,
+    pub ffn_hidden_dim: usize,
+    pub is_swa: bool,
+    pub shared_kv_source_layer: Option<usize>,
     pub has_attn_v: bool, // True if layer has separate V projection; false = use K as V
-                          // TODO: Add biases, global attn, etc. falls benötigt
 }
 
 #[derive(Clone)]
@@ -2759,10 +3257,15 @@ pub struct Gemma4Weights {
     pub token_embd: Weight,
     pub output_norm: Vec<f32>,
     pub output: Weight,
+    pub final_logit_softcap: f32,
+    pub per_layer_token_embd: Option<Weight>,
+    pub per_layer_model_proj: Option<Weight>,
+    pub per_layer_proj_norm: Vec<f32>,
+    pub per_layer_dim: usize,
     pub layers: Vec<Gemma4LayerWeights>,
 }
 
-/// Loader für Gemma-4 Modelle (Stub, lädt nur Grundstruktur)
+/// Loads Gemma-family dense decoder weights, including Gemma 4 GGUF variants.
 pub fn load_gemma4_model(
     mmap_data: &[u8],
     gguf: &GGUFFile,
@@ -2813,12 +3316,6 @@ pub fn load_gemma4_model(
     // Infer head/value dims from available tensors (some Gemma-4 GGUFs
     // have unreliable metadata). Prefer inferred shapes when possible.
     {
-        for l in 0..config.n_layers {
-            let q_name = format!("blk.{}.attn_q.weight", l);
-            if let Some(info) = tensor_idx.get(&q_name) {
-                eprintln!("Layer {} attn_q shape: {:?}", l, info.dims);
-            }
-        }
         let mut head_dim_cand: Option<usize> = None;
         let mut value_dim_cand: Option<usize> = None;
         let mut kv_heads_cand: Option<usize> = None;
@@ -2920,61 +3417,94 @@ pub fn load_gemma4_model(
         eprintln!("Note: output tied to embeddings");
         token_embd.clone()
     };
-
-    // Infer head/value dims from available tensors
-    {
-        let mut head_dim_cand: Option<usize> = None;
-        let mut value_dim_cand: Option<usize> = None;
-        for l in 0..config.n_layers {
-            let qn = format!("blk.{}.attn_q.weight", l);
-            if let Some(info) = tensor_idx.get(&qn) {
-                if info.dims.len() >= 2 {
-                    let rows = info.dims[1] as usize;
-                    let cols = info.dims[0] as usize;
-                    if cols == config.dim && rows % config.n_heads == 0 {
-                        head_dim_cand = Some(rows / config.n_heads);
+    let final_logit_softcap = gguf.get_f32("gemma4.final_logit_softcapping", 30.0);
+    let rope_base = gguf.get_f32("gemma4.rope.freq_base", config.rope_theta);
+    let rope_base_swa = gguf.get_f32("gemma4.rope.freq_base_swa", rope_base);
+    let rope_freqs_full = load_optional_f32_vec(
+        mmap_data,
+        data_offset,
+        "rope_freqs.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        config.head_dim / 2,
+    );
+    let sliding_window_pattern: Vec<bool> =
+        match gguf.metadata.get("gemma4.attention.sliding_window_pattern") {
+            Some(crate::gguf::MetaValue::Array(values)) => values
+                .iter()
+                .filter_map(|v| {
+                    if let crate::gguf::MetaValue::Bool(value) = v {
+                        Some(*value)
+                    } else {
+                        None
                     }
-                }
-            }
-            let vn = format!("blk.{}.attn_v.weight", l);
-            if let Some(info) = tensor_idx.get(&vn) {
-                if info.dims.len() >= 2 {
-                    let rows = info.dims[1] as usize;
-                    let cols = info.dims[0] as usize;
-                    if cols == config.dim && rows % config.n_kv_heads == 0 {
-                        value_dim_cand = Some(rows / config.n_kv_heads);
-                    }
-                }
-            }
-            if head_dim_cand.is_some() && value_dim_cand.is_some() {
-                break;
-            }
-        }
-        if let Some(hd) = head_dim_cand {
-            if hd != config.head_dim {
-                eprintln!(
-                    "[INFO] Overriding config.head_dim {} -> {} based on attn_q tensor shapes",
-                    config.head_dim, hd
-                );
-                config.head_dim = hd;
-            }
-        }
-        if let Some(vd) = value_dim_cand {
-            if vd != config.value_dim {
-                eprintln!(
-                    "[INFO] Overriding config.value_dim {} -> {} based on attn_v tensor shapes",
-                    config.value_dim, vd
-                );
-                config.value_dim = vd;
-            }
-        }
-        config.kv_dim = config.value_dim * config.n_kv_heads;
-        config.kv_mul = config.n_heads / config.n_kv_heads;
-        eprintln!(
-            "Adjusted Gemma4 config: head_dim={}, value_dim={}, kv_dim={}, kv_mul={}",
-            config.head_dim, config.value_dim, config.kv_dim, config.kv_mul
-        );
-    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+    let layer_is_swa: Vec<bool> = (0..config.n_layers)
+        .map(|l| {
+            let v_name = format!("blk.{}.attn_v.weight", l);
+            sliding_window_pattern
+                .get(l)
+                .copied()
+                .unwrap_or_else(|| tensor_idx.contains_key(&v_name))
+        })
+        .collect();
+    let shared_kv_layers = gguf.get_u32("gemma4.attention.shared_kv_layers", 0) as usize;
+    let first_shared_kv_layer = (shared_kv_layers > 0 && shared_kv_layers < config.n_layers)
+        .then_some(config.n_layers - shared_kv_layers);
+    let per_layer_dim = gguf.get_u32("gemma4.embedding_length_per_layer_input", 0) as usize;
+    let per_layer_len = per_layer_dim.saturating_mul(config.n_layers);
+    let per_layer_token_embd =
+        if per_layer_dim > 0 && tensor_idx.contains_key("per_layer_token_embd.weight") {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                "per_layer_token_embd.weight",
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(
+                "per_layer_token_embd.weight",
+                &w,
+                config.vocab_size,
+                per_layer_len,
+            );
+            Some(w)
+        } else {
+            None
+        };
+    let per_layer_model_proj =
+        if per_layer_dim > 0 && tensor_idx.contains_key("per_layer_model_proj.weight") {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                "per_layer_model_proj.weight",
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape("per_layer_model_proj.weight", &w, per_layer_len, config.dim);
+            Some(w)
+        } else {
+            None
+        };
+    let per_layer_proj_norm =
+        if per_layer_dim > 0 && tensor_idx.contains_key("per_layer_proj_norm.weight") {
+            load_f32_vec(
+                mmap_data,
+                data_offset,
+                "per_layer_proj_norm.weight",
+                &tensor_idx,
+                &inferred_sizes,
+            )
+        } else {
+            Vec::new()
+        };
 
     let mut layers = Vec::with_capacity(config.n_layers);
     for l in 0..config.n_layers {
@@ -3131,6 +3661,28 @@ pub fn load_gemma4_model(
         let ffn_gate_name = format!("blk.{}.ffn_gate.weight", l);
         let ffn_up_name = format!("blk.{}.ffn_up.weight", l);
         let ffn_down_name = format!("blk.{}.ffn_down.weight", l);
+        let per_layer_inp_gate_name = format!("blk.{}.inp_gate.weight", l);
+        let per_layer_proj_name = format!("blk.{}.proj.weight", l);
+        let per_layer_post_norm_name = format!("blk.{}.post_norm.weight", l);
+        let is_swa = layer_is_swa[l];
+        let shared_kv_source_layer = first_shared_kv_layer.and_then(|first_shared| {
+            if l < first_shared {
+                return None;
+            }
+            (0..first_shared)
+                .rev()
+                .find(|&source| layer_is_swa[source] == is_swa)
+        });
+        let ffn_hidden_dim_l = tensor_idx
+            .get(&ffn_gate_name)
+            .and_then(|info| {
+                if info.dims.len() >= 2 && info.dims[0] as usize == dim {
+                    Some(info.dims[1] as usize)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(config.hidden_dim);
 
         // Load or fallback Q
         let attn_q = if tensor_idx.contains_key(&q_name) {
@@ -3162,11 +3714,10 @@ pub fn load_gemma4_model(
             validate_shape(&alt, l, &w, q_rows, dim, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                q_name, l, q_rows, dim
+            panic!(
+                "Missing tensor: {} (or alternative attention query tensor for layer {})",
+                q_name, l
             );
-            Weight::F32(vec![0.0; q_rows * dim])
         };
 
         // Load or fallback K
@@ -3199,17 +3750,15 @@ pub fn load_gemma4_model(
             validate_shape(&alt, l, &w, k_rows, dim, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                k_name, l, k_rows, dim
+            panic!(
+                "Missing tensor: {} (or alternative attention key tensor for layer {})",
+                k_name, l
             );
-            Weight::F32(vec![0.0; k_rows * dim])
         };
 
         // Load or fallback V
         // Special handling: if V tensor is missing, use K as V (K=V reuse for full-attention layers)
-        let has_attn_v = tensor_idx.contains_key(&v_name);
-        let attn_v = if has_attn_v {
+        let (attn_v, has_attn_v) = if tensor_idx.contains_key(&v_name) {
             let w = load_weight(
                 mmap_data,
                 data_offset,
@@ -3220,7 +3769,7 @@ pub fn load_gemma4_model(
                 borrow_quantized,
             );
             validate_shape(&v_name, l, &w, v_rows, dim, &config);
-            w
+            (w, true)
         } else if let Some(alt) = find_alternative(&tensor_idx, l, &["attn", "v"]) {
             eprintln!(
                 "[INFO] Using alternative tensor {} for {} (layer {})",
@@ -3236,7 +3785,7 @@ pub fn load_gemma4_model(
                 borrow_quantized,
             );
             validate_shape(&alt, l, &w, v_rows, dim, &config);
-            w
+            (w, true)
         } else {
             // K=V reuse: missing attn_v means use K tensor as V
             // This is common in full-attention/sliding-window layers
@@ -3244,8 +3793,25 @@ pub fn load_gemma4_model(
                 "[INFO] Missing tensor: {} (layer {}) — using K as V (K=V reuse)",
                 v_name, l
             );
-            attn_k.clone()
+            (attn_k.clone(), false)
         };
+        let full_rope_factors = if is_swa {
+            None
+        } else if rope_freqs_full.len() >= head_dim_l / 2 {
+            Some(&rope_freqs_full[..head_dim_l / 2])
+        } else {
+            eprintln!(
+                "[WARN] Layer {}: missing rope_freqs.weight for full-attention Gemma4 layer; proportional RoPE may be inaccurate",
+                l
+            );
+            None
+        };
+        let rope_inv_freq = build_rope_inv_freq_with_factors(
+            if is_swa { rope_base_swa } else { rope_base },
+            head_dim_l,
+            1.0,
+            full_rope_factors,
+        );
 
         // Load or fallback output projection
         let attn_output = if tensor_idx.contains_key(&out_name) {
@@ -3285,14 +3851,10 @@ pub fn load_gemma4_model(
             validate_shape(&alt, l, &w, out_rows, config.n_heads * value_dim_l, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                out_name,
-                l,
-                out_rows,
-                config.n_heads * value_dim_l
+            panic!(
+                "Missing tensor: {} (or alternative attention output tensor for layer {})",
+                out_name, l
             );
-            Weight::F32(vec![0.0; out_rows * config.n_heads * value_dim_l])
         };
 
         // FFN weights: gate/up/down
@@ -3306,14 +3868,10 @@ pub fn load_gemma4_model(
                 false,
                 borrow_quantized,
             );
-            validate_shape(&ffn_gate_name, l, &w, config.hidden_dim, dim, &config);
+            validate_shape(&ffn_gate_name, l, &w, ffn_hidden_dim_l, dim, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                ffn_gate_name, l, config.hidden_dim, dim
-            );
-            Weight::F32(vec![0.0; config.hidden_dim * dim])
+            panic!("Missing tensor: {} (layer {})", ffn_gate_name, l);
         };
 
         let ffn_up = if tensor_idx.contains_key(&ffn_up_name) {
@@ -3326,14 +3884,10 @@ pub fn load_gemma4_model(
                 false,
                 borrow_quantized,
             );
-            validate_shape(&ffn_up_name, l, &w, config.hidden_dim, dim, &config);
+            validate_shape(&ffn_up_name, l, &w, ffn_hidden_dim_l, dim, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                ffn_up_name, l, config.hidden_dim, dim
-            );
-            Weight::F32(vec![0.0; config.hidden_dim * dim])
+            panic!("Missing tensor: {} (layer {})", ffn_up_name, l);
         };
 
         let ffn_down = if tensor_idx.contains_key(&ffn_down_name) {
@@ -3346,58 +3900,122 @@ pub fn load_gemma4_model(
                 false,
                 borrow_quantized,
             );
-            validate_shape(&ffn_down_name, l, &w, dim, config.hidden_dim, &config);
+            validate_shape(&ffn_down_name, l, &w, dim, ffn_hidden_dim_l, &config);
             w
         } else {
-            eprintln!(
-                "[WARN] Missing tensor: {} (layer {}) expected shape {}x{} — using zero fallback",
-                ffn_down_name, l, dim, config.hidden_dim
-            );
-            Weight::F32(vec![0.0; dim * config.hidden_dim])
+            panic!("Missing tensor: {} (layer {})", ffn_down_name, l);
         };
-
-        let has_attn_v = tensor_idx.contains_key(&v_name);
-        let layer = Gemma4LayerWeights {
-            attn_norm: if tensor_idx.contains_key(&format!("blk.{}.attn_norm.weight", l)) {
+        let per_layer_inp_gate =
+            if per_layer_dim > 0 && tensor_idx.contains_key(&per_layer_inp_gate_name) {
+                let w = load_weight(
+                    mmap_data,
+                    data_offset,
+                    &per_layer_inp_gate_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                );
+                validate_shape(&per_layer_inp_gate_name, l, &w, per_layer_dim, dim, &config);
+                Some(w)
+            } else {
+                None
+            };
+        let per_layer_proj = if per_layer_dim > 0 && tensor_idx.contains_key(&per_layer_proj_name) {
+            let w = load_weight(
+                mmap_data,
+                data_offset,
+                &per_layer_proj_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_shape(&per_layer_proj_name, l, &w, dim, per_layer_dim, &config);
+            Some(w)
+        } else {
+            None
+        };
+        let per_layer_post_norm =
+            if per_layer_dim > 0 && tensor_idx.contains_key(&per_layer_post_norm_name) {
                 load_f32_vec(
                     mmap_data,
                     data_offset,
-                    &format!("blk.{}.attn_norm.weight", l),
+                    &per_layer_post_norm_name,
                     &tensor_idx,
                     &inferred_sizes,
                 )
             } else {
-                eprintln!(
-                    "[WARN] Missing tensor: blk.{}.attn_norm.weight (layer {})",
-                    l, l
-                );
-                vec![0.0; dim]
-            },
+                Vec::new()
+            };
+
+        let layer = Gemma4LayerWeights {
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
             attn_q,
             attn_k,
             attn_v,
+            attn_q_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            attn_k_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
             attn_output,
-            ffn_norm: if tensor_idx.contains_key(&format!("blk.{}.ffn_norm.weight", l)) {
-                load_f32_vec(
-                    mmap_data,
-                    data_offset,
-                    &format!("blk.{}.ffn_norm.weight", l),
-                    &tensor_idx,
-                    &inferred_sizes,
-                )
-            } else {
-                eprintln!(
-                    "[WARN] Missing tensor: blk.{}.ffn_norm.weight (layer {})",
-                    l, l
-                );
-                vec![0.0; dim]
-            },
+            post_attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.post_attention_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            ffn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
             ffn_down,
             ffn_up,
             ffn_gate,
+            post_ffw_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.post_ffw_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            layer_output_scale: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.layer_output_scale.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            rope_inv_freq,
+            per_layer_inp_gate,
+            per_layer_proj,
+            per_layer_post_norm,
             head_dim: head_dim_l,
             n_kv_heads: n_kv_heads_l,
             value_dim: value_dim_l,
+            ffn_hidden_dim: ffn_hidden_dim_l,
+            is_swa,
+            shared_kv_source_layer,
             has_attn_v,
         };
         layers.push(layer);
@@ -3410,6 +4028,11 @@ pub fn load_gemma4_model(
         token_embd,
         output_norm,
         output,
+        final_logit_softcap,
+        per_layer_token_embd,
+        per_layer_model_proj,
+        per_layer_proj_norm,
+        per_layer_dim,
         layers,
     };
     (config, weights)
@@ -3442,7 +4065,7 @@ pub fn forward_hidden<'a>(
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        if !try_q4k_matvec3_into(
+        if !try_quant_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
         ) {
             layer.wq.matvec_into(&buf.xn, &mut buf.q);
@@ -3519,7 +4142,7 @@ pub fn forward_hidden<'a>(
 
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        if !try_q4k_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
+        if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
             layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
             layer.w3.matvec_into(&buf.xn2, &mut buf.up);
         }
@@ -3562,7 +4185,7 @@ pub fn forward_hidden_gpt_oss<'a>(
         let layer = &weights.layers[l];
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
-        if !try_q4k_matvec3_into(
+        if !try_quant_matvec3_into(
             &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
         ) {
             layer.wq.matvec_into(&buf.xn, &mut buf.q);
@@ -3724,54 +4347,119 @@ pub fn forward_hidden_gemma4<'a>(
     let dim = config.dim;
 
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
+    let emb_scale = (dim as f32).sqrt();
+    for value in &mut buf.x {
+        *value *= emb_scale;
+    }
+    let has_per_layer_inputs = prepare_gemma4_per_layer_inputs(config, weights, buf, token);
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
 
-        layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
-        layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
-
         let head_dim_l = layer.head_dim;
         let n_kv_heads_l = layer.n_kv_heads;
         let value_dim_l = layer.value_dim;
+        let shared_kv_source_layer = layer.shared_kv_source_layer;
+        let kv_cache_layer = shared_kv_source_layer.unwrap_or(l);
 
-        if layer.has_attn_v {
-            layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+        if shared_kv_source_layer.is_some() {
+            layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+        } else if layer.has_attn_v {
+            if !try_quant_matvec3_into(
+                &layer.attn_q,
+                &layer.attn_k,
+                &layer.attn_v,
+                &buf.xn,
+                &mut buf.q,
+                &mut buf.k,
+                &mut buf.v,
+            ) {
+                layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+                layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+                layer.attn_v.matvec_into(&buf.xn, &mut buf.v);
+            }
         } else {
+            if !try_quant_matvec2_into(
+                &layer.attn_q,
+                &layer.attn_k,
+                &buf.xn,
+                &mut buf.q,
+                &mut buf.k,
+            ) {
+                layer.attn_q.matvec_into(&buf.xn, &mut buf.q);
+                layer.attn_k.matvec_into(&buf.xn, &mut buf.k);
+            }
             let kv_size = n_kv_heads_l * head_dim_l;
             buf.v[..kv_size].copy_from_slice(&buf.k[..kv_size]);
         }
 
-        apply_rope_qk(
-            &mut buf.q,
-            &mut buf.k,
-            pos,
-            head_dim_l,
-            config.n_heads,
-            n_kv_heads_l,
-            &buf.rope_inv_freq,
-        );
-
+        let q_len = config.n_heads * head_dim_l;
         let kv_k_size = n_kv_heads_l * head_dim_l;
         let kv_v_size = n_kv_heads_l * value_dim_l;
+        rms_norm_heads_in_place(
+            &mut buf.q[..q_len],
+            head_dim_l,
+            config.n_heads,
+            Some(&layer.attn_q_norm),
+            config.rms_norm_eps,
+        );
+        if shared_kv_source_layer.is_some() {
+            apply_rope_neox(
+                &mut buf.q[..q_len],
+                pos,
+                head_dim_l,
+                config.n_heads,
+                &layer.rope_inv_freq,
+            );
+        } else {
+            rms_norm_heads_in_place(
+                &mut buf.k[..kv_k_size],
+                head_dim_l,
+                n_kv_heads_l,
+                Some(&layer.attn_k_norm),
+                config.rms_norm_eps,
+            );
+            rms_norm_heads_in_place(
+                &mut buf.v[..kv_v_size],
+                value_dim_l,
+                n_kv_heads_l,
+                None,
+                config.rms_norm_eps,
+            );
 
-        let kv_k_start = cache.k_offset(pos);
-        let kv_v_start = cache.v_offset(pos);
-        cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
-        cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+            apply_rope_qk_neox(
+                &mut buf.q,
+                &mut buf.k,
+                pos,
+                head_dim_l,
+                config.n_heads,
+                n_kv_heads_l,
+                &layer.rope_inv_freq,
+            );
 
-        let scale = 1.0 / (head_dim_l as f32).sqrt();
+            let kv_k_start = cache.k_offset(pos);
+            let kv_v_start = cache.v_offset(pos);
+            cache.k[l][kv_k_start..kv_k_start + kv_k_size].copy_from_slice(&buf.k[..kv_k_size]);
+            cache.v[l][kv_v_start..kv_v_start + kv_v_size].copy_from_slice(&buf.v[..kv_v_size]);
+        }
+
+        let scale = 1.0;
         let sliding_window = active_sliding_window(config, cache);
-        let attn_window = attention_start_pos(pos, sliding_window);
+        let attn_window = if layer.is_swa {
+            attention_start_pos(pos, sliding_window)
+        } else {
+            0
+        };
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
+        let attn_out_len = config.n_heads * value_dim_l;
         if !crate::metal::attention_into(
-            &buf.q,
-            &cache.k[l],
-            &cache.v[l],
-            &mut buf.attn_out,
+            &buf.q[..config.n_heads * head_dim_l],
+            &cache.k[kv_cache_layer],
+            &cache.v[kv_cache_layer],
+            &mut buf.attn_out[..attn_out_len],
             config.n_heads,
             kv_mul_l,
             head_dim_l,
@@ -3789,8 +4477,8 @@ pub fn forward_hidden_gemma4<'a>(
                 let out_off = h * value_dim_l;
                 online_attention(
                     &buf.q[q_off..q_off + head_dim_l],
-                    &cache.k[l][kv_h * head_dim_l..],
-                    &cache.v[l][kv_h * value_dim_l..],
+                    &cache.k[kv_cache_layer][kv_h * head_dim_l..],
+                    &cache.v[kv_cache_layer][kv_h * value_dim_l..],
                     cache.per_pos_k_dim,
                     cache.per_pos_v_dim,
                     cache.storage_len,
@@ -3804,24 +4492,55 @@ pub fn forward_hidden_gemma4<'a>(
             }
         }
 
-        layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);
+        layer
+            .attn_output
+            .matvec_into(&buf.attn_out[..attn_out_len], &mut buf.proj);
+        rms_norm_into(
+            &buf.proj,
+            &layer.post_attn_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
         for i in 0..dim {
-            buf.x[i] += buf.proj[i];
+            buf.x[i] += buf.xn2[i];
         }
 
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
-        layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+        if !try_quant_matvec2_into(
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &buf.xn2,
+            &mut buf.gate,
+            &mut buf.up,
+        ) {
+            layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+            layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+        }
 
-        buf.hidden.resize(config.hidden_dim, 0.0);
-        for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
+        let ffn_hidden_dim = layer.ffn_hidden_dim;
+        buf.hidden.resize(ffn_hidden_dim, 0.0);
+        for i in 0..ffn_hidden_dim {
+            buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
         }
 
         layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+        rms_norm_into(
+            &buf.proj,
+            &layer.post_ffw_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
         for i in 0..dim {
-            buf.x[i] += buf.proj[i];
+            buf.x[i] += buf.xn2[i];
+        }
+        if has_per_layer_inputs {
+            apply_gemma4_per_layer_residual(config, layer, buf, l, weights.per_layer_dim);
+        }
+        if let Some(&scale) = layer.layer_output_scale.first() {
+            for value in &mut buf.x {
+                *value *= scale;
+            }
         }
     }
 

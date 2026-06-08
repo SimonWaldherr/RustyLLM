@@ -13,7 +13,7 @@ use std::env;
 use std::fs;
 
 // Import from the library
-use rusty_llm::gguf::GGUFFile;
+use rusty_llm::gguf::{GGMLType, GGUFFile, MetaValue};
 
 /// runs the CLI and prints fatal errors.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,17 +30,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GGUFFile::parse(&data)?;
 
     println!("\n=== GEMMA-4 GGUF Layer Architecture Analysis ===\n");
+    println!("=== RELEVANT METADATA ===");
+    let mut metadata: Vec<_> = gguf.metadata.iter().collect();
+    metadata.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, value) in metadata {
+        if key.contains("gemma4")
+            || key.contains("attention")
+            || key.contains("rope")
+            || key.contains("tokenizer.ggml.add_bos_token")
+            || key.contains("tokenizer.ggml.model")
+            || key.contains("tokenizer.ggml.pre")
+            || key.contains("tokenizer.ggml.bos")
+            || key.contains("tokenizer.ggml.eos")
+            || key.contains("tokenizer.ggml.padding")
+        {
+            println!("{} = {:?}", key, value);
+        }
+    }
+    let tokens = gguf
+        .metadata
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_string_array())
+        .unwrap_or_default();
+    let merge_count = match gguf.metadata.get("tokenizer.ggml.merges") {
+        Some(MetaValue::Array(values)) => values.len(),
+        _ => 0,
+    };
+    let score_count = match gguf.metadata.get("tokenizer.ggml.scores") {
+        Some(MetaValue::Array(values)) => values.len(),
+        _ => 0,
+    };
+    println!("tokenizer.ggml.tokens.count = {}", tokens.len());
+    println!("tokenizer.ggml.merges.count = {}", merge_count);
+    println!("tokenizer.ggml.scores.count = {}", score_count);
+    for needle in [
+        "<start_of_turn>",
+        "<end_of_turn>",
+        "<|turn>",
+        "<turn|>",
+        "system",
+        "user",
+        "model",
+    ] {
+        if let Some((id, token)) = tokens
+            .iter()
+            .enumerate()
+            .find(|(_, token)| token.as_str() == needle)
+        {
+            println!("token_id({}) = {} ({:?})", needle, id, token);
+        }
+    }
+    for name in [
+        "output_norm.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q_norm.weight",
+        "blk.0.post_attention_norm.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.post_ffw_norm.weight",
+    ] {
+        print_f32_tensor_stats(name, &data, &gguf);
+    }
+    println!();
 
     // Organize tensors by block
     let mut blocks: HashMap<String, Vec<_>> = HashMap::new();
 
     for tensor in &gguf.tensors {
-        // Extract block number from tensor name (e.g., "blk.5.attn_q" -> "blk.5")
-        if let Some(blk_start) = tensor.name.find("blk.") {
-            if let Some(blk_end) = tensor.name[blk_start..].find('.') {
-                let block_key = &tensor.name[blk_start..blk_start + blk_end];
+        // Extract block number from tensor name (e.g. "blk.5.attn_q" -> "blk.5").
+        if let Some(rest) = tensor.name.strip_prefix("blk.") {
+            let layer_digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            if !layer_digits.is_empty() && rest[layer_digits.len()..].starts_with('.') {
+                let block_key = format!("blk.{}", layer_digits);
                 blocks
-                    .entry(block_key.to_string())
+                    .entry(block_key)
                     .or_insert_with(Vec::new)
                     .push(tensor);
             }
@@ -55,9 +117,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(999)
     });
 
-    // Analyze specific layers: normal layers (0, 1, 2, 3, 4, 6, 7...) vs special layers (5, 11, 17, 23, 29)
-    let special_layers = [5, 11, 17, 23, 29];
-    let analysis_layers = vec![0, 5, 11];
+    // Analyze specific layers: normal layers vs special K=V-reuse layers.
+    let special_layers = [5, 11, 17, 23, 29, 35, 41, 47];
+    let analysis_layers = vec![0, 5, 11, 47];
 
     for layer_num in analysis_layers {
         let block_key = format!("blk.{}", layer_num);
@@ -137,6 +199,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn print_f32_tensor_stats(name: &str, data: &[u8], gguf: &GGUFFile) {
+    let Some(tensor) = gguf.tensors.iter().find(|tensor| tensor.name == name) else {
+        return;
+    };
+    if tensor.dtype != GGMLType::F32 {
+        return;
+    }
+    let count = tensor.numel();
+    let offset = gguf.data_offset + tensor.offset as usize;
+    let byte_len = count.saturating_mul(4);
+    if offset + byte_len > data.len() || count == 0 {
+        return;
+    }
+
+    let raw = &data[offset..offset + byte_len];
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f64;
+    for chunk in raw.chunks_exact(4) {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        min = min.min(value);
+        max = max.max(value);
+        sum += value as f64;
+    }
+    println!(
+        "{} stats: count={}, min={:.6}, mean={:.6}, max={:.6}",
+        name,
+        count,
+        min,
+        sum / count as f64,
+        max
+    );
 }
 
 /// Compares selected tensor blocks for the GGUF analysis utility.

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 enum TokenizerMode {
     SentencePiece,
     Gpt2Bpe,
+    Gemma4Bpe,
 }
 
 pub struct Tokenizer {
@@ -17,6 +18,7 @@ pub struct Tokenizer {
     scores: Vec<f32>,
     token_to_id: HashMap<String, u32>,
     bpe_merges: HashMap<(u32, u32), (usize, u32)>,
+    bpe_text_merges: HashMap<(String, String), (usize, u32)>,
     byte_encoder: [char; 256],
     byte_decoder: HashMap<char, u8>,
     byte_token_ids: [Option<u32>; 256],
@@ -45,6 +47,7 @@ impl Tokenizer {
         }
 
         let mut bpe_merges = HashMap::new();
+        let mut bpe_text_merges = HashMap::new();
         if let Some(merges) = metadata
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_string_array())
@@ -54,12 +57,14 @@ impl Tokenizer {
                     let mut merged = String::with_capacity(left.len() + right.len());
                     merged.push_str(left);
                     merged.push_str(right);
-                    if let (Some(&left_id), Some(&right_id), Some(&merged_id)) = (
-                        token_to_id.get(left),
-                        token_to_id.get(right),
-                        token_to_id.get(&merged),
-                    ) {
-                        bpe_merges.insert((left_id, right_id), (rank, merged_id));
+                    if let Some(&merged_id) = token_to_id.get(&merged) {
+                        bpe_text_merges
+                            .insert((left.to_string(), right.to_string()), (rank, merged_id));
+                        if let (Some(&left_id), Some(&right_id)) =
+                            (token_to_id.get(left), token_to_id.get(right))
+                        {
+                            bpe_merges.insert((left_id, right_id), (rank, merged_id));
+                        }
                     }
                 }
             }
@@ -77,7 +82,9 @@ impl Tokenizer {
         // GGUF tokenizer metadata is not fully standardized across model
         // families, so mode selection uses a few conservative hints.
         let pre_lower = pre.to_ascii_lowercase();
-        let mode = if model.eq_ignore_ascii_case("gpt2")
+        let mode = if model.eq_ignore_ascii_case("gemma4") {
+            TokenizerMode::Gemma4Bpe
+        } else if model.eq_ignore_ascii_case("gpt2")
             || pre_lower.contains("qwen")
             || pre_lower.contains("gpt")
         {
@@ -115,6 +122,7 @@ impl Tokenizer {
             scores,
             token_to_id,
             bpe_merges,
+            bpe_text_merges,
             byte_encoder,
             byte_decoder,
             byte_token_ids,
@@ -146,6 +154,7 @@ impl Tokenizer {
         let encoded = match self.mode {
             TokenizerMode::SentencePiece => self.encode_sentencepiece(text),
             TokenizerMode::Gpt2Bpe => self.encode_gpt2_bpe(text),
+            TokenizerMode::Gemma4Bpe => self.encode_gemma4_bpe(text),
         };
         tokens.extend_from_slice(&encoded);
         tokens
@@ -181,6 +190,11 @@ impl Tokenizer {
     /// Returns the number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// Returns whether normal text encoding prepends the BOS token.
+    pub fn adds_bos_token(&self) -> bool {
+        self.add_bos_token
     }
 
     /// Looks up the ID of a special token string.
@@ -283,6 +297,57 @@ impl Tokenizer {
 
             out.extend(symbols);
         }
+        out
+    }
+
+    /// Encodes text with Gemma 4's SPM-style BPE over raw UTF-8.
+    fn encode_gemma4_bpe(&self, text: &str) -> Vec<u32> {
+        let normalized = text.replace(' ', "\u{2581}");
+        let mut out = Vec::new();
+
+        for piece in split_gemma4_pieces(&normalized) {
+            if piece.is_empty() {
+                continue;
+            }
+
+            let is_newlines = piece.as_bytes().iter().all(|&b| b == b'\n');
+            if is_newlines {
+                if let Some(&id) = self.token_to_id.get(piece) {
+                    out.push(id);
+                    continue;
+                }
+            }
+
+            let mut symbols: Vec<String> = piece.chars().map(|ch| ch.to_string()).collect();
+            while symbols.len() > 1 {
+                let mut best_rank = usize::MAX;
+                let mut best_idx = None;
+                let mut best_id = 0u32;
+
+                for i in 0..symbols.len() - 1 {
+                    if let Some(&(rank, merged_id)) = self
+                        .bpe_text_merges
+                        .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                    {
+                        if rank < best_rank {
+                            best_rank = rank;
+                            best_idx = Some(i);
+                            best_id = merged_id;
+                        }
+                    }
+                }
+
+                let Some(i) = best_idx else { break };
+                let merged = self.decode_raw(best_id).to_string();
+                symbols[i] = merged;
+                symbols.remove(i + 1);
+            }
+
+            for symbol in symbols {
+                self.encode_piece(&symbol, &mut out);
+            }
+        }
+
         out
     }
 
@@ -391,6 +456,29 @@ fn pretokenize_gpt2(text: &str) -> Vec<&str> {
     pieces
 }
 
+/// Splits Gemma 4 text into non-newline and newline runs.
+fn split_gemma4_pieces(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    let mut last_is_newline: Option<bool> = None;
+
+    for (idx, ch) in text.char_indices() {
+        let is_newline = ch == '\n';
+        if let Some(prev) = last_is_newline {
+            if prev != is_newline {
+                pieces.push(&text[start..idx]);
+                start = idx;
+            }
+        }
+        last_is_newline = Some(is_newline);
+    }
+
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
+}
+
 /// Builds reversible GPT-2 byte encoder and decoder tables.
 fn build_byte_maps() -> ([char; 256], HashMap<char, u8>) {
     // Mirrors GPT-2's bytes_to_unicode table so arbitrary byte sequences can
@@ -418,4 +506,81 @@ fn build_byte_maps() -> ([char; 256], HashMap<char, u8>) {
         }
     }
     (enc, dec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn str_array(items: &[&str]) -> MetaValue {
+        MetaValue::Array(
+            items
+                .iter()
+                .map(|item| MetaValue::Str((*item).to_string()))
+                .collect(),
+        )
+    }
+
+    fn gemma4_test_tokenizer() -> Tokenizer {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "tokenizer.ggml.model".to_string(),
+            MetaValue::Str("gemma4".to_string()),
+        );
+        metadata.insert("tokenizer.ggml.bos_token_id".to_string(), MetaValue::U32(0));
+        metadata.insert("tokenizer.ggml.eos_token_id".to_string(), MetaValue::U32(1));
+        metadata.insert(
+            "tokenizer.ggml.add_bos_token".to_string(),
+            MetaValue::Bool(true),
+        );
+        metadata.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            str_array(&[
+                "<bos>",
+                "<eos>",
+                "H",
+                "i",
+                "\u{2581}",
+                "t",
+                "h",
+                "e",
+                "\n",
+                "\n\n",
+                "Hi",
+                "\u{2581}t",
+                "\u{2581}th",
+                "\u{2581}the",
+                "<0x21>",
+            ]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.scores".to_string(),
+            MetaValue::Array(vec![MetaValue::F32(0.0); 15]),
+        );
+        metadata.insert(
+            "tokenizer.ggml.merges".to_string(),
+            str_array(&["H i", "\u{2581} t", "\u{2581}t h", "\u{2581}th e"]),
+        );
+        Tokenizer::from_metadata(&metadata)
+    }
+
+    #[test]
+    fn gemma4_bpe_uses_spm_spaces_and_merge_ranks() {
+        let tok = gemma4_test_tokenizer();
+        assert_eq!(tok.encode_without_bos("Hi the"), vec![10, 13]);
+    }
+
+    #[test]
+    fn gemma4_bpe_keeps_newline_runs_and_byte_fallback() {
+        let tok = gemma4_test_tokenizer();
+        assert_eq!(tok.encode_without_bos("Hi\n\n!"), vec![10, 9, 14]);
+    }
+
+    #[test]
+    fn gemma4_splitter_groups_newline_runs() {
+        assert_eq!(
+            split_gemma4_pieces("a\n\nb\n"),
+            vec!["a", "\n\n", "b", "\n"]
+        );
+    }
 }

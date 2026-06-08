@@ -130,6 +130,239 @@ impl KQuantMatvecKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantMatvecKind {
+    Q8_0,
+    Q8_1,
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q4K,
+    Q5K,
+    Q6K,
+    Mxfp4,
+}
+
+impl QuantMatvecKind {
+    #[inline]
+    fn matvec_kind(self) -> MatvecKind {
+        match self {
+            Self::Q8_0 => MatvecKind::Q8_0,
+            Self::Q8_1 => MatvecKind::Q8_1,
+            Self::Q4_0 => MatvecKind::Q4_0,
+            Self::Q4_1 => MatvecKind::Q4_1,
+            Self::Q5_0 => MatvecKind::Q5_0,
+            Self::Q5_1 => MatvecKind::Q5_1,
+            Self::Q4K => MatvecKind::Q4K,
+            Self::Q5K => MatvecKind::Q5K,
+            Self::Q6K => MatvecKind::Q6K,
+            Self::Mxfp4 => MatvecKind::Mxfp4,
+        }
+    }
+
+    #[inline]
+    fn block_size(self) -> usize {
+        match self {
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            _ => 32,
+        }
+    }
+
+    #[inline]
+    fn row_bytes(self, cols: usize) -> Option<usize> {
+        if cols == 0 || cols % self.block_size() != 0 {
+            return None;
+        }
+        let blocks = cols / self.block_size();
+        let bytes = match self {
+            Self::Q8_0 => 34,
+            Self::Q8_1 => 36,
+            Self::Q4_0 => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            Self::Mxfp4 => 17,
+        };
+        blocks.checked_mul(bytes)
+    }
+}
+
+#[inline]
+fn is_kquant_kind(kind: QuantMatvecKind) -> bool {
+    matches!(
+        kind,
+        QuantMatvecKind::Q4K | QuantMatvecKind::Q5K | QuantMatvecKind::Q6K
+    )
+}
+
+#[inline]
+fn is_mixed_kquant3(a: QuantMatvecKind, b: QuantMatvecKind, c: QuantMatvecKind) -> bool {
+    is_kquant_kind(a) && is_kquant_kind(b) && is_kquant_kind(c) && !(a == b && b == c)
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn quant_kind_from_kquant(kind: KQuantMatvecKind) -> QuantMatvecKind {
+    match kind {
+        KQuantMatvecKind::Q4K => QuantMatvecKind::Q4K,
+        KQuantMatvecKind::Q5K => QuantMatvecKind::Q5K,
+        KQuantMatvecKind::Q6K => QuantMatvecKind::Q6K,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn quant_single_metal_into(
+    kind: QuantMatvecKind,
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    x: &[f32],
+    out: &mut Vec<f32>,
+) -> bool {
+    match kind {
+        QuantMatvecKind::Q4K => crate::metal::q4k_matvec_into(weights, x, rows, cols, out),
+        QuantMatvecKind::Q6K => crate::metal::q6k_matvec_into(weights, x, rows, cols, out),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn quant_cpu_into(
+    kind: QuantMatvecKind,
+    weights: &[u8],
+    rows: usize,
+    cols: usize,
+    row_bytes: usize,
+    x: &[f32],
+    out: &mut Vec<f32>,
+) {
+    out.resize(rows, 0.0);
+    parallel_matvec_u8(kind.matvec_kind(), out, rows, cols, row_bytes, weights, x);
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+fn try_quant_metal3_into(
+    a: (QuantMatvecKind, &[u8], usize, usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize, usize),
+    c: (QuantMatvecKind, &[u8], usize, usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (kind_a, weights_a, rows_a, cols_a, row_bytes_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b, row_bytes_b) = b;
+    let (kind_c, weights_c, rows_c, cols_c, row_bytes_c) = c;
+
+    match (kind_a, kind_b, kind_c) {
+        (QuantMatvecKind::Q4K, QuantMatvecKind::Q4K, QuantMatvecKind::Q4K) => {
+            if crate::metal::q4k_matvec3_into(
+                (weights_a, rows_a, cols_a),
+                (weights_b, rows_b, cols_b),
+                (weights_c, rows_c, cols_c),
+                x,
+                out_a,
+                out_b,
+                out_c,
+            ) {
+                return true;
+            }
+        }
+        (QuantMatvecKind::Q6K, QuantMatvecKind::Q6K, QuantMatvecKind::Q6K) => {
+            if crate::metal::q6k_matvec3_into(
+                (weights_a, rows_a, cols_a),
+                (weights_b, rows_b, cols_b),
+                (weights_c, rows_c, cols_c),
+                x,
+                out_a,
+                out_b,
+                out_c,
+            ) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
+    let used_a = quant_single_metal_into(kind_a, weights_a, rows_a, cols_a, x, out_a);
+    let used_b = quant_single_metal_into(kind_b, weights_b, rows_b, cols_b, x, out_b);
+    let used_c = quant_single_metal_into(kind_c, weights_c, rows_c, cols_c, x, out_c);
+    if !(used_a || used_b || used_c) {
+        return false;
+    }
+
+    if !used_a {
+        quant_cpu_into(kind_a, weights_a, rows_a, cols_a, row_bytes_a, x, out_a);
+    }
+    if !used_b {
+        quant_cpu_into(kind_b, weights_b, rows_b, cols_b, row_bytes_b, x, out_b);
+    }
+    if !used_c {
+        quant_cpu_into(kind_c, weights_c, rows_c, cols_c, row_bytes_c, x, out_c);
+    }
+    true
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+fn try_quant_metal2_into(
+    a: (QuantMatvecKind, &[u8], usize, usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (kind_a, weights_a, rows_a, cols_a, row_bytes_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b, row_bytes_b) = b;
+
+    match (kind_a, kind_b) {
+        (QuantMatvecKind::Q4K, QuantMatvecKind::Q4K) => {
+            if crate::metal::q4k_matvec2_into(
+                (weights_a, rows_a, cols_a),
+                (weights_b, rows_b, cols_b),
+                x,
+                out_a,
+                out_b,
+            ) {
+                return true;
+            }
+        }
+        (QuantMatvecKind::Q6K, QuantMatvecKind::Q6K) => {
+            if crate::metal::q6k_matvec2_into(
+                (weights_a, rows_a, cols_a),
+                (weights_b, rows_b, cols_b),
+                x,
+                out_a,
+                out_b,
+            ) {
+                return true;
+            }
+        }
+        _ => {}
+    }
+
+    let used_a = quant_single_metal_into(kind_a, weights_a, rows_a, cols_a, x, out_a);
+    let used_b = quant_single_metal_into(kind_b, weights_b, rows_b, cols_b, x, out_b);
+    if !(used_a || used_b) {
+        return false;
+    }
+
+    if !used_a {
+        quant_cpu_into(kind_a, weights_a, rows_a, cols_a, row_bytes_a, x, out_a);
+    }
+    if !used_b {
+        quant_cpu_into(kind_b, weights_b, rows_b, cols_b, row_bytes_b, x, out_b);
+    }
+    true
+}
+
 /// Runs an f32 matrix-vector job through the worker pool.
 fn parallel_matvec_f32(out: &mut [f32], rows: usize, cols: usize, data: &[f32], x: &[f32]) {
     parallel_matvec(
@@ -1405,6 +1638,37 @@ pub fn matvec_kquant3_into(
     out_b.resize(rows_b, 0.0);
     out_c.resize(rows_c, 0.0);
 
+    #[cfg(not(target_family = "wasm"))]
+    if try_quant_metal3_into(
+        (
+            quant_kind_from_kquant(kind_a),
+            weights_a,
+            rows_a,
+            cols_a,
+            row_bytes_a,
+        ),
+        (
+            quant_kind_from_kquant(kind_b),
+            weights_b,
+            rows_b,
+            cols_b,
+            row_bytes_b,
+        ),
+        (
+            quant_kind_from_kquant(kind_c),
+            weights_c,
+            rows_c,
+            cols_c,
+            row_bytes_c,
+        ),
+        x,
+        out_a,
+        out_b,
+        out_c,
+    ) {
+        return true;
+    }
+
     #[cfg(target_family = "wasm")]
     {
         let kind_a = kind_a.matvec_kind();
@@ -1462,6 +1726,228 @@ pub fn matvec_kquant3_into(
             row_span_a: row_bytes_a,
             row_span_b: row_bytes_b,
             row_span_c: row_bytes_c,
+            workers,
+        });
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_quant3_into(
+    a: (QuantMatvecKind, &[u8], usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize),
+    c: (QuantMatvecKind, &[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (kind_a, weights_a, rows_a, cols_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b) = b;
+    let (kind_c, weights_c, rows_c, cols_c) = c;
+    if cols_a != cols_b || cols_a != cols_c || cols_a != x.len() {
+        return false;
+    }
+    let Some(row_bytes_a) = kind_a.row_bytes(cols_a) else {
+        return false;
+    };
+    let Some(row_bytes_b) = kind_b.row_bytes(cols_b) else {
+        return false;
+    };
+    let Some(row_bytes_c) = kind_c.row_bytes(cols_c) else {
+        return false;
+    };
+    let needed_a = match row_bytes_a.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes_b.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_c = match row_bytes_c.checked_mul(rows_c) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b || weights_c.len() < needed_c {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+    out_c.resize(rows_c, 0.0);
+
+    #[cfg(not(target_family = "wasm"))]
+    if try_quant_metal3_into(
+        (kind_a, weights_a, rows_a, cols_a, row_bytes_a),
+        (kind_b, weights_b, rows_b, cols_b, row_bytes_b),
+        (kind_c, weights_c, rows_c, cols_c, row_bytes_c),
+        x,
+        out_a,
+        out_b,
+        out_c,
+    ) {
+        return true;
+    }
+    if is_mixed_kquant3(kind_a, kind_b, kind_c) {
+        return false;
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        let kind_a = kind_a.matvec_kind();
+        let kind_b = kind_b.matvec_kind();
+        let kind_c = kind_c.matvec_kind();
+        for row in 0..rows_a {
+            out_a[row] = dot_row_from_kind(
+                kind_a,
+                &weights_a[row * row_bytes_a..(row + 1) * row_bytes_a],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_row_from_kind(
+                kind_b,
+                &weights_b[row * row_bytes_b..(row + 1) * row_bytes_b],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_c {
+            out_c[row] = dot_row_from_kind(
+                kind_c,
+                &weights_c[row * row_bytes_c..(row + 1) * row_bytes_c],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b + rows_c;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind_a: kind_a.matvec_kind(),
+            kind_b: kind_b.matvec_kind(),
+            kind_c: kind_c.matvec_kind(),
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_c.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_c.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c,
+            cols: cols_a,
+            row_span_a: row_bytes_a,
+            row_span_b: row_bytes_b,
+            row_span_c: row_bytes_c,
+            workers,
+        });
+        true
+    }
+}
+
+pub fn matvec_quant2_into(
+    a: (QuantMatvecKind, &[u8], usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (kind_a, weights_a, rows_a, cols_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b) = b;
+    if cols_a != cols_b || cols_a != x.len() {
+        return false;
+    }
+    let Some(row_bytes_a) = kind_a.row_bytes(cols_a) else {
+        return false;
+    };
+    let Some(row_bytes_b) = kind_b.row_bytes(cols_b) else {
+        return false;
+    };
+    let needed_a = match row_bytes_a.checked_mul(rows_a) {
+        Some(v) => v,
+        None => return false,
+    };
+    let needed_b = match row_bytes_b.checked_mul(rows_b) {
+        Some(v) => v,
+        None => return false,
+    };
+    if weights_a.len() < needed_a || weights_b.len() < needed_b {
+        return false;
+    }
+
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+
+    #[cfg(not(target_family = "wasm"))]
+    if try_quant_metal2_into(
+        (kind_a, weights_a, rows_a, cols_a, row_bytes_a),
+        (kind_b, weights_b, rows_b, cols_b, row_bytes_b),
+        x,
+        out_a,
+        out_b,
+    ) {
+        return true;
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        let kind_a = kind_a.matvec_kind();
+        let kind_b = kind_b.matvec_kind();
+        for row in 0..rows_a {
+            out_a[row] = dot_row_from_kind(
+                kind_a,
+                &weights_a[row * row_bytes_a..(row + 1) * row_bytes_a],
+                x,
+                cols_a,
+            );
+        }
+        for row in 0..rows_b {
+            out_b[row] = dot_row_from_kind(
+                kind_b,
+                &weights_b[row * row_bytes_b..(row + 1) * row_bytes_b],
+                x,
+                cols_a,
+            );
+        }
+        return true;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let total_rows = rows_a + rows_b;
+        if total_rows == 0 {
+            return true;
+        }
+        let workers = num_threads().min(total_rows);
+        worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
+            kind_a: kind_a.matvec_kind(),
+            kind_b: kind_b.matvec_kind(),
+            kind_c: kind_b.matvec_kind(),
+            a_data: weights_a.as_ptr(),
+            b_data: weights_b.as_ptr(),
+            c_data: weights_b.as_ptr(),
+            x: x.as_ptr(),
+            out_a: out_a.as_mut_ptr(),
+            out_b: out_b.as_mut_ptr(),
+            out_c: out_b.as_mut_ptr(),
+            rows_a,
+            rows_b,
+            rows_c: 0,
+            cols: cols_a,
+            row_span_a: row_bytes_a,
+            row_span_b: row_bytes_b,
+            row_span_c: row_bytes_b,
             workers,
         });
         true
@@ -1581,9 +2067,16 @@ fn matvec_k2_into(
 #[cfg(target_family = "wasm")]
 fn dot_row_from_kind(kind: MatvecKind, row: &[u8], x: &[f32], cols: usize) -> f32 {
     match kind {
+        MatvecKind::Q8_0 => dot_q8_0_f32(row, x, cols),
+        MatvecKind::Q8_1 => dot_q8_1_f32(row, x, cols),
+        MatvecKind::Q4_0 => dot_q4_0_f32(row, x, cols),
+        MatvecKind::Q4_1 => dot_q4_1_f32(row, x, cols),
+        MatvecKind::Q5_0 => dot_q5_0_f32(row, x, cols),
+        MatvecKind::Q5_1 => dot_q5_1_f32(row, x, cols),
         MatvecKind::Q4K => dot_q4_k_f32(row, x, cols),
         MatvecKind::Q5K => dot_q5_k_f32(row, x, cols),
         MatvecKind::Q6K => dot_q6_k_f32(row, x, cols),
+        MatvecKind::Mxfp4 => dot_mxfp4_f32(row, x, cols),
         _ => 0.0,
     }
 }
@@ -3015,6 +3508,23 @@ mod tests {
         block
     }
 
+    /// Builds deterministic synthetic Q4_0 matrix weights.
+    fn make_q4_0_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
+        let row_bytes = (cols / 32) * 18;
+        let mut data = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..(cols / 32) {
+                let base = row * row_bytes + block * 18;
+                data[base] = 0x00;
+                data[base + 1] = 0x3c; // f16 1.0
+                for i in 0..16 {
+                    data[base + 2 + i] = seed.wrapping_add((row * 17 + block * 11 + i * 5) as u8);
+                }
+            }
+        }
+        data
+    }
+
     #[test]
     fn q4_0_dequant_uses_split_layout() {
         // ggml Q4_0 split layout: lo nibble of byte i → weight[i],
@@ -3311,6 +3821,73 @@ mod tests {
     }
 
     #[test]
+    /// Verifies generic Q4_0 two-projection fusion against separate matvecs.
+    fn q4_0_quant_matvec2_matches_separate_matvecs() {
+        set_num_threads(3);
+        let cols = 64;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.037).sin() * 0.3) + ((i % 9) as f32 * 0.02))
+            .collect();
+        let a = make_q4_0_weights(5, cols, 11);
+        let b = make_q4_0_weights(7, cols, 29);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        matvec_q4_0_into(&a, &x, 5, cols, &mut exp_a);
+        matvec_q4_0_into(&b, &x, 7, cols, &mut exp_b);
+
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        assert!(matvec_quant2_into(
+            (QuantMatvecKind::Q4_0, &a, 5, cols),
+            (QuantMatvecKind::Q4_0, &b, 7, cols),
+            &x,
+            &mut got_a,
+            &mut got_b
+        ));
+
+        assert_close_slice(&got_a, &exp_a, 1e-5);
+        assert_close_slice(&got_b, &exp_b, 1e-5);
+    }
+
+    #[test]
+    /// Verifies generic Q4_0 three-projection fusion against separate matvecs.
+    fn q4_0_quant_matvec3_matches_separate_matvecs() {
+        set_num_threads(3);
+        let cols = 64;
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.041).cos() * 0.25) + ((i % 13) as f32 * 0.015))
+            .collect();
+        let a = make_q4_0_weights(5, cols, 3);
+        let b = make_q4_0_weights(7, cols, 19);
+        let c = make_q4_0_weights(4, cols, 41);
+
+        let mut exp_a = Vec::new();
+        let mut exp_b = Vec::new();
+        let mut exp_c = Vec::new();
+        matvec_q4_0_into(&a, &x, 5, cols, &mut exp_a);
+        matvec_q4_0_into(&b, &x, 7, cols, &mut exp_b);
+        matvec_q4_0_into(&c, &x, 4, cols, &mut exp_c);
+
+        let mut got_a = Vec::new();
+        let mut got_b = Vec::new();
+        let mut got_c = Vec::new();
+        assert!(matvec_quant3_into(
+            (QuantMatvecKind::Q4_0, &a, 5, cols),
+            (QuantMatvecKind::Q4_0, &b, 7, cols),
+            (QuantMatvecKind::Q4_0, &c, 4, cols),
+            &x,
+            &mut got_a,
+            &mut got_b,
+            &mut got_c
+        ));
+
+        assert_close_slice(&got_a, &exp_a, 1e-5);
+        assert_close_slice(&got_b, &exp_b, 1e-5);
+        assert_close_slice(&got_c, &exp_c, 1e-5);
+    }
+
+    #[test]
     /// Verifies fused Q5_K projections match separate projections.
     fn q5k_matvec_fusion_matches_separate_matvecs() {
         let cols = 512;
@@ -3343,6 +3920,23 @@ mod tests {
         assert_eq!(out_a, exp_a);
         assert_eq!(out_b, exp_b);
         assert_eq!(out_c, exp_c);
+    }
+
+    #[test]
+    /// Verifies Q6_K fused dot matches explicit dequantization.
+    fn q6k_dot_matches_reference_dequant() {
+        let cols = 512;
+        let weights = make_q6k_weights(1, cols, 17);
+        let x: Vec<f32> = (0..cols)
+            .map(|i| ((i as f32 * 0.019).sin() * 0.35) - ((i % 11) as f32 * 0.017))
+            .collect();
+        let deq = dequant_row_q6_k(&weights, cols);
+        let reference: f32 = deq.iter().zip(&x).map(|(w, xv)| w * xv).sum();
+        let fused = dot_q6_k_f32(&weights, &x, cols);
+        assert!(
+            (fused - reference).abs() < 1e-2,
+            "fused {fused} vs reference {reference}"
+        );
     }
 
     #[test]

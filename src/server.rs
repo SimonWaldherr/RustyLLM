@@ -1618,9 +1618,15 @@ fn model_aliases_for_arch(arch: &str) -> &'static [&'static str] {
         "mistral" | "mixtral" | "ministral" => &["mistral", "mixtral", "ministral"],
         "qwen2" | "qwen3" => &["qwen2", "qwen2.5", "qwen3"],
         "gpt-oss" => &["gpt-oss"],
-        "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => {
-            &["gemma", "gemma2", "gemma4", "gemma4-assistant"]
-        }
+        "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4n" | "gemma4-assistant" => &[
+            "gemma",
+            "gemma2",
+            "gemma3",
+            "gemma4",
+            "gemma4n",
+            "gemma4-assistant",
+            "google/gemma-4-12b-qat",
+        ],
         "deepseek" | "deepseek-v2" | "deepseek2" => &["deepseek", "deepseek-v2", "deepseek2"],
         "nemotron" => &["nemotron"],
         "hermes" => &["hermes"],

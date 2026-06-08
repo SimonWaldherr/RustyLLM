@@ -24,6 +24,7 @@ pub enum GGMLType {
     Q5_K = 13,
     Q6_K = 14,
     Q8_K = 15,
+    BF16 = 30,
     MXFP4 = 39,
     Unknown = 255,
 }
@@ -46,6 +47,7 @@ impl From<u32> for GGMLType {
             13 => Self::Q5_K,
             14 => Self::Q6_K,
             15 => Self::Q8_K,
+            30 => Self::BF16,
             39 => Self::MXFP4,
             _ => Self::Unknown,
         }
@@ -57,7 +59,7 @@ impl GGMLType {
     pub fn block_bytes(&self) -> usize {
         match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18, // f16 scale + 16 packed nibbles
             Self::Q4_1 => 20, // f16 scale + f16 min + 16 packed nibbles
             Self::Q5_0 => 22, // f16 scale + 32 high bits + 16 packed nibbles
@@ -75,7 +77,7 @@ impl GGMLType {
     /// Elements per block
     pub fn block_size(&self) -> usize {
         match self {
-            Self::F32 | Self::F16 => 1,
+            Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_K | Self::Q5_K | Self::Q6_K => 256,
             _ => 32,
         }
@@ -85,7 +87,7 @@ impl GGMLType {
     pub fn data_size(&self, n: usize) -> Option<usize> {
         match self {
             Self::F32 => Some(n * 4),
-            Self::F16 => Some(n * 2),
+            Self::F16 | Self::BF16 => Some(n * 2),
             Self::Q4_0
             | Self::Q4_1
             | Self::Q5_0

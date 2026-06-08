@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-pub const Q6K_MIN_METAL_ROWS: usize = 8_192;
+pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
 pub const ATTENTION_MIN_METAL_TOKENS: usize = 8_192;
 static ATTENTION_MIN_METAL_TOKENS_RUNTIME: OnceLock<usize> = OnceLock::new();
 
@@ -888,7 +888,10 @@ mod tests {
             super::parse_attention_min_metal_tokens(Some("bogus")),
             super::ATTENTION_MIN_METAL_TOKENS
         );
-        assert_eq!(super::parse_attention_min_metal_tokens(Some("  768  ")), 768);
+        assert_eq!(
+            super::parse_attention_min_metal_tokens(Some("  768  ")),
+            768
+        );
     }
 
     #[test]

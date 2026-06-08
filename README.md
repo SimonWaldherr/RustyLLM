@@ -90,16 +90,23 @@ RustyLLM accepts GGUF files whose `general.architecture` metadata matches one of
 the supported architecture identifiers:
 
 `llama`, `llama2`, `llama3`, `mistral`, `mistral3`, `mixtral`, `ministral`,
-`qwen2`, `qwen3`, `gpt-oss`, `gemma`, `gemma2`, `gemma4`, `granite`,
-`granite3`, `granite4`, `deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`,
-`hermes`, `phi`, `phi2`, `phi3`, `phi4`, `falcon`, `falcon3`, `stablelm`,
-`starcoder2`, `command-r`, `cohere`, `internlm2`, `olmo`, `olmo2`, `exaone`,
-`solar`, `yi`, `arctic`, `nomic-bert`, `nomic-embed`, and
+`qwen2`, `qwen3`, `gpt-oss`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
+`gemma4n`, `gemma4-assistant`, `granite`, `granite3`, `granite4`,
+`deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`, `hermes`, `phi`, `phi2`,
+`phi3`, `phi4`, `falcon`, `falcon3`, `stablelm`, `starcoder2`, `command-r`,
+`cohere`, `internlm2`, `olmo`, `olmo2`, `exaone`, `solar`, `yi`, `arctic`,
+`nomic-bert`, `nomic-embed`, and
 `text-embedding-nomic-embed-text`.
 
 Support still depends on the tensors present in a specific GGUF file. Use
 `--inspect` before loading an unfamiliar model to verify architecture, tensor
 types, tokenizer metadata, and API compatibility.
+
+Gemma-family GGUFs use the dedicated Gemma loader and native
+`<start_of_turn>` chat formatting when the tokenizer template exposes it.
+Q4_0 QAT GGUFs such as `google/gemma-4-12B-it-qat-q4_0-gguf` are supported by
+the same path and use fused CPU Q/K/V and Gate/Up projection jobs when Metal is
+not selected for those projections.
 
 ## Requirements
 
@@ -735,10 +742,11 @@ No generated WASM binaries are written back to the repository branch.
 
 - `RUSTY_LLM_MODEL_DIR`: default directory used by model discovery.
 - `RUSTY_LLM_FAST_ATTN`: enables the approximate fast attention path when set.
-- `RUSTY_LLM_METAL`: controls the macOS Metal Q4_K/Q6_K GPU path. When the
-  binary was built with the `metal` feature and the backend compiled and is
-  available, Metal is used by default. Set `RUSTY_LLM_METAL=0` to force the CPU
-  path; `RUSTY_LLM_METAL=1` keeps it explicit.
+- `RUSTY_LLM_METAL`: controls the macOS Metal Q4_0/Q8_0/Q4_K/Q6_K and
+  long-context attention GPU paths. When the binary was built with the `metal`
+  feature and the backend compiled and is available, Metal is used by default.
+  Set `RUSTY_LLM_METAL=0` to force the CPU path; `RUSTY_LLM_METAL=1` keeps it
+  explicit.
 
 ## Development
 

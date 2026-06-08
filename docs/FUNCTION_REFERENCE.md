@@ -80,6 +80,7 @@ the high-level runtime API.
 - `Tokenizer::decode_raw` returns the raw vocabulary string for a token ID.
 - `Tokenizer::decode_token` decodes one token into user-facing text.
 - `Tokenizer::vocab_size` returns the vocabulary size.
+- `Tokenizer::adds_bos_token` reports whether text encoding prepends BOS.
 - `Tokenizer::special_id` looks up a special token by literal text.
 - `Tokenizer::encode_sentencepiece` runs the SentencePiece-style BPE path.
 - `Tokenizer::encode_gpt2_bpe` runs reversible byte-level GPT-2 BPE.
@@ -136,6 +137,8 @@ the high-level runtime API.
   `matvec_q4_k_into`, `matvec_q4_k3_into`, `matvec_q4_k2_into`,
   `matvec_q6_k_into`, and `matvec_mxfp4_into` write matrix-vector results into
   caller-owned output buffers.
+- `matvec_quant2_into` and `matvec_quant3_into` fuse two or three supported
+  quantized projections that share the same input vector.
 - `dequant_row_q8_0`, `dequant_row_q4_0`, `dequant_row_q4_k`,
   `dequant_row_q6_k`, and `dequant_row_mxfp4` decode one quantized row to
   `f32` values.
@@ -170,8 +173,8 @@ the high-level runtime API.
   borrowed tensor bytes.
 - `Weight::matvec`, `matvec_into`, `row`, `row_into`, and `row_f32` run typed
   tensor access for dense and quantized weights.
-- `try_q4k_matvec3_into` and `try_q4k_matvec2_into` run optional fused Q4_K
-  projections when feature/target gates allow them.
+- `try_quant_matvec3_into` and `try_quant_matvec2_into` run optional fused
+  quantized projections when feature/target gates allow them.
 - `ExpertWeight::matvec_expert` and `matvec_expert_into` run one expert slice
   from a mixture-of-experts tensor.
 - `KVCache::new` allocates per-layer key/value cache storage.
@@ -217,6 +220,8 @@ the high-level runtime API.
 - `l2_normalize_in_place` normalizes a vector for cosine similarity.
 - `cosine_similarity` computes cosine similarity with validation.
 - `architecture_supported` checks whether a GGUF architecture is loadable.
+- `is_gemma_arch` identifies Gemma-family architecture strings that share the
+  Gemma loader and runtime profile.
 - `Runner::from_gguf_bytes` builds a runner from in-memory GGUF bytes.
 - `Runner::from_path` memory-maps and loads a runner from a GGUF file path.
 - `Runner::architecture`, `model_name`, `tokenizer`, `gguf`, and `config`
@@ -232,8 +237,8 @@ the high-level runtime API.
 - `Runner::embed` returns a mean-pooled, L2-normalized embedding.
 - `Runner::is_stop_token` checks built-in stop tokens.
 - `Runner::render_messages`, `render_plain_messages`,
-  `render_gpt_oss_messages`, and `render_header_chat_messages` convert chat
-  messages into prompt token IDs.
+  `render_gpt_oss_messages`, `render_gemma_turn_messages`, and
+  `render_header_chat_messages` convert chat messages into prompt token IDs.
 - `Runner::chat_template_kind` classifies supported chat template styles.
 - `Runner::longest_common_prefix` finds reusable KV-cache prefix length.
 - `Runner::kv_dims` returns cache dimensions for the active model family.

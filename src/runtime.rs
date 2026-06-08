@@ -127,7 +127,9 @@ impl RuntimeProfile {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "mistral" | "ministral" => Some(Self::Mistral),
-            "gemma" | "gemma4" | "gemma4-assistant" => Some(Self::Gemma),
+            "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4n" | "gemma4-assistant" => {
+                Some(Self::Gemma)
+            }
             _ => None,
         }
     }
@@ -307,6 +309,15 @@ fn push_recent_token(recent: &mut Vec<u32>, token: u32) {
     }
 }
 
+/// Returns a trailing byte offset adjusted to a valid UTF-8 boundary.
+fn trailing_char_boundary_start(text: &str, max_bytes: usize) -> usize {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    start
+}
+
 /// Returns the highest finite-logit token ID, falling back to 0.
 fn argmax_finite_token(logits: &[f32]) -> u32 {
     let mut best_idx = 0usize;
@@ -404,6 +415,9 @@ pub struct Runner {
 
 /// Reports whether the architecture string maps to a supported loader.
 pub fn architecture_supported(arch: &str) -> bool {
+    if is_gemma_arch(arch) {
+        return true;
+    }
     matches!(
         arch,
         "llama"
@@ -416,10 +430,6 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "qwen2"
             | "qwen3"
             | "gpt-oss"
-            | "gemma"
-            | "gemma2"
-            | "gemma4"
-            | "gemma4-assistant"
             | "granite"
             | "granite3"
             | "granite4"
@@ -448,6 +458,14 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "nomic-bert"
             | "nomic-embed"
             | "text-embedding-nomic-embed-text"
+    )
+}
+
+/// Reports whether an architecture uses the Gemma-family dense decoder path.
+pub(crate) fn is_gemma_arch(arch: &str) -> bool {
+    matches!(
+        arch,
+        "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4n" | "gemma4-assistant"
     )
 }
 
@@ -492,7 +510,7 @@ impl CompatibilityReport {
         }
         if let Some(name) = self.unsupported_tensor_types.first() {
             return format!(
-                "Tensor '{}' uses an unsupported quantization type. Please re-quantize the model using F16, Q8_0/Q8_1, Q4_0/Q4_1, Q5_0/Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
+                "Tensor '{}' uses an unsupported quantization type. Please re-quantize the model using F16/BF16, Q8_0/Q8_1, Q4_0/Q4_1, Q5_0/Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
                 name
             );
         }
@@ -520,6 +538,7 @@ pub fn compatibility_report(gguf: &GGUFFile) -> CompatibilityReport {
         match tensor.dtype {
             GGMLType::F32
             | GGMLType::F16
+            | GGMLType::BF16
             | GGMLType::Q4_0
             | GGMLType::Q4_1
             | GGMLType::Q5_0
@@ -546,7 +565,11 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
     let config = Config::from_gguf(gguf);
 
     match arch {
-        "gpt-oss" | "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => return,
+        "gpt-oss" => return,
+        _ if is_gemma_arch(arch) => {
+            validate_gemma_layout(gguf, &config, report);
+            return;
+        }
         "deepseek2" | "deepseek-v2" => {
             if has("blk.0.attn_kv_a_mqa.weight") || has("blk.0.attn_kv_b.weight") {
                 report.unsupported_layouts.push(String::from(
@@ -614,6 +637,58 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
     }
 }
 
+fn validate_gemma_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+    let has_layer_weight = |layer: usize, canonical: &str, subs: &[&str]| {
+        let canonical_name = format!("blk.{}.{}", layer, canonical);
+        if has(&canonical_name) {
+            return true;
+        }
+        let prefix = format!("blk.{}.", layer);
+        gguf.tensors.iter().any(|tensor| {
+            tensor.name.starts_with(&prefix)
+                && tensor.name.ends_with(".weight")
+                && subs.iter().all(|needle| tensor.name.contains(needle))
+        })
+    };
+
+    if config.dim == 0 || config.n_layers == 0 || config.n_heads == 0 || config.n_kv_heads == 0 {
+        report
+            .unsupported_layouts
+            .push(String::from("missing required Gemma transformer metadata"));
+        return;
+    }
+
+    for name in ["token_embd.weight", "output_norm.weight"] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+
+    for layer in 0..config.n_layers {
+        for suffix in ["attn_norm.weight", "ffn_norm.weight"] {
+            let name = format!("blk.{}.{}", layer, suffix);
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+        for (canonical, subs) in [
+            ("attn_q.weight", &["attn", "q"][..]),
+            ("attn_k.weight", &["attn", "k"][..]),
+            ("attn_output.weight", &["attn", "output"][..]),
+            ("ffn_gate.weight", &["ffn", "gate"][..]),
+            ("ffn_up.weight", &["ffn", "up"][..]),
+            ("ffn_down.weight", &["ffn", "down"][..]),
+        ] {
+            if !has_layer_weight(layer, canonical, subs) {
+                report
+                    .missing_tensors
+                    .push(format!("blk.{}.{}", layer, canonical));
+            }
+        }
+    }
+}
+
 fn validate_row_count(
     gguf: &GGUFFile,
     name: &str,
@@ -640,6 +715,7 @@ fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
         match tensor.dtype {
             GGMLType::F32
             | GGMLType::F16
+            | GGMLType::BF16
             | GGMLType::Q4_0
             | GGMLType::Q4_1
             | GGMLType::Q5_0
@@ -654,7 +730,7 @@ fn validate_tensor_dtypes(gguf: &GGUFFile) -> Result<(), String> {
                 return Err(format!(
                     "Tensor '{}' uses unsupported quantization type {:?}. \
 	                     Please re-quantize the model using a supported format: \
-	                     F16, Q8_0, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
+	                     F16/BF16, Q8_0, Q8_1, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, or MXFP4.",
                     tensor.name, unsupported
                 ));
             }
@@ -683,7 +759,7 @@ impl Runner {
                 let (config, weights) = model::load_gpt_oss_model(data, &gguf, false);
                 (config, LoadedWeights::GptOss(weights))
             }
-            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => {
+            arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
                 (config, LoadedWeights::Gemma4(weights))
             }
@@ -731,7 +807,7 @@ impl Runner {
                 let (config, weights) = model::load_gpt_oss_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::GptOss(weights))
             }
-            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => {
+            arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::Gemma4(weights))
             }
@@ -935,7 +1011,7 @@ impl Runner {
         }
         match self.arch.as_str() {
             "mistral" | "mistral3" | "ministral" => RuntimeProfile::Mistral,
-            "gemma" | "gemma2" | "gemma4" | "gemma4-assistant" => RuntimeProfile::Gemma,
+            arch if is_gemma_arch(arch) => RuntimeProfile::Gemma,
             _ => RuntimeProfile::Auto,
         }
     }
@@ -1296,7 +1372,7 @@ impl Runner {
             // longest stop sequence length plus the current token length.  This
             // keeps the scan O(max_stop_len) per token instead of O(output_len).
             if max_stop_len > 0 {
-                let window_start = output.len().saturating_sub(max_stop_len + text.len());
+                let window_start = trailing_char_boundary_start(&output, max_stop_len + text.len());
                 let window = &output[window_start..];
                 for stop in &options.stop_sequences {
                     if let Some(rel_idx) = window.find(stop.as_str()) {
@@ -1531,7 +1607,7 @@ impl Runner {
         output.push_str(&text);
 
         if max_stop_len > 0 {
-            let window_start = output.len().saturating_sub(max_stop_len + text.len());
+            let window_start = trailing_char_boundary_start(output, max_stop_len + text.len());
             let window = &output[window_start..];
             for stop in stop_sequences {
                 if let Some(rel_idx) = window.find(stop.as_str()) {
@@ -1638,6 +1714,10 @@ impl Runner {
     fn is_stop_token(&self, token: u32) -> bool {
         if self.arch == "gpt-oss" {
             token == self.tok.eos_id || token == 200002 || token == 200007
+        } else if is_gemma_arch(&self.arch) {
+            token == self.tok.eos_id
+                || self.tok.special_id("<end_of_turn>") == Some(token)
+                || self.tok.special_id("<turn|>") == Some(token)
         } else {
             token == self.tok.eos_id
         }
@@ -1649,6 +1729,11 @@ impl Runner {
         // metadata exposes one we know how to mirror.
         if self.arch == "gpt-oss" {
             return self.render_gpt_oss_messages(messages, system_prompt);
+        }
+        if matches!(self.chat_template_kind(), Some("gemma-turn")) {
+            if let Some(tokens) = self.render_gemma_turn_messages(messages, system_prompt) {
+                return tokens;
+            }
         }
         if matches!(self.chat_template_kind(), Some("header-chat")) {
             if let Some(tokens) = self.render_header_chat_messages(messages, system_prompt) {
@@ -1740,6 +1825,111 @@ impl Runner {
         tokens
     }
 
+    /// Renders Gemma-style turn-delimited chat messages.
+    fn render_gemma_turn_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+    ) -> Option<Vec<u32>> {
+        let (start, end, system_as_turn) = if let (Some(start), Some(end)) = (
+            self.tok.special_id("<start_of_turn>"),
+            self.tok.special_id("<end_of_turn>"),
+        ) {
+            (start, end, false)
+        } else if let (Some(start), Some(end)) = (
+            self.tok.special_id("<|turn>"),
+            self.tok.special_id("<turn|>"),
+        ) {
+            (start, end, true)
+        } else {
+            return None;
+        };
+        let mut tokens = Vec::new();
+        if self.tok.adds_bos_token() {
+            tokens.push(self.tok.bos_id);
+        }
+
+        let mut system_parts = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            system_parts.push(system_prompt.trim().to_string());
+        }
+        for message in messages {
+            if matches!(message.role, ChatRole::System) && !message.content.trim().is_empty() {
+                system_parts.push(message.content.trim().to_string());
+            }
+        }
+        let mut pending_system = system_parts.join("\n\n");
+        let mut emitted_user = false;
+
+        if system_as_turn && !pending_system.is_empty() {
+            self.push_gemma_turn(start, end, "system", &pending_system, true, &mut tokens);
+            pending_system.clear();
+        }
+
+        for message in messages {
+            match message.role {
+                ChatRole::System => {}
+                ChatRole::User => {
+                    let mut content = String::new();
+                    if !system_as_turn && !pending_system.is_empty() {
+                        content.push_str(&pending_system);
+                        content.push_str("\n\n");
+                        pending_system.clear();
+                    }
+                    content.push_str(message.content.trim());
+                    self.push_gemma_turn(start, end, "user", &content, true, &mut tokens);
+                    emitted_user = true;
+                }
+                ChatRole::Assistant => {
+                    self.push_gemma_turn(
+                        start,
+                        end,
+                        "model",
+                        message.content.trim(),
+                        true,
+                        &mut tokens,
+                    );
+                }
+            }
+        }
+
+        if !pending_system.is_empty() && !emitted_user {
+            self.push_gemma_turn(start, end, "user", &pending_system, true, &mut tokens);
+        }
+
+        tokens.push(start);
+        self.push_gemma_role("model", &mut tokens);
+        tokens.extend(self.tok.encode_without_bos("\n"));
+        Some(tokens)
+    }
+
+    fn push_gemma_role(&self, role: &str, out: &mut Vec<u32>) {
+        if let Some(role_id) = self.tok.special_id(role) {
+            out.push(role_id);
+        } else {
+            out.extend(self.tok.encode_without_bos(role));
+        }
+    }
+
+    fn push_gemma_turn(
+        &self,
+        start: u32,
+        end: u32,
+        role: &str,
+        content: &str,
+        trailing_newline: bool,
+        out: &mut Vec<u32>,
+    ) {
+        out.push(start);
+        self.push_gemma_role(role, out);
+        out.extend(self.tok.encode_without_bos("\n"));
+        out.extend(self.tok.encode_without_bos(content));
+        out.push(end);
+        if trailing_newline {
+            out.extend(self.tok.encode_without_bos("\n"));
+        }
+    }
+
     /// Renders messages using header-delimited chat templates.
     fn render_header_chat_messages(
         &self,
@@ -1796,6 +1986,10 @@ impl Runner {
             .as_str()?;
         if template.contains("<|start_header_id|>") && template.contains("<|eot_id|>") {
             Some("header-chat")
+        } else if (template.contains("<start_of_turn>") && template.contains("<end_of_turn>"))
+            || (template.contains("<|turn>") && template.contains("<turn|>"))
+        {
+            Some("gemma-turn")
         } else {
             None
         }
@@ -2028,7 +2222,7 @@ impl Runner {
             output.push_str(&text);
 
             if max_stop_len > 0 {
-                let window_start = output.len().saturating_sub(max_stop_len + text.len());
+                let window_start = trailing_char_boundary_start(&output, max_stop_len + text.len());
                 let window = &output[window_start..];
                 for stop in &options.stop_sequences {
                     if let Some(rel_idx) = window.find(stop.as_str()) {
@@ -2484,7 +2678,7 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 mod tests {
     use super::{
         RECENT_TOKEN_LIMIT, cosine_similarity, l2_normalize_in_place, mean_pool_in_place,
-        push_recent_token, recent_token_tail,
+        push_recent_token, recent_token_tail, trailing_char_boundary_start,
     };
 
     #[test]
@@ -2586,6 +2780,18 @@ mod tests {
         assert_eq!(recent.len(), RECENT_TOKEN_LIMIT);
         assert_eq!(recent[0], 1);
         assert_eq!(recent[RECENT_TOKEN_LIMIT - 1], 999);
+    }
+
+    #[test]
+    /// Verifies stop-sequence scan windows never split a multi-byte UTF-8 character.
+    fn trailing_char_boundary_start_preserves_utf8_boundaries() {
+        let text = " audngram \u{09AD}\u{09DF}\u{09BE}\u{09AC}\u{09B9}\u{09EF}";
+
+        for max_bytes in 0..=text.len() + 4 {
+            let start = trailing_char_boundary_start(text, max_bytes);
+            assert!(text.is_char_boundary(start));
+            let _ = &text[start..];
+        }
     }
 }
 

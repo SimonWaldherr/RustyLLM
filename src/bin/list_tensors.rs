@@ -16,18 +16,23 @@ use std::fs;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <gguf_file>", args[0]);
+        eprintln!("Usage: {} <gguf_file> [--all]", args[0]);
         std::process::exit(1);
     }
 
     let gguf_path = &args[1];
+    let print_all = args.iter().any(|arg| arg == "--all");
     let data = fs::read(gguf_path)?;
     let gguf = GGUFFile::parse(&data)?;
 
     println!("Total tensors: {}\n", gguf.tensors.len());
 
-    // Print first 30 tensor names
-    for (i, tensor) in gguf.tensors.iter().take(30).enumerate() {
+    let tensors: Box<dyn Iterator<Item = (usize, &rusty_llm::gguf::TensorInfo)>> = if print_all {
+        Box::new(gguf.tensors.iter().enumerate())
+    } else {
+        Box::new(gguf.tensors.iter().take(30).enumerate())
+    };
+    for (i, tensor) in tensors {
         println!(
             "{}: {} -> shape: {:?}, dtype: {:?}",
             i, tensor.name, tensor.dims, tensor.dtype
