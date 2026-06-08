@@ -1,6 +1,6 @@
 APP        ?= rusty-llm
 CARGO      ?= cargo
-MODEL_DIR  ?= $(HOME)/.cache/lm-studio/models/lmstudio-community
+MODEL_DIR  ?= $(HOME)/.lmstudio/models/lmstudio-community
 MODEL      ?=
 PROMPT     ?= Wer war Albert Einstein?
 SYNONYM_PROMPT ?= Nenne ein Synonym für Synonym und antworte nur mit diesem einen Wort.
@@ -30,7 +30,7 @@ CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 _MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
 _RUN_ARGS  := --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)"
 
-.PHONY: all build release run repl serve serve-metal https list-models inspect list-tensors bench bench-model bench-model-metal synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal fmt test vet check wasm clean help
+.PHONY: all build release run repl serve serve-metal https list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal fmt test vet check wasm clean help
 
 all: check release
 
@@ -64,7 +64,9 @@ inspect: release
 list-tensors: release
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --list-tensors
 
-bench:
+bench: bench-model
+
+cargo-bench:
 	$(CARGO) bench
 
 bench-model: release
@@ -144,7 +146,8 @@ help:
 	@printf "  make list-models                     List GGUFs in MODEL_DIR\n"
 	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
 	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
-	@printf "  make bench                           Run Rust benchmark suite\n"
+	@printf "  make bench MODEL=...                 Run generation benchmark with tokens/sec JSON\n"
+	@printf "  make cargo-bench                     Run Rust benchmark harness\n"
 	@printf "  make bench-model MODEL=...           Run CLI generation benchmark JSON with per-run output\n"
 	@printf "  make bench-model-metal MODEL=...     Run generation benchmark with RUSTY_LLM_METAL=1\n"
 	@printf "  make synonym-bench MODEL=...         Run fixed one-word synonym prompt benchmark\n"

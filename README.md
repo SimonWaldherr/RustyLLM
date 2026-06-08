@@ -198,8 +198,8 @@ rusty-llm --model-dir ./models --model phi-4 --prompt "Write a Rust enum example
 If no model directory is provided, RustyLLM uses:
 
 1. `RUSTY_LLM_MODEL_DIR`, when set and non-empty.
-2. `$HOME/.cache/lm-studio/models/lmstudio-community`.
-3. `.cache/lm-studio/models/lmstudio-community` as a final fallback.
+2. `$HOME/.lmstudio/models/lmstudio-community`.
+3. `$HOME/.cache/lm-studio/models/lmstudio-community` as a final fallback.
 
 Model selection is intentionally lenient: `--model` can match repository names,
 file names, relative IDs, or GGUF metadata names. If a selector matches multiple

@@ -1,5 +1,8 @@
 use crate::gguf::{GGMLType, GGUFFile};
-use crate::model::{self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight};
+use crate::model::{
+    self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight, apply_rope_qk,
+    online_attention, rms_norm_into, silu,
+};
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use std::sync::Mutex;
@@ -991,61 +994,137 @@ impl Runner {
             deterministic_bench_vector(self.config.n_heads * self.config.value_dim);
         let hidden_input = deterministic_bench_vector(self.config.hidden_dim);
         let mut out = Vec::new();
-        rows.push(measure_matvec(
-            "attn_q",
+        let attn_q = measure_matvec("attn_q", &layer_weights.wq, &dim_input, runs, &mut out);
+        rows.push(attn_q.clone());
+        let attn_k = measure_matvec("attn_k", &layer_weights.wk, &dim_input, runs, &mut out);
+        rows.push(attn_k.clone());
+        let attn_v = measure_matvec("attn_v", &layer_weights.wv, &dim_input, runs, &mut out);
+        rows.push(attn_v.clone());
+        let attn_qkv_fused = measure_fused_kquant3(
+            "attn_qkv.fused",
             &layer_weights.wq,
-            &dim_input,
-            runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
-            "attn_k",
             &layer_weights.wk,
-            &dim_input,
-            runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
-            "attn_v",
             &layer_weights.wv,
             &dim_input,
             runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
+        );
+        if let Some(row) = &attn_qkv_fused {
+            rows.push(row.clone());
+        }
+        let attn_output = measure_matvec(
             "attn_output",
             &layer_weights.wo,
             &attn_out_input,
             runs,
             &mut out,
-        ));
-        rows.push(measure_matvec(
-            "ffn_gate",
+        );
+        rows.push(attn_output.clone());
+        let ffn_gate = measure_matvec("ffn_gate", &layer_weights.w1, &dim_input, runs, &mut out);
+        rows.push(ffn_gate.clone());
+        let ffn_up = measure_matvec("ffn_up", &layer_weights.w3, &dim_input, runs, &mut out);
+        rows.push(ffn_up.clone());
+        let ffn_gate_up_fused = measure_fused_kquant2(
+            "ffn_gate_up.fused",
             &layer_weights.w1,
-            &dim_input,
-            runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
-            "ffn_up",
             &layer_weights.w3,
             &dim_input,
             runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
-            "ffn_down",
-            &layer_weights.w2,
-            &hidden_input,
-            runs,
-            &mut out,
-        ));
-        rows.push(measure_matvec(
-            "output",
-            &weights.output,
+        );
+        if let Some(row) = &ffn_gate_up_fused {
+            rows.push(row.clone());
+        }
+        let ffn_down = measure_matvec("ffn_down", &layer_weights.w2, &hidden_input, runs, &mut out);
+        rows.push(ffn_down.clone());
+        let output = measure_matvec("output", &weights.output, &dim_input, runs, &mut out);
+        rows.push(output.clone());
+
+        rows.push(measure_rms_norm(
+            "attn_norm.rms",
             &dim_input,
+            &layer_weights.attn_norm,
+            self.config.rms_norm_eps,
             runs,
-            &mut out,
+        ));
+        rows.push(measure_rope_qk(
+            "attn_rope.qk",
+            self.config.n_heads * self.config.head_dim,
+            self.config.n_kv_heads * self.config.head_dim,
+            self.config.head_dim,
+            self.config.n_heads,
+            self.config.n_kv_heads,
+            &deterministic_rope_inv_freq(
+                self.config.rope_theta,
+                self.config.head_dim,
+                self.config.rope_scaling_factor,
+                self.config.rope_original_context_length,
+            ),
+            runs,
+        ));
+        let mut attn_ctx_lens = vec![
+            32usize.min(self.config.max_seq_len),
+            64usize.min(self.config.max_seq_len),
+            128usize.min(self.config.max_seq_len),
+            256usize.min(self.config.max_seq_len),
+            512usize.min(self.config.max_seq_len),
+            1024usize.min(self.config.max_seq_len),
+            2048usize.min(self.config.max_seq_len),
+            4096usize.min(self.config.max_seq_len),
+            8192usize.min(self.config.max_seq_len),
+        ];
+        attn_ctx_lens.sort_unstable();
+        attn_ctx_lens.dedup();
+        for ctx_len in attn_ctx_lens.into_iter().filter(|ctx| *ctx > 0) {
+            rows.push(measure_attention_scan(
+                &format!("attn_scan.ctx{}", ctx_len),
+                self.config.n_heads,
+                self.config.n_kv_heads,
+                self.config.kv_mul,
+                self.config.head_dim,
+                self.config.value_dim,
+                ctx_len,
+                runs,
+            ));
+        }
+        rows.push(measure_rms_norm(
+            "ffn_norm.rms",
+            &dim_input,
+            &layer_weights.ffn_norm,
+            self.config.rms_norm_eps,
+            runs,
+        ));
+        rows.push(measure_ffn_activation(
+            "ffn_activation.silu_mul",
+            self.config.hidden_dim,
+            runs,
+        ));
+
+        let attn_qkv_ms = attn_qkv_fused
+            .as_ref()
+            .map(|row| row.avg_ms)
+            .unwrap_or(attn_q.avg_ms + attn_k.avg_ms + attn_v.avg_ms);
+        let ffn_gate_up_ms = ffn_gate_up_fused
+            .as_ref()
+            .map(|row| row.avg_ms)
+            .unwrap_or(ffn_gate.avg_ms + ffn_up.avg_ms);
+        let layer_projection_ms =
+            attn_qkv_ms + attn_output.avg_ms + ffn_gate_up_ms + ffn_down.avg_ms;
+        rows.push(estimated_kernel_row(
+            "layer_projections.estimated",
+            self.config.dim,
+            runs,
+            layer_projection_ms,
+        ));
+        rows.push(estimated_kernel_row(
+            "decode_projections.estimated",
+            self.config.dim,
+            runs,
+            layer_projection_ms * self.config.n_layers as f64 + output.avg_ms,
+        ));
+        rows.push(estimated_kernel_row(
+            "decode_output_projection.estimated",
+            self.config.dim,
+            runs,
+            output.avg_ms,
         ));
         Ok((layer, rows))
     }
@@ -2009,16 +2088,188 @@ fn measure_matvec(
     out: &mut Vec<f32>,
 ) -> KernelBenchRow {
     let (rows, cols) = weight_shape(weight, x.len());
-    measure_kernel(name, weight, rows, cols, runs, || {
+    measure_kernel_raw(name, weight_dtype(weight), rows, cols, runs, || {
         weight.matvec_into(x, out);
         std::hint::black_box(out.len());
     })
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Measures a fused Q/K/V K-quant matvec when all three projections are eligible.
+fn measure_fused_kquant3(
+    name: &str,
+    a: &Weight,
+    b: &Weight,
+    c: &Weight,
+    x: &[f32],
+    runs: usize,
+) -> Option<KernelBenchRow> {
+    let (
+        Weight::Quantized {
+            data: a_data,
+            dtype: a_dtype,
+            rows: a_rows,
+            cols: a_cols,
+        },
+        Weight::Quantized {
+            data: b_data,
+            dtype: b_dtype,
+            rows: b_rows,
+            cols: b_cols,
+        },
+        Weight::Quantized {
+            data: c_data,
+            dtype: c_dtype,
+            rows: c_rows,
+            cols: c_cols,
+        },
+    ) = (a, b, c)
+    else {
+        return None;
+    };
+    let a_kind = kquant_matvec_kind(*a_dtype)?;
+    let b_kind = kquant_matvec_kind(*b_dtype)?;
+    let c_kind = kquant_matvec_kind(*c_dtype)?;
+    if *a_cols != *b_cols || *a_cols != *c_cols || *a_cols != x.len() {
+        return None;
+    }
+
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let mut out_c = Vec::new();
+    let dtype = format!("{:?}+{:?}+{:?}", a_dtype, b_dtype, c_dtype);
+    Some(measure_kernel_raw(
+        name,
+        dtype,
+        *a_rows + *b_rows + *c_rows,
+        *a_cols,
+        runs,
+        || {
+            let ran = crate::simd::matvec_kquant3_into(
+                (a_kind, a_data.as_slice(), *a_rows, *a_cols),
+                (b_kind, b_data.as_slice(), *b_rows, *b_cols),
+                (c_kind, c_data.as_slice(), *c_rows, *c_cols),
+                x,
+                &mut out_a,
+                &mut out_b,
+                &mut out_c,
+            );
+            std::hint::black_box(ran);
+            std::hint::black_box(out_a.len() + out_b.len() + out_c.len());
+        },
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+fn measure_fused_kquant3(
+    _name: &str,
+    _a: &Weight,
+    _b: &Weight,
+    _c: &Weight,
+    _x: &[f32],
+    _runs: usize,
+) -> Option<KernelBenchRow> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Measures a fused gate/up K-quant matvec when both projections are eligible.
+fn measure_fused_kquant2(
+    name: &str,
+    a: &Weight,
+    b: &Weight,
+    x: &[f32],
+    runs: usize,
+) -> Option<KernelBenchRow> {
+    let (
+        Weight::Quantized {
+            data: a_data,
+            dtype: a_dtype,
+            rows: a_rows,
+            cols: a_cols,
+        },
+        Weight::Quantized {
+            data: b_data,
+            dtype: b_dtype,
+            rows: b_rows,
+            cols: b_cols,
+        },
+    ) = (a, b)
+    else {
+        return None;
+    };
+    let a_kind = kquant_matvec_kind(*a_dtype)?;
+    let b_kind = kquant_matvec_kind(*b_dtype)?;
+    if *a_cols != *b_cols || *a_cols != x.len() {
+        return None;
+    }
+
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    let mut out_c = Vec::new();
+    let dtype = format!("{:?}+{:?}", a_dtype, b_dtype);
+    Some(measure_kernel_raw(
+        name,
+        dtype,
+        *a_rows + *b_rows,
+        *a_cols,
+        runs,
+        || {
+            let ran = crate::simd::matvec_kquant3_into(
+                (a_kind, a_data.as_slice(), *a_rows, *a_cols),
+                (b_kind, b_data.as_slice(), *b_rows, *b_cols),
+                (b_kind, b_data.as_slice(), 0, *b_cols),
+                x,
+                &mut out_a,
+                &mut out_b,
+                &mut out_c,
+            );
+            std::hint::black_box(ran);
+            std::hint::black_box(out_a.len() + out_b.len());
+        },
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+fn measure_fused_kquant2(
+    _name: &str,
+    _a: &Weight,
+    _b: &Weight,
+    _x: &[f32],
+    _runs: usize,
+) -> Option<KernelBenchRow> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn kquant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::KQuantMatvecKind> {
+    match dtype {
+        GGMLType::Q4_K => Some(crate::simd::KQuantMatvecKind::Q4K),
+        GGMLType::Q5_K => Some(crate::simd::KQuantMatvecKind::Q5K),
+        GGMLType::Q6_K => Some(crate::simd::KQuantMatvecKind::Q6K),
+        _ => None,
+    }
 }
 
 /// Runs a benchmark closure repeatedly and summarizes timing.
 fn measure_kernel<F>(
     name: &str,
     weight: &Weight,
+    rows: usize,
+    cols: usize,
+    runs: usize,
+    body: F,
+) -> KernelBenchRow
+where
+    F: FnMut(),
+{
+    measure_kernel_raw(name, weight_dtype(weight), rows, cols, runs, body)
+}
+
+/// Runs a benchmark closure repeatedly and summarizes timing.
+fn measure_kernel_raw<F>(
+    name: &str,
+    dtype: String,
     rows: usize,
     cols: usize,
     runs: usize,
@@ -2035,7 +2286,7 @@ where
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     KernelBenchRow {
         name: name.to_string(),
-        dtype: weight_dtype(weight),
+        dtype,
         rows,
         cols,
         runs,
@@ -2060,6 +2311,163 @@ fn weight_dtype(weight: &Weight) -> String {
     match weight {
         Weight::F32(_) => String::from("F32"),
         Weight::Quantized { dtype, .. } => format!("{:?}", dtype),
+    }
+}
+
+/// Measures RMSNorm on a representative activation vector.
+fn measure_rms_norm(
+    name: &str,
+    x: &[f32],
+    weight: &[f32],
+    eps: f32,
+    runs: usize,
+) -> KernelBenchRow {
+    let mut out = Vec::new();
+    measure_kernel_raw(name, String::from("F32"), x.len(), x.len(), runs, || {
+        rms_norm_into(x, weight, eps, &mut out);
+        std::hint::black_box(out.len());
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Measures the Q/K rotary embedding transform.
+fn measure_rope_qk(
+    name: &str,
+    q_len: usize,
+    k_len: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    inv_freq: &[f32],
+    runs: usize,
+) -> KernelBenchRow {
+    let mut q = deterministic_bench_vector(q_len);
+    let mut k = deterministic_bench_vector(k_len);
+    measure_kernel_raw(
+        name,
+        String::from("F32"),
+        q_len + k_len,
+        head_dim,
+        runs,
+        || {
+            apply_rope_qk(&mut q, &mut k, 32, head_dim, n_heads, n_kv_heads, inv_freq);
+            std::hint::black_box(q.len() + k.len());
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Measures the per-layer attention scan against a synthetic cache.
+fn measure_attention_scan(
+    name: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    head_dim: usize,
+    value_dim: usize,
+    ctx_len: usize,
+    runs: usize,
+) -> KernelBenchRow {
+    let kv_k_dim = n_kv_heads * head_dim;
+    let kv_v_dim = n_kv_heads * value_dim;
+    let q = deterministic_bench_vector(n_heads * head_dim);
+    let k = deterministic_bench_vector(ctx_len * kv_k_dim);
+    let v = deterministic_bench_vector(ctx_len * kv_v_dim);
+    let mut out = vec![0.0f32; n_heads * value_dim];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    measure_kernel_raw(name, String::from("F32"), ctx_len, n_heads, runs, || {
+        for h in 0..n_heads {
+            let kv_h = h / kv_mul.max(1);
+            let q_off = h * head_dim;
+            let out_off = h * value_dim;
+            online_attention(
+                &q[q_off..q_off + head_dim],
+                &k[kv_h * head_dim..],
+                &v[kv_h * value_dim..],
+                kv_k_dim,
+                kv_v_dim,
+                ctx_len,
+                head_dim,
+                value_dim,
+                0,
+                ctx_len.saturating_sub(1),
+                scale,
+                &mut out[out_off..out_off + value_dim],
+            );
+        }
+        std::hint::black_box(out.len());
+    })
+}
+
+/// Measures the FFN activation path after the gate/up projections.
+fn measure_ffn_activation(name: &str, hidden_dim: usize, runs: usize) -> KernelBenchRow {
+    let mut gate = deterministic_bench_vector(hidden_dim);
+    let up = deterministic_bench_vector(hidden_dim);
+    measure_kernel_raw(
+        name,
+        String::from("F32"),
+        hidden_dim,
+        hidden_dim,
+        runs,
+        || {
+            for i in 0..hidden_dim {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            std::hint::black_box(gate.len() + up.len());
+        },
+    )
+}
+
+/// Reconstructs the rotary inverse-frequency table used by the model.
+fn deterministic_rope_inv_freq(
+    theta: f32,
+    head_dim: usize,
+    scaling: f32,
+    original_context_length: usize,
+) -> Vec<f32> {
+    let pair_count = head_dim / 2;
+    let mut inv = vec![0.0f32; pair_count];
+    if pair_count == 0 {
+        return inv;
+    }
+    if scaling > 1.0 {
+        let d_half = head_dim as f32 / 2.0;
+        let low = d_half
+            * ((original_context_length as f32 / (32.0 * 2.0 * std::f32::consts::PI)).ln()
+                / theta.ln());
+        let high = d_half
+            * ((original_context_length as f32 / (1.0 * 2.0 * std::f32::consts::PI)).ln()
+                / theta.ln());
+        for (pair, slot) in inv.iter_mut().enumerate() {
+            let i = (pair * 2) as f32;
+            let base_freq = theta.powf(i / head_dim as f32);
+            let idx = pair as f32;
+            let ramp = ((idx - low) / (high - low)).clamp(0.0, 1.0);
+            let mask = 1.0 - ramp;
+            let interpolation = 1.0 / (scaling * base_freq);
+            let extrapolation = 1.0 / base_freq;
+            *slot = interpolation * (1.0 - mask) + extrapolation * mask;
+        }
+    } else {
+        for (pair, slot) in inv.iter_mut().enumerate() {
+            let i = (pair * 2) as f32;
+            let base_freq = theta.powf(i / head_dim as f32);
+            *slot = 1.0 / base_freq;
+        }
+    }
+    inv
+}
+
+/// Builds a derived benchmark row from already-measured kernel timings.
+fn estimated_kernel_row(name: &str, cols: usize, runs: usize, avg_ms: f64) -> KernelBenchRow {
+    KernelBenchRow {
+        name: name.to_string(),
+        dtype: String::from("estimated"),
+        rows: 0,
+        cols,
+        runs,
+        avg_ms,
+        total_ms: avg_ms * runs as f64,
     }
 }
 

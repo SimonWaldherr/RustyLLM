@@ -8,7 +8,7 @@ This report compares the CPU path with the optional Apple Metal GPU path. Metal 
 
 | Setting | Value |
 |---|---|
-| Model directory | `/Users/simonwaldherr/.cache/lm-studio/models` |
+| Model directory | `/Users/simonwaldherr/.lmstudio/models/lmstudio-community` |
 | Prompt | Explain local LLM inference performance in one concise paragraph. |
 | Runs | 2 x 64 generated tokens per model |
 | Pause | 8 seconds between models |

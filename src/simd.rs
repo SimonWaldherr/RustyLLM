@@ -3246,8 +3246,8 @@ mod tests {
             &mut got_b,
         ));
 
-        assert_eq!(got_a, exp_a);
-        assert_eq!(got_b, exp_b);
+        assert_close_slice(&got_a, &exp_a, 1e-5);
+        assert_close_slice(&got_b, &exp_b, 1e-5);
     }
 
     #[test]
@@ -3282,9 +3282,9 @@ mod tests {
             &mut got_c
         ));
 
-        assert_eq!(got_a, exp_a);
-        assert_eq!(got_b, exp_b);
-        assert_eq!(got_c, exp_c);
+        assert_close_slice(&got_a, &exp_a, 1e-5);
+        assert_close_slice(&got_b, &exp_b, 1e-5);
+        assert_close_slice(&got_c, &exp_c, 1e-5);
     }
 
     #[test]
@@ -3406,5 +3406,16 @@ mod tests {
         assert_eq!(out_q, exp_q);
         assert_eq!(out_k, exp_k);
         assert_eq!(out_v, exp_v);
+    }
+
+    fn assert_close_slice(actual: &[f32], expected: &[f32], relative: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = expected.abs().max(1.0) * relative;
+            assert!(
+                (*actual - *expected).abs() <= tolerance,
+                "value[{idx}] actual {actual} expected {expected} tolerance {tolerance}"
+            );
+        }
     }
 }

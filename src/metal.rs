@@ -1,6 +1,21 @@
 use std::sync::OnceLock;
 
-pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
+pub const Q6K_MIN_METAL_ROWS: usize = 8_192;
+pub const ATTENTION_MIN_METAL_TOKENS: usize = 8_192;
+static ATTENTION_MIN_METAL_TOKENS_RUNTIME: OnceLock<usize> = OnceLock::new();
+
+fn parse_attention_min_metal_tokens(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(ATTENTION_MIN_METAL_TOKENS)
+}
+
+/// Returns the attention window size threshold that enables Metal.
+pub fn attention_min_metal_tokens() -> usize {
+    *ATTENTION_MIN_METAL_TOKENS_RUNTIME.get_or_init(|| {
+        let raw = std::env::var("RUSTY_LLM_METAL_ATTENTION_MIN_TOKENS").ok();
+        parse_attention_min_metal_tokens(raw.as_deref())
+    })
+}
 
 #[cfg(all(target_os = "macos", rusty_metal))]
 mod ffi {
@@ -103,6 +118,30 @@ mod ffi {
             cols: usize,
             out: *mut f32,
         ) -> i32;
+        /// Runs one attention scan over cached keys and values on the Metal backend.
+        pub fn rusty_metal_attention(
+            query: *const f32,
+            query_len: usize,
+            keys: *const f32,
+            keys_len: usize,
+            values: *const f32,
+            values_len: usize,
+            sinks: *const f32,
+            sinks_len: usize,
+            out: *mut f32,
+            out_len: usize,
+            heads: usize,
+            kv_mul: usize,
+            head_dim: usize,
+            value_dim: usize,
+            key_stride: usize,
+            value_stride: usize,
+            slot_count: usize,
+            start_t: usize,
+            end_t: usize,
+            scale: f32,
+            use_sink: i32,
+        ) -> i32;
     }
 }
 
@@ -136,6 +175,81 @@ pub fn requested() -> Option<bool> {
 /// Reads the environment flag for experimental Q6_K Metal acceleration.
 pub fn q6k_enabled() -> bool {
     enabled()
+}
+
+/// Attempts a Metal attention scan across all query heads.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_into(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    out: &mut [f32],
+    heads: usize,
+    kv_mul: usize,
+    head_dim: usize,
+    value_dim: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+) -> bool {
+    attention_raw(
+        query,
+        keys,
+        values,
+        None,
+        out,
+        heads,
+        kv_mul,
+        head_dim,
+        value_dim,
+        key_stride,
+        value_stride,
+        slot_count,
+        start_t,
+        end_t,
+        scale,
+    )
+}
+
+/// Attempts a Metal attention scan with per-head sink scores.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_with_sink_into(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    sinks: &[f32],
+    out: &mut [f32],
+    heads: usize,
+    kv_mul: usize,
+    head_dim: usize,
+    value_dim: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+) -> bool {
+    attention_raw(
+        query,
+        keys,
+        values,
+        Some(sinks),
+        out,
+        heads,
+        kv_mul,
+        head_dim,
+        value_dim,
+        key_stride,
+        value_stride,
+        slot_count,
+        start_t,
+        end_t,
+        scale,
+    )
 }
 
 /// Attempts a Metal Q4_K matrix-vector multiply into the output buffer.
@@ -277,6 +391,14 @@ fn q4k_single_should_use_metal(rows: usize, cols: usize) -> bool {
     rows >= 8_192 || cols >= 4_096
 }
 
+/// Decides whether a full attention scan is large enough for Metal dispatch.
+fn attention_scan_should_use_metal(start_t: usize, end_t: usize) -> bool {
+    end_t
+        .checked_sub(start_t)
+        .map(|span| span + 1 >= attention_min_metal_tokens())
+        .unwrap_or(false)
+}
+
 #[cfg(all(target_os = "macos", rusty_metal))]
 /// Calls the raw Metal Q4_K projection shim or reports unsupported.
 fn q4k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) -> bool {
@@ -288,6 +410,77 @@ fn q4k_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut
             rows,
             cols,
             out.as_mut_ptr(),
+        ) != 0
+    }
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal attention shim or reports unsupported.
+fn attention_raw(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    sinks: Option<&[f32]>,
+    out: &mut [f32],
+    heads: usize,
+    kv_mul: usize,
+    head_dim: usize,
+    value_dim: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+) -> bool {
+    if !enabled()
+        || !attention_scan_should_use_metal(start_t, end_t)
+        || heads == 0
+        || kv_mul == 0
+        || head_dim == 0
+        || value_dim == 0
+        || slot_count == 0
+        || query.len() < heads.saturating_mul(head_dim)
+        || keys.len() < slot_count.saturating_mul(key_stride)
+        || values.len() < slot_count.saturating_mul(value_stride)
+        || out.len() < heads.saturating_mul(value_dim)
+    {
+        return false;
+    }
+    if let Some(sinks) = sinks {
+        if sinks.len() < heads {
+            return false;
+        }
+    }
+    let query_len = std::mem::size_of_val(query);
+    let keys_len = std::mem::size_of_val(keys);
+    let values_len = std::mem::size_of_val(values);
+    let out_len = std::mem::size_of_val(out);
+    let sinks_len = sinks.map(std::mem::size_of_val).unwrap_or(0);
+    unsafe {
+        ffi::rusty_metal_attention(
+            query.as_ptr(),
+            query_len,
+            keys.as_ptr(),
+            keys_len,
+            values.as_ptr(),
+            values_len,
+            sinks.map(|s| s.as_ptr()).unwrap_or(std::ptr::null()),
+            sinks_len,
+            out.as_mut_ptr(),
+            out_len,
+            heads,
+            kv_mul,
+            head_dim,
+            value_dim,
+            key_stride,
+            value_stride,
+            slot_count,
+            start_t,
+            end_t,
+            scale,
+            sinks.is_some() as i32,
         ) != 0
     }
 }
@@ -445,6 +638,29 @@ fn q4k_matvec_raw(
     _rows: usize,
     _cols: usize,
     _out: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw Metal attention shim or reports unsupported.
+fn attention_raw(
+    _query: &[f32],
+    _keys: &[f32],
+    _values: &[f32],
+    _sinks: Option<&[f32]>,
+    _out: &mut [f32],
+    _heads: usize,
+    _kv_mul: usize,
+    _head_dim: usize,
+    _value_dim: usize,
+    _key_stride: usize,
+    _value_stride: usize,
+    _slot_count: usize,
+    _start_t: usize,
+    _end_t: usize,
+    _scale: f32,
 ) -> bool {
     false
 }
@@ -657,5 +873,28 @@ mod tests {
         assert!(!super::q4k_single_should_use_metal(1024, 3072));
         assert!(super::q4k_single_should_use_metal(9216, 3072));
         assert!(super::q4k_single_should_use_metal(3072, 4096));
+    }
+
+    #[test]
+    /// Verifies the Metal attention threshold parser handles overrides and fallbacks.
+    fn attention_min_tokens_parser_handles_overrides() {
+        assert_eq!(
+            super::parse_attention_min_metal_tokens(None),
+            super::ATTENTION_MIN_METAL_TOKENS
+        );
+        assert_eq!(super::parse_attention_min_metal_tokens(Some("0")), 0);
+        assert_eq!(super::parse_attention_min_metal_tokens(Some("512")), 512);
+        assert_eq!(
+            super::parse_attention_min_metal_tokens(Some("bogus")),
+            super::ATTENTION_MIN_METAL_TOKENS
+        );
+        assert_eq!(super::parse_attention_min_metal_tokens(Some("  768  ")), 768);
+    }
+
+    #[test]
+    /// Verifies that short attention windows stay on the CPU path.
+    fn attention_metal_heuristic_skips_short_windows() {
+        assert!(!super::attention_scan_should_use_metal(0, 8_190));
+        assert!(super::attention_scan_should_use_metal(0, 8_191));
     }
 }

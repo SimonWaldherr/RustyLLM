@@ -1,6 +1,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <math.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -10,13 +13,39 @@ typedef struct {
     uint32_t n_blocks;
 } RustyQ4KParams;
 
+typedef struct {
+    uint32_t heads;
+    uint32_t kv_mul;
+    uint32_t head_dim;
+    uint32_t value_dim;
+    uint32_t key_stride;
+    uint32_t value_stride;
+    uint32_t slot_count;
+    uint32_t start_t;
+    uint32_t end_t;
+    uint32_t use_sink;
+    float scale;
+} RustyAttentionParams;
+
 static id<MTLDevice> gDevice;
 static id<MTLCommandQueue> gQueue;
 static id<MTLComputePipelineState> gQ4KPipeline;
 static id<MTLComputePipelineState> gQ6KPipeline;
 static id<MTLComputePipelineState> gQ4_0Pipeline;
 static id<MTLComputePipelineState> gQ8_0Pipeline;
+static id<MTLComputePipelineState> gAttentionPipeline;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gWeightBuffers;
+static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gSharedBuffers;
+static const float gAttentionZero = 0.0f;
+
+static void rusty_metal_log_error(const char *step, NSError *error) {
+    if (!getenv("RUSTY_LLM_METAL_DEBUG")) return;
+    if (error) {
+        fprintf(stderr, "RustyLLM Metal init failed at %s: %s\n", step, [[error localizedDescription] UTF8String]);
+    } else {
+        fprintf(stderr, "RustyLLM Metal init failed at %s\n", step);
+    }
+}
 
 static NSString *const kQ4KSource =
 @"#include <metal_stdlib>\n"
@@ -201,42 +230,164 @@ static NSString *const kQ8_0Source =
 "        sum += simd_shuffle_xor(sum, offset);\n"
 "    if (lane == 0) out[row] = sum;\n"
 "}\n";
+
+static NSString *const kAttentionSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct Params { uint heads; uint kv_mul; uint head_dim; uint value_dim; uint key_stride; uint value_stride; uint slot_count; uint start_t; uint end_t; uint use_sink; float scale; };\n"
+"kernel void attention_scan(device const float* query [[buffer(0)]],\n"
+"                           device const float* keys [[buffer(1)]],\n"
+"                           device const float* values [[buffer(2)]],\n"
+"                           device float* out [[buffer(3)]],\n"
+"                           device const float* sinks [[buffer(4)]],\n"
+"                           constant Params& p [[buffer(5)]],\n"
+"                           uint head [[threadgroup_position_in_grid]],\n"
+"                           uint lane [[thread_index_in_simdgroup]]) {\n"
+"    if (head >= p.heads) return;\n"
+"    threadgroup float q_shared[2048];\n"
+"    threadgroup float out_shared[2048];\n"
+"    const device float* q_row = query + head * p.head_dim;\n"
+"    device float* out_row = out + head * p.value_dim;\n"
+"    uint kv_head = head / p.kv_mul;\n"
+"    const device float* k_base = keys + kv_head * p.key_stride;\n"
+"    const device float* v_base = values + kv_head * p.value_stride;\n"
+"    for (uint i = lane; i < p.head_dim; i += 32) q_shared[i] = q_row[i];\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) out_shared[i] = 0.0f;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float max_score = p.use_sink != 0 ? sinks[head] : -INFINITY;\n"
+"    float denom = p.use_sink != 0 ? 1.0f : 0.0f;\n"
+"    for (uint t = p.start_t; t <= p.end_t; ++t) {\n"
+"        uint slot = t % p.slot_count;\n"
+"        const device float* k_row = k_base + slot * p.key_stride;\n"
+"        const device float* v_row = v_base + slot * p.value_stride;\n"
+"        float partial = 0.0f;\n"
+"        for (uint i = lane; i < p.head_dim; i += 32) {\n"
+"            partial += q_shared[i] * k_row[i];\n"
+"        }\n"
+"        for (ushort offset = 16; offset > 0; offset >>= 1) {\n"
+"            partial += simd_shuffle_xor(partial, offset);\n"
+"        }\n"
+"        float acc_scale = 1.0f;\n"
+"        float value_scale = 0.0f;\n"
+"        if (lane == 0) {\n"
+"            float score = partial * p.scale;\n"
+"            if (score > max_score) {\n"
+"                acc_scale = isfinite(max_score) ? exp(max_score - score) : 0.0f;\n"
+"                value_scale = 1.0f;\n"
+"                denom = denom * acc_scale + 1.0f;\n"
+"                max_score = score;\n"
+"            } else {\n"
+"                acc_scale = 1.0f;\n"
+"                value_scale = exp(score - max_score);\n"
+"                denom += value_scale;\n"
+"            }\n"
+"        }\n"
+"        acc_scale = simd_broadcast_first(acc_scale);\n"
+"        value_scale = simd_broadcast_first(value_scale);\n"
+"        for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"            out_shared[i] = out_shared[i] * acc_scale + value_scale * v_row[i];\n"
+"        }\n"
+"    }\n"
+"    float inv_denom = lane == 0 ? (denom > 0.0f ? 1.0f / denom : 0.0f) : 0.0f;\n"
+"    inv_denom = simd_broadcast_first(inv_denom);\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"        out_row[i] = out_shared[i] * inv_denom;\n"
+"    }\n"
+"}\n";
 static BOOL rusty_metal_init(void) {
     static dispatch_once_t once;
     static BOOL ok = NO;
     dispatch_once(&once, ^{
         gDevice = MTLCreateSystemDefaultDevice();
-        if (!gDevice) return;
+        if (!gDevice) {
+            rusty_metal_log_error("MTLCreateSystemDefaultDevice", nil);
+            return;
+        }
         NSError *error = nil;
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         options.fastMathEnabled = YES;
         id<MTLLibrary> library = [gDevice newLibraryWithSource:kQ4KSource options:options error:&error];
-        if (!library) return;
+        if (!library) {
+            rusty_metal_log_error("compile q4k library", error);
+            return;
+        }
         id<MTLFunction> function = [library newFunctionWithName:@"q4k_matvec"];
-        if (!function) return;
+        if (!function) {
+            rusty_metal_log_error("load q4k function", nil);
+            return;
+        }
         gQ4KPipeline = [gDevice newComputePipelineStateWithFunction:function error:&error];
-        if (!gQ4KPipeline) return;
+        if (!gQ4KPipeline) {
+            rusty_metal_log_error("create q4k pipeline", error);
+            return;
+        }
         id<MTLLibrary> q6_library = [gDevice newLibraryWithSource:kQ6KSource options:options error:&error];
-        if (!q6_library) return;
+        if (!q6_library) {
+            rusty_metal_log_error("compile q6k library", error);
+            return;
+        }
         id<MTLFunction> q6_function = [q6_library newFunctionWithName:@"q6k_matvec"];
-        if (!q6_function) return;
+        if (!q6_function) {
+            rusty_metal_log_error("load q6k function", nil);
+            return;
+        }
         gQ6KPipeline = [gDevice newComputePipelineStateWithFunction:q6_function error:&error];
-        if (!gQ6KPipeline) return;
+        if (!gQ6KPipeline) {
+            rusty_metal_log_error("create q6k pipeline", error);
+            return;
+        }
         id<MTLLibrary> q4_0_library = [gDevice newLibraryWithSource:kQ4_0Source options:options error:&error];
-        if (!q4_0_library) return;
+        if (!q4_0_library) {
+            rusty_metal_log_error("compile q4_0 library", error);
+            return;
+        }
         id<MTLFunction> q4_0_function = [q4_0_library newFunctionWithName:@"q4_0_matvec"];
-        if (!q4_0_function) return;
+        if (!q4_0_function) {
+            rusty_metal_log_error("load q4_0 function", nil);
+            return;
+        }
         gQ4_0Pipeline = [gDevice newComputePipelineStateWithFunction:q4_0_function error:&error];
-        if (!gQ4_0Pipeline) return;
+        if (!gQ4_0Pipeline) {
+            rusty_metal_log_error("create q4_0 pipeline", error);
+            return;
+        }
         id<MTLLibrary> q8_0_library = [gDevice newLibraryWithSource:kQ8_0Source options:options error:&error];
-        if (!q8_0_library) return;
+        if (!q8_0_library) {
+            rusty_metal_log_error("compile q8_0 library", error);
+            return;
+        }
         id<MTLFunction> q8_0_function = [q8_0_library newFunctionWithName:@"q8_0_matvec"];
-        if (!q8_0_function) return;
+        if (!q8_0_function) {
+            rusty_metal_log_error("load q8_0 function", nil);
+            return;
+        }
         gQ8_0Pipeline = [gDevice newComputePipelineStateWithFunction:q8_0_function error:&error];
-        if (!gQ8_0Pipeline) return;
+        if (!gQ8_0Pipeline) {
+            rusty_metal_log_error("create q8_0 pipeline", error);
+            return;
+        }
+        id<MTLLibrary> attention_library = [gDevice newLibraryWithSource:kAttentionSource options:options error:&error];
+        if (!attention_library) {
+            rusty_metal_log_error("compile attention library", error);
+            return;
+        }
+        id<MTLFunction> attention_function = [attention_library newFunctionWithName:@"attention_scan"];
+        if (!attention_function) {
+            rusty_metal_log_error("load attention function", nil);
+            return;
+        }
+        gAttentionPipeline = [gDevice newComputePipelineStateWithFunction:attention_function error:&error];
+        if (!gAttentionPipeline) {
+            rusty_metal_log_error("create attention pipeline", error);
+            return;
+        }
         gQueue = [gDevice newCommandQueue];
-        if (!gQueue) return;
+        if (!gQueue) {
+            rusty_metal_log_error("create command queue", nil);
+            return;
+        }
         gWeightBuffers = [[NSMutableDictionary alloc] init];
+        gSharedBuffers = [[NSMutableDictionary alloc] init];
         ok = YES;
     });
     return ok;
@@ -253,6 +404,26 @@ static id<MTLBuffer> rusty_metal_weight_buffer(const uint8_t *weights, uintptr_t
         [gWeightBuffers setObject:weight_buffer forKey:key];
     }
     return weight_buffer;
+}
+
+static id<MTLBuffer> rusty_metal_shared_buffer(const void *bytes, uintptr_t bytes_len) {
+    NSNumber *key = @((uintptr_t)bytes);
+    id<MTLBuffer> buffer = [gSharedBuffers objectForKey:key];
+    if (!buffer || [buffer length] < bytes_len) {
+        buffer = [gDevice newBufferWithBytesNoCopy:(void *)bytes
+                                            length:(NSUInteger)bytes_len
+                                           options:MTLResourceStorageModeShared
+                                       deallocator:nil];
+        if (!buffer) return nil;
+        [gSharedBuffers setObject:buffer forKey:key];
+    }
+    return buffer;
+}
+
+static id<MTLBuffer> rusty_metal_copy_buffer(const void *bytes, uintptr_t bytes_len) {
+    return [gDevice newBufferWithBytes:bytes
+                                length:(NSUInteger)bytes_len
+                               options:MTLResourceStorageModeShared];
 }
 
 static BOOL rusty_metal_ensure_buffer(id<MTLBuffer> __strong *buffer, NSUInteger size) {
@@ -730,6 +901,98 @@ int rusty_metal_q8_0_matvec(const uint8_t *weights,
         if ([command_buffer status] != MTLCommandBufferStatusCompleted) return 0;
 
         memcpy(out, [out_buffer contents], out_size);
+        return 1;
+    }
+}
+
+int rusty_metal_attention(const float *query,
+                          uintptr_t query_len,
+                          const float *keys,
+                          uintptr_t keys_len,
+                          const float *values,
+                          uintptr_t values_len,
+                          const float *sinks,
+                          uintptr_t sinks_len,
+                          float *out,
+                          uintptr_t out_len,
+                          uintptr_t heads,
+                          uintptr_t kv_mul,
+                          uintptr_t head_dim,
+                          uintptr_t value_dim,
+                          uintptr_t key_stride,
+                          uintptr_t value_stride,
+                          uintptr_t slot_count,
+                          uintptr_t start_t,
+                          uintptr_t end_t,
+                          float scale,
+                          int use_sink) {
+    if (!rusty_metal_init() || !query || !keys || !values || !out || heads == 0 || kv_mul == 0 ||
+        head_dim == 0 || value_dim == 0 || slot_count == 0 || head_dim > 2048 || value_dim > 2048) {
+        return 0;
+    }
+
+    uintptr_t query_bytes = heads * head_dim * sizeof(float);
+    uintptr_t keys_bytes = slot_count * key_stride * sizeof(float);
+    uintptr_t values_bytes = slot_count * value_stride * sizeof(float);
+    uintptr_t out_bytes = heads * value_dim * sizeof(float);
+    uintptr_t sinks_bytes = heads * sizeof(float);
+
+    if (query_len < query_bytes || keys_len < keys_bytes || values_len < values_bytes ||
+        out_len < out_bytes || (use_sink && (!sinks || sinks_len < sinks_bytes))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> query_buffer = rusty_metal_copy_buffer(query, query_len);
+        id<MTLBuffer> keys_buffer = rusty_metal_shared_buffer(keys, keys_len);
+        id<MTLBuffer> values_buffer = rusty_metal_shared_buffer(values, values_len);
+        static id<MTLBuffer> out_buffer = nil;
+        if (!query_buffer || !keys_buffer || !values_buffer ||
+            !rusty_metal_ensure_buffer(&out_buffer, out_len)) {
+            return 0;
+        }
+
+        id<MTLBuffer> sinks_buffer = nil;
+        if (use_sink) {
+            sinks_buffer = rusty_metal_copy_buffer(sinks, sinks_len);
+        } else {
+            sinks_buffer = rusty_metal_copy_buffer(&gAttentionZero, sizeof(gAttentionZero));
+        }
+        if (!sinks_buffer) return 0;
+
+        RustyAttentionParams params = {
+            .heads = (uint32_t)heads,
+            .kv_mul = (uint32_t)kv_mul,
+            .head_dim = (uint32_t)head_dim,
+            .value_dim = (uint32_t)value_dim,
+            .key_stride = (uint32_t)key_stride,
+            .value_stride = (uint32_t)value_stride,
+            .slot_count = (uint32_t)slot_count,
+            .start_t = (uint32_t)start_t,
+            .end_t = (uint32_t)end_t,
+            .use_sink = (uint32_t)use_sink,
+            .scale = scale,
+        };
+
+        id<MTLCommandBuffer> command_buffer = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        [encoder setComputePipelineState:gAttentionPipeline];
+        [encoder setBuffer:query_buffer offset:0 atIndex:0];
+        [encoder setBuffer:keys_buffer offset:0 atIndex:1];
+        [encoder setBuffer:values_buffer offset:0 atIndex:2];
+        [encoder setBuffer:out_buffer offset:0 atIndex:3];
+        [encoder setBuffer:sinks_buffer offset:0 atIndex:4];
+        [encoder setBytes:&params length:sizeof(params) atIndex:5];
+
+        MTLSize threads_per_group = MTLSizeMake(32, 1, 1);
+        MTLSize threadgroups = MTLSizeMake((NSUInteger)heads, 1, 1);
+        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if ([command_buffer status] != MTLCommandBufferStatusCompleted) return 0;
+
+        memcpy(out, [out_buffer contents], out_bytes);
         return 1;
     }
 }

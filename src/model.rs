@@ -143,7 +143,7 @@ impl RawTensorData {
     }
 
     /// Returns the tensor bytes regardless of whether they are owned or borrowed.
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(data) => data,
             Self::View { ptr, len } => unsafe { std::slice::from_raw_parts(*ptr, *len) },
@@ -1245,12 +1245,12 @@ fn load_optional_f32_vec(
     name: &str,
     tensors: &HashMap<String, &crate::gguf::TensorInfo>,
     inferred_sizes: &HashMap<String, usize>,
-    len: usize,
+    _len: usize,
 ) -> Vec<f32> {
     if tensors.contains_key(name) {
         load_f32_vec(mmap_data, data_offset, name, tensors, inferred_sizes)
     } else {
-        vec![0.0; len]
+        Vec::new()
     }
 }
 
@@ -1267,7 +1267,7 @@ fn load_optional_f32_slice(
         let values = load_f32_vec(mmap_data, data_offset, name, tensors, inferred_sizes);
         values[start..start + len].to_vec()
     } else {
-        vec![0.0; len]
+        Vec::new()
     }
 }
 
@@ -1972,7 +1972,7 @@ pub fn load_gpt_oss_model(
 /// RMS Normalization writing into a pre-allocated output buffer.
 #[inline]
 /// Applies RMSNorm to an activation vector into an output buffer.
-fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
+pub(crate) fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
     let n = x.len();
     let ss = simd::dot_f32(x, x) / n as f32;
     let scale = 1.0 / (ss + eps).sqrt();
@@ -1982,8 +1982,20 @@ fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f32>) {
     }
 }
 
+#[inline]
+/// Adds an optional projection bias when the model stores one.
+fn add_bias_if_present(out: &mut [f32], bias: &[f32]) {
+    if bias.is_empty() {
+        return;
+    }
+    debug_assert_eq!(out.len(), bias.len());
+    for i in 0..out.len() {
+        out[i] += bias[i];
+    }
+}
+
 /// Applies the same rotary angles to query and key vectors in one pass.
-fn apply_rope_qk(
+pub(crate) fn apply_rope_qk(
     q: &mut [f32],
     k: &mut [f32],
     pos: usize,
@@ -2054,7 +2066,7 @@ fn fast_exp_approx(x: f32) -> f32 {
 
 #[inline]
 /// Runs numerically stable online attention with an additional attention-sink score.
-fn online_attention_with_sink(
+pub(crate) fn online_attention_with_sink(
     query: &[f32],
     keys: &[f32],
     values: &[f32],
@@ -2106,7 +2118,7 @@ fn online_attention_with_sink(
 
 #[inline]
 /// Runs numerically stable online attention over cached keys and values.
-fn online_attention(
+pub(crate) fn online_attention(
     query: &[f32],
     keys: &[f32],
     values: &[f32],
@@ -2158,7 +2170,7 @@ fn online_attention(
 /// SiLU activation
 #[inline(always)]
 /// Computes the SiLU activation.
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
@@ -2323,9 +2335,6 @@ pub fn forward_gpt_oss_into(
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
-        for value in buf.attn_out.iter_mut() {
-            *value = 0.0;
-        }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = if l % 2 == 0 {
@@ -2334,25 +2343,46 @@ pub fn forward_gpt_oss_into(
             0
         };
 
-        for h in 0..config.n_heads {
-            let kv_h = h / config.kv_mul;
-            let q_off = h * config.head_dim;
-            let out_off = h * config.value_dim;
-            online_attention_with_sink(
-                &buf.q[q_off..q_off + config.head_dim],
-                &cache.k[l][kv_h * config.head_dim..],
-                &cache.v[l][kv_h * config.value_dim..],
-                kv_k_dim,
-                kv_v_dim,
-                cache.storage_len,
-                config.head_dim,
-                config.value_dim,
-                attn_window,
-                pos,
-                scale,
-                layer.sinks[h],
-                &mut buf.attn_out[out_off..out_off + config.value_dim],
-            );
+        if !crate::metal::attention_with_sink_into(
+            &buf.q,
+            &cache.k[l],
+            &cache.v[l],
+            &layer.sinks,
+            &mut buf.attn_out,
+            config.n_heads,
+            config.kv_mul,
+            config.head_dim,
+            config.value_dim,
+            kv_k_dim,
+            kv_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for value in buf.attn_out.iter_mut() {
+                *value = 0.0;
+            }
+            for h in 0..config.n_heads {
+                let kv_h = h / config.kv_mul;
+                let q_off = h * config.head_dim;
+                let out_off = h * config.value_dim;
+                online_attention_with_sink(
+                    &buf.q[q_off..q_off + config.head_dim],
+                    &cache.k[l][kv_h * config.head_dim..],
+                    &cache.v[l][kv_h * config.value_dim..],
+                    kv_k_dim,
+                    kv_v_dim,
+                    cache.storage_len,
+                    config.head_dim,
+                    config.value_dim,
+                    attn_window,
+                    pos,
+                    scale,
+                    layer.sinks[h],
+                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                );
+            }
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
@@ -2468,15 +2498,9 @@ pub fn forward_into(
             layer.wv.matvec_into(&buf.xn, &mut buf.v);
         }
 
-        for i in 0..buf.q.len() {
-            buf.q[i] += layer.bq[i];
-        }
-        for i in 0..buf.k.len() {
-            buf.k[i] += layer.bk[i];
-        }
-        for i in 0..buf.v.len() {
-            buf.v[i] += layer.bv[i];
-        }
+        add_bias_if_present(&mut buf.q, &layer.bq);
+        add_bias_if_present(&mut buf.k, &layer.bk);
+        add_bias_if_present(&mut buf.v, &layer.bv);
 
         apply_rope_qk(
             &mut buf.q,
@@ -2504,24 +2528,41 @@ pub fn forward_into(
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = attention_start_pos(pos, sliding_window);
 
-        for h in 0..config.n_heads {
-            let kv_h = h / kv_mul;
-            let q_off = h * head_dim;
-            let out_off = h * config.value_dim;
-            online_attention(
-                &buf.q[q_off..q_off + head_dim],
-                &cache.k[l][kv_h * config.head_dim..],
-                &cache.v[l][kv_h * config.value_dim..],
-                kv_k_dim,
-                kv_v_dim,
-                cache.storage_len,
-                head_dim,
-                config.value_dim,
-                attn_window,
-                pos,
-                scale,
-                &mut buf.attn_out[out_off..out_off + config.value_dim],
-            );
+        if !crate::metal::attention_into(
+            &buf.q,
+            &cache.k[l],
+            &cache.v[l],
+            &mut buf.attn_out,
+            config.n_heads,
+            kv_mul,
+            head_dim,
+            config.value_dim,
+            kv_k_dim,
+            kv_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for h in 0..config.n_heads {
+                let kv_h = h / kv_mul;
+                let q_off = h * head_dim;
+                let out_off = h * config.value_dim;
+                online_attention(
+                    &buf.q[q_off..q_off + head_dim],
+                    &cache.k[l][kv_h * config.head_dim..],
+                    &cache.v[l][kv_h * config.value_dim..],
+                    kv_k_dim,
+                    kv_v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    config.value_dim,
+                    attn_window,
+                    pos,
+                    scale,
+                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                );
+            }
         }
 
         // Output projection + residual
@@ -3409,15 +3450,9 @@ pub fn forward_hidden<'a>(
             layer.wv.matvec_into(&buf.xn, &mut buf.v);
         }
 
-        for i in 0..buf.q.len() {
-            buf.q[i] += layer.bq[i];
-        }
-        for i in 0..buf.k.len() {
-            buf.k[i] += layer.bk[i];
-        }
-        for i in 0..buf.v.len() {
-            buf.v[i] += layer.bv[i];
-        }
+        add_bias_if_present(&mut buf.q, &layer.bq);
+        add_bias_if_present(&mut buf.k, &layer.bk);
+        add_bias_if_present(&mut buf.v, &layer.bv);
 
         apply_rope_qk(
             &mut buf.q,
@@ -3440,24 +3475,41 @@ pub fn forward_hidden<'a>(
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = attention_start_pos(pos, sliding_window);
 
-        for h in 0..config.n_heads {
-            let kv_h = h / kv_mul;
-            let q_off = h * head_dim;
-            let out_off = h * config.value_dim;
-            online_attention(
-                &buf.q[q_off..q_off + head_dim],
-                &cache.k[l][kv_h * config.head_dim..],
-                &cache.v[l][kv_h * config.value_dim..],
-                kv_k_dim,
-                kv_v_dim,
-                cache.storage_len,
-                head_dim,
-                config.value_dim,
-                attn_window,
-                pos,
-                scale,
-                &mut buf.attn_out[out_off..out_off + config.value_dim],
-            );
+        if !crate::metal::attention_into(
+            &buf.q,
+            &cache.k[l],
+            &cache.v[l],
+            &mut buf.attn_out,
+            config.n_heads,
+            kv_mul,
+            head_dim,
+            config.value_dim,
+            kv_k_dim,
+            kv_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for h in 0..config.n_heads {
+                let kv_h = h / kv_mul;
+                let q_off = h * head_dim;
+                let out_off = h * config.value_dim;
+                online_attention(
+                    &buf.q[q_off..q_off + head_dim],
+                    &cache.k[l][kv_h * config.head_dim..],
+                    &cache.v[l][kv_h * config.value_dim..],
+                    kv_k_dim,
+                    kv_v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    config.value_dim,
+                    attn_window,
+                    pos,
+                    scale,
+                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                );
+            }
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
@@ -3545,9 +3597,6 @@ pub fn forward_hidden_gpt_oss<'a>(
         cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
         cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
 
-        for value in buf.attn_out.iter_mut() {
-            *value = 0.0;
-        }
         let scale = 1.0 / (config.head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = if l % 2 == 0 {
@@ -3556,25 +3605,46 @@ pub fn forward_hidden_gpt_oss<'a>(
             0
         };
 
-        for h in 0..config.n_heads {
-            let kv_h = h / config.kv_mul;
-            let q_off = h * config.head_dim;
-            let out_off = h * config.value_dim;
-            online_attention_with_sink(
-                &buf.q[q_off..q_off + config.head_dim],
-                &cache.k[l][kv_h * config.head_dim..],
-                &cache.v[l][kv_h * config.value_dim..],
-                kv_k_dim,
-                kv_v_dim,
-                cache.storage_len,
-                config.head_dim,
-                config.value_dim,
-                attn_window,
-                pos,
-                scale,
-                layer.sinks[h],
-                &mut buf.attn_out[out_off..out_off + config.value_dim],
-            );
+        if !crate::metal::attention_with_sink_into(
+            &buf.q,
+            &cache.k[l],
+            &cache.v[l],
+            &layer.sinks,
+            &mut buf.attn_out,
+            config.n_heads,
+            config.kv_mul,
+            config.head_dim,
+            config.value_dim,
+            kv_k_dim,
+            kv_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for value in buf.attn_out.iter_mut() {
+                *value = 0.0;
+            }
+            for h in 0..config.n_heads {
+                let kv_h = h / config.kv_mul;
+                let q_off = h * config.head_dim;
+                let out_off = h * config.value_dim;
+                online_attention_with_sink(
+                    &buf.q[q_off..q_off + config.head_dim],
+                    &cache.k[l][kv_h * config.head_dim..],
+                    &cache.v[l][kv_h * config.value_dim..],
+                    kv_k_dim,
+                    kv_v_dim,
+                    cache.storage_len,
+                    config.head_dim,
+                    config.value_dim,
+                    attn_window,
+                    pos,
+                    scale,
+                    layer.sinks[h],
+                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                );
+            }
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
@@ -3697,24 +3767,41 @@ pub fn forward_hidden_gemma4<'a>(
         let attn_window = attention_start_pos(pos, sliding_window);
 
         let kv_mul_l = config.n_heads / n_kv_heads_l;
-        for h in 0..config.n_heads {
-            let kv_h = h / kv_mul_l;
-            let q_off = h * head_dim_l;
-            let out_off = h * value_dim_l;
-            online_attention(
-                &buf.q[q_off..q_off + head_dim_l],
-                &cache.k[l][kv_h * head_dim_l..],
-                &cache.v[l][kv_h * value_dim_l..],
-                cache.per_pos_k_dim,
-                cache.per_pos_v_dim,
-                cache.storage_len,
-                head_dim_l,
-                value_dim_l,
-                attn_window,
-                pos,
-                scale,
-                &mut buf.attn_out[out_off..out_off + value_dim_l],
-            );
+        if !crate::metal::attention_into(
+            &buf.q,
+            &cache.k[l],
+            &cache.v[l],
+            &mut buf.attn_out,
+            config.n_heads,
+            kv_mul_l,
+            head_dim_l,
+            value_dim_l,
+            cache.per_pos_k_dim,
+            cache.per_pos_v_dim,
+            cache.storage_len,
+            attn_window,
+            pos,
+            scale,
+        ) {
+            for h in 0..config.n_heads {
+                let kv_h = h / kv_mul_l;
+                let q_off = h * head_dim_l;
+                let out_off = h * value_dim_l;
+                online_attention(
+                    &buf.q[q_off..q_off + head_dim_l],
+                    &cache.k[l][kv_h * head_dim_l..],
+                    &cache.v[l][kv_h * value_dim_l..],
+                    cache.per_pos_k_dim,
+                    cache.per_pos_v_dim,
+                    cache.storage_len,
+                    head_dim_l,
+                    value_dim_l,
+                    attn_window,
+                    pos,
+                    scale,
+                    &mut buf.attn_out[out_off..out_off + value_dim_l],
+                );
+            }
         }
 
         layer.attn_output.matvec_into(&buf.attn_out, &mut buf.proj);

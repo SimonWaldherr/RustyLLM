@@ -14,7 +14,7 @@
 set -euo pipefail
 
 BINARY="${BINARY:-./target/release/rusty-llm}"
-MODEL_DIR="${MODEL_DIR:-$HOME/.cache/lm-studio/models}"
+MODEL_DIR="${MODEL_DIR:-$HOME/.lmstudio/models/lmstudio-community}"
 BENCH_PROFILES="${BENCH_PROFILES:-cpu metal}"
 MODEL_FILTER="${MODEL_FILTER:-}"
 MODEL_LIMIT="${MODEL_LIMIT:-0}"

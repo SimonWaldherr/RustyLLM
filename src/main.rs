@@ -989,6 +989,7 @@ fn run_benchmark_json(
             "enabled": metal::enabled(),
             "q4_k": metal::enabled(),
             "q6_k": metal::q6k_enabled(),
+            "attention_min_tokens": metal::attention_min_metal_tokens(),
         },
         "runs": runs,
         "prompt": prompt,
@@ -1075,6 +1076,7 @@ fn run_kernel_benchmark(
                 "q4_k": metal::enabled(),
                 "q6_k": metal::q6k_enabled(),
                 "q6_k_min_rows": metal::Q6K_MIN_METAL_ROWS,
+                "attention_min_tokens": metal::attention_min_metal_tokens(),
             },
             "layer": layer,
             "runs": runs,
@@ -1091,12 +1093,13 @@ fn run_kernel_benchmark(
         layer, runs
     );
     println!(
-        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows={}",
+        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows={} attention_min_tokens={}",
         metal::available(),
         metal::enabled(),
         metal::enabled(),
         metal::q6k_enabled(),
-        metal::Q6K_MIN_METAL_ROWS
+        metal::Q6K_MIN_METAL_ROWS,
+        metal::attention_min_metal_tokens()
     );
     for row in rows {
         println!(
