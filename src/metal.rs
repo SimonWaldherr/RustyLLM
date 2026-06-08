@@ -392,6 +392,7 @@ fn q4k_single_should_use_metal(rows: usize, cols: usize) -> bool {
 }
 
 /// Decides whether a full attention scan is large enough for Metal dispatch.
+#[cfg(any(all(target_os = "macos", rusty_metal), test))]
 fn attention_scan_should_use_metal(start_t: usize, end_t: usize) -> bool {
     end_t
         .checked_sub(start_t)
