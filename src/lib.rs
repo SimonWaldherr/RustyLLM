@@ -28,7 +28,6 @@
 #[cfg(not(target_family = "wasm"))]
 pub mod catalog;
 pub mod gguf;
-#[cfg(not(target_family = "wasm"))]
 pub mod metal;
 #[cfg(not(target_family = "wasm"))]
 pub mod mmap;
