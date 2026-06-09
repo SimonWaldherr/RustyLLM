@@ -604,6 +604,7 @@ fn q6k_min_metal_rows() -> usize {
 }
 
 /// Decides whether a full attention scan is large enough for Metal dispatch.
+#[cfg(any(all(target_os = "macos", rusty_metal), test))]
 fn attention_scan_should_use_metal(start_t: usize, end_t: usize) -> bool {
     let threshold = if ultra_mode_enabled() {
         ultra_attention_min_metal_tokens()
