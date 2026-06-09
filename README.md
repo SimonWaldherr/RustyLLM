@@ -5,7 +5,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 
-→ **[Benchmark results](BENCHMARK.md)** — compatibility and speed for 19 tested models on Apple M2 Max.
+→ **[Benchmark results](BENCHMARK.md)** — compatibility and speed for 14 tested models on Apple M2 Max.
 
 RustyLLM is a lightweight, educational AI-inference project for developers who
 want to understand how a local language-model runner works. You do not need AI
@@ -205,8 +205,11 @@ rusty-llm --model-dir ./models --model phi-4 --prompt "Write a Rust enum example
 If no model directory is provided, RustyLLM uses:
 
 1. `RUSTY_LLM_MODEL_DIR`, when set and non-empty.
-2. `$HOME/.lmstudio/models/lmstudio-community`.
-3. `$HOME/.cache/lm-studio/models/lmstudio-community` as a final fallback.
+2. the default local LM Studio community model cache.
+
+For benchmark automation, `bench_models.sh` and the Makefile's default
+`MODEL_DIR` scan additional common LM Studio, Ollama, GPT4All, Jan, `~/models`,
+and project-local model paths.
 
 Model selection is intentionally lenient: `--model` can match repository names,
 file names, relative IDs, or GGUF metadata names. If a selector matches multiple
@@ -250,6 +253,11 @@ Generation options:
 - `--stop <text>` stops generation when the text appears. The flag can be
   repeated.
 - `--threads <N>` overrides the SIMD worker thread count.
+- `--profile <name>` selects runtime planning: `auto`, `mistral`,
+  `mistral-ultra`, or `gemma`. `mistral-ultra` is an experimental aggressive
+  Metal mode for Mistral/Ministral-style GGUFs; it lowers Metal dispatch
+  thresholds for Q4_K/Q6_K projections and attention scans, with native SIMD
+  fallback for kernels that still run on CPU.
 - `--mtp-assistant <path>` loads a smaller assistant GGUF for greedy
   speculative decoding.
 - `--mtp-tokens <N>` sets the maximum speculative draft tokens.
@@ -702,6 +710,24 @@ Default Cargo features:
 - `metal`: compiles the optional macOS Metal backend when Xcode command line
   tools are available. When compiled and the GPU backend is available, it is
   used by default at runtime (set `RUSTY_LLM_METAL=0` to opt out).
+
+Mistral Ultra mode:
+
+```bash
+RUSTY_LLM_METAL=1 rusty-llm --model-dir ./models --model Ministral \
+  --profile mistral-ultra --prompt "Explain metal inference briefly."
+```
+
+For repeatable checks, use `make bench-model-ultra MODEL=...` or
+`make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with
+`RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS`, `RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS`, and
+`RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal
+matvec and attention calls prefer Shared/NoCopy host buffers by default to avoid
+extra Rust/Metal memcpy traffic; set `RUSTY_LLM_METAL_NOCOPY=0` to benchmark the
+older copy-buffer path. Mistral-style Q4_K/Q4_K/Q6_K FFN blocks are fused into
+one Metal command buffer when `RUSTY_LLM_METAL_FUSED_FFN=1` is set; this is
+experimental because the older Gate/Up, CPU SwiGLU, Down sequence is faster on
+short Ministral decode benchmarks.
 
 Optional feature:
 

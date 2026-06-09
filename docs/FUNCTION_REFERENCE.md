@@ -154,6 +154,14 @@ the high-level runtime API.
 - `enabled` checks whether Metal use was requested and is available.
 - `requested` reads the `RUSTY_LLM_METAL` environment flag.
 - `q6k_enabled` checks the `RUSTY_LLM_METAL_Q6K` environment flag.
+- `nocopy_enabled` checks whether Metal Shared/NoCopy host buffers should be
+  preferred over explicit memcpy staging buffers.
+- `fused_ffn_enabled` checks whether the experimental
+  `RUSTY_LLM_METAL_FUSED_FFN=1` path should fuse Mistral-style Q4_K/Q4_K/Q6_K
+  FFN blocks into one Metal command buffer.
+- `ultra_q4k_min_metal_rows`, `ultra_q6k_min_metal_rows`,
+  `ultra_attention_min_metal_tokens`, `scoped_ultra_mode`, and
+  `ultra_mode_enabled` manage the per-thread Mistral Ultra routing mode.
 - `q4k_matvec_into`, `q6k_matvec_into`, `q4k_matvec2_into`, and
   `q4k_matvec3_into` try selected Metal matrix-vector kernels and fall back by
   returning `false`.
@@ -227,6 +235,8 @@ the high-level runtime API.
 - `Runner::architecture`, `model_name`, `tokenizer`, `gguf`, and `config`
   expose loaded model metadata.
 - `Runner::kernel_benchmark` benchmarks representative matrix-vector kernels.
+- `Runner::kernel_benchmark_with_options` runs kernel benchmarks under explicit
+  runtime options such as Mistral Ultra.
 - `Runner::generate` produces one non-streaming completion.
 - `Runner::generate_chat` renders chat messages and produces a response.
 - `Runner::generate_stream` produces tokens and calls a callback as text
@@ -246,6 +256,7 @@ the high-level runtime API.
 - `Runner::generate_chat_with_session` generates a chat response with KV-cache
   reuse.
 - `measure_matvec` times one matrix-vector operation repeatedly.
+- `measure_expert_matvec` times one routed MoE expert matrix-vector operation.
 - `measure_kernel` is the generic timing loop used by kernel benchmarks.
 - `weight_shape` returns a benchmarkable matrix shape for a weight.
 - `weight_dtype` returns a display dtype for a weight.

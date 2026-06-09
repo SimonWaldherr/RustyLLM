@@ -5,6 +5,9 @@
 #   ./bench_models.sh
 #   BENCH_PROFILES=cpu ./bench_models.sh
 #   BENCH_PROFILES="cpu metal" MODEL_DIR=/path/to/models ./bench_models.sh
+#   RUSTY_LLM_MODEL_DIR=/path/to/models ./bench_models.sh
+#   REPORT_ONLY=1 ./bench_models.sh
+#   FIND_MODEL_DIR_ONLY=1 ./bench_models.sh
 #   MODEL_FILTER=phi MODEL_LIMIT=2 MAX_TOKENS=16 WAIT_SECS=0 ./bench_models.sh
 #
 # Output:
@@ -14,7 +17,7 @@
 set -euo pipefail
 
 BINARY="${BINARY:-./target/release/rusty-llm}"
-MODEL_DIR="${MODEL_DIR:-$HOME/.lmstudio/models/lmstudio-community}"
+MODEL_DIR="${MODEL_DIR:-}"
 BENCH_PROFILES="${BENCH_PROFILES:-cpu metal}"
 MODEL_FILTER="${MODEL_FILTER:-}"
 MODEL_LIMIT="${MODEL_LIMIT:-0}"
@@ -26,15 +29,137 @@ TIMEOUT_SECS="${TIMEOUT_SECS:-600}"
 README="${README:-README.md}"
 BENCHMARK_MD="${BENCHMARK_MD:-BENCHMARK.md}"
 RAW_DIR="${RAW_DIR:-.bench_raw}"
+REPORT_ONLY="${REPORT_ONLY:-0}"
+FIND_MODEL_DIR_ONLY="${FIND_MODEL_DIR_ONLY:-0}"
 
 RESULTS_TSV="$RAW_DIR/results.tsv"
 PROFILES_TSV="$RAW_DIR/profiles.tsv"
 
-mkdir -p "$RAW_DIR"
-: > "$RESULTS_TSV"
-: > "$PROFILES_TSV"
-
 log() { printf '%s\n' "$1"; }
+
+format_decimal() {
+  LC_ALL=C awk -v value="$1" '
+    BEGIN {
+      if (value == "" || value == "null" || value == "—") {
+        print value
+      } else {
+        printf "%.1f", value + 0
+      }
+    }
+  '
+}
+
+is_gguf_file() {
+  [ -f "$1" ] || return 1
+  [ "$(dd if="$1" bs=4 count=1 2>/dev/null || true)" = "GGUF" ]
+}
+
+find_model_files() {
+  [ -d "$1" ] || return 0
+  find "$1" \( -iname "*.gguf" -o -path "*/blobs/sha256-*" \) -type f -print 2>/dev/null | sort
+}
+
+has_model_files() {
+  [ -d "$1" ] || return 1
+  local path
+  while IFS= read -r path; do
+    case "$(basename "$path")" in
+      *mmproj*|*MMProj*|*MMPROJ*) continue ;;
+    esac
+    case "$path" in
+      *.gguf|*.GGUF) return 0 ;;
+      *) is_gguf_file "$path" && return 0 ;;
+    esac
+  done < <(find_model_files "$1")
+  return 1
+}
+
+model_dir_candidates() {
+  if [ -n "${RUSTY_LLM_MODEL_DIR:-}" ]; then
+    printf '%s\n' "$RUSTY_LLM_MODEL_DIR"
+  fi
+  if [ -n "${OLLAMA_MODELS:-}" ]; then
+    printf '%s\n' "$OLLAMA_MODELS"
+  fi
+
+  if [ -n "${HOME:-}" ]; then
+    # LM Studio
+    printf '%s\n' "$HOME/.cache/lm-studio/models/lmstudio-community"
+    printf '%s\n' "$HOME/.lmstudio/models/lmstudio-community"
+    printf '%s\n' "$HOME/Library/Application Support/LM Studio/models"
+    printf '%s\n' "$HOME/.cache/lm-studio/models"
+    printf '%s\n' "$HOME/.lmstudio/models"
+    # Ollama stores GGUF payloads as content-addressed blobs.
+    printf '%s\n' "$HOME/.ollama/models"
+    # GPT4All / Nomic stores downloadable GGUF models in user cache folders.
+    printf '%s\n' "$HOME/Library/Application Support/nomic.ai/GPT4All"
+    printf '%s\n' "$HOME/.cache/nomic.ai/GPT4All"
+    # Jan commonly keeps local model files under its app data/cache trees.
+    printf '%s\n' "$HOME/jan/models"
+    printf '%s\n' "$HOME/.cache/jan/models"
+    printf '%s\n' "$HOME/Library/Application Support/Jan/models"
+    # Plain project-local/user model folders are useful for source checkouts.
+    printf '%s\n' "$HOME/models"
+  fi
+  if [ -n "${USERPROFILE:-}" ]; then
+    printf '%s\n' "$USERPROFILE/.ollama/models"
+  fi
+  if [ -n "${LOCALAPPDATA:-}" ]; then
+    printf '%s\n' "$LOCALAPPDATA/LM Studio/models"
+    printf '%s\n' "$LOCALAPPDATA/Ollama/models"
+    printf '%s\n' "$LOCALAPPDATA/nomic.ai/GPT4All"
+    printf '%s\n' "$LOCALAPPDATA/Jan/models"
+  fi
+  printf '%s\n' "/usr/share/ollama/.ollama/models"
+  printf '%s\n' "/usr/share/ollama/models"
+  printf '%s\n' "/usr/local/share/ollama/.ollama/models"
+  printf '%s\n' "/usr/local/share/ollama/models"
+  printf '%s\n' "/var/lib/ollama/models"
+  printf '%s\n' "/var/lib/ollama/.ollama/models"
+  printf '%s\n' "./models"
+}
+
+resolve_model_dir() {
+  if [ -n "$MODEL_DIR" ]; then
+    if [ -d "$MODEL_DIR" ]; then
+      printf '%s\n' "$MODEL_DIR"
+      return 0
+    fi
+    printf 'error: MODEL_DIR does not exist: %s\n' "$MODEL_DIR" >&2
+    return 1
+  fi
+
+  local candidate
+  local seen=""
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    case "$seen" in
+      *"
+$candidate
+"*) continue ;;
+    esac
+    seen="${seen}
+$candidate
+"
+    if has_model_files "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(model_dir_candidates)
+
+  printf 'error: no GGUF text models found in known model directories.\n' >&2
+  printf '       Set MODEL_DIR=/path/to/models or RUSTY_LLM_MODEL_DIR=/path/to/models.\n' >&2
+  printf '       Checked:\n' >&2
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && printf '       - %s\n' "$candidate" >&2
+  done < <(model_dir_candidates)
+  return 1
+}
+
+model_dir_from_results() {
+  [ -s "$RESULTS_TSV" ] || return 1
+  awk -F '\t' 'NF >= 5 && $5 != "" { sub("/[^/]*$", "", $5); print $5; exit }' "$RESULTS_TSV"
+}
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -128,9 +253,23 @@ profile_config() {
   esac
 }
 
+if [ "$FIND_MODEL_DIR_ONLY" = "1" ]; then
+  resolve_model_dir
+  exit 0
+fi
+
 require_cmd python3
 require_cmd jq
 require_cmd timeout
+
+mkdir -p "$RAW_DIR"
+
+if [ "$REPORT_ONLY" = "1" ] && [ -z "$MODEL_DIR" ]; then
+  MODEL_DIR=$(resolve_model_dir 2>/dev/null || model_dir_from_results || true)
+  [ -n "$MODEL_DIR" ] || MODEL_DIR="unknown"
+else
+  MODEL_DIR=$(resolve_model_dir)
+fi
 
 if [ ! -x "$BINARY" ]; then
   log "Binary not found or not executable: $BINARY"
@@ -138,14 +277,39 @@ if [ ! -x "$BINARY" ]; then
   cargo build --release
 fi
 
+PROFILE_WORDS=${BENCH_PROFILES//,/ }
+read -r -a PROFILE_INPUTS <<< "$PROFILE_WORDS"
+RUN_DATE=$(date "+%Y-%m-%d %H:%M %Z")
+
+if [ "$REPORT_ONLY" = "1" ]; then
+  if [ ! -s "$RESULTS_TSV" ] || [ ! -s "$PROFILES_TSV" ]; then
+    log "REPORT_ONLY=1 requires existing raw TSV files:"
+    log "  $RESULTS_TSV"
+    log "  $PROFILES_TSV"
+    exit 1
+  fi
+  log "RustyLLM Model Benchmark - $(date)"
+  log "  Binary   : $BINARY"
+  log "  Models   : report-only (from $RESULTS_TSV)"
+  log "  Profiles : report-only (from $PROFILES_TSV)"
+  log "================================================================"
+else
+  : > "$RESULTS_TSV"
+  : > "$PROFILES_TSV"
+
 # Collect text GGUF models. Projector files are skipped because they are not
-# standalone language models.
+# standalone language models. Ollama blob stores are included when the blob
+# itself has a GGUF file signature.
 declare -a MODELS
 MODELS=()
 while IFS= read -r model_path; do
   model_file=$(basename "$model_path")
   case "$model_file" in
     *mmproj*|*MMProj*|*MMPROJ*) continue ;;
+  esac
+  case "$model_path" in
+    *.gguf|*.GGUF) ;;
+    *) is_gguf_file "$model_path" || continue ;;
   esac
   if [ -n "$MODEL_FILTER" ] && ! printf '%s\n' "$model_path" | grep -qi "$MODEL_FILTER"; then
     continue
@@ -154,18 +318,13 @@ while IFS= read -r model_path; do
   if [ "$MODEL_LIMIT" -gt 0 ] && [ "${#MODELS[@]}" -ge "$MODEL_LIMIT" ]; then
     break
   fi
-done < <(find "$MODEL_DIR" -name "*.gguf" -print | sort)
+done < <(find_model_files "$MODEL_DIR")
 
 TOTAL=${#MODELS[@]}
 if [ "$TOTAL" -eq 0 ]; then
   log "No GGUF text models found in $MODEL_DIR"
   exit 1
 fi
-
-PROFILE_WORDS=${BENCH_PROFILES//,/ }
-read -r -a PROFILE_INPUTS <<< "$PROFILE_WORDS"
-
-RUN_DATE=$(date "+%Y-%m-%d %H:%M %Z")
 
 log "RustyLLM Model Benchmark - $(date)"
 log "  Binary   : $BINARY"
@@ -246,8 +405,8 @@ for profile_input in "${PROFILE_INPUTS[@]}"; do
       LOAD_MS=$(printf '%s' "$BENCH_JSON" | jq -r '.load_ms // 0' 2>/dev/null || echo "0")
       DECODE=$(printf '%s' "$BENCH_JSON" | jq -r '.summary.aggregate_decode_tok_s // 0' 2>/dev/null || echo "0")
       PREFILL=$(printf '%s' "$BENCH_JSON" | jq -r '.summary.aggregate_prefill_tok_s // 0' 2>/dev/null || echo "0")
-      DF=$(printf "%.1f" "$DECODE" 2>/dev/null || echo "$DECODE")
-      PF=$(printf "%.1f" "$PREFILL" 2>/dev/null || echo "$PREFILL")
+      DF=$(format_decimal "$DECODE")
+      PF=$(format_decimal "$PREFILL")
       log "  ok: load=${LOAD_MS}ms  decode=${DF} tok/s  prefill=${PF} tok/s"
       append_tsv \
         "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" "$((idx + 1))" \
@@ -265,6 +424,7 @@ for profile_input in "${PROFILE_INPUTS[@]}"; do
     "$PROFILE_KEY" "$PROFILE_LABEL" "$METAL_ENV" \
     "$(clean_field "$RAW_PROFILE_DIR")" "$(clean_field "$PROFILE_RUNTIME")"
 done
+fi
 
 HW_INFO=$(system_profiler SPHardwareDataType 2>/dev/null || true)
 CPU=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)

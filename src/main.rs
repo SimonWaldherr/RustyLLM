@@ -79,7 +79,7 @@ fn print_usage(name: &str) {
     eprintln!("  --no-speculative          Disable speculative decoding");
     eprintln!("  --kv-cache-dtype <T>      KV cache dtype: auto, f32, bf16, q8");
     eprintln!("  --max-context <N>         Cap runtime context/KV-cache length");
-    eprintln!("  --profile <name>          Runtime profile: auto, mistral, gemma");
+    eprintln!("  --profile <name>          Runtime profile: auto, mistral, mistral-ultra, gemma");
     eprintln!("  --sliding-window <N>      Override sliding-window size for runtime planning");
     eprintln!("  --no-flash-attn           Disable online-softmax attention optimization marker");
     eprintln!("  --system-prompt <T>       Override the default system prompt");
@@ -443,6 +443,11 @@ fn run() -> Result<(), String> {
     if std::env::var_os("RUSTY_LLM_FAST_ATTN").is_some() {
         eprintln!("Attention: fast approximation mode enabled");
     }
+    if options.runtime.profile == RuntimeProfile::MistralUltra {
+        eprintln!(
+            "Mistral Ultra: aggressive Metal matvec/attention routing with native SIMD fallback"
+        );
+    }
 
     if let Some(n) = threads_override {
         simd::set_num_threads(n);
@@ -550,6 +555,7 @@ fn run() -> Result<(), String> {
         run_kernel_benchmark(
             &runner,
             &model_path,
+            &options,
             kernel_bench_runs,
             kernel_bench_layer,
             kernel_bench_json,
@@ -920,6 +926,17 @@ fn run_benchmark_json(
     runs: usize,
     output: bool,
 ) -> Result<(), String> {
+    let ultra_profile = options.runtime.profile == RuntimeProfile::MistralUltra;
+    let metal_q4k_min_rows = if ultra_profile {
+        metal::ultra_q4k_min_metal_rows()
+    } else {
+        metal::Q4K_MIN_METAL_ROWS
+    };
+    let metal_q6k_min_rows = if ultra_profile {
+        metal::ultra_q6k_min_metal_rows()
+    } else {
+        metal::Q6K_MIN_METAL_ROWS
+    };
     let mut total_prompt_tokens = 0usize;
     let mut total_generated_tokens = 0usize;
     let mut total_prefill = Duration::from_secs(0);
@@ -987,9 +1004,18 @@ fn run_benchmark_json(
         "metal": {
             "available": metal::available(),
             "enabled": metal::enabled(),
+            "ultra": ultra_profile,
+            "nocopy": metal::nocopy_enabled(),
+            "fused_ffn": metal::fused_ffn_enabled(),
             "q4_k": metal::enabled(),
             "q6_k": metal::q6k_enabled(),
+            "q4_k_min_rows": metal_q4k_min_rows,
+            "q4_k_min_cols": metal::Q4K_MIN_METAL_COLS,
+            "q6_k_min_rows": metal_q6k_min_rows,
             "attention_min_tokens": metal::attention_min_metal_tokens(),
+            "ultra_q4_k_min_rows": metal::ultra_q4k_min_metal_rows(),
+            "ultra_q6_k_min_rows": metal::ultra_q6k_min_metal_rows(),
+            "ultra_attention_min_tokens": metal::ultra_attention_min_metal_tokens(),
         },
         "runs": runs,
         "prompt": prompt,
@@ -1038,11 +1064,23 @@ fn run_benchmark_json(
 fn run_kernel_benchmark(
     runner: &Runner,
     model_path: &Path,
+    options: &GenerationOptions,
     runs: usize,
     layer: usize,
     json: bool,
 ) -> Result<(), String> {
-    let (layer, rows) = runner.kernel_benchmark(runs, layer)?;
+    let ultra_profile = options.runtime.profile == RuntimeProfile::MistralUltra;
+    let metal_q4k_min_rows = if ultra_profile {
+        metal::ultra_q4k_min_metal_rows()
+    } else {
+        metal::Q4K_MIN_METAL_ROWS
+    };
+    let metal_q6k_min_rows = if ultra_profile {
+        metal::ultra_q6k_min_metal_rows()
+    } else {
+        metal::Q6K_MIN_METAL_ROWS
+    };
+    let (layer, rows) = runner.kernel_benchmark_with_options(runs, layer, options)?;
     if json {
         let kernels: Vec<_> = rows
             .iter()
@@ -1073,11 +1111,20 @@ fn run_kernel_benchmark(
             "metal": {
                 "available": metal::available(),
                 "enabled": metal::enabled(),
+                "ultra": ultra_profile,
+                "nocopy": metal::nocopy_enabled(),
+                "fused_ffn": metal::fused_ffn_enabled(),
                 "q4_k": metal::enabled(),
                 "q6_k": metal::q6k_enabled(),
-                "q6_k_min_rows": metal::Q6K_MIN_METAL_ROWS,
+                "q4_k_min_rows": metal_q4k_min_rows,
+                "q4_k_min_cols": metal::Q4K_MIN_METAL_COLS,
+                "q6_k_min_rows": metal_q6k_min_rows,
                 "attention_min_tokens": metal::attention_min_metal_tokens(),
+                "ultra_q4_k_min_rows": metal::ultra_q4k_min_metal_rows(),
+                "ultra_q6_k_min_rows": metal::ultra_q6k_min_metal_rows(),
+                "ultra_attention_min_tokens": metal::ultra_attention_min_metal_tokens(),
             },
+            "profile": options.runtime.profile.as_str(),
             "layer": layer,
             "runs": runs,
             "kernels": kernels,
@@ -1093,13 +1140,19 @@ fn run_kernel_benchmark(
         layer, runs
     );
     println!(
-        "Metal available={} enabled={} q4_k={} q6_k={} q6_k_min_rows={} attention_min_tokens={}",
+        "Metal available={} enabled={} ultra={} nocopy={} fused_ffn={} q4_k={} q6_k={} q4_k_min_rows={} q4_k_min_cols={} q6_k_min_rows={} attention_min_tokens={} ultra_attention_min_tokens={}",
         metal::available(),
         metal::enabled(),
+        ultra_profile,
+        metal::nocopy_enabled(),
+        metal::fused_ffn_enabled(),
         metal::enabled(),
         metal::q6k_enabled(),
-        metal::Q6K_MIN_METAL_ROWS,
-        metal::attention_min_metal_tokens()
+        metal_q4k_min_rows,
+        metal::Q4K_MIN_METAL_COLS,
+        metal_q6k_min_rows,
+        metal::attention_min_metal_tokens(),
+        metal::ultra_attention_min_metal_tokens()
     );
     for row in rows {
         println!(

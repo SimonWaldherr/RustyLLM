@@ -1,6 +1,33 @@
 use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+fn macos_sdk_candidates() -> impl Iterator<Item = PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(sdkroot) = env::var_os("SDKROOT").filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(sdkroot));
+    }
+    if let Some(developer_dir) = env::var_os("DEVELOPER_DIR").filter(|value| !value.is_empty()) {
+        candidates.push(
+            PathBuf::from(developer_dir)
+                .join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+        );
+    }
+    candidates.push(
+        PathBuf::from("/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+    );
+    candidates.push(PathBuf::from(
+        "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    ));
+
+    candidates.into_iter()
+}
+
+fn find_macos_sdk() -> Option<PathBuf> {
+    macos_sdk_candidates().find(|path| Path::new(path).exists())
+}
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rusty_metal)");
@@ -15,27 +42,37 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set"));
     let obj = out_dir.join("metal_backend.o");
     let lib = out_dir.join("librusty_metal_backend.a");
+    let tmp_dir = out_dir.join("xcrun-tmp");
+    let _ = fs::create_dir_all(&tmp_dir);
 
-    let clang_status = Command::new("xcrun")
-        .args([
-            "clang",
-            "-x",
-            "objective-c",
-            "-fobjc-arc",
-            "-O3",
-            "-c",
-            "src/metal_backend.m",
-            "-o",
-        ])
+    let mut clang = Command::new("clang");
+    clang
+        .env("TMPDIR", &tmp_dir)
+        .env("TMP", &tmp_dir)
+        .env("TEMP", &tmp_dir)
+        .stderr(Stdio::piped())
+        .args(["-x", "objective-c", "-fobjc-arc", "-O3"]);
+    if let Some(sdk) = find_macos_sdk() {
+        clang.arg("-isysroot").arg(sdk);
+    }
+    let clang_output = clang
+        .args(["-c", "src/metal_backend.m", "-o"])
         .arg(&obj)
-        .status();
+        .output();
 
-    let Ok(status) = clang_status else {
-        println!("cargo:warning=Metal backend disabled: xcrun clang was not available");
+    let Ok(output) = clang_output else {
+        println!("cargo:warning=Metal backend disabled: clang was not available");
         return;
     };
-    if !status.success() {
-        println!("cargo:warning=Metal backend disabled: Objective-C shim did not compile");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("unknown clang error");
+        println!(
+            "cargo:warning=Metal backend disabled: Objective-C shim did not compile ({detail})"
+        );
         return;
     }
 

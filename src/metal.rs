@@ -1,12 +1,41 @@
+use std::cell::Cell;
 use std::sync::OnceLock;
 
+pub const Q4K_MIN_METAL_ROWS: usize = 8_192;
+pub const Q4K_MIN_METAL_COLS: usize = 4_096;
 pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
 pub const ATTENTION_MIN_METAL_TOKENS: usize = 8_192;
+pub const ULTRA_ATTENTION_MIN_METAL_TOKENS: usize = 512;
+pub const ULTRA_Q4K_MIN_METAL_ROWS: usize = 512;
+pub const ULTRA_Q6K_MIN_METAL_ROWS: usize = 512;
 static ATTENTION_MIN_METAL_TOKENS_RUNTIME: OnceLock<usize> = OnceLock::new();
+static ULTRA_ATTENTION_MIN_METAL_TOKENS_RUNTIME: OnceLock<usize> = OnceLock::new();
+static ULTRA_Q4K_MIN_METAL_ROWS_RUNTIME: OnceLock<usize> = OnceLock::new();
+static ULTRA_Q6K_MIN_METAL_ROWS_RUNTIME: OnceLock<usize> = OnceLock::new();
+
+thread_local! {
+    static ULTRA_MODE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores the previous per-thread Metal ultra-mode flag when dropped.
+pub struct UltraModeGuard {
+    previous: bool,
+}
+
+impl Drop for UltraModeGuard {
+    fn drop(&mut self) {
+        ULTRA_MODE.with(|flag| flag.set(self.previous));
+    }
+}
 
 fn parse_attention_min_metal_tokens(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(ATTENTION_MIN_METAL_TOKENS)
+}
+
+fn parse_usize_or(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 /// Returns the attention window size threshold that enables Metal.
@@ -15,6 +44,43 @@ pub fn attention_min_metal_tokens() -> usize {
         let raw = std::env::var("RUSTY_LLM_METAL_ATTENTION_MIN_TOKENS").ok();
         parse_attention_min_metal_tokens(raw.as_deref())
     })
+}
+
+/// Returns the short-context threshold used by explicit Mistral ultra mode.
+pub fn ultra_attention_min_metal_tokens() -> usize {
+    *ULTRA_ATTENTION_MIN_METAL_TOKENS_RUNTIME.get_or_init(|| {
+        let raw = std::env::var("RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS").ok();
+        parse_usize_or(raw.as_deref(), ULTRA_ATTENTION_MIN_METAL_TOKENS)
+    })
+}
+
+/// Returns the Q4_K row threshold used by explicit Mistral ultra mode.
+pub fn ultra_q4k_min_metal_rows() -> usize {
+    *ULTRA_Q4K_MIN_METAL_ROWS_RUNTIME.get_or_init(|| {
+        let raw = std::env::var("RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS").ok();
+        parse_usize_or(raw.as_deref(), ULTRA_Q4K_MIN_METAL_ROWS)
+    })
+}
+
+/// Returns the Q6_K row threshold used by explicit Mistral ultra mode.
+pub fn ultra_q6k_min_metal_rows() -> usize {
+    *ULTRA_Q6K_MIN_METAL_ROWS_RUNTIME.get_or_init(|| {
+        let raw = std::env::var("RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS").ok();
+        parse_usize_or(raw.as_deref(), ULTRA_Q6K_MIN_METAL_ROWS)
+    })
+}
+
+/// Enables aggressive Metal routing for the current thread while the guard lives.
+pub fn scoped_ultra_mode(enabled: bool) -> UltraModeGuard {
+    ULTRA_MODE.with(|flag| {
+        let previous = flag.replace(enabled);
+        UltraModeGuard { previous }
+    })
+}
+
+/// Reports whether the current thread is using aggressive Metal routing.
+pub fn ultra_mode_enabled() -> bool {
+    ULTRA_MODE.with(Cell::get)
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
@@ -100,6 +166,38 @@ mod ffi {
             out_b: *mut f32,
             out_c: *mut f32,
         ) -> i32;
+        /// Runs Q4_K, Q4_K, and Q6_K projections in one Metal dispatch.
+        pub fn rusty_metal_q4k_q4k_q6k_matvec3(
+            weights_a: *const u8,
+            weights_a_len: usize,
+            rows_a: usize,
+            weights_b: *const u8,
+            weights_b_len: usize,
+            rows_b: usize,
+            weights_c: *const u8,
+            weights_c_len: usize,
+            rows_c: usize,
+            x: *const f32,
+            cols: usize,
+            out_a: *mut f32,
+            out_b: *mut f32,
+            out_c: *mut f32,
+        ) -> i32;
+        /// Runs a Mistral-style Q4_K/Q4_K/Q6_K FFN block in one Metal command buffer.
+        pub fn rusty_metal_q4k_q4k_q6k_ffn(
+            gate_weights: *const u8,
+            gate_weights_len: usize,
+            up_weights: *const u8,
+            up_weights_len: usize,
+            down_weights: *const u8,
+            down_weights_len: usize,
+            x: *const f32,
+            input_cols: usize,
+            hidden_rows: usize,
+            down_rows: usize,
+            down_cols: usize,
+            out: *mut f32,
+        ) -> i32;
         /// Runs one Q4_0 matrix-vector multiply on the Metal backend.
         pub fn rusty_metal_q4_0_matvec(
             weights: *const u8,
@@ -164,7 +262,17 @@ pub fn available() -> bool {
 /// Set `RUSTY_LLM_METAL=0` to force the CPU path.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| requested() != Some(false) && available())
+    *ENABLED.get_or_init(metal_enabled_default)
+}
+
+#[cfg(test)]
+fn metal_enabled_default() -> bool {
+    requested() == Some(true) && available()
+}
+
+#[cfg(not(test))]
+fn metal_enabled_default() -> bool {
+    requested() != Some(false) && available()
 }
 
 /// Reads the environment flag that requests Metal acceleration.
@@ -175,6 +283,16 @@ pub fn requested() -> Option<bool> {
 /// Reads the environment flag for experimental Q6_K Metal acceleration.
 pub fn q6k_enabled() -> bool {
     enabled()
+}
+
+/// Reports whether the Metal backend should prefer Shared/NoCopy host buffers.
+pub fn nocopy_enabled() -> bool {
+    env_flag("RUSTY_LLM_METAL_NOCOPY") != Some(false)
+}
+
+/// Reports whether Mistral-style fused Metal FFN blocks are enabled.
+pub fn fused_ffn_enabled() -> bool {
+    env_flag("RUSTY_LLM_METAL_FUSED_FFN") == Some(true)
 }
 
 /// Attempts a Metal attention scan across all query heads.
@@ -275,7 +393,7 @@ pub fn q6k_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < Q6K_MIN_METAL_ROWS {
+    if !enabled() || rows < q6k_min_metal_rows() {
         return false;
     }
     out.resize(rows, 0.0);
@@ -295,7 +413,7 @@ pub fn q6k_matvec2_into(
     }
     let (weights_a, rows_a, cols_a) = a;
     let (weights_b, rows_b, cols_b) = b;
-    if cols_a != cols_b || cols_a != x.len() || rows_a + rows_b < Q6K_MIN_METAL_ROWS {
+    if cols_a != cols_b || cols_a != x.len() || rows_a + rows_b < q6k_min_metal_rows() {
         return false;
     }
     out_a.resize(rows_a, 0.0);
@@ -324,7 +442,7 @@ pub fn q6k_matvec3_into(
     if cols_a != cols_b
         || cols_a != cols_c
         || cols_a != x.len()
-        || rows_a + rows_b + rows_c < Q6K_MIN_METAL_ROWS
+        || rows_a + rows_b + rows_c < q6k_min_metal_rows()
     {
         return false;
     }
@@ -386,16 +504,115 @@ pub fn q4k_matvec3_into(
     )
 }
 
+/// Attempts fused Q4_K, Q4_K, and Q6_K Metal projections.
+pub fn q4k_q4k_q6k_matvec3_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let (weights_a, rows_a, cols_a) = a;
+    let (weights_b, rows_b, cols_b) = b;
+    let (weights_c, rows_c, cols_c) = c;
+    if cols_a != cols_b || cols_a != cols_c || cols_a != x.len() {
+        return false;
+    }
+    out_a.resize(rows_a, 0.0);
+    out_b.resize(rows_b, 0.0);
+    out_c.resize(rows_c, 0.0);
+    q4k_q4k_q6k_matvec3_raw(
+        weights_a, rows_a, weights_b, rows_b, weights_c, rows_c, x, cols_a, out_a, out_b, out_c,
+    )
+}
+
+/// Attempts a fused Mistral-style Q4_K/Q4_K/Q6_K FFN block on Metal.
+pub fn q4k_q4k_q6k_ffn_into(
+    gate: (&[u8], usize, usize),
+    up: (&[u8], usize, usize),
+    down: (&[u8], usize, usize),
+    x: &[f32],
+    out: &mut Vec<f32>,
+) -> bool {
+    if !enabled() || !fused_ffn_enabled() {
+        return false;
+    }
+    let (gate_weights, gate_rows, gate_cols) = gate;
+    let (up_weights, up_rows, up_cols) = up;
+    let (down_weights, down_rows, down_cols) = down;
+    if gate_cols != up_cols
+        || gate_cols != x.len()
+        || gate_rows != up_rows
+        || gate_rows != down_cols
+        || gate_rows < q6k_min_metal_rows()
+        || gate_cols % 256 != 0
+        || down_cols % 256 != 0
+    {
+        return false;
+    }
+    let gate_row_bytes = (gate_cols / 256) * 144;
+    let down_row_bytes = (down_cols / 256) * 210;
+    let Some(gate_needed) = gate_row_bytes.checked_mul(gate_rows) else {
+        return false;
+    };
+    let Some(up_needed) = gate_row_bytes.checked_mul(up_rows) else {
+        return false;
+    };
+    let Some(down_needed) = down_row_bytes.checked_mul(down_rows) else {
+        return false;
+    };
+    if gate_weights.len() < gate_needed
+        || up_weights.len() < up_needed
+        || down_weights.len() < down_needed
+    {
+        return false;
+    }
+    out.resize(down_rows, 0.0);
+    q4k_q4k_q6k_ffn_raw(
+        gate_weights,
+        up_weights,
+        down_weights,
+        x,
+        gate_cols,
+        gate_rows,
+        down_rows,
+        down_cols,
+        out,
+    )
+}
+
 /// Decides whether a single Q4_K projection is large enough for Metal dispatch.
 fn q4k_single_should_use_metal(rows: usize, cols: usize) -> bool {
-    rows >= 8_192 || cols >= 4_096
+    if ultra_mode_enabled() {
+        rows >= ultra_q4k_min_metal_rows() || cols >= Q4K_MIN_METAL_COLS
+    } else {
+        rows >= Q4K_MIN_METAL_ROWS || cols >= Q4K_MIN_METAL_COLS
+    }
+}
+
+fn q6k_min_metal_rows() -> usize {
+    if ultra_mode_enabled() {
+        ultra_q6k_min_metal_rows()
+    } else {
+        Q6K_MIN_METAL_ROWS
+    }
 }
 
 /// Decides whether a full attention scan is large enough for Metal dispatch.
 fn attention_scan_should_use_metal(start_t: usize, end_t: usize) -> bool {
+    let threshold = if ultra_mode_enabled() {
+        ultra_attention_min_metal_tokens()
+    } else {
+        attention_min_metal_tokens()
+    };
     end_t
         .checked_sub(start_t)
-        .map(|span| span + 1 >= attention_min_metal_tokens())
+        .map(|span| span + 1 >= threshold)
         .unwrap_or(false)
 }
 
@@ -630,6 +847,74 @@ fn q4k_matvec3_raw(
     }
 }
 
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw mixed Q4_K/Q4_K/Q6_K Metal projection shim.
+fn q4k_q4k_q6k_matvec3_raw(
+    weights_a: &[u8],
+    rows_a: usize,
+    weights_b: &[u8],
+    rows_b: usize,
+    weights_c: &[u8],
+    rows_c: usize,
+    x: &[f32],
+    cols: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+    out_c: &mut [f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_q4k_q4k_q6k_matvec3(
+            weights_a.as_ptr(),
+            weights_a.len(),
+            rows_a,
+            weights_b.as_ptr(),
+            weights_b.len(),
+            rows_b,
+            weights_c.as_ptr(),
+            weights_c.len(),
+            rows_c,
+            x.as_ptr(),
+            cols,
+            out_a.as_mut_ptr(),
+            out_b.as_mut_ptr(),
+            out_c.as_mut_ptr(),
+        ) != 0
+    }
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw fused Mistral-style Q4_K/Q4_K/Q6_K FFN Metal shim.
+fn q4k_q4k_q6k_ffn_raw(
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    x: &[f32],
+    input_cols: usize,
+    hidden_rows: usize,
+    down_rows: usize,
+    down_cols: usize,
+    out: &mut [f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_q4k_q4k_q6k_ffn(
+            gate_weights.as_ptr(),
+            gate_weights.len(),
+            up_weights.as_ptr(),
+            up_weights.len(),
+            down_weights.as_ptr(),
+            down_weights.len(),
+            x.as_ptr(),
+            input_cols,
+            hidden_rows,
+            down_rows,
+            down_cols,
+            out.as_mut_ptr(),
+        ) != 0
+    }
+}
+
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 /// Calls the raw Metal Q4_K projection shim or reports unsupported.
 fn q4k_matvec_raw(
@@ -762,6 +1047,42 @@ fn q4k_matvec3_raw(
     false
 }
 
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw mixed Q4_K/Q4_K/Q6_K Metal projection shim or reports unsupported.
+fn q4k_q4k_q6k_matvec3_raw(
+    _weights_a: &[u8],
+    _rows_a: usize,
+    _weights_b: &[u8],
+    _rows_b: usize,
+    _weights_c: &[u8],
+    _rows_c: usize,
+    _x: &[f32],
+    _cols: usize,
+    _out_a: &mut [f32],
+    _out_b: &mut [f32],
+    _out_c: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw fused Mistral-style Q4_K/Q4_K/Q6_K FFN Metal shim.
+fn q4k_q4k_q6k_ffn_raw(
+    _gate_weights: &[u8],
+    _up_weights: &[u8],
+    _down_weights: &[u8],
+    _x: &[f32],
+    _input_cols: usize,
+    _hidden_rows: usize,
+    _down_rows: usize,
+    _down_cols: usize,
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
 pub const Q4_0_MIN_METAL_ROWS: usize = 512;
 pub const Q8_0_MIN_METAL_ROWS: usize = 512;
 
@@ -876,6 +1197,19 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that ultra mode routes smaller Mistral projections to Metal.
+    fn ultra_mode_lowers_metal_matvec_thresholds() {
+        assert!(!super::ultra_mode_enabled());
+        {
+            let _guard = super::scoped_ultra_mode(true);
+            assert!(super::ultra_mode_enabled());
+            assert!(super::q4k_single_should_use_metal(1024, 3072));
+            assert_eq!(super::q6k_min_metal_rows(), super::ULTRA_Q6K_MIN_METAL_ROWS);
+        }
+        assert!(!super::ultra_mode_enabled());
+    }
+
+    #[test]
     /// Verifies the Metal attention threshold parser handles overrides and fallbacks.
     fn attention_min_tokens_parser_handles_overrides() {
         assert_eq!(
@@ -899,5 +1233,19 @@ mod tests {
     fn attention_metal_heuristic_skips_short_windows() {
         assert!(!super::attention_scan_should_use_metal(0, 8_190));
         assert!(super::attention_scan_should_use_metal(0, 8_191));
+    }
+
+    #[test]
+    /// Verifies that ultra mode lowers the attention Metal threshold.
+    fn ultra_mode_lowers_attention_threshold() {
+        assert!(!super::attention_scan_should_use_metal(
+            0,
+            super::ULTRA_ATTENTION_MIN_METAL_TOKENS - 1
+        ));
+        let _guard = super::scoped_ultra_mode(true);
+        assert!(super::attention_scan_should_use_metal(
+            0,
+            super::ULTRA_ATTENTION_MIN_METAL_TOKENS - 1
+        ));
     }
 }

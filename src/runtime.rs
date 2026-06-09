@@ -1,7 +1,7 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::model::{
-    self, Config, DecodeBuffer, GptOssWeights, KVCache, ModelWeights, Weight, apply_rope_qk,
-    online_attention, rms_norm_into, silu,
+    self, Config, DecodeBuffer, ExpertWeight, GptOssWeights, KVCache, ModelWeights, Weight,
+    apply_rope_qk, online_attention, rms_norm_into, silu,
 };
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -118,6 +118,7 @@ impl KvCacheDType {
 pub enum RuntimeProfile {
     Auto,
     Mistral,
+    MistralUltra,
     Gemma,
 }
 
@@ -127,6 +128,9 @@ impl RuntimeProfile {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "mistral" | "ministral" => Some(Self::Mistral),
+            "ultra" | "mistral-ultra" | "ministral-ultra" | "mistral_ultra" | "ministral_ultra" => {
+                Some(Self::MistralUltra)
+            }
             "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4n" | "gemma4-assistant" => {
                 Some(Self::Gemma)
             }
@@ -139,6 +143,7 @@ impl RuntimeProfile {
         match self {
             Self::Auto => "auto",
             Self::Mistral => "mistral",
+            Self::MistralUltra => "mistral-ultra",
             Self::Gemma => "gemma",
         }
     }
@@ -922,11 +927,20 @@ impl Runner {
     pub fn optimization_warnings(&self, options: &GenerationOptions) -> Vec<String> {
         let mut warnings = Vec::new();
         let profile = self.effective_profile(options);
-        if profile == RuntimeProfile::Mistral && self.config.max_seq_len >= 131_072 {
+        if matches!(
+            profile,
+            RuntimeProfile::Mistral | RuntimeProfile::MistralUltra
+        ) && self.config.max_seq_len >= 131_072
+        {
             warnings.push(format!(
                 "Ministral context metadata advertises {} tokens; default runtime cap is {} unless --max-context overrides it.",
                 self.config.max_seq_len,
                 self.effective_max_context(options)
+            ));
+        }
+        if profile == RuntimeProfile::MistralUltra && !crate::metal::enabled() {
+            warnings.push(String::from(
+                "Mistral ultra profile requested, but Metal is unavailable or disabled; falling back to native SIMD CPU kernels.",
             ));
         }
         if options.speculative.enabled
@@ -1020,10 +1034,17 @@ impl Runner {
         if let Some(max_context) = options.runtime.max_context {
             return max_context.min(self.config.max_seq_len).max(1);
         }
-        if self.effective_profile(options) == RuntimeProfile::Mistral {
+        if matches!(
+            self.effective_profile(options),
+            RuntimeProfile::Mistral | RuntimeProfile::MistralUltra
+        ) {
             return self.config.max_seq_len.clamp(1, 8192);
         }
         self.config.max_seq_len.max(1)
+    }
+
+    fn effective_metal_ultra(&self, options: &GenerationOptions) -> bool {
+        self.effective_profile(options) == RuntimeProfile::MistralUltra
     }
 
     fn effective_sliding_window(&self, options: &GenerationOptions) -> Option<usize> {
@@ -1039,14 +1060,40 @@ impl Runner {
         runs: usize,
         requested_layer: usize,
     ) -> Result<(usize, Vec<KernelBenchRow>), String> {
+        self.kernel_benchmark_with_options(runs, requested_layer, &GenerationOptions::default())
+    }
+
+    /// Benchmarks representative projection kernels under the provided runtime options.
+    pub fn kernel_benchmark_with_options(
+        &self,
+        runs: usize,
+        requested_layer: usize,
+        options: &GenerationOptions,
+    ) -> Result<(usize, Vec<KernelBenchRow>), String> {
         if runs == 0 {
             return Err(String::from("--kernel-bench-runs must be greater than 0."));
         }
-        let LoadedWeights::Standard(weights) = &self.weights else {
-            return Err(String::from(
-                "--kernel-bench currently supports standard transformer weights only.",
-            ));
-        };
+        let _metal_ultra_guard =
+            crate::metal::scoped_ultra_mode(self.effective_metal_ultra(options));
+        match &self.weights {
+            LoadedWeights::Standard(weights) => {
+                self.standard_kernel_benchmark(weights, runs, requested_layer)
+            }
+            LoadedWeights::GptOss(weights) => {
+                self.gpt_oss_kernel_benchmark(weights, runs, requested_layer)
+            }
+            LoadedWeights::Gemma4(_) => Err(String::from(
+                "--kernel-bench currently supports standard transformer and gpt-oss MoE weights only.",
+            )),
+        }
+    }
+
+    fn standard_kernel_benchmark(
+        &self,
+        weights: &ModelWeights,
+        runs: usize,
+        requested_layer: usize,
+    ) -> Result<(usize, Vec<KernelBenchRow>), String> {
         let layer = requested_layer.min(weights.layers.len().saturating_sub(1));
         let mut rows = Vec::new();
         let mut row_out = Vec::new();
@@ -1111,6 +1158,17 @@ impl Runner {
         }
         let ffn_down = measure_matvec("ffn_down", &layer_weights.w2, &hidden_input, runs, &mut out);
         rows.push(ffn_down.clone());
+        let ffn_block_fused = measure_mistral_ffn_block(
+            "ffn_block.fused",
+            &layer_weights.w1,
+            &layer_weights.w3,
+            &layer_weights.w2,
+            &dim_input,
+            runs,
+        );
+        if let Some(row) = &ffn_block_fused {
+            rows.push(row.clone());
+        }
         let output = measure_matvec("output", &weights.output, &dim_input, runs, &mut out);
         rows.push(output.clone());
 
@@ -1182,8 +1240,212 @@ impl Runner {
             .as_ref()
             .map(|row| row.avg_ms)
             .unwrap_or(ffn_gate.avg_ms + ffn_up.avg_ms);
+        let ffn_block_ms = ffn_block_fused
+            .as_ref()
+            .map(|row| row.avg_ms)
+            .unwrap_or(ffn_gate_up_ms + ffn_down.avg_ms);
+        let layer_projection_ms = attn_qkv_ms + attn_output.avg_ms + ffn_block_ms;
+        rows.push(estimated_kernel_row(
+            "layer_projections.estimated",
+            self.config.dim,
+            runs,
+            layer_projection_ms,
+        ));
+        rows.push(estimated_kernel_row(
+            "decode_projections.estimated",
+            self.config.dim,
+            runs,
+            layer_projection_ms * self.config.n_layers as f64 + output.avg_ms,
+        ));
+        rows.push(estimated_kernel_row(
+            "decode_output_projection.estimated",
+            self.config.dim,
+            runs,
+            output.avg_ms,
+        ));
+        Ok((layer, rows))
+    }
+
+    fn gpt_oss_kernel_benchmark(
+        &self,
+        weights: &GptOssWeights,
+        runs: usize,
+        requested_layer: usize,
+    ) -> Result<(usize, Vec<KernelBenchRow>), String> {
+        let layer = requested_layer.min(weights.layers.len().saturating_sub(1));
+        let mut rows = Vec::new();
+        let mut row_out = Vec::new();
+        rows.push(measure_kernel(
+            "token_embd.row",
+            &weights.token_embd,
+            self.config.vocab_size,
+            self.config.dim,
+            runs,
+            || {
+                row_out = weights.token_embd.row(0, self.config.dim);
+                std::hint::black_box(row_out.len());
+            },
+        ));
+        if weights.layers.is_empty() {
+            return Ok((layer, rows));
+        }
+
+        let layer_weights = &weights.layers[layer];
+        let dim_input = deterministic_bench_vector(self.config.dim);
+        let attn_out_input =
+            deterministic_bench_vector(self.config.n_heads * self.config.value_dim);
+        let hidden_input = deterministic_bench_vector(self.config.hidden_dim);
+        let mut out = Vec::new();
+
+        let attn_q = measure_matvec("attn_q", &layer_weights.wq, &dim_input, runs, &mut out);
+        rows.push(attn_q.clone());
+        let attn_k = measure_matvec("attn_k", &layer_weights.wk, &dim_input, runs, &mut out);
+        rows.push(attn_k.clone());
+        let attn_v = measure_matvec("attn_v", &layer_weights.wv, &dim_input, runs, &mut out);
+        rows.push(attn_v.clone());
+        let attn_qkv_fused = measure_fused_kquant3(
+            "attn_qkv.fused",
+            &layer_weights.wq,
+            &layer_weights.wk,
+            &layer_weights.wv,
+            &dim_input,
+            runs,
+        );
+        if let Some(row) = &attn_qkv_fused {
+            rows.push(row.clone());
+        }
+
+        let attn_output = measure_matvec(
+            "attn_output",
+            &layer_weights.wo,
+            &attn_out_input,
+            runs,
+            &mut out,
+        );
+        rows.push(attn_output.clone());
+        let router = measure_matvec(
+            "router_gate",
+            &layer_weights.gate_inp,
+            &dim_input,
+            runs,
+            &mut out,
+        );
+        rows.push(router.clone());
+
+        let expert_idx = 0usize;
+        let expert_gate = measure_expert_matvec(
+            "expert0_gate",
+            &layer_weights.gate_exps,
+            expert_idx,
+            &dim_input,
+            runs,
+            &mut out,
+        );
+        rows.push(expert_gate.clone());
+        let expert_up = measure_expert_matvec(
+            "expert0_up",
+            &layer_weights.up_exps,
+            expert_idx,
+            &dim_input,
+            runs,
+            &mut out,
+        );
+        rows.push(expert_up.clone());
+        let expert_down = measure_expert_matvec(
+            "expert0_down",
+            &layer_weights.down_exps,
+            expert_idx,
+            &hidden_input,
+            runs,
+            &mut out,
+        );
+        rows.push(expert_down.clone());
+
+        let output = measure_matvec("output", &weights.output, &dim_input, runs, &mut out);
+        rows.push(output.clone());
+
+        rows.push(measure_rms_norm(
+            "attn_norm.rms",
+            &dim_input,
+            &layer_weights.attn_norm,
+            self.config.rms_norm_eps,
+            runs,
+        ));
+        rows.push(measure_rope_qk(
+            "attn_rope.qk",
+            self.config.n_heads * self.config.head_dim,
+            self.config.n_kv_heads * self.config.head_dim,
+            self.config.head_dim,
+            self.config.n_heads,
+            self.config.n_kv_heads,
+            &deterministic_rope_inv_freq(
+                self.config.rope_theta,
+                self.config.head_dim,
+                self.config.rope_scaling_factor,
+                self.config.rope_original_context_length,
+            ),
+            runs,
+        ));
+
+        let mut attn_ctx_lens = vec![
+            32usize.min(self.config.max_seq_len),
+            64usize.min(self.config.max_seq_len),
+            128usize.min(self.config.max_seq_len),
+            256usize.min(self.config.max_seq_len),
+            512usize.min(self.config.max_seq_len),
+            1024usize.min(self.config.max_seq_len),
+            2048usize.min(self.config.max_seq_len),
+            4096usize.min(self.config.max_seq_len),
+            8192usize.min(self.config.max_seq_len),
+        ];
+        attn_ctx_lens.sort_unstable();
+        attn_ctx_lens.dedup();
+        for ctx_len in attn_ctx_lens.into_iter().filter(|ctx| *ctx > 0) {
+            rows.push(measure_attention_scan(
+                &format!("attn_scan.ctx{}", ctx_len),
+                self.config.n_heads,
+                self.config.n_kv_heads,
+                self.config.kv_mul,
+                self.config.head_dim,
+                self.config.value_dim,
+                ctx_len,
+                runs,
+            ));
+        }
+
+        rows.push(measure_rms_norm(
+            "ffn_norm.rms",
+            &dim_input,
+            &layer_weights.post_attn_norm,
+            self.config.rms_norm_eps,
+            runs,
+        ));
+        rows.push(measure_ffn_activation(
+            "expert_activation.swiglu",
+            self.config.hidden_dim,
+            runs,
+        ));
+
+        let attn_qkv_ms = attn_qkv_fused
+            .as_ref()
+            .map(|row| row.avg_ms)
+            .unwrap_or(attn_q.avg_ms + attn_k.avg_ms + attn_v.avg_ms);
+        let expert_triplet_ms = expert_gate.avg_ms + expert_up.avg_ms + expert_down.avg_ms;
+        rows.push(estimated_kernel_row(
+            "expert0_triplet.estimated",
+            self.config.dim,
+            runs,
+            expert_triplet_ms,
+        ));
+        let routed_expert_ms = expert_triplet_ms * self.config.expert_used_count.max(1) as f64;
+        rows.push(estimated_kernel_row(
+            "routed_experts.estimated",
+            self.config.dim,
+            runs,
+            routed_expert_ms,
+        ));
         let layer_projection_ms =
-            attn_qkv_ms + attn_output.avg_ms + ffn_gate_up_ms + ffn_down.avg_ms;
+            attn_qkv_ms + attn_output.avg_ms + router.avg_ms + routed_expert_ms;
         rows.push(estimated_kernel_row(
             "layer_projections.estimated",
             self.config.dim,
@@ -1253,6 +1515,8 @@ impl Runner {
             .lock()
             .expect("generation lock poisoned");
         options.validate()?;
+        let _metal_ultra_guard =
+            crate::metal::scoped_ultra_mode(self.effective_metal_ultra(options));
 
         if messages.is_empty() {
             return Err(String::from("No prompt provided."));
@@ -2288,6 +2552,29 @@ fn measure_matvec(
     })
 }
 
+/// Measures one routed expert matrix-vector kernel.
+fn measure_expert_matvec(
+    name: &str,
+    weight: &ExpertWeight,
+    expert: usize,
+    x: &[f32],
+    runs: usize,
+    out: &mut Vec<f32>,
+) -> KernelBenchRow {
+    let expert = expert.min(weight.experts.saturating_sub(1));
+    measure_kernel_raw(
+        name,
+        format!("{:?}", weight.dtype),
+        weight.rows,
+        weight.cols,
+        runs,
+        || {
+            weight.matvec_expert_into(expert, x, out);
+            std::hint::black_box(out.len());
+        },
+    )
+}
+
 #[cfg(not(target_family = "wasm"))]
 /// Measures a fused Q/K/V K-quant matvec when all three projections are eligible.
 fn measure_fused_kquant3(
@@ -2429,6 +2716,89 @@ fn measure_fused_kquant2(
     _name: &str,
     _a: &Weight,
     _b: &Weight,
+    _x: &[f32],
+    _runs: usize,
+) -> Option<KernelBenchRow> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Measures the fused Mistral FFN block when the Q4_K/Q4_K/Q6_K Metal path is available.
+fn measure_mistral_ffn_block(
+    name: &str,
+    gate: &Weight,
+    up: &Weight,
+    down: &Weight,
+    x: &[f32],
+    runs: usize,
+) -> Option<KernelBenchRow> {
+    let (
+        Weight::Quantized {
+            data: gate_data,
+            dtype: GGMLType::Q4_K,
+            rows: gate_rows,
+            cols: gate_cols,
+        },
+        Weight::Quantized {
+            data: up_data,
+            dtype: GGMLType::Q4_K,
+            rows: up_rows,
+            cols: up_cols,
+        },
+        Weight::Quantized {
+            data: down_data,
+            dtype: GGMLType::Q6_K,
+            rows: down_rows,
+            cols: down_cols,
+        },
+    ) = (gate, up, down)
+    else {
+        return None;
+    };
+    if *gate_cols != *up_cols
+        || *gate_cols != x.len()
+        || *gate_rows != *up_rows
+        || *gate_rows != *down_cols
+    {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    if !crate::metal::q4k_q4k_q6k_ffn_into(
+        (gate_data.as_slice(), *gate_rows, *gate_cols),
+        (up_data.as_slice(), *up_rows, *up_cols),
+        (down_data.as_slice(), *down_rows, *down_cols),
+        x,
+        &mut out,
+    ) {
+        return None;
+    }
+    Some(measure_kernel_raw(
+        name,
+        String::from("Q4_K+SwiGLU+Q6_K"),
+        *down_rows,
+        *gate_cols,
+        runs,
+        || {
+            let ran = crate::metal::q4k_q4k_q6k_ffn_into(
+                (gate_data.as_slice(), *gate_rows, *gate_cols),
+                (up_data.as_slice(), *up_rows, *up_cols),
+                (down_data.as_slice(), *down_rows, *down_cols),
+                x,
+                &mut out,
+            );
+            std::hint::black_box(ran);
+            std::hint::black_box(out.len());
+        },
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+fn measure_mistral_ffn_block(
+    _name: &str,
+    _gate: &Weight,
+    _up: &Weight,
+    _down: &Weight,
     _x: &[f32],
     _runs: usize,
 ) -> Option<KernelBenchRow> {
@@ -2677,8 +3047,8 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECENT_TOKEN_LIMIT, cosine_similarity, l2_normalize_in_place, mean_pool_in_place,
-        push_recent_token, recent_token_tail, trailing_char_boundary_start,
+        RECENT_TOKEN_LIMIT, RuntimeProfile, cosine_similarity, l2_normalize_in_place,
+        mean_pool_in_place, push_recent_token, recent_token_tail, trailing_char_boundary_start,
     };
 
     #[test]
@@ -2780,6 +3150,18 @@ mod tests {
         assert_eq!(recent.len(), RECENT_TOKEN_LIMIT);
         assert_eq!(recent[0], 1);
         assert_eq!(recent[RECENT_TOKEN_LIMIT - 1], 999);
+    }
+
+    #[test]
+    /// Verifies explicit Mistral ultra profile aliases parse to the aggressive profile.
+    fn runtime_profile_parses_mistral_ultra_aliases() {
+        for value in ["ultra", "mistral-ultra", "ministral_ultra"] {
+            assert_eq!(
+                RuntimeProfile::parse(value),
+                Some(RuntimeProfile::MistralUltra)
+            );
+        }
+        assert_eq!(RuntimeProfile::MistralUltra.as_str(), "mistral-ultra");
     }
 
     #[test]

@@ -288,6 +288,19 @@ fn try_quant_metal3_into(
                 return true;
             }
         }
+        (QuantMatvecKind::Q4K, QuantMatvecKind::Q4K, QuantMatvecKind::Q6K) => {
+            if crate::metal::q4k_q4k_q6k_matvec3_into(
+                (weights_a, rows_a, cols_a),
+                (weights_b, rows_b, cols_b),
+                (weights_c, rows_c, cols_c),
+                x,
+                out_a,
+                out_b,
+                out_c,
+            ) {
+                return true;
+            }
+        }
         _ => {}
     }
 
@@ -3997,9 +4010,9 @@ mod tests {
             &mut out_k,
             &mut out_v
         ));
-        assert_eq!(out_q, exp_q);
-        assert_eq!(out_k, exp_k);
-        assert_eq!(out_v, exp_v);
+        assert_close_slice(&out_q, &exp_q, 1e-5);
+        assert_close_slice(&out_k, &exp_k, 1e-5);
+        assert_close_slice(&out_v, &exp_v, 1e-5);
     }
 
     fn assert_close_slice(actual: &[f32], expected: &[f32], relative: f32) {
