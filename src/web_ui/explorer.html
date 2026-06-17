@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustyLLM GGUF Explorer</title>
+  <meta name="description" content="Explore GGUF metadata, tokenizer output, token vectors, and nearest vocabulary neighbors in RustyLLM.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="explorer">
+
+<div id="announce" role="status" aria-live="polite" aria-atomic="true" class="sr-only"></div>
+
+<div class="app">
+  <header role="banner">
+    <div class="top">
+      <h1>RustyLLM GGUF Explorer</h1>
+      <a href="/chat?expert">Expert UI</a>
+    </div>
+    <div id="status" class="status" role="status" aria-live="polite">Loading model...</div>
+  </header>
+
+  <div class="workspace">
+    <aside aria-label="Explorer controls">
+      <form id="explorerForm" class="stack" novalidate>
+        <div class="field">
+          <label for="input">Text or term</label>
+          <textarea id="input" rows="4" autocomplete="off" spellcheck="false">local model</textarea>
+          <div class="hint">Text is tokenized without BOS for static token-embedding search.</div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="tokenId">Token ID</label>
+            <input id="tokenId" type="number" min="0" inputmode="numeric" placeholder="optional">
+          </div>
+          <div class="field">
+            <label for="limit">Neighbors</label>
+            <input id="limit" type="number" min="1" max="60" value="24" inputmode="numeric">
+          </div>
+        </div>
+
+        <label class="inline">
+          <input id="includeSpecial" type="checkbox">
+          Include special and byte tokens
+        </label>
+
+        <div class="actions">
+          <button id="explore" type="submit">Explore</button>
+          <button id="clearToken" class="secondary" type="button">Use text</button>
+        </div>
+      </form>
+
+      <section class="explorer-side-section" aria-labelledby="modelTitle">
+        <h2 id="modelTitle">Model</h2>
+        <div id="modelFacts" class="fact-grid compact"></div>
+      </section>
+    </aside>
+
+    <main aria-label="GGUF explorer results">
+      <section class="explorer-grid">
+        <article class="explorer-panel wide" aria-labelledby="anatomyTitle">
+          <div class="panel-head">
+            <h2 id="anatomyTitle">GGUF Anatomy</h2>
+            <span id="tensorCount" class="panel-note"></span>
+          </div>
+          <div id="anatomy" class="anatomy-grid"></div>
+        </article>
+
+        <article class="explorer-panel" aria-labelledby="tokenizerTitle">
+          <div class="panel-head">
+            <h2 id="tokenizerTitle">Tokenizer</h2>
+            <span id="tokenCount" class="panel-note"></span>
+          </div>
+          <div id="tokens" class="token-list"></div>
+        </article>
+
+        <article class="explorer-panel" aria-labelledby="vectorTitle">
+          <div class="panel-head">
+            <h2 id="vectorTitle">Vector</h2>
+            <span id="vectorSource" class="panel-note"></span>
+          </div>
+          <div id="vectorStats" class="fact-grid"></div>
+          <div id="vectorBars" class="vector-bars"></div>
+        </article>
+
+        <article class="explorer-panel wide" aria-labelledby="neighborTitle">
+          <div class="panel-head">
+            <h2 id="neighborTitle">Nearest Tokens</h2>
+            <span id="neighborNote" class="panel-note"></span>
+          </div>
+          <div class="neighbor-layout">
+            <div id="neighborMap" class="neighbor-map" role="img" aria-label="2D projection of nearest token vectors"></div>
+            <div id="neighbors" class="neighbor-list"></div>
+          </div>
+        </article>
+
+        <article class="explorer-panel wide" aria-labelledby="tensorTitle">
+          <div class="panel-head">
+            <h2 id="tensorTitle">Tensor Directory</h2>
+            <span class="panel-note">first 80 tensors</span>
+          </div>
+          <div id="tensorTable" class="tensor-table"></div>
+        </article>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script src="explorer.js"></script>
+</body>
+</html>

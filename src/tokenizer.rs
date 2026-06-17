@@ -192,6 +192,16 @@ impl Tokenizer {
         self.vocab.len()
     }
 
+    /// Returns the raw tokenizer vocabulary entry for a token ID.
+    pub fn raw_token(&self, id: u32) -> Option<&str> {
+        self.vocab.get(id as usize).map(String::as_str)
+    }
+
+    /// Returns the tokenizer score for a token ID when GGUF metadata provided one.
+    pub fn token_score(&self, id: u32) -> Option<f32> {
+        self.scores.get(id as usize).copied()
+    }
+
     /// Returns whether normal text encoding prepends the BOS token.
     pub fn adds_bos_token(&self) -> bool {
         self.add_bos_token

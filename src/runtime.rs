@@ -5,6 +5,7 @@ use crate::model::{
 };
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
+use std::cmp::Ordering;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,13 @@ pub struct EmbeddingResult {
     pub embedding: Vec<f32>,
     /// Number of tokens in the input prompt.
     pub token_count: usize,
+}
+
+/// Nearest vocabulary-token result from token-embedding similarity search.
+#[derive(Clone, Debug)]
+pub struct TokenNeighbor {
+    pub id: u32,
+    pub score: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -866,6 +874,149 @@ impl Runner {
     /// Returns the model configuration used for inference.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Returns the number of rows available in the loaded token embedding matrix.
+    pub fn token_embedding_count(&self) -> usize {
+        let dim = self.config.dim;
+        match self.token_embedding_weight() {
+            Weight::F32(data) if dim > 0 => data.len() / dim,
+            Weight::F32(_) => 0,
+            Weight::Quantized { rows, .. } => *rows,
+        }
+    }
+
+    /// Returns one raw token-embedding row as f32 values.
+    pub fn token_embedding(&self, token_id: u32) -> Result<Vec<f32>, String> {
+        let mut out = Vec::new();
+        self.token_embedding_into(token_id, &mut out)?;
+        Ok(out)
+    }
+
+    /// Mean-pools token-embedding rows for `text` in token-embedding space.
+    ///
+    /// This is intentionally different from [`Runner::embed`]: it does not run
+    /// transformer layers. It stays in the static `token_embd.weight` space so
+    /// vocabulary-token nearest-neighbor search compares like with like.
+    pub fn token_embedding_query(&self, text: &str) -> Result<(Vec<f32>, Vec<u32>), String> {
+        let tokens = self.tok.encode_without_bos(text);
+        if tokens.is_empty() {
+            return Err(String::from("token_embedding_query: input tokenised to zero tokens"));
+        }
+
+        let mut sum = vec![0.0f32; self.config.dim];
+        let mut row = Vec::new();
+        let mut used = Vec::new();
+        for token in tokens {
+            if self.token_embedding_into(token, &mut row).is_ok() {
+                for (dst, value) in sum.iter_mut().zip(row.iter()) {
+                    *dst += *value;
+                }
+                used.push(token);
+            }
+        }
+        if used.is_empty() {
+            return Err(String::from(
+                "token_embedding_query: no input token has an embedding row",
+            ));
+        }
+
+        mean_pool_in_place(&mut sum, used.len());
+        l2_normalize_in_place(&mut sum);
+        Ok((sum, used))
+    }
+
+    /// Finds the closest vocabulary tokens in static token-embedding space.
+    pub fn nearest_token_embeddings(
+        &self,
+        query: &[f32],
+        limit: usize,
+        include_special: bool,
+    ) -> Result<Vec<TokenNeighbor>, String> {
+        if query.len() != self.config.dim {
+            return Err(format!(
+                "nearest_token_embeddings: dimension mismatch ({} vs {})",
+                query.len(),
+                self.config.dim
+            ));
+        }
+
+        let mut query_norm = 0.0f32;
+        for value in query {
+            query_norm += value * value;
+        }
+        query_norm = query_norm.sqrt();
+        if query_norm <= 1e-12 {
+            return Err(String::from(
+                "nearest_token_embeddings: zero-norm query vector",
+            ));
+        }
+
+        let row_count = self.token_embedding_count().min(self.tok.vocab_size());
+        let mut row = Vec::with_capacity(self.config.dim);
+        let mut neighbors = Vec::with_capacity(row_count.min(limit.max(1) * 4));
+        for token_id in 0..row_count {
+            if !include_special && self.skip_explorer_token(token_id as u32) {
+                continue;
+            }
+            self.token_embedding_into(token_id as u32, &mut row)?;
+
+            let mut dot = 0.0f32;
+            let mut row_norm = 0.0f32;
+            for (a, b) in query.iter().zip(row.iter()) {
+                dot += a * b;
+                row_norm += b * b;
+            }
+            row_norm = row_norm.sqrt();
+            if row_norm <= 1e-12 {
+                continue;
+            }
+            neighbors.push(TokenNeighbor {
+                id: token_id as u32,
+                score: dot / (query_norm * row_norm),
+            });
+        }
+
+        neighbors.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+        neighbors.truncate(limit.clamp(1, 100));
+        Ok(neighbors)
+    }
+
+    fn token_embedding_weight(&self) -> &Weight {
+        match &self.weights {
+            LoadedWeights::Standard(weights) => &weights.token_embd,
+            LoadedWeights::GptOss(weights) => &weights.token_embd,
+            LoadedWeights::Gemma4(weights) => &weights.token_embd,
+        }
+    }
+
+    fn token_embedding_into(&self, token_id: u32, out: &mut Vec<f32>) -> Result<(), String> {
+        let row_count = self.token_embedding_count();
+        if token_id as usize >= row_count {
+            return Err(format!(
+                "token_embedding: token id {} is out of range for {} embedding rows",
+                token_id, row_count
+            ));
+        }
+        self.token_embedding_weight()
+            .row_into(token_id as usize, self.config.dim, out);
+        Ok(())
+    }
+
+    fn skip_explorer_token(&self, token_id: u32) -> bool {
+        if token_id == self.tok.bos_id || token_id == self.tok.eos_id {
+            return true;
+        }
+        let raw = self.tok.raw_token(token_id).unwrap_or("");
+        let decoded = self.tok.decode_token(token_id);
+        if decoded.trim().is_empty() {
+            return true;
+        }
+        if raw.starts_with("<0x") {
+            return true;
+        }
+        (raw.starts_with('<') && raw.ends_with('>'))
+            || (raw.starts_with('[') && raw.ends_with(']'))
     }
 
     /// Attaches a verified assistant checkpoint for greedy speculative decoding.

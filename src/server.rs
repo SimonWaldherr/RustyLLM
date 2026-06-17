@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use crate::gguf::MetaValue;
 use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
 use crate::session::SessionStore;
 #[cfg(feature = "tls")]
@@ -11,6 +12,7 @@ use std::collections::HashSet;
 use std::fs;
 #[cfg(feature = "tls")]
 use std::fs::File;
+use std::io::BufRead;
 #[cfg(feature = "tls")]
 use std::io::BufReader;
 use std::io::{self, Read, Write};
@@ -215,6 +217,43 @@ struct OpenAiChatCompletionsRequest {
     cache_prompt: Option<bool>,
 }
 
+#[derive(Deserialize)]
+struct OpenAiResponsesRequest {
+    model: Option<String>,
+    input: Option<serde_json::Value>,
+    instructions: Option<String>,
+    max_output_tokens: Option<usize>,
+    /// Compatibility alias accepted by some clients.
+    max_completion_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repeat_penalty: Option<f32>,
+    seed: Option<u64>,
+    #[allow(dead_code)]
+    stream: Option<bool>,
+    stop: Option<StopSpec>,
+    text: Option<ResponsesTextConfig>,
+    response_format: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    tools: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
+    tool_choice: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    previous_response_id: Option<String>,
+    #[allow(dead_code)]
+    conversation: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    store: Option<bool>,
+    #[allow(dead_code)]
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesTextConfig {
+    format: Option<serde_json::Value>,
+}
+
 /// OpenAI-compatible `/v1/embeddings` request.
 #[derive(Deserialize)]
 struct EmbeddingsRequest {
@@ -273,6 +312,26 @@ struct OllamaEmbeddingRequest {
     model: Option<String>,
     prompt: Option<String>,
     input: Option<EmbeddingsInput>,
+}
+
+#[derive(Deserialize)]
+struct ExplorerTokenizeRequest {
+    input: String,
+    add_bos: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct ExplorerVectorRequest {
+    input: Option<String>,
+    token_id: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ExplorerNeighborsRequest {
+    input: Option<String>,
+    token_id: Option<u32>,
+    limit: Option<usize>,
+    include_special: Option<bool>,
 }
 
 // ─── Response types ───────────────────────────────────────────────────────────
@@ -429,6 +488,51 @@ struct OpenAiCompletionResponse {
     usage: OpenAiUsage,
 }
 
+#[derive(Serialize)]
+struct OpenAiResponsesUsage {
+    input_tokens: usize,
+    output_tokens: usize,
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct OpenAiResponsesOutputText {
+    r#type: &'static str,
+    text: String,
+    annotations: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct OpenAiResponsesOutputMessage {
+    r#type: &'static str,
+    id: String,
+    status: &'static str,
+    role: &'static str,
+    content: Vec<OpenAiResponsesOutputText>,
+}
+
+#[derive(Serialize)]
+struct OpenAiResponsesResponse {
+    id: String,
+    object: &'static str,
+    created_at: u64,
+    status: &'static str,
+    model: String,
+    output: Vec<OpenAiResponsesOutputMessage>,
+    output_text: String,
+    usage: OpenAiResponsesUsage,
+    error: Option<serde_json::Value>,
+    incomplete_details: Option<serde_json::Value>,
+    parallel_tool_calls: bool,
+}
+
+#[derive(Clone)]
+pub struct McpServeOptions {
+    pub defaults: GenerationOptions,
+    pub chat_history_path: Option<String>,
+    pub chat_history_lock: Arc<Mutex<()>>,
+}
+
 /// Starts the blocking HTTP or HTTPS server loop.
 pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
     let listener = TcpListener::bind(&options.addr)
@@ -581,11 +685,22 @@ where
             .map_err(|err| err.to_string());
     }
 
+    if request.method == "GET" && swagger_ui_route(&request.path) {
+        return write_http_response_with_content_type(
+            &mut stream,
+            200,
+            "text/html; charset=utf-8",
+            swagger_ui_html(),
+        )
+        .map_err(|err| err.to_string());
+    }
+
     if request.method == "GET" && chat_ui_route(&request.path).is_some() {
         if options.chat_ui {
             let body = match chat_ui_route(&request.path) {
                 Some(ChatUiRoute::Simple) => chat_ui_html(),
                 Some(ChatUiRoute::Expert) => expert_chat_ui_html(),
+                Some(ChatUiRoute::Explorer) => explorer_ui_html(),
                 None => unreachable!(),
             };
             return write_http_response_with_content_type(
@@ -621,6 +736,15 @@ where
                 )
                 .map_err(|err| err.to_string());
             }
+            "/explorer.js" => {
+                return write_http_response_with_content_type(
+                    &mut stream,
+                    200,
+                    "text/javascript; charset=utf-8",
+                    include_str!("web_ui/explorer.js"),
+                )
+                .map_err(|err| err.to_string());
+            }
             _ => {}
         }
     }
@@ -632,6 +756,12 @@ where
 enum ChatUiRoute {
     Simple,
     Expert,
+    Explorer,
+}
+
+/// Returns true for the embedded Swagger UI route.
+fn swagger_ui_route(path: &str) -> bool {
+    matches!(path, "/docs" | "/swagger" | "/swagger-ui")
 }
 
 /// Maps a request path to one of the embedded chat UI assets.
@@ -639,6 +769,7 @@ fn chat_ui_route(path: &str) -> Option<ChatUiRoute> {
     match path {
         "/chat" => Some(ChatUiRoute::Simple),
         "/chat?expert" => Some(ChatUiRoute::Expert),
+        "/explorer" | "/chat?explorer" => Some(ChatUiRoute::Explorer),
         _ => None,
     }
 }
@@ -849,6 +980,7 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
             (200, String::from("{\"status\":\"ok\"}"))
         }
         ("GET", "/api/version") => (200, String::from("{\"version\":\"rusty-llm-0.3.0\"}")),
+        ("GET", "/api/explorer/model") => route_explorer_model(runner),
         ("GET", "/api/tags") => route_ollama_tags(runner, &model_ids),
         ("GET", "/v1/models") | ("GET", "/api/v0/models") => {
             let created = unix_timestamp();
@@ -880,6 +1012,9 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                     | "/api/chat"
                     | "/api/embeddings"
                     | "/api/embed"
+                    | "/api/explorer/tokenize"
+                    | "/api/explorer/vector"
+                    | "/api/explorer/neighbors"
             ) =>
         {
             if !request
@@ -908,6 +1043,9 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                 "/api/embeddings" | "/api/embed" => {
                     route_ollama_embeddings(&request.body, runner, &model_ids)
                 }
+                "/api/explorer/tokenize" => route_explorer_tokenize(&request.body, runner),
+                "/api/explorer/vector" => route_explorer_vector(&request.body, runner),
+                "/api/explorer/neighbors" => route_explorer_neighbors(&request.body, runner),
                 _ => (404, json_error("Not found")),
             }
         }
@@ -1209,6 +1347,341 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
             }
         }
         Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn route_explorer_model(runner: &Runner) -> (u16, String) {
+    let config = runner.config();
+    let mut dtype_counts = std::collections::BTreeMap::<String, usize>::new();
+    let mut family_counts = std::collections::BTreeMap::<String, usize>::new();
+    for tensor in &runner.gguf().tensors {
+        *dtype_counts.entry(format!("{:?}", tensor.dtype)).or_insert(0) += 1;
+        *family_counts
+            .entry(explorer_tensor_family(&tensor.name))
+            .or_insert(0) += 1;
+    }
+
+    let mut metadata = serde_json::Map::new();
+    let mut keys = runner.gguf().metadata.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        if explorer_metadata_key(&key) {
+            if let Some(value) = runner.gguf().metadata.get(&key) {
+                metadata.insert(key, meta_value_json(value));
+            }
+        }
+    }
+
+    let tensors = runner
+        .gguf()
+        .tensors
+        .iter()
+        .take(80)
+        .map(|tensor| {
+            serde_json::json!({
+                "name": tensor.name,
+                "dims": tensor.dims,
+                "dtype": format!("{:?}", tensor.dtype),
+                "elements": tensor.numel(),
+                "offset": tensor.offset,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json_response(serde_json::json!({
+        "model": {
+            "name": runner.model_name(),
+            "architecture": runner.architecture(),
+            "vocab_size": runner.tokenizer().vocab_size(),
+            "token_embedding_rows": runner.token_embedding_count(),
+        },
+        "config": {
+            "dim": config.dim,
+            "hidden_dim": config.hidden_dim,
+            "layers": config.n_layers,
+            "heads": config.n_heads,
+            "kv_heads": config.n_kv_heads,
+            "head_dim": config.head_dim,
+            "value_dim": config.value_dim,
+            "context_length": config.max_seq_len,
+            "rope_theta": config.rope_theta,
+            "sliding_window": config.sliding_window,
+            "experts": config.expert_count,
+            "experts_used": config.expert_used_count,
+        },
+        "gguf": {
+            "metadata_count": runner.gguf().metadata.len(),
+            "tensor_count": runner.gguf().tensors.len(),
+            "data_offset": runner.gguf().data_offset,
+            "dtype_counts": dtype_counts,
+            "family_counts": family_counts,
+            "metadata": metadata,
+            "tensors": tensors,
+        }
+    }))
+}
+
+fn route_explorer_tokenize(body: &[u8], runner: &Runner) -> (u16, String) {
+    match serde_json::from_slice::<ExplorerTokenizeRequest>(body) {
+        Ok(payload) => {
+            let tokens = if payload.add_bos.unwrap_or(false) {
+                runner.tokenizer().encode(&payload.input)
+            } else {
+                runner.tokenizer().encode_without_bos(&payload.input)
+            };
+            let token_json = tokens
+                .iter()
+                .map(|&id| explorer_token_json(runner, id))
+                .collect::<Vec<_>>();
+            json_response(serde_json::json!({
+                "input": payload.input,
+                "token_count": tokens.len(),
+                "tokens": token_json,
+            }))
+        }
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn route_explorer_vector(body: &[u8], runner: &Runner) -> (u16, String) {
+    match serde_json::from_slice::<ExplorerVectorRequest>(body) {
+        Ok(payload) => match explorer_query_vector(runner, payload.input.as_deref(), payload.token_id)
+        {
+            Ok(query) => json_response(serde_json::json!({
+                "source": query.source,
+                "tokens": query.tokens.iter().map(|&id| explorer_token_json(runner, id)).collect::<Vec<_>>(),
+                "vector": vector_summary_json(&query.vector),
+                "projection": projection_json(&query.vector),
+            })),
+            Err(err) => (400, json_error(&err)),
+        },
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+fn route_explorer_neighbors(body: &[u8], runner: &Runner) -> (u16, String) {
+    match serde_json::from_slice::<ExplorerNeighborsRequest>(body) {
+        Ok(payload) => {
+            let limit = payload.limit.unwrap_or(24).clamp(1, 60);
+            let include_special = payload.include_special.unwrap_or(false);
+            let token_id = payload.token_id;
+            match explorer_query_vector(runner, payload.input.as_deref(), token_id) {
+                Ok(query) => {
+                    let search_limit = if token_id.is_some() { limit + 1 } else { limit };
+                    let mut neighbors =
+                        match runner.nearest_token_embeddings(&query.vector, search_limit, include_special)
+                        {
+                            Ok(neighbors) => neighbors,
+                            Err(err) => return (400, json_error(&err)),
+                        };
+                    if let Some(id) = token_id {
+                        neighbors.retain(|neighbor| neighbor.id != id);
+                        neighbors.truncate(limit);
+                    }
+
+                    let items = neighbors
+                        .iter()
+                        .filter_map(|neighbor| {
+                            let vector = runner.token_embedding(neighbor.id).ok()?;
+                            Some(serde_json::json!({
+                                "token": explorer_token_json(runner, neighbor.id),
+                                "score": neighbor.score,
+                                "projection": projection_json(&vector),
+                                "vector_preview": vector.iter().take(8).copied().collect::<Vec<_>>(),
+                            }))
+                        })
+                        .collect::<Vec<_>>();
+
+                    json_response(serde_json::json!({
+                        "source": query.source,
+                        "query_tokens": query.tokens.iter().map(|&id| explorer_token_json(runner, id)).collect::<Vec<_>>(),
+                        "query_projection": projection_json(&query.vector),
+                        "limit": limit,
+                        "include_special": include_special,
+                        "neighbors": items,
+                    }))
+                }
+                Err(err) => (400, json_error(&err)),
+            }
+        }
+        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+struct ExplorerQueryVector {
+    source: &'static str,
+    tokens: Vec<u32>,
+    vector: Vec<f32>,
+}
+
+fn explorer_query_vector(
+    runner: &Runner,
+    input: Option<&str>,
+    token_id: Option<u32>,
+) -> Result<ExplorerQueryVector, String> {
+    if let Some(id) = token_id {
+        return Ok(ExplorerQueryVector {
+            source: "token_embedding",
+            tokens: vec![id],
+            vector: runner.token_embedding(id)?,
+        });
+    }
+
+    let Some(text) = input.map(str::trim).filter(|text| !text.is_empty()) else {
+        return Err(String::from("input or token_id is required."));
+    };
+    let (vector, tokens) = runner.token_embedding_query(text)?;
+    Ok(ExplorerQueryVector {
+        source: "mean_token_embedding",
+        tokens,
+        vector,
+    })
+}
+
+fn explorer_token_json(runner: &Runner, token_id: u32) -> serde_json::Value {
+    let raw = runner.tokenizer().raw_token(token_id).unwrap_or("");
+    let decoded = runner.tokenizer().decode_token(token_id);
+    serde_json::json!({
+        "id": token_id,
+        "raw": raw,
+        "decoded": decoded,
+        "score": runner.tokenizer().token_score(token_id),
+        "special": explorer_token_is_special(runner, token_id, raw, &decoded),
+    })
+}
+
+fn explorer_token_is_special(runner: &Runner, token_id: u32, raw: &str, decoded: &str) -> bool {
+    if token_id == runner.tokenizer().bos_id || token_id == runner.tokenizer().eos_id {
+        return true;
+    }
+    if decoded.trim().is_empty() {
+        return true;
+    }
+    if raw.starts_with("<0x") {
+        return true;
+    }
+    (raw.starts_with('<') && raw.ends_with('>')) || (raw.starts_with('[') && raw.ends_with(']'))
+}
+
+fn vector_summary_json(vector: &[f32]) -> serde_json::Value {
+    let mut norm = 0.0f32;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut sum = 0.0f32;
+    for &value in vector {
+        norm += value * value;
+        min = min.min(value);
+        max = max.max(value);
+        sum += value;
+    }
+    let mut top = vector
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| (index, value))
+        .collect::<Vec<_>>();
+    top.sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top_dimensions = top
+        .into_iter()
+        .take(12)
+        .map(|(index, value)| serde_json::json!({ "index": index, "value": value }))
+        .collect::<Vec<_>>();
+
+    let dimensions = vector.len();
+    serde_json::json!({
+        "dimensions": dimensions,
+        "l2_norm": norm.sqrt(),
+        "min": if dimensions == 0 { 0.0 } else { min },
+        "max": if dimensions == 0 { 0.0 } else { max },
+        "mean": if dimensions == 0 { 0.0 } else { sum / dimensions as f32 },
+        "preview": vector.iter().take(48).copied().collect::<Vec<_>>(),
+        "top_dimensions": top_dimensions,
+    })
+}
+
+fn projection_json(vector: &[f32]) -> serde_json::Value {
+    let (x, y) = explorer_projection(vector);
+    serde_json::json!({ "x": x, "y": y })
+}
+
+fn explorer_projection(vector: &[f32]) -> (f32, f32) {
+    if vector.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut x = 0.0f32;
+    let mut y = 0.0f32;
+    for (i, &value) in vector.iter().enumerate() {
+        let p = i as f32 + 1.0;
+        x += value * (p * 12.9898).sin();
+        y += value * (p * 78.233).cos();
+    }
+    let scale = (vector.len() as f32).sqrt().max(1.0);
+    (x / scale, y / scale)
+}
+
+fn explorer_metadata_key(key: &str) -> bool {
+    key.starts_with("general.")
+        || key.starts_with("tokenizer.ggml.model")
+        || key.starts_with("tokenizer.ggml.pre")
+        || key.starts_with("tokenizer.ggml.add_")
+        || key.ends_with(".context_length")
+        || key.ends_with(".embedding_length")
+        || key.ends_with(".block_count")
+        || key.ends_with(".feed_forward_length")
+        || key.contains(".attention.")
+        || key.contains(".rope.")
+        || key.contains(".expert_")
+}
+
+fn explorer_tensor_family(name: &str) -> String {
+    if name == "token_embd.weight" {
+        return String::from("token embeddings");
+    }
+    if name.starts_with("output") {
+        return String::from("output");
+    }
+    if !name.starts_with("blk.") {
+        return String::from("other");
+    }
+    if name.contains(".attn_") || name.contains("attention") {
+        String::from("attention")
+    } else if name.contains(".ffn_") || name.contains(".moe_") || name.contains("expert") {
+        String::from("feed-forward")
+    } else if name.contains("norm") {
+        String::from("normalization")
+    } else {
+        String::from("block other")
+    }
+}
+
+fn meta_value_json(value: &MetaValue) -> serde_json::Value {
+    match value {
+        MetaValue::U8(v) => serde_json::json!(v),
+        MetaValue::I8(v) => serde_json::json!(v),
+        MetaValue::U16(v) => serde_json::json!(v),
+        MetaValue::I16(v) => serde_json::json!(v),
+        MetaValue::U32(v) => serde_json::json!(v),
+        MetaValue::I32(v) => serde_json::json!(v),
+        MetaValue::U64(v) => serde_json::json!(v),
+        MetaValue::I64(v) => serde_json::json!(v),
+        MetaValue::F32(v) => serde_json::json!(v),
+        MetaValue::F64(v) => serde_json::json!(v),
+        MetaValue::Bool(v) => serde_json::json!(v),
+        MetaValue::Str(v) => serde_json::json!(v),
+        MetaValue::Array(values) => {
+            if values.len() > 16 {
+                serde_json::json!({
+                    "type": "array",
+                    "len": values.len(),
+                    "preview": values.iter().take(8).map(meta_value_json).collect::<Vec<_>>(),
+                })
+            } else {
+                serde_json::Value::Array(values.iter().map(meta_value_json).collect())
+            }
+        }
     }
 }
 
@@ -1797,6 +2270,11 @@ fn chat_ui_html() -> &'static str {
 /// Returns the embedded expert chat UI HTML.
 fn expert_chat_ui_html() -> &'static str {
     include_str!("web_ui/expert.html")
+}
+
+/// Returns the embedded GGUF explorer UI HTML.
+fn explorer_ui_html() -> &'static str {
+    include_str!("web_ui/explorer.html")
 }
 
 /// Writes a standard HTML response.
