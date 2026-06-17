@@ -198,6 +198,26 @@ mod ffi {
             down_cols: usize,
             out: *mut f32,
         ) -> i32;
+        /// Runs Mistral post-attention output projection, residual norm, and FFN in one command buffer.
+        pub fn rusty_metal_mistral_post_attention_ffn(
+            wo_weights: *const u8,
+            wo_weights_len: usize,
+            gate_weights: *const u8,
+            gate_weights_len: usize,
+            up_weights: *const u8,
+            up_weights_len: usize,
+            down_weights: *const u8,
+            down_weights_len: usize,
+            x: *mut f32,
+            dim: usize,
+            attn_out: *const f32,
+            attn_cols: usize,
+            ffn_norm: *const f32,
+            rms_eps: f32,
+            hidden_rows: usize,
+            down_rows: usize,
+            down_cols: usize,
+        ) -> i32;
         /// Runs one Q4_0 matrix-vector multiply on the Metal backend.
         pub fn rusty_metal_q4_0_matvec(
             weights: *const u8,
@@ -287,12 +307,20 @@ pub fn q6k_enabled() -> bool {
 
 /// Reports whether the Metal backend should prefer Shared/NoCopy host buffers.
 pub fn nocopy_enabled() -> bool {
-    env_flag("RUSTY_LLM_METAL_NOCOPY") != Some(false)
+    static NOCOPY_ENABLED: OnceLock<bool> = OnceLock::new();
+    *NOCOPY_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_NOCOPY") != Some(false))
 }
 
 /// Reports whether Mistral-style fused Metal FFN blocks are enabled.
 pub fn fused_ffn_enabled() -> bool {
-    env_flag("RUSTY_LLM_METAL_FUSED_FFN") == Some(true)
+    static FUSED_FFN_ENABLED: OnceLock<bool> = OnceLock::new();
+    *FUSED_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_FUSED_FFN") != Some(false))
+}
+
+/// Reports whether the experimental fused Mistral post-attention/FFN block is enabled.
+pub fn post_attention_ffn_enabled() -> bool {
+    static POST_ATTENTION_FFN_ENABLED: OnceLock<bool> = OnceLock::new();
+    *POST_ATTENTION_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_POST_FFN") == Some(true))
 }
 
 /// Attempts a Metal attention scan across all query heads.
@@ -915,6 +943,47 @@ fn q4k_q4k_q6k_ffn_raw(
     }
 }
 
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw fused Mistral post-attention/FFN Metal shim.
+fn mistral_post_attention_ffn_raw(
+    wo_weights: &[u8],
+    gate_weights: &[u8],
+    up_weights: &[u8],
+    down_weights: &[u8],
+    x: &mut [f32],
+    attn_out: &[f32],
+    ffn_norm: &[f32],
+    rms_eps: f32,
+    dim: usize,
+    attn_cols: usize,
+    hidden_rows: usize,
+    down_rows: usize,
+    down_cols: usize,
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_mistral_post_attention_ffn(
+            wo_weights.as_ptr(),
+            wo_weights.len(),
+            gate_weights.as_ptr(),
+            gate_weights.len(),
+            up_weights.as_ptr(),
+            up_weights.len(),
+            down_weights.as_ptr(),
+            down_weights.len(),
+            x.as_mut_ptr(),
+            dim,
+            attn_out.as_ptr(),
+            attn_cols,
+            ffn_norm.as_ptr(),
+            rms_eps,
+            hidden_rows,
+            down_rows,
+            down_cols,
+        ) != 0
+    }
+}
+
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 /// Calls the raw Metal Q4_K projection shim or reports unsupported.
 fn q4k_matvec_raw(
@@ -1081,6 +1150,79 @@ fn q4k_q4k_q6k_ffn_raw(
     _out: &mut [f32],
 ) -> bool {
     false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+/// Calls the raw fused Mistral post-attention/FFN Metal shim.
+fn mistral_post_attention_ffn_raw(
+    _wo_weights: &[u8],
+    _gate_weights: &[u8],
+    _up_weights: &[u8],
+    _down_weights: &[u8],
+    _x: &mut [f32],
+    _attn_out: &[f32],
+    _ffn_norm: &[f32],
+    _rms_eps: f32,
+    _dim: usize,
+    _attn_cols: usize,
+    _hidden_rows: usize,
+    _down_rows: usize,
+    _down_cols: usize,
+) -> bool {
+    false
+}
+
+/// Attempts a fused Mistral post-attention + FFN Metal block.
+#[allow(clippy::too_many_arguments)]
+pub fn mistral_post_attention_ffn_into(
+    wo: (&[u8], usize, usize),
+    gate: (&[u8], usize, usize),
+    up: (&[u8], usize, usize),
+    down: (&[u8], usize, usize),
+    x: &mut [f32],
+    attn_out: &[f32],
+    ffn_norm: &[f32],
+    rms_eps: f32,
+) -> bool {
+    if !enabled() || !post_attention_ffn_enabled() {
+        return false;
+    }
+    let (wo_weights, wo_rows, wo_cols) = wo;
+    let (gate_weights, gate_rows, gate_cols) = gate;
+    let (up_weights, up_rows, up_cols) = up;
+    let (down_weights, down_rows, down_cols) = down;
+    if wo_rows == 0
+        || wo_cols == 0
+        || gate_rows == 0
+        || down_rows == 0
+        || wo_rows != x.len()
+        || wo_cols != attn_out.len()
+        || gate_cols != x.len()
+        || up_cols != x.len()
+        || gate_rows != up_rows
+        || gate_rows != down_cols
+        || down_rows != x.len()
+        || ffn_norm.len() != x.len()
+    {
+        return false;
+    }
+    let dim = x.len();
+    mistral_post_attention_ffn_raw(
+        wo_weights,
+        gate_weights,
+        up_weights,
+        down_weights,
+        x,
+        attn_out,
+        ffn_norm,
+        rms_eps,
+        dim,
+        wo_cols,
+        gate_rows,
+        down_rows,
+        down_cols,
+    )
 }
 
 pub const Q4_0_MIN_METAL_ROWS: usize = 512;

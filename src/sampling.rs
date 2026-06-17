@@ -88,33 +88,43 @@ pub fn sample_with_scratch(
         return argmax_finite_token(logits);
     }
 
+    // Repetition penalty
+    if config.repeat_penalty != 1.0 {
+        for &tok in recent_tokens {
+            if (tok as usize) < n {
+                let v = logits[tok as usize];
+                logits[tok as usize] = if !v.is_finite() {
+                    f32::NEG_INFINITY
+                } else if v > 0.0 {
+                    v / config.repeat_penalty
+                } else {
+                    v * config.repeat_penalty
+                };
+            }
+        }
+    }
+
+    let inv_temp = 1.0 / config.temperature;
+    if config.top_k > 0 && config.top_k < n {
+        return sample_top_k(
+            logits,
+            config.top_k,
+            config.top_p,
+            inv_temp,
+            rng,
+            candidates,
+        );
+    }
+
     for v in logits.iter_mut() {
         if !v.is_finite() {
             *v = f32::NEG_INFINITY;
         }
     }
 
-    // Repetition penalty
-    if config.repeat_penalty != 1.0 {
-        for &tok in recent_tokens {
-            if (tok as usize) < n {
-                if logits[tok as usize] > 0.0 {
-                    logits[tok as usize] /= config.repeat_penalty;
-                } else {
-                    logits[tok as usize] *= config.repeat_penalty;
-                }
-            }
-        }
-    }
-
     // Temperature
-    let inv_temp = 1.0 / config.temperature;
     for v in logits.iter_mut() {
         *v *= inv_temp;
-    }
-
-    if config.top_k > 0 && config.top_k < n {
-        return sample_top_k(logits, config.top_k, config.top_p, rng, candidates);
     }
 
     // Convert logits into positive sampling weights.
@@ -185,11 +195,12 @@ fn sample_top_k(
     logits: &[f32],
     top_k: usize,
     top_p: f32,
+    inv_temp: f32,
     rng: &mut Rng,
     candidates: &mut Vec<(usize, f32)>,
 ) -> u32 {
     if top_k == 1 {
-        return argmax_token(logits);
+        return argmax_finite_token(logits);
     }
 
     candidates.clear();
@@ -198,6 +209,11 @@ fn sample_top_k(
     }
 
     for (idx, &logit) in logits.iter().enumerate() {
+        let logit = if logit.is_finite() {
+            logit
+        } else {
+            f32::NEG_INFINITY
+        };
         if candidates.len() < top_k {
             candidates.push((idx, logit));
             bubble_up_last(candidates);
@@ -211,13 +227,13 @@ fn sample_top_k(
     }
 
     if candidates.is_empty() || !candidates[0].1.is_finite() {
-        return argmax_token(logits);
+        return argmax_finite_token(logits);
     }
 
     let max = candidates[0].1;
     let mut sum = 0.0f32;
     for (_, weight) in candidates.iter_mut() {
-        *weight = (*weight - max).exp();
+        *weight = ((*weight - max) * inv_temp).exp();
         sum += *weight;
     }
     if !sum.is_finite() || sum <= 0.0 {
@@ -262,16 +278,6 @@ fn bubble_up_last(candidates: &mut [(usize, f32)]) {
         candidates.swap(i, i - 1);
         i -= 1;
     }
-}
-
-/// Returns the index of the highest logit.
-fn argmax_token(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i as u32)
-        .unwrap_or(0)
 }
 
 /// Returns the index of the highest finite logit.

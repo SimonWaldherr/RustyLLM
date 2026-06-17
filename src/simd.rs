@@ -2188,11 +2188,28 @@ pub fn matvec_mxfp4_into(qweight: &[u8], x: &[f32], rows: usize, cols: usize, ou
     parallel_matvec_u8(MatvecKind::Mxfp4, out, rows, cols, row_bytes, qweight, x);
 }
 
-/// Dequantizes one Q8_0 row into f32 values.
-pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+macro_rules! dequant_row_vec {
+    ($name:ident, $into:ident) => {
+        pub fn $name(qrow: &[u8], cols: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; cols];
+            $into(qrow, &mut out);
+            out
+        }
+    };
+}
+
+#[inline]
+fn clear_dequant_tail(out: &mut [f32], written: usize) {
+    if written < out.len() {
+        out[written..].fill(0.0);
+    }
+}
+
+/// Dequantizes one Q8_0 row into caller-owned storage.
+pub fn dequant_row_q8_0_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 34;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2200,14 +2217,14 @@ pub fn dequant_row_q8_0(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i] = scale * (block[2 + i] as i8) as f32;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q8_0, dequant_row_q8_0_into);
 
-/// Dequantizes one Q8_1 row into f32 values.
-pub fn dequant_row_q8_1(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one Q8_1 row into caller-owned storage.
+pub fn dequant_row_q8_1_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 36;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2215,14 +2232,14 @@ pub fn dequant_row_q8_1(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i] = scale * (block[4 + i] as i8) as f32;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q8_1, dequant_row_q8_1_into);
 
-/// Dequantizes one Q4_0 row into f32 values.
-pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one Q4_0 row into caller-owned storage.
+pub fn dequant_row_q4_0_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 18;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2235,14 +2252,14 @@ pub fn dequant_row_q4_0(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i + 16] = scale * hi;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q4_0, dequant_row_q4_0_into);
 
-/// Dequantizes one Q4_1 row into f32 values.
-pub fn dequant_row_q4_1(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one Q4_1 row into caller-owned storage.
+pub fn dequant_row_q4_1_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 20;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2253,14 +2270,14 @@ pub fn dequant_row_q4_1(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i * 2 + 1] = scale * (byte >> 4) as f32 + min;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q4_1, dequant_row_q4_1_into);
 
-/// Dequantizes one Q5_0 row into f32 values.
-pub fn dequant_row_q5_0(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one Q5_0 row into caller-owned storage.
+pub fn dequant_row_q5_0_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 22;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2276,14 +2293,14 @@ pub fn dequant_row_q5_0(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i * 2 + 1] = scale * hi;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q5_0, dequant_row_q5_0_into);
 
-/// Dequantizes one Q5_1 row into f32 values.
-pub fn dequant_row_q5_1(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one Q5_1 row into caller-owned storage.
+pub fn dequant_row_q5_1_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 24;
-    let mut out = vec![0.0f32; cols];
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
         let scale = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -2300,14 +2317,14 @@ pub fn dequant_row_q5_1(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i * 2 + 1] = scale * hi + min;
         }
     }
-    out
 }
+dequant_row_vec!(dequant_row_q5_1, dequant_row_q5_1_into);
 
-/// Dequantizes one Q4_K row into f32 values.
-pub fn dequant_row_q4_k(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 256;
+/// Dequantizes one Q4_K row into caller-owned storage.
+pub fn dequant_row_q4_k_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 256;
+    clear_dequant_tail(out, n_blocks * 256);
     let block_size = 144;
-    let mut out = vec![0.0f32; cols];
 
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
@@ -2338,15 +2355,14 @@ pub fn dequant_row_q4_k(qrow: &[u8], cols: usize) -> Vec<f32> {
             is += 2;
         }
     }
-
-    out
 }
+dequant_row_vec!(dequant_row_q4_k, dequant_row_q4_k_into);
 
-/// Dequantizes one Q5_K row into f32 values.
-pub fn dequant_row_q5_k(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 256;
+/// Dequantizes one Q5_K row into caller-owned storage.
+pub fn dequant_row_q5_k_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 256;
+    clear_dequant_tail(out, n_blocks * 256);
     let block_size = 176;
-    let mut out = vec![0.0f32; cols];
 
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
@@ -2383,15 +2399,14 @@ pub fn dequant_row_q5_k(qrow: &[u8], cols: usize) -> Vec<f32> {
             u2 <<= 2;
         }
     }
-
-    out
 }
+dequant_row_vec!(dequant_row_q5_k, dequant_row_q5_k_into);
 
-/// Dequantizes one Q6_K row into f32 values.
-pub fn dequant_row_q6_k(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 256;
+/// Dequantizes one Q6_K row into caller-owned storage.
+pub fn dequant_row_q6_k_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 256;
+    clear_dequant_tail(out, n_blocks * 256);
     let block_size = 210;
-    let mut out = vec![0.0f32; cols];
 
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
@@ -2420,15 +2435,14 @@ pub fn dequant_row_q6_k(qrow: &[u8], cols: usize) -> Vec<f32> {
             sc = &sc[8..];
         }
     }
-
-    out
 }
+dequant_row_vec!(dequant_row_q6_k, dequant_row_q6_k_into);
 
-/// Dequantizes one MXFP4 row into f32 values.
-pub fn dequant_row_mxfp4(qrow: &[u8], cols: usize) -> Vec<f32> {
-    let n_blocks = cols / 32;
+/// Dequantizes one MXFP4 row into caller-owned storage.
+pub fn dequant_row_mxfp4_into(qrow: &[u8], out: &mut [f32]) {
+    let n_blocks = out.len() / 32;
+    clear_dequant_tail(out, n_blocks * 32);
     let block_size = 17;
-    let mut out = vec![0.0f32; cols];
 
     for b in 0..n_blocks {
         let block = &qrow[b * block_size..(b + 1) * block_size];
@@ -2439,9 +2453,8 @@ pub fn dequant_row_mxfp4(qrow: &[u8], cols: usize) -> Vec<f32> {
             out[b * 32 + i * 2 + 1] = mxfp4_nibble_to_f32(byte >> 4) * scale;
         }
     }
-
-    out
 }
+dequant_row_vec!(dequant_row_mxfp4, dequant_row_mxfp4_into);
 
 // ─── Scalar fallbacks ────────────────────────────────────────────────────────
 

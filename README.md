@@ -725,9 +725,8 @@ For repeatable checks, use `make bench-model-ultra MODEL=...` or
 matvec and attention calls prefer Shared/NoCopy host buffers by default to avoid
 extra Rust/Metal memcpy traffic; set `RUSTY_LLM_METAL_NOCOPY=0` to benchmark the
 older copy-buffer path. Mistral-style Q4_K/Q4_K/Q6_K FFN blocks are fused into
-one Metal command buffer when `RUSTY_LLM_METAL_FUSED_FFN=1` is set; this is
-experimental because the older Gate/Up, CPU SwiGLU, Down sequence is faster on
-short Ministral decode benchmarks.
+one Metal command buffer by default; set `RUSTY_LLM_METAL_FUSED_FFN=0` to compare
+against the older Gate/Up, CPU SwiGLU, Down sequence.
 
 Optional feature:
 

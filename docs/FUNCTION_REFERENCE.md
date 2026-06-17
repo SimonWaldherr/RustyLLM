@@ -156,9 +156,8 @@ the high-level runtime API.
 - `q6k_enabled` checks the `RUSTY_LLM_METAL_Q6K` environment flag.
 - `nocopy_enabled` checks whether Metal Shared/NoCopy host buffers should be
   preferred over explicit memcpy staging buffers.
-- `fused_ffn_enabled` checks whether the experimental
-  `RUSTY_LLM_METAL_FUSED_FFN=1` path should fuse Mistral-style Q4_K/Q4_K/Q6_K
-  FFN blocks into one Metal command buffer.
+- `fused_ffn_enabled` checks whether Mistral-style Q4_K/Q4_K/Q6_K FFN blocks
+  should be fused into one Metal command buffer.
 - `ultra_q4k_min_metal_rows`, `ultra_q6k_min_metal_rows`,
   `ultra_attention_min_metal_tokens`, `scoped_ultra_mode`, and
   `ultra_mode_enabled` manage the per-thread Mistral Ultra routing mode.

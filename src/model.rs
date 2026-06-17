@@ -252,65 +252,9 @@ impl Weight {
 
     /// Extract one row as f32 values.
     pub fn row(&self, row: usize, cols: usize) -> Vec<f32> {
-        match self {
-            Weight::F32(data) => {
-                let start = row * cols;
-                data[start..start + cols].to_vec()
-            }
-            Weight::Quantized {
-                data,
-                dtype,
-                rows,
-                cols: qcols,
-            } => {
-                let data = data.as_slice();
-                assert_eq!(*qcols, cols, "row(): column mismatch");
-                assert!(row < *rows, "row(): row out of bounds");
-                match dtype {
-                    GGMLType::Q8_0 => {
-                        let row_bytes = (cols / 32) * 34;
-                        simd::dequant_row_q8_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q8_1 => {
-                        let row_bytes = (cols / 32) * 36;
-                        simd::dequant_row_q8_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q4_0 => {
-                        let row_bytes = (cols / 32) * 18;
-                        simd::dequant_row_q4_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q4_1 => {
-                        let row_bytes = (cols / 32) * 20;
-                        simd::dequant_row_q4_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q5_0 => {
-                        let row_bytes = (cols / 32) * 22;
-                        simd::dequant_row_q5_0(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q5_1 => {
-                        let row_bytes = (cols / 32) * 24;
-                        simd::dequant_row_q5_1(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q4_K => {
-                        let row_bytes = (cols / 256) * 144;
-                        simd::dequant_row_q4_k(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q5_K => {
-                        let row_bytes = (cols / 256) * 176;
-                        simd::dequant_row_q5_k(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::Q6_K => {
-                        let row_bytes = (cols / 256) * 210;
-                        simd::dequant_row_q6_k(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    GGMLType::MXFP4 => {
-                        let row_bytes = (cols / 32) * 17;
-                        simd::dequant_row_mxfp4(&data[row * row_bytes..(row + 1) * row_bytes], cols)
-                    }
-                    _ => panic!("Unsupported quantized row extraction: {:?}", dtype),
-                }
-            }
-        }
+        let mut out = vec![0.0; cols];
+        self.row_into(row, cols, &mut out);
+        out
     }
 
     /// Extract one row as f32 values into caller-owned storage.
@@ -321,9 +265,19 @@ impl Weight {
                 let start = row * cols;
                 out.copy_from_slice(&data[start..start + cols]);
             }
-            Weight::Quantized { .. } => {
-                let row_data = self.row(row, cols);
-                out.copy_from_slice(&row_data);
+            Weight::Quantized {
+                data,
+                dtype,
+                rows,
+                cols: qcols,
+            } => {
+                let data = data.as_slice();
+                assert_eq!(*qcols, cols, "row(): column mismatch");
+                assert!(row < *rows, "row(): row out of bounds");
+                let row_bytes = quantized_row_bytes(*dtype, cols)
+                    .unwrap_or_else(|| panic!("Unsupported quantized row extraction: {:?}", dtype));
+                let start = row * row_bytes;
+                dequantize_row_into(*dtype, &data[start..start + row_bytes], out);
             }
         }
     }
@@ -706,6 +660,87 @@ fn try_metal_mistral_ffn_into(
     _down: &Weight,
     _x: &[f32],
     _out: &mut Vec<f32>,
+) -> bool {
+    false
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Attempts to run Mistral post-attention output projection, residual norm, and FFN in one Metal command buffer.
+fn try_metal_mistral_post_attention_ffn_into(
+    wo: &Weight,
+    gate: &Weight,
+    up: &Weight,
+    down: &Weight,
+    x: &mut [f32],
+    attn_out: &[f32],
+    ffn_norm: &[f32],
+    rms_eps: f32,
+) -> bool {
+    if !crate::metal::post_attention_ffn_enabled() {
+        return false;
+    }
+    let (
+        Weight::Quantized {
+            data: wo_data,
+            dtype: GGMLType::Q4_K,
+            rows: wo_rows,
+            cols: wo_cols,
+        },
+        Weight::Quantized {
+            data: gate_data,
+            dtype: GGMLType::Q4_K,
+            rows: gate_rows,
+            cols: gate_cols,
+        },
+        Weight::Quantized {
+            data: up_data,
+            dtype: GGMLType::Q4_K,
+            rows: up_rows,
+            cols: up_cols,
+        },
+        Weight::Quantized {
+            data: down_data,
+            dtype: GGMLType::Q6_K,
+            rows: down_rows,
+            cols: down_cols,
+        },
+    ) = (wo, gate, up, down)
+    else {
+        return false;
+    };
+    if *wo_rows != x.len()
+        || *wo_cols != attn_out.len()
+        || *gate_cols != x.len()
+        || *up_cols != x.len()
+        || *gate_rows != *up_rows
+        || *gate_rows != *down_cols
+        || *down_rows != x.len()
+        || ffn_norm.len() != x.len()
+    {
+        return false;
+    }
+    crate::metal::mistral_post_attention_ffn_into(
+        (wo_data.as_slice(), *wo_rows, *wo_cols),
+        (gate_data.as_slice(), *gate_rows, *gate_cols),
+        (up_data.as_slice(), *up_rows, *up_cols),
+        (down_data.as_slice(), *down_rows, *down_cols),
+        x,
+        attn_out,
+        ffn_norm,
+        rms_eps,
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn try_metal_mistral_post_attention_ffn_into(
+    _wo: &Weight,
+    _gate: &Weight,
+    _up: &Weight,
+    _down: &Weight,
+    _x: &mut Vec<f32>,
+    _attn_out: &[f32],
+    _ffn_norm: &[f32],
+    _rms_eps: f32,
 ) -> bool {
     false
 }
@@ -1131,27 +1166,34 @@ fn quantized_row_bytes(dtype: GGMLType, cols: usize) -> Option<usize> {
     }
 }
 
+fn dequantize_row_into(dtype: GGMLType, raw: &[u8], out: &mut [f32]) {
+    match dtype {
+        GGMLType::Q4_0 => simd::dequant_row_q4_0_into(raw, out),
+        GGMLType::Q4_1 => simd::dequant_row_q4_1_into(raw, out),
+        GGMLType::Q5_0 => simd::dequant_row_q5_0_into(raw, out),
+        GGMLType::Q5_1 => simd::dequant_row_q5_1_into(raw, out),
+        GGMLType::Q8_0 => simd::dequant_row_q8_0_into(raw, out),
+        GGMLType::Q8_1 => simd::dequant_row_q8_1_into(raw, out),
+        GGMLType::Q4_K => simd::dequant_row_q4_k_into(raw, out),
+        GGMLType::Q5_K => simd::dequant_row_q5_k_into(raw, out),
+        GGMLType::Q6_K => simd::dequant_row_q6_k_into(raw, out),
+        GGMLType::MXFP4 => simd::dequant_row_mxfp4_into(raw, out),
+        _ => panic!("Unsupported quantized dequantization: {:?}", dtype),
+    }
+}
+
 fn dequantize_tensor_rows(dtype: GGMLType, raw: &[u8], rows: usize, cols: usize) -> Vec<f32> {
     let row_bytes = quantized_row_bytes(dtype, cols)
         .unwrap_or_else(|| panic!("Unsupported quantized dequantization: {:?}", dtype));
-    let mut out = Vec::with_capacity(rows * cols);
+    let mut out = vec![0.0; rows * cols];
     for row in 0..rows {
         let start = row * row_bytes;
         let end = start + row_bytes;
-        let values = match dtype {
-            GGMLType::Q4_0 => simd::dequant_row_q4_0(&raw[start..end], cols),
-            GGMLType::Q4_1 => simd::dequant_row_q4_1(&raw[start..end], cols),
-            GGMLType::Q5_0 => simd::dequant_row_q5_0(&raw[start..end], cols),
-            GGMLType::Q5_1 => simd::dequant_row_q5_1(&raw[start..end], cols),
-            GGMLType::Q8_0 => simd::dequant_row_q8_0(&raw[start..end], cols),
-            GGMLType::Q8_1 => simd::dequant_row_q8_1(&raw[start..end], cols),
-            GGMLType::Q4_K => simd::dequant_row_q4_k(&raw[start..end], cols),
-            GGMLType::Q5_K => simd::dequant_row_q5_k(&raw[start..end], cols),
-            GGMLType::Q6_K => simd::dequant_row_q6_k(&raw[start..end], cols),
-            GGMLType::MXFP4 => simd::dequant_row_mxfp4(&raw[start..end], cols),
-            _ => unreachable!(),
-        };
-        out.extend_from_slice(&values);
+        dequantize_row_into(
+            dtype,
+            &raw[start..end],
+            &mut out[row * cols..(row + 1) * cols],
+        );
     }
     out
 }
@@ -2814,6 +2856,7 @@ pub fn forward_into(
     let head_dim = config.head_dim;
     let _kv_dim = config.kv_dim;
     let kv_mul = config.kv_mul;
+    let fused_post_attention_ffn = crate::metal::post_attention_ffn_enabled();
 
     // Token embedding
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
@@ -2896,6 +2939,21 @@ pub fn forward_into(
                     &mut buf.attn_out[out_off..out_off + config.value_dim],
                 );
             }
+        }
+
+        if fused_post_attention_ffn
+            && try_metal_mistral_post_attention_ffn_into(
+                &layer.wo,
+                &layer.w1,
+                &layer.w3,
+                &layer.w2,
+                &mut buf.x,
+                &buf.attn_out,
+                &layer.ffn_norm,
+                config.rms_norm_eps,
+            )
+        {
+            continue;
         }
 
         // Output projection + residual

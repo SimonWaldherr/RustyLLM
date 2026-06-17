@@ -11,6 +11,7 @@ typedef struct {
     uint32_t cols;
     uint32_t row_bytes;
     uint32_t n_blocks;
+    uint32_t rows_per_group;
 } RustyQ4KParams;
 
 enum {
@@ -36,6 +37,11 @@ typedef struct {
     uint32_t len;
 } RustyUnaryParams;
 
+typedef struct {
+    uint32_t len;
+    float eps;
+} RustyResidualNormParams;
+
 static id<MTLDevice> gDevice;
 static id<MTLCommandQueue> gQueue;
 static id<MTLComputePipelineState> gQ4KPipeline;
@@ -44,9 +50,13 @@ static id<MTLComputePipelineState> gQ4_0Pipeline;
 static id<MTLComputePipelineState> gQ8_0Pipeline;
 static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
+static id<MTLComputePipelineState> gResidualRmsPipeline;
+static id<MTLComputePipelineState> gResidualAddPipeline;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gWeightBuffers;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gSharedBuffers;
 static const float gAttentionZero = 0.0f;
+
+static BOOL rusty_metal_private_weights_enabled(void);
 
 static void rusty_metal_log_error(const char *step, NSError *error) {
     if (!getenv("RUSTY_LLM_METAL_DEBUG")) return;
@@ -60,7 +70,7 @@ static void rusty_metal_log_error(const char *step, NSError *error) {
 static NSString *const kQ4KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "inline uchar2 scale_min_k4(uint j, const device uchar* q) {\n"
 "    if (j < 4) return uchar2(q[j] & 63, q[j + 4] & 63);\n"
 "    return uchar2((q[j + 4] & 15) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));\n"
@@ -74,11 +84,13 @@ static NSString *const kQ4KSource =
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row = group * 4 + sg;\n"
+"    uint row_half = lane >> 4;\n"
+"    uint sublane = lane & 15;\n"
+"    uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
 "    if (row >= p.rows) return;\n"
 "    const device uchar* row_base = weights + row * p.row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (uint b = lane; b < p.n_blocks; b += 32) {\n"
+"    for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
 "        const device uchar* block = row_base + b * 144;\n"
 "        ushort db = ushort(block[0]) | (ushort(block[1]) << 8);\n"
 "        ushort dmb = ushort(block[2]) | (ushort(block[3]) << 8);\n"
@@ -108,15 +120,15 @@ static NSString *const kQ4KSource =
 "            is += 2;\n"
 "        }\n"
 "    }\n"
-"    for (ushort offset = 16; offset > 0; offset >>= 1)\n"
+"    for (ushort offset = 8; offset > 0; offset >>= 1)\n"
 "        sum += simd_shuffle_xor(sum, offset);\n"
-"    if (lane == 0) out[row] = sum;\n"
+"    if (sublane == 0) out[row] = sum;\n"
 "}\n";
 
 static NSString *const kQ6KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "inline int i8(uchar v) { return v < 128 ? int(v) : int(v) - 256; }\n"
 "// Simdgroup-reduced Q6_K matvec using simdgroup reduction.\n"
 "kernel void q6k_matvec(device const uchar* weights [[buffer(0)]],\n"
@@ -126,11 +138,13 @@ static NSString *const kQ6KSource =
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row = group * 4 + sg;\n"
+"    uint row_half = lane >> 4;\n"
+"    uint sublane = lane & 15;\n"
+"    uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
 "    if (row >= p.rows) return;\n"
 "    const device uchar* row_base = weights + row * p.row_bytes;\n"
 "    float sum = 0.0f;\n"
-"    for (uint b = lane; b < p.n_blocks; b += 32) {\n"
+"    for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
 "        const device uchar* block = row_base + b * 210;\n"
 "        const device uchar* ql = block;\n"
 "        const device uchar* qh = block + 128;\n"
@@ -174,9 +188,9 @@ static NSString *const kQ6KSource =
 "            }\n"
 "        }\n"
 "    }\n"
-"    for (ushort offset = 16; offset > 0; offset >>= 1)\n"
+"    for (ushort offset = 8; offset > 0; offset >>= 1)\n"
 "        sum += simd_shuffle_xor(sum, offset);\n"
-"    if (lane == 0) out[row] = sum;\n"
+"    if (sublane == 0) out[row] = sum;\n"
 "}\n";
 
 // Q4_0: 18 bytes/block (2-byte f16 scale + 16 bytes of 32 nibbles), 32 elements/block.
@@ -184,7 +198,7 @@ static NSString *const kQ6KSource =
 static NSString *const kQ4_0Source =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "kernel void q4_0_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                        device const float* x [[buffer(1)]],\n"
 "                        device float* out [[buffer(2)]],\n"
@@ -192,7 +206,7 @@ static NSString *const kQ4_0Source =
 "                        uint group [[threadgroup_position_in_grid]],\n"
 "                        uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                        uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row = group * 4 + sg;\n"
+"    uint row = group * p.rows_per_group + sg;\n"
 "    if (row >= p.rows) return;\n"
 "    const device uchar* row_base = weights + row * p.row_bytes;\n"
 "    float sum = 0.0f;\n"
@@ -221,7 +235,7 @@ static NSString *const kQ4_0Source =
 static NSString *const kQ8_0Source =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "kernel void q8_0_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                        device const float* x [[buffer(1)]],\n"
 "                        device float* out [[buffer(2)]],\n"
@@ -229,7 +243,7 @@ static NSString *const kQ8_0Source =
 "                        uint group [[threadgroup_position_in_grid]],\n"
 "                        uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                        uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row = group * 4 + sg;\n"
+"    uint row = group * p.rows_per_group + sg;\n"
 "    if (row >= p.rows) return;\n"
 "    const device uchar* row_base = weights + row * p.row_bytes;\n"
 "    float sum = 0.0f;\n"
@@ -326,6 +340,42 @@ static NSString *const kSiluMulSource =
 "    float g = gate[gid];\n"
 "    out[gid] = (g / (1.0f + exp(-g))) * up[gid];\n"
 "}\n";
+
+static NSString *const kResidualSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct NormParams { uint len; float eps; };\n"
+"struct AddParams { uint len; };\n"
+"kernel void residual_rms(device float* x [[buffer(0)]],\n"
+"                         device const float* residual [[buffer(1)]],\n"
+"                         device const float* weight [[buffer(2)]],\n"
+"                         device float* out [[buffer(3)]],\n"
+"                         constant NormParams& p [[buffer(4)]],\n"
+"                         uint tid [[thread_index_in_threadgroup]]) {\n"
+"    threadgroup float partial[256];\n"
+"    float sum = 0.0f;\n"
+"    for (uint i = tid; i < p.len; i += 256) {\n"
+"        float v = x[i] + residual[i];\n"
+"        x[i] = v;\n"
+"        sum += v * v;\n"
+"    }\n"
+"    partial[tid] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint stride = 128; stride > 0; stride >>= 1) {\n"
+"        if (tid < stride) partial[tid] += partial[tid + stride];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    float scale = rsqrt(partial[0] / float(p.len) + p.eps);\n"
+"    for (uint i = tid; i < p.len; i += 256) out[i] = x[i] * weight[i] * scale;\n"
+"}\n"
+"kernel void residual_add(device float* x [[buffer(0)]],\n"
+"                         device const float* residual [[buffer(1)]],\n"
+"                         constant AddParams& p [[buffer(2)]],\n"
+"                         uint gid [[thread_position_in_grid]]) {\n"
+"    if (gid >= p.len) return;\n"
+"    x[gid] += residual[gid];\n"
+"}\n";
+
 static BOOL rusty_metal_init(void) {
     static dispatch_once_t once;
     static BOOL ok = NO;
@@ -428,6 +478,31 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create silu_mul pipeline", error);
             return;
         }
+        id<MTLLibrary> residual_library = [gDevice newLibraryWithSource:kResidualSource options:options error:&error];
+        if (!residual_library) {
+            rusty_metal_log_error("compile residual kernels", error);
+            return;
+        }
+        id<MTLFunction> residual_rms_function = [residual_library newFunctionWithName:@"residual_rms"];
+        if (!residual_rms_function) {
+            rusty_metal_log_error("load residual_rms function", nil);
+            return;
+        }
+        gResidualRmsPipeline = [gDevice newComputePipelineStateWithFunction:residual_rms_function error:&error];
+        if (!gResidualRmsPipeline) {
+            rusty_metal_log_error("create residual_rms pipeline", error);
+            return;
+        }
+        id<MTLFunction> residual_add_function = [residual_library newFunctionWithName:@"residual_add"];
+        if (!residual_add_function) {
+            rusty_metal_log_error("load residual_add function", nil);
+            return;
+        }
+        gResidualAddPipeline = [gDevice newComputePipelineStateWithFunction:residual_add_function error:&error];
+        if (!gResidualAddPipeline) {
+            rusty_metal_log_error("create residual_add pipeline", error);
+            return;
+        }
         gQueue = [gDevice newCommandQueue];
         if (!gQueue) {
             rusty_metal_log_error("create command queue", nil);
@@ -444,9 +519,35 @@ static id<MTLBuffer> rusty_metal_weight_buffer(const uint8_t *weights, uintptr_t
     NSNumber *key = @((uintptr_t)weights);
     id<MTLBuffer> weight_buffer = [gWeightBuffers objectForKey:key];
     if (!weight_buffer || [weight_buffer length] < weights_len) {
-        weight_buffer = [gDevice newBufferWithBytes:weights
-                                             length:(NSUInteger)weights_len
-                                            options:MTLResourceStorageModeShared];
+        if (rusty_metal_private_weights_enabled()) {
+            id<MTLBuffer> staging = [gDevice newBufferWithBytes:weights
+                                                         length:(NSUInteger)weights_len
+                                                        options:MTLResourceStorageModeShared];
+            weight_buffer = [gDevice newBufferWithLength:(NSUInteger)weights_len
+                                                 options:MTLResourceStorageModePrivate];
+            if (staging && weight_buffer) {
+                id<MTLCommandBuffer> command_buffer = [gQueue commandBuffer];
+                id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+                [blit copyFromBuffer:staging
+                         sourceOffset:0
+                             toBuffer:weight_buffer
+                    destinationOffset:0
+                                 size:(NSUInteger)weights_len];
+                [blit endEncoding];
+                [command_buffer commit];
+                [command_buffer waitUntilCompleted];
+                if ([command_buffer status] != MTLCommandBufferStatusCompleted) {
+                    weight_buffer = nil;
+                }
+            } else {
+                weight_buffer = nil;
+            }
+        }
+        if (!weight_buffer) {
+            weight_buffer = [gDevice newBufferWithBytes:weights
+                                                 length:(NSUInteger)weights_len
+                                                options:MTLResourceStorageModeShared];
+        }
         if (!weight_buffer) return nil;
         [gWeightBuffers setObject:weight_buffer forKey:key];
     }
@@ -486,6 +587,24 @@ static BOOL rusty_metal_nocopy_enabled(void) {
     return !rusty_metal_env_disabled("RUSTY_LLM_METAL_NOCOPY");
 }
 
+static BOOL rusty_metal_private_weights_enabled(void) {
+    const char *value = getenv("RUSTY_LLM_METAL_PRIVATE_WEIGHTS");
+    return value && !rusty_metal_env_disabled("RUSTY_LLM_METAL_PRIVATE_WEIGHTS");
+}
+
+static NSUInteger rusty_metal_q6k_rows_per_group(NSUInteger rows) {
+    const char *value = getenv("RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP");
+    if (value && *value) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(value, &end, 10);
+        if (end != value && parsed >= 2 && parsed <= 8 && (parsed % 2) == 0) {
+            return (NSUInteger)parsed;
+        }
+    }
+    (void)rows;
+    return 8;
+}
+
 static BOOL rusty_metal_ensure_buffer(id<MTLBuffer> __strong *buffer, NSUInteger size) {
     if (!*buffer || [*buffer length] < size) {
         *buffer = [gDevice newBufferWithLength:size options:MTLResourceStorageModeShared];
@@ -521,17 +640,36 @@ static id<MTLBuffer> rusty_metal_output_buffer(void *bytes,
     return *copy_buffer;
 }
 
+static id<MTLBuffer> rusty_metal_inout_buffer(void *bytes,
+                                              NSUInteger bytes_len,
+                                              id<MTLBuffer> __strong *copy_buffer,
+                                              BOOL *needs_copy) {
+    *needs_copy = YES;
+    if (rusty_metal_nocopy_enabled()) {
+        id<MTLBuffer> shared = rusty_metal_shared_buffer(bytes, (uintptr_t)bytes_len);
+        if (shared) {
+            *needs_copy = NO;
+            return shared;
+        }
+    }
+    if (!rusty_metal_ensure_buffer(copy_buffer, bytes_len)) return nil;
+    memcpy([*copy_buffer contents], bytes, bytes_len);
+    return *copy_buffer;
+}
+
 static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLBuffer> weight_buffer,
                                    id<MTLBuffer> x_buffer,
                                    id<MTLBuffer> out_buffer,
                                    uintptr_t rows,
                                    uintptr_t cols) {
+    const NSUInteger rows_per_group = 8;
     RustyQ4KParams params = {
         .rows = (uint32_t)rows,
         .cols = (uint32_t)cols,
         .row_bytes = (uint32_t)((cols / 256) * 144),
         .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
     };
 
     [encoder setComputePipelineState:gQ4KPipeline];
@@ -542,7 +680,7 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
 
     MTLSize threads_per_group = MTLSizeMake(RUSTY_MATVEC_THREADS_PER_GROUP, 1, 1);
     MTLSize threadgroups = MTLSizeMake(
-        ((NSUInteger)rows + RUSTY_MATVEC_ROWS_PER_GROUP - 1) / RUSTY_MATVEC_ROWS_PER_GROUP,
+        ((NSUInteger)rows + rows_per_group - 1) / rows_per_group,
         1,
         1
     );
@@ -555,11 +693,13 @@ static void rusty_metal_encode_q6k(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLBuffer> out_buffer,
                                    uintptr_t rows,
                                    uintptr_t cols) {
+    NSUInteger rows_per_group = rusty_metal_q6k_rows_per_group((NSUInteger)rows);
     RustyQ4KParams params = {
         .rows = (uint32_t)rows,
         .cols = (uint32_t)cols,
         .row_bytes = (uint32_t)((cols / 256) * 210),
         .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
     };
 
     [encoder setComputePipelineState:gQ6KPipeline];
@@ -568,9 +708,9 @@ static void rusty_metal_encode_q6k(id<MTLComputeCommandEncoder> encoder,
     [encoder setBuffer:out_buffer offset:0 atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-    MTLSize threads_per_group = MTLSizeMake(RUSTY_MATVEC_THREADS_PER_GROUP, 1, 1);
+    MTLSize threads_per_group = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
     MTLSize threadgroups = MTLSizeMake(
-        ((NSUInteger)rows + RUSTY_MATVEC_ROWS_PER_GROUP - 1) / RUSTY_MATVEC_ROWS_PER_GROUP,
+        ((NSUInteger)rows + rows_per_group - 1) / rows_per_group,
         1,
         1
     );
@@ -588,6 +728,7 @@ static void rusty_metal_encode_q4_0(id<MTLComputeCommandEncoder> encoder,
         .cols = (uint32_t)cols,
         .row_bytes = (uint32_t)((cols / 32) * 18),
         .n_blocks = (uint32_t)(cols / 32),
+        .rows_per_group = RUSTY_MATVEC_ROWS_PER_GROUP,
     };
 
     [encoder setComputePipelineState:gQ4_0Pipeline];
@@ -616,6 +757,7 @@ static void rusty_metal_encode_q8_0(id<MTLComputeCommandEncoder> encoder,
         .cols = (uint32_t)cols,
         .row_bytes = (uint32_t)((cols / 32) * 34),
         .n_blocks = (uint32_t)(cols / 32),
+        .rows_per_group = RUSTY_MATVEC_ROWS_PER_GROUP,
     };
 
     [encoder setComputePipelineState:gQ8_0Pipeline];
@@ -1056,6 +1198,111 @@ int rusty_metal_q4k_q4k_q6k_ffn(const uint8_t *gate_weights,
         if ([command_buffer status] != MTLCommandBufferStatusCompleted) return 0;
 
         if (out_needs_copy) memcpy(out, [out_metal contents], out_size);
+        return 1;
+    }
+}
+
+int rusty_metal_mistral_post_attention_ffn(const uint8_t *wo_weights,
+                                           uintptr_t wo_weights_len,
+                                           const uint8_t *gate_weights,
+                                           uintptr_t gate_weights_len,
+                                           const uint8_t *up_weights,
+                                           uintptr_t up_weights_len,
+                                           const uint8_t *down_weights,
+                                           uintptr_t down_weights_len,
+                                           float *x,
+                                           uintptr_t dim,
+                                           const float *attn_out,
+                                           uintptr_t attn_cols,
+                                           const float *ffn_norm,
+                                           float rms_eps,
+                                           uintptr_t hidden_rows,
+                                           uintptr_t down_rows,
+                                           uintptr_t down_cols) {
+    if (!rusty_metal_init() || !wo_weights || !gate_weights || !up_weights || !down_weights ||
+        !x || !attn_out || !ffn_norm || dim == 0 || attn_cols == 0 || hidden_rows == 0 ||
+        down_rows == 0 || down_cols == 0 || down_rows != dim || hidden_rows != down_cols ||
+        (dim % 256) != 0 || (attn_cols % 256) != 0 || (down_cols % 256) != 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> wo_weight = rusty_metal_weight_buffer(wo_weights, wo_weights_len);
+        id<MTLBuffer> gate_weight = rusty_metal_weight_buffer(gate_weights, gate_weights_len);
+        id<MTLBuffer> up_weight = rusty_metal_weight_buffer(up_weights, up_weights_len);
+        id<MTLBuffer> down_weight = rusty_metal_weight_buffer(down_weights, down_weights_len);
+        if (!wo_weight || !gate_weight || !up_weight || !down_weight) return 0;
+
+        static id<MTLBuffer> x_buffer = nil;
+        static id<MTLBuffer> attn_buffer = nil;
+        static id<MTLBuffer> norm_weight_buffer = nil;
+        static id<MTLBuffer> proj_buffer = nil;
+        static id<MTLBuffer> norm_buffer = nil;
+        static id<MTLBuffer> gate_buffer = nil;
+        static id<MTLBuffer> up_buffer = nil;
+        static id<MTLBuffer> hidden_buffer = nil;
+        NSUInteger x_size = (NSUInteger)(dim * sizeof(float));
+        NSUInteger attn_size = (NSUInteger)(attn_cols * sizeof(float));
+        NSUInteger hidden_size = (NSUInteger)(hidden_rows * sizeof(float));
+        BOOL x_needs_copy = YES;
+
+        id<MTLBuffer> x_metal = rusty_metal_inout_buffer(x, x_size, &x_buffer, &x_needs_copy);
+        id<MTLBuffer> attn_metal = rusty_metal_input_buffer(attn_out, attn_size, &attn_buffer);
+        id<MTLBuffer> norm_weight_metal = rusty_metal_input_buffer(ffn_norm, x_size, &norm_weight_buffer);
+        if (!x_metal || !attn_metal || !norm_weight_metal ||
+            !rusty_metal_ensure_buffer(&proj_buffer, x_size) ||
+            !rusty_metal_ensure_buffer(&norm_buffer, x_size) ||
+            !rusty_metal_ensure_buffer(&gate_buffer, hidden_size) ||
+            !rusty_metal_ensure_buffer(&up_buffer, hidden_size) ||
+            !rusty_metal_ensure_buffer(&hidden_buffer, hidden_size)) {
+            return 0;
+        }
+
+        RustyResidualNormParams norm_params = {
+            .len = (uint32_t)dim,
+            .eps = rms_eps,
+        };
+        RustyUnaryParams hidden_params = {
+            .len = (uint32_t)hidden_rows,
+        };
+        RustyUnaryParams add_params = {
+            .len = (uint32_t)dim,
+        };
+
+        id<MTLCommandBuffer> command_buffer = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        rusty_metal_encode_q4k(encoder, wo_weight, attn_metal, proj_buffer, dim, attn_cols);
+        [encoder setComputePipelineState:gResidualRmsPipeline];
+        [encoder setBuffer:x_metal offset:0 atIndex:0];
+        [encoder setBuffer:proj_buffer offset:0 atIndex:1];
+        [encoder setBuffer:norm_weight_metal offset:0 atIndex:2];
+        [encoder setBuffer:norm_buffer offset:0 atIndex:3];
+        [encoder setBytes:&norm_params length:sizeof(norm_params) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        rusty_metal_encode_q4k(encoder, gate_weight, norm_buffer, gate_buffer, hidden_rows, dim);
+        rusty_metal_encode_q4k(encoder, up_weight, norm_buffer, up_buffer, hidden_rows, dim);
+        [encoder setComputePipelineState:gSiluMulPipeline];
+        [encoder setBuffer:gate_buffer offset:0 atIndex:0];
+        [encoder setBuffer:up_buffer offset:0 atIndex:1];
+        [encoder setBuffer:hidden_buffer offset:0 atIndex:2];
+        [encoder setBytes:&hidden_params length:sizeof(hidden_params) atIndex:3];
+        MTLSize silu_threads = MTLSizeMake(256, 1, 1);
+        MTLSize silu_groups = MTLSizeMake(((NSUInteger)hidden_rows + 255) / 256, 1, 1);
+        [encoder dispatchThreadgroups:silu_groups threadsPerThreadgroup:silu_threads];
+        rusty_metal_encode_q6k(encoder, down_weight, hidden_buffer, proj_buffer, down_rows, down_cols);
+        [encoder setComputePipelineState:gResidualAddPipeline];
+        [encoder setBuffer:x_metal offset:0 atIndex:0];
+        [encoder setBuffer:proj_buffer offset:0 atIndex:1];
+        [encoder setBytes:&add_params length:sizeof(add_params) atIndex:2];
+        MTLSize add_threads = MTLSizeMake(256, 1, 1);
+        MTLSize add_groups = MTLSizeMake(((NSUInteger)dim + 255) / 256, 1, 1);
+        [encoder dispatchThreadgroups:add_groups threadsPerThreadgroup:add_threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if ([command_buffer status] != MTLCommandBufferStatusCompleted) return 0;
+
+        if (x_needs_copy) memcpy(x, [x_metal contents], x_size);
         return 1;
     }
 }
