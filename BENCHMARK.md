@@ -1,6 +1,6 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-06-09 22:01 CEST**
+Updated: **2026-06-17 23:02 CEST**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
 
@@ -36,8 +36,8 @@ This report compares the CPU path with the optional Apple Metal GPU path. Metal 
 
 | Profile | Ok | Failed | Skipped/partial | Best decode | Median decode |
 |---|---:|---:|---:|---:|---:|
-| CPU | 11 | 0 | 3 | 12.7 | 5.0 |
-| Metal GPU | 11 | 0 | 3 | 23.7 | 13.2 |
+| CPU | 11 | 0 | 3 | 12.9 | 5.0 |
+| Metal GPU | 11 | 0 | 3 | 27.7 | 15.1 |
 
 ## CPU vs Metal
 
@@ -46,19 +46,19 @@ Each speed cell is `decode / prefill` in tokens per second. Speedup uses decode 
 | # | Model | Arch | Size | CPU | Metal | Metal/CPU | Result |
 |---:|---|:---:|---:|---:|---:|---:|---|
 | 1 | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` | deepseek2 | 9884 | partial | partial | — | DeepSeek2 MLA attention tensors are present… |
-| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | 4466 | 5.4 / 5.7 | 14.8 / 12.9 | 2.75x | Metal faster |
-| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | 6652 | 4.3 / 4.8 | 8.0 / 7.6 | 1.86x | Metal faster |
-| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | 16017 | 12.1 / 17.6 | 18.3 / 20.6 | 1.52x | Metal faster |
-| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | 3269 | 12.7 / 15.5 | 16.0 / 17.1 | 1.26x | Metal faster |
-| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | 11548 | 2.7 / 2.8 | 2.6 / 2.5 | 0.93x | CPU faster |
-| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | 4713 | 4.6 / 4.6 | 13.2 / 11.2 | 2.89x | Metal faster |
+| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | 4466 | 5.3 / 5.8 | 18.6 / 14.8 | 3.49x | Metal faster |
+| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | 6652 | 4.3 / 4.8 | 7.6 / 7.2 | 1.79x | Metal faster |
+| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | 16017 | 12.2 / 15.1 | 18.5 / 14.1 | 1.51x | Metal faster |
+| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | 3269 | 12.9 / 15.6 | 18.2 / 18.7 | 1.41x | Metal faster |
+| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | 11548 | 2.7 / 2.8 | 2.5 / 2.5 | 0.91x | CPU faster |
+| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | 4713 | 4.5 / 4.7 | 15.1 / 11.6 | 3.32x | Metal faster |
 | 8 | `granite-embedding-278m-multilingual-Q4_K_M.gguf` | bert | 208 | skip | skip | — | unsupported architecture |
-| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | 4692 | 5.0 / 5.4 | 15.1 / 13.7 | 3.03x | Metal faster |
-| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | 7857 | 3.0 / 3.2 | 9.8 / 8.2 | 3.27x | Metal faster |
-| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | 2047 | 10.1 / 11.7 | 23.7 / 22.3 | 2.33x | Metal faster |
+| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | 4692 | 5.0 / 5.4 | 18.6 / 15.1 | 3.73x | Metal faster |
+| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | 7857 | 3.0 / 3.2 | 11.2 / 6.8 | 3.71x | Metal faster |
+| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | 2047 | 10.1 / 11.6 | 27.7 / 24.5 | 2.75x | Metal faster |
 | 12 | `NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf` | nemotron_h | 2705 | skip | skip | — | unsupported architecture |
-| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | 2282 | 9.7 / 10.1 | 13.0 / 13.0 | 1.34x | Metal faster |
-| 14 | `phi-4-Q4_K_M.gguf` | phi3 | 8633 | 2.8 / 2.9 | 6.1 / 5.5 | 2.19x | Metal faster |
+| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | 2282 | 8.5 / 9.0 | 13.6 / 14.0 | 1.61x | Metal faster |
+| 14 | `phi-4-Q4_K_M.gguf` | phi3 | 8633 | 2.6 / 2.6 | 7.5 / 5.7 | 2.85x | Metal faster |
 
 ## Support Issues
 
@@ -78,70 +78,70 @@ Each speed cell is `decode / prefill` in tokens per second. Speedup uses decode 
 | # | Model | Arch | Status | Size | Load | Decode | Prefill | Note |
 |---:|---|:---:|---|---:|---:|---:|---:|---|
 | 1 | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` | deepseek2 | partial | 9884 | — | — | — | DeepSeek2 MLA attention tensors are present, but the runtime does not yet implement MLA |
-| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | ok | 4466 | 270 | 5.4 | 5.7 |  |
-| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | ok | 6652 | 542 | 4.3 | 4.8 |  |
-| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | ok | 16017 | 956 | 12.1 | 17.6 |  |
-| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | ok | 3269 | 403 | 12.7 | 15.5 |  |
-| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | ok | 11548 | 698 | 2.7 | 2.8 |  |
-| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | ok | 4713 | 242 | 4.6 | 4.6 |  |
+| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | ok | 4466 | 263 | 5.3 | 5.8 |  |
+| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | ok | 6652 | 590 | 4.3 | 4.8 |  |
+| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | ok | 16017 | 6537 | 12.2 | 15.1 |  |
+| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | ok | 3269 | 421 | 12.9 | 15.6 |  |
+| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | ok | 11548 | 756 | 2.7 | 2.8 |  |
+| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | ok | 4713 | 255 | 4.5 | 4.7 |  |
 | 8 | `granite-embedding-278m-multilingual-Q4_K_M.gguf` | bert | skip | 208 | — | — | — | unsupported architecture |
-| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | ok | 4692 | 324 | 5.0 | 5.4 |  |
-| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | ok | 7857 | 470 | 3.0 | 3.2 |  |
-| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | ok | 2047 | 184 | 10.1 | 11.7 |  |
+| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | ok | 4692 | 334 | 5.0 | 5.4 |  |
+| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | ok | 7857 | 507 | 3.0 | 3.2 |  |
+| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | ok | 2047 | 202 | 10.1 | 11.6 |  |
 | 12 | `NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf` | nemotron_h | skip | 2705 | — | — | — | unsupported architecture |
-| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | ok | 2282 | 77 | 9.7 | 10.1 |  |
-| 14 | `phi-4-Q4_K_M.gguf` | phi3 | ok | 8633 | 428 | 2.8 | 2.9 |  |
+| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | ok | 2282 | 91 | 8.5 | 9.0 |  |
+| 14 | `phi-4-Q4_K_M.gguf` | phi3 | ok | 8633 | 519 | 2.6 | 2.6 |  |
 
 ### CPU Decode Ranking
 
 | Rank | Model | Decode | Prefill | Load |
 |---:|---|---:|---:|---:|
-| 1 | `gemma-4-E2B-it-Q4_K_M.gguf` | 12.7 | 15.5 | 403 |
-| 2 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | 12.1 | 17.6 | 956 |
-| 3 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | 10.1 | 11.7 | 184 |
-| 4 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | 9.7 | 10.1 | 77 |
-| 5 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | 5.4 | 5.7 | 270 |
-| 6 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 5.0 | 5.4 | 324 |
-| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | 4.6 | 4.6 | 242 |
-| 8 | `gemma-4-12B-it-QAT-Q4_0.gguf` | 4.3 | 4.8 | 542 |
-| 9 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | 3.0 | 3.2 | 470 |
-| 10 | `phi-4-Q4_K_M.gguf` | 2.8 | 2.9 | 428 |
-| 11 | `gpt-oss-20b-MXFP4.gguf` | 2.7 | 2.8 | 698 |
+| 1 | `gemma-4-E2B-it-Q4_K_M.gguf` | 12.9 | 15.6 | 421 |
+| 2 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | 12.2 | 15.1 | 6537 |
+| 3 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | 10.1 | 11.6 | 202 |
+| 4 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | 8.5 | 9.0 | 91 |
+| 5 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | 5.3 | 5.8 | 263 |
+| 6 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 5.0 | 5.4 | 334 |
+| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | 4.5 | 4.7 | 255 |
+| 8 | `gemma-4-12B-it-QAT-Q4_0.gguf` | 4.3 | 4.8 | 590 |
+| 9 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | 3.0 | 3.2 | 507 |
+| 10 | `gpt-oss-20b-MXFP4.gguf` | 2.7 | 2.8 | 756 |
+| 11 | `phi-4-Q4_K_M.gguf` | 2.6 | 2.6 | 519 |
 
 ### Metal GPU
 
 | # | Model | Arch | Status | Size | Load | Decode | Prefill | Note |
 |---:|---|:---:|---|---:|---:|---:|---:|---|
 | 1 | `DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf` | deepseek2 | partial | 9884 | — | — | — | DeepSeek2 MLA attention tensors are present, but the runtime does not yet implement MLA |
-| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | ok | 4466 | 273 | 14.8 | 12.9 |  |
-| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | ok | 6652 | 529 | 8.0 | 7.6 |  |
-| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | ok | 16017 | 899 | 18.3 | 20.6 |  |
-| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | ok | 3269 | 395 | 16.0 | 17.1 |  |
-| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | ok | 11548 | 666 | 2.6 | 2.5 |  |
-| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | ok | 4713 | 222 | 13.2 | 11.2 |  |
+| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | qwen2 | ok | 4466 | 286 | 18.6 | 14.8 |  |
+| 3 | `gemma-4-12B-it-QAT-Q4_0.gguf` | gemma4 | ok | 6652 | 555 | 7.6 | 7.2 |  |
+| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | gemma4 | ok | 16017 | 7153 | 18.5 | 14.1 |  |
+| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | gemma4 | ok | 3269 | 424 | 18.2 | 18.7 |  |
+| 6 | `gpt-oss-20b-MXFP4.gguf` | gpt-oss | ok | 11548 | 740 | 2.5 | 2.5 |  |
+| 7 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | granite | ok | 4713 | 265 | 15.1 | 11.6 |  |
 | 8 | `granite-embedding-278m-multilingual-Q4_K_M.gguf` | bert | skip | 208 | — | — | — | unsupported architecture |
-| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | ok | 4692 | 302 | 15.1 | 13.7 |  |
-| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | ok | 7857 | 436 | 9.8 | 8.2 |  |
-| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | ok | 2047 | 191 | 23.7 | 22.3 |  |
+| 9 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | llama | ok | 4692 | 365 | 18.6 | 15.1 |  |
+| 10 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | mistral3 | ok | 7857 | 525 | 11.2 | 6.8 |  |
+| 11 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | mistral3 | ok | 2047 | 220 | 27.7 | 24.5 |  |
 | 12 | `NVIDIA-Nemotron-3-Nano-4B-Q4_K_M.gguf` | nemotron_h | skip | 2705 | — | — | — | unsupported architecture |
-| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | ok | 2282 | 64 | 13.0 | 13.0 |  |
-| 14 | `phi-4-Q4_K_M.gguf` | phi3 | ok | 8633 | 391 | 6.1 | 5.5 |  |
+| 13 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | phi3 | ok | 2282 | 84 | 13.6 | 14.0 |  |
+| 14 | `phi-4-Q4_K_M.gguf` | phi3 | ok | 8633 | 426 | 7.5 | 5.7 |  |
 
 ### Metal GPU Decode Ranking
 
 | Rank | Model | Decode | Prefill | Load |
 |---:|---|---:|---:|---:|
-| 1 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | 23.7 | 22.3 | 191 |
-| 2 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | 18.3 | 20.6 | 899 |
-| 3 | `gemma-4-E2B-it-Q4_K_M.gguf` | 16.0 | 17.1 | 395 |
-| 4 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 15.1 | 13.7 | 302 |
-| 5 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | 14.8 | 12.9 | 273 |
-| 6 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | 13.2 | 11.2 | 222 |
-| 7 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | 13.0 | 13.0 | 64 |
-| 8 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | 9.8 | 8.2 | 436 |
-| 9 | `gemma-4-12B-it-QAT-Q4_0.gguf` | 8.0 | 7.6 | 529 |
-| 10 | `phi-4-Q4_K_M.gguf` | 6.1 | 5.5 | 391 |
-| 11 | `gpt-oss-20b-MXFP4.gguf` | 2.6 | 2.5 | 666 |
+| 1 | `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` | 27.7 | 24.5 | 220 |
+| 2 | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | 18.6 | 14.8 | 286 |
+| 3 | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | 18.6 | 15.1 | 365 |
+| 4 | `gemma-4-26B-A4B-it-Q4_K_M.gguf` | 18.5 | 14.1 | 7153 |
+| 5 | `gemma-4-E2B-it-Q4_K_M.gguf` | 18.2 | 18.7 | 424 |
+| 6 | `granite-3.1-8b-instruct-Q4_K_M.gguf` | 15.1 | 11.6 | 265 |
+| 7 | `Phi-3.1-mini-128k-instruct-Q4_K_M.gguf` | 13.6 | 14.0 | 84 |
+| 8 | `Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf` | 11.2 | 6.8 | 525 |
+| 9 | `gemma-4-12B-it-QAT-Q4_0.gguf` | 7.6 | 7.2 | 555 |
+| 10 | `phi-4-Q4_K_M.gguf` | 7.5 | 5.7 | 426 |
+| 11 | `gpt-oss-20b-MXFP4.gguf` | 2.5 | 2.5 | 740 |
 
 ---
 
