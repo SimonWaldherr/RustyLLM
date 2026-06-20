@@ -715,10 +715,7 @@ fn handle_mcp_request(
         }
     };
 
-    if id.is_none() {
-        return None;
-    }
-    let id = id.expect("id checked above");
+    let id = id?;
     let params = request
         .get("params")
         .cloned()
