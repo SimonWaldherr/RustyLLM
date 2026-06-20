@@ -80,6 +80,10 @@ function apiErrorMessage(parsed, text, status) {
   return text || ("HTTP " + status);
 }
 
+function makeSessionId(prefix) {
+  return prefix + "-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
 /* ════════════════════════════════
    Expert UI
    ════════════════════════════════ */
@@ -91,6 +95,9 @@ function initExpert() {
   const modelHintEl   = document.getElementById("modelHint");
   const promptEl      = document.getElementById("prompt");
   const systemPromptEl = document.getElementById("systemPrompt");
+  const thinkingEl    = document.getElementById("thinking");
+  const thinkingPromptEl = document.getElementById("thinkingPrompt");
+  const thinkingMaxTokensEl = document.getElementById("thinkingMaxTokens");
   const messagesEl    = document.getElementById("messages");
   const emptyEl       = document.getElementById("empty");
   const statusEl      = document.getElementById("status");
@@ -124,6 +131,7 @@ function initExpert() {
   const ragAnswerEl     = document.getElementById("rag-answer");
 
   const history = [];
+  let conversationId = makeSessionId("expert");
   let controller = null;
   let activeTurn = 0;
 
@@ -205,12 +213,21 @@ function initExpert() {
       repeat_penalty: Number(repeatPenaltyEl.value)
     };
     if (forOpenAI) options.model = selectedModel();
+    options.conversation_id = conversationId;
+    options.cache_prompt = true;
     const seed = seedEl.value.trim();
     const system = systemPromptEl.value.trim();
     const stop = stopSpec();
     if (seed) options.seed = Number(seed);
     if (system) options.system_prompt = system;
     if (stop) options.stop = stop;
+    options.thinking = Boolean(thinkingEl.checked);
+    if (thinkingEl.checked) {
+      const thinkingPrompt = thinkingPromptEl.value.trim();
+      const thinkingMaxTokens = Number(thinkingMaxTokensEl.value) || 192;
+      if (thinkingPrompt) options.thinking_prompt = thinkingPrompt;
+      options.thinking_max_tokens = thinkingMaxTokens;
+    }
     return options;
   }
 
@@ -442,6 +459,7 @@ function initExpert() {
 
   clearEl.addEventListener("click", () => {
     history.length = 0;
+    conversationId = makeSessionId("expert");
     messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
     emptyEl.hidden = false;
     updateStats("");
@@ -559,6 +577,8 @@ function initChat() {
   const maxTokensEl      = document.getElementById("maxTokens");
   const temperatureEl    = document.getElementById("temperature");
   const tempValueEl      = document.getElementById("tempValue");
+  const thinkingEl       = document.getElementById("thinking");
+  const thinkingPromptEl = document.getElementById("thinkingPrompt");
   const scrollEl         = document.getElementById("scroll");
   const statsEl          = document.getElementById("stats");
   const scrollBtnEl      = document.getElementById("scroll-btn");
@@ -592,14 +612,25 @@ function initChat() {
         temperatureEl.value = p.temperature;
         tempValueEl.textContent = Number(p.temperature).toFixed(2);
       }
+      if (p.thinking !== undefined) thinkingEl.checked = Boolean(p.thinking);
+      if (p.thinkingPrompt !== undefined) thinkingPromptEl.value = p.thinkingPrompt;
     } catch (_) {}
   }
   function savePrefs() {
-    try { localStorage.setItem(PREFS_KEY, JSON.stringify({ maxTokens: maxTokensEl.value, temperature: temperatureEl.value })); } catch (_) {}
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify({
+        maxTokens: maxTokensEl.value,
+        temperature: temperatureEl.value,
+        thinking: thinkingEl.checked,
+        thinkingPrompt: thinkingPromptEl.value
+      }));
+    } catch (_) {}
   }
   loadPrefs();
   maxTokensEl.addEventListener("change", savePrefs);
   temperatureEl.addEventListener("change", savePrefs);
+  thinkingEl.addEventListener("change", savePrefs);
+  thinkingPromptEl.addEventListener("change", savePrefs);
 
   /* ── Session / history storage ── */
   const SESSIONS_KEY = "rustyllm_sessions";
@@ -840,8 +871,14 @@ function initChat() {
         body: JSON.stringify({
           messages: history.concat(userMessage),
           stream: true,
+          conversation_id: currentSessionId,
+          cache_prompt: true,
           max_tokens: Number(maxTokensEl.value) || 512,
-          temperature: Number(temperatureEl.value)
+          temperature: Number(temperatureEl.value),
+          thinking: Boolean(thinkingEl.checked),
+          ...(thinkingEl.checked && thinkingPromptEl.value.trim()
+            ? { thinking_prompt: thinkingPromptEl.value.trim() }
+            : {})
         }),
         signal: turn.signal
       });

@@ -10,7 +10,7 @@
 //! [`SessionStore`] manages a bounded set of sessions with LRU eviction.
 
 use crate::model::{DecodeBuffer, KVCache};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -36,6 +36,8 @@ pub struct Session {
     pub cached_tokens_served: usize,
     /// Cumulative count of tokens that required a fresh forward pass.
     pub evaluated_tokens: usize,
+    /// Canonical `SKILL.md` paths already injected for this conversation.
+    pub loaded_skill_paths: HashSet<String>,
 }
 
 impl Session {
@@ -50,6 +52,7 @@ impl Session {
             last_used: Instant::now(),
             cached_tokens_served: 0,
             evaluated_tokens: 0,
+            loaded_skill_paths: HashSet::new(),
         }
     }
 

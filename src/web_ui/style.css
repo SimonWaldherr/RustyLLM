@@ -1125,6 +1125,8 @@ body.chat .settings {
 body.chat .stats { font-size: 12px; color: var(--muted); margin-left: auto; }
 body.chat .hint { width: min(900px, 100%); margin: 6px auto 0; color: var(--muted); font-size: 12px; }
 body.chat label { display: inline-flex; align-items: center; gap: 7px; }
+body.chat label.toggle { white-space: nowrap; }
+body.chat input[type="checkbox"] { accent-color: var(--accent); }
 body.chat input[type="number"] {
   width: 76px;
   border: 1px solid var(--line);
@@ -1135,6 +1137,28 @@ body.chat input[type="number"] {
   font: inherit;
 }
 body.chat input[type="range"] { accent-color: var(--accent); }
+body.chat .thinking-details {
+  width: min(900px, 100%);
+  margin: 8px auto 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  overflow: hidden;
+}
+body.chat .thinking-details summary {
+  cursor: pointer;
+  padding: 7px 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  background: color-mix(in srgb, var(--line) 28%, transparent);
+}
+body.chat .thinking-details textarea {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  min-height: 74px;
+  max-height: 160px;
+}
 
 @media (max-width: 700px) {
   body.chat .history-panel { width: 200px; }

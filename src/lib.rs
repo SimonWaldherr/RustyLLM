@@ -39,6 +39,8 @@ pub mod server;
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 pub mod session;
 pub mod simd;
+#[cfg(not(target_family = "wasm"))]
+pub mod skills;
 pub mod tokenizer;
 
 pub use runtime::{

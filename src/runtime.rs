@@ -6,6 +6,8 @@ use crate::model::{
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
 use std::cmp::Ordering;
+#[cfg(not(target_family = "wasm"))]
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -62,11 +64,58 @@ pub struct GenerationOptions {
     pub sampler: SamplerConfig,
     pub seed: u64,
     pub system_prompt: String,
+    pub thinking: ThinkingConfig,
+    pub skills: SkillConfig,
     pub speculative: SpeculativeConfig,
     pub runtime: RuntimeOptConfig,
     /// Stop generation when any of these strings appears in the output.
     /// The matched sequence is not included in the returned text.
     pub stop_sequences: Vec<String>,
+}
+
+pub const DEFAULT_THINKING_SYSTEM_PROMPT: &str = "Formuliere den folgenden Prompt in eigenen Worten, möglichst kompakt und mit passender Fachterminologie. Identifiziere Sprache und Stil des Original-Prompts. Erkenne, ob der Prompt eine Ausgabe in einem bestimmten Stil fordert; falls kein Stil gefordert wird, orientiere dich am Prompt. Gib ausschließlich den umformulierten Prompt aus, ohne Erklärung, Vorrede oder Markdown.";
+
+#[derive(Clone, Debug)]
+pub struct ThinkingConfig {
+    pub enabled: bool,
+    pub system_prompt: String,
+    pub max_tokens: usize,
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_prompt: DEFAULT_THINKING_SYSTEM_PROMPT.to_string(),
+            max_tokens: 192,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SkillConfig {
+    pub directory: Option<String>,
+    pub max_skills: usize,
+    pub max_bytes_per_skill: usize,
+}
+
+impl SkillConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.directory
+            .as_deref()
+            .map(|path| !path.trim().is_empty())
+            .unwrap_or(false)
+    }
+}
+
+impl Default for SkillConfig {
+    fn default() -> Self {
+        Self {
+            directory: None,
+            max_skills: 3,
+            max_bytes_per_skill: 16 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +236,8 @@ impl Default for GenerationOptions {
             sampler: SamplerConfig::default(),
             seed: 0,
             system_prompt: String::from("You are a helpful assistant."),
+            thinking: ThinkingConfig::default(),
+            skills: SkillConfig::default(),
             speculative: SpeculativeConfig::default(),
             runtime: RuntimeOptConfig::default(),
             stop_sequences: Vec::new(),
@@ -199,6 +250,20 @@ impl GenerationOptions {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_tokens == 0 {
             return Err(String::from("max_tokens must be greater than 0."));
+        }
+        if self.thinking.enabled && self.thinking.max_tokens == 0 {
+            return Err(String::from("thinking max_tokens must be greater than 0."));
+        }
+        if self.thinking.enabled && self.thinking.system_prompt.trim().is_empty() {
+            return Err(String::from("thinking prompt must not be empty."));
+        }
+        if self.skills.is_enabled() {
+            if self.skills.max_skills == 0 {
+                return Err(String::from("--max-skills must be greater than 0."));
+            }
+            if self.skills.max_bytes_per_skill == 0 {
+                return Err(String::from("--skill-max-bytes must be greater than 0."));
+            }
         }
         if !self.sampler.temperature.is_finite() || self.sampler.temperature < 0.0 {
             return Err(String::from("temperature must be a finite number >= 0."));
@@ -279,6 +344,12 @@ pub struct GenerationResult {
 pub struct LoadInfo {
     pub file_size_bytes: usize,
     pub load_time: Duration,
+    pub mmap_time: Duration,
+    pub parse_time: Duration,
+    pub compatibility_time: Duration,
+    pub tokenizer_time: Duration,
+    pub weights_time: Duration,
+    pub runner_time: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +413,38 @@ fn argmax_finite_token(logits: &[f32]) -> u32 {
         }
     }
     best_idx as u32
+}
+
+fn clean_thinking_prompt(text: &str) -> String {
+    let mut value = text.trim().to_string();
+    if let Some(stripped) = value.strip_prefix("```") {
+        value = stripped.trim().to_string();
+        if let Some((_, rest)) = value.split_once('\n') {
+            value = rest.trim().to_string();
+        }
+        if let Some(stripped) = value.strip_suffix("```") {
+            value = stripped.trim().to_string();
+        }
+    }
+
+    for prefix in [
+        "Prompt:",
+        "Umformulierter Prompt:",
+        "Rewritten prompt:",
+        "Reformulated prompt:",
+    ] {
+        if let Some(stripped) = value.strip_prefix(prefix) {
+            value = stripped.trim().to_string();
+            break;
+        }
+    }
+
+    let quoted = (value.starts_with('"') && value.ends_with('"'))
+        || (value.starts_with('\'') && value.ends_with('\''));
+    if quoted && value.len() >= 2 {
+        value = value[1..value.len() - 1].trim().to_string();
+    }
+    value
 }
 
 #[inline]
@@ -800,21 +903,30 @@ impl Runner {
     /// Loads a runner by memory-mapping a GGUF file path.
     pub fn from_path(path: &str) -> Result<(Self, LoadInfo), String> {
         let t0 = Instant::now();
+        let t_mmap = Instant::now();
         let mmap = crate::mmap::MmapFile::open(path)
             .map_err(|err| format!("Failed to open model: {}", err))?;
+        let mmap_time = t_mmap.elapsed();
         let file_size_bytes = mmap.len();
-        let gguf = GGUFFile::parse(mmap.as_slice())?;
+        let t_parse = Instant::now();
+        let gguf = GGUFFile::parse_quiet(mmap.as_slice())?;
+        let parse_time = t_parse.elapsed();
         let arch = gguf
             .get_str("general.architecture")
             .unwrap_or("llama")
             .to_string();
 
+        let t_compatibility = Instant::now();
         let compatibility = compatibility_report(&gguf);
         if !compatibility.is_supported() {
             return Err(compatibility.first_error(&arch));
         }
+        let compatibility_time = t_compatibility.elapsed();
 
+        let t_tokenizer = Instant::now();
         let tok = Tokenizer::from_metadata(&gguf.metadata);
+        let tokenizer_time = t_tokenizer.elapsed();
+        let t_weights = Instant::now();
         let (config, weights) = match arch.as_str() {
             "gpt-oss" => {
                 let (config, weights) = model::load_gpt_oss_model(mmap.as_slice(), &gguf, true);
@@ -830,7 +942,9 @@ impl Runner {
                 (config, LoadedWeights::Standard(weights))
             }
         };
+        let weights_time = t_weights.elapsed();
 
+        let t_runner = Instant::now();
         let runner = Self {
             gguf,
             arch,
@@ -841,12 +955,19 @@ impl Runner {
             generation_lock: Mutex::new(()),
             mapped_model: Some(mmap),
         };
+        let runner_time = t_runner.elapsed();
         let load_time = t0.elapsed();
         Ok((
             runner,
             LoadInfo {
                 file_size_bytes,
                 load_time,
+                mmap_time,
+                parse_time,
+                compatibility_time,
+                tokenizer_time,
+                weights_time,
+                runner_time,
             },
         ))
     }
@@ -1057,6 +1178,26 @@ impl Runner {
             "max-context={} tokens",
             self.effective_max_context(options)
         ));
+        if options.thinking.enabled {
+            items.push(format!(
+                "thinking=on max_tokens={}",
+                options.thinking.max_tokens
+            ));
+        } else {
+            items.push(String::from("thinking=off"));
+        }
+        if let Some(directory) = options.skills.directory.as_deref() {
+            if !directory.trim().is_empty() {
+                items.push(format!(
+                    "skills=on dir={} max={}",
+                    directory, options.skills.max_skills
+                ));
+            } else {
+                items.push(String::from("skills=off"));
+            }
+        } else {
+            items.push(String::from("skills=off"));
+        }
         if options.speculative.enabled && self.speculative_assistant.is_some() {
             items.push(format!(
                 "mtp=greedy assistant={} draft_tokens={} adaptive={} min_accept_rate={:.2}",
@@ -1652,21 +1793,107 @@ impl Runner {
         self.generate_chat_stream(&messages, options, on_token)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn options_with_skill_context(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+        loaded_skills: &mut HashSet<String>,
+    ) -> Result<GenerationOptions, String> {
+        let bundle =
+            crate::skills::prepare_skill_context(&options.skills, messages, loaded_skills)?;
+        if bundle.system_prompt_suffix.is_empty() {
+            return Ok(options.clone());
+        }
+
+        for path in &bundle.loaded_paths {
+            loaded_skills.insert(path.clone());
+        }
+
+        let mut generation = options.clone();
+        generation.system_prompt =
+            crate::skills::append_skill_context(&generation.system_prompt, &bundle);
+        Ok(generation)
+    }
+
+    /// Generates a complete response for a plain prompt with prompt-selected skills.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn generate_with_skill_memory(
+        &self,
+        prompt: &str,
+        options: &GenerationOptions,
+        loaded_skills: &mut HashSet<String>,
+    ) -> Result<GenerationResult, String> {
+        let messages = [ChatMessage::user(prompt)];
+        self.generate_chat_stream_with_skill_memory(&messages, options, loaded_skills, |_| {})
+    }
+
+    /// Generates a chat response with prompt-selected skills.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn generate_chat_with_skill_memory(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+        loaded_skills: &mut HashSet<String>,
+    ) -> Result<GenerationResult, String> {
+        self.generate_chat_stream_with_skill_memory(messages, options, loaded_skills, |_| {})
+    }
+
+    /// Generates a prompt response while streaming decoded chunks and loading each matching skill once.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn generate_stream_with_skill_memory<F>(
+        &self,
+        prompt: &str,
+        options: &GenerationOptions,
+        loaded_skills: &mut HashSet<String>,
+        on_token: F,
+    ) -> Result<GenerationResult, String>
+    where
+        F: FnMut(&str),
+    {
+        let messages = [ChatMessage::user(prompt)];
+        self.generate_chat_stream_with_skill_memory(&messages, options, loaded_skills, on_token)
+    }
+
+    /// Generates chat text while loading only prompt-relevant `SKILL.md` files once per memory set.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn generate_chat_stream_with_skill_memory<F>(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+        loaded_skills: &mut HashSet<String>,
+        on_token: F,
+    ) -> Result<GenerationResult, String>
+    where
+        F: FnMut(&str),
+    {
+        let generation = self.options_with_skill_context(messages, options, loaded_skills)?;
+        self.generate_chat_stream(messages, &generation, on_token)
+    }
+
     /// Generates a chat response while streaming decoded text chunks.
     pub fn generate_chat_stream<F>(
         &self,
         messages: &[ChatMessage],
         options: &GenerationOptions,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<GenerationResult, String>
     where
         F: FnMut(&str),
     {
+        options.validate()?;
+        if options.thinking.enabled {
+            let prepared_messages = self.apply_thinking_to_messages(messages, options)?;
+            let mut generation = options.clone();
+            generation.thinking.enabled = false;
+            return self.generate_chat_stream(&prepared_messages, &generation, on_token);
+        }
+
         let _guard = self
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
-        options.validate()?;
+        let mut on_token = on_token;
         let _metal_ultra_guard =
             crate::metal::scoped_ultra_mode(self.effective_metal_ultra(options));
 
@@ -1826,6 +2053,48 @@ impl Runner {
                 speculative: speculative_stats,
             },
         })
+    }
+
+    /// Runs the model-independent Thinking pre-pass over the latest user turn.
+    fn apply_thinking_to_messages(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+    ) -> Result<Vec<ChatMessage>, String> {
+        if messages.is_empty() {
+            return Err(String::from("No prompt provided."));
+        }
+
+        let Some(target_idx) = messages
+            .iter()
+            .rposition(|message| matches!(message.role, ChatRole::User))
+        else {
+            return Ok(messages.to_vec());
+        };
+
+        let original = messages[target_idx].content.trim();
+        if original.is_empty() {
+            return Ok(messages.to_vec());
+        }
+
+        let mut thinking_options = options.clone();
+        thinking_options.thinking.enabled = false;
+        thinking_options.max_tokens = options.thinking.max_tokens;
+        thinking_options.sampler.temperature = 0.0;
+        thinking_options.system_prompt = options.thinking.system_prompt.clone();
+        thinking_options.stop_sequences.clear();
+        thinking_options.speculative.enabled = false;
+
+        let thinking_messages = [ChatMessage::user(original.to_string())];
+        let rewritten = self.generate_chat(&thinking_messages, &thinking_options)?;
+        let rewritten_prompt = clean_thinking_prompt(&rewritten.text);
+        if rewritten_prompt.is_empty() {
+            return Ok(messages.to_vec());
+        }
+
+        let mut prepared = messages.to_vec();
+        prepared[target_idx].content = rewritten_prompt;
+        Ok(prepared)
     }
 
     fn prepare_speculative_state<'a>(
@@ -2478,6 +2747,23 @@ impl Runner {
         crate::session::Session::new(kv_cache, decode_buf)
     }
 
+    /// Generates chat text with session KV reuse and prompt-selected skills.
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    pub fn generate_chat_with_session_with_skill_memory<F>(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+        session: &mut crate::session::Session,
+        on_token: F,
+    ) -> Result<GenerationResult, String>
+    where
+        F: FnMut(&str),
+    {
+        let generation =
+            self.options_with_skill_context(messages, options, &mut session.loaded_skill_paths)?;
+        self.generate_chat_with_session(messages, &generation, session, on_token)
+    }
+
     /// Multi-turn generation that reuses a persistent [`crate::session::Session`].
     ///
     /// On each call the full chat prompt is rendered and tokenised.  A
@@ -2493,22 +2779,34 @@ impl Runner {
     /// Falls back to a full prefill when the new prompt exceeds the session's
     /// KV-cache capacity.
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
-    /// Generates chat text while reusing a session KV cache when possible.
     pub fn generate_chat_with_session<F>(
         &self,
         messages: &[ChatMessage],
         options: &GenerationOptions,
         session: &mut crate::session::Session,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<GenerationResult, String>
     where
         F: FnMut(&str),
     {
+        options.validate()?;
+        if options.thinking.enabled {
+            let prepared_messages = self.apply_thinking_to_messages(messages, options)?;
+            let mut generation = options.clone();
+            generation.thinking.enabled = false;
+            return self.generate_chat_with_session(
+                &prepared_messages,
+                &generation,
+                session,
+                on_token,
+            );
+        }
+
         let _guard = self
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
-        options.validate()?;
+        let mut on_token = on_token;
 
         if messages.is_empty() {
             return Err(String::from("No prompt provided."));
@@ -3199,8 +3497,9 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECENT_TOKEN_LIMIT, RuntimeProfile, cosine_similarity, l2_normalize_in_place,
-        mean_pool_in_place, push_recent_token, recent_token_tail, trailing_char_boundary_start,
+        RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt, cosine_similarity,
+        l2_normalize_in_place, mean_pool_in_place, push_recent_token, recent_token_tail,
+        trailing_char_boundary_start,
     };
 
     #[test]
@@ -3248,6 +3547,19 @@ mod tests {
         assert!(cosine_similarity(&[], &[]).is_err());
         assert!(cosine_similarity(&[1.0], &[1.0, 2.0]).is_err());
         assert!(cosine_similarity(&[0.0, 0.0], &[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    /// Verifies that Thinking prompt cleanup removes common model wrappers.
+    fn clean_thinking_prompt_removes_common_wrappers() {
+        assert_eq!(
+            clean_thinking_prompt("Prompt: Analyse Einsteins Relativitätstheorie."),
+            "Analyse Einsteins Relativitätstheorie."
+        );
+        assert_eq!(
+            clean_thinking_prompt("```text\nRewritten prompt: Compare TCP and UDP.\n```"),
+            "Compare TCP and UDP."
+        );
     }
 
     #[test]

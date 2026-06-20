@@ -197,6 +197,9 @@ struct GenerateRequest {
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
     system_prompt: Option<String>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     stop: Option<StopSpec>,
     /// Optional conversation ID for persistent KV-cache sessions.
     conversation_id: Option<String>,
@@ -225,6 +228,9 @@ struct OpenAiCompletionsRequest {
     #[allow(dead_code)]
     stream: Option<bool>,
     system_prompt: Option<String>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     stop: Option<StopSpec>,
     response_format: Option<serde_json::Value>,
     #[allow(dead_code)]
@@ -255,6 +261,9 @@ struct OpenAiChatCompletionsRequest {
     #[allow(dead_code)]
     stream: Option<bool>,
     system_prompt: Option<String>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     stop: Option<StopSpec>,
     response_format: Option<serde_json::Value>,
     #[allow(dead_code)]
@@ -280,6 +289,9 @@ struct OpenAiResponsesRequest {
     top_k: Option<usize>,
     repeat_penalty: Option<f32>,
     seed: Option<u64>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     #[allow(dead_code)]
     stream: Option<bool>,
     stop: Option<StopSpec>,
@@ -327,6 +339,9 @@ struct OllamaGenerateRequest {
     model: Option<String>,
     prompt: Option<String>,
     system: Option<String>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     #[allow(dead_code)]
     stream: Option<bool>,
     options: Option<OllamaOptions>,
@@ -337,6 +352,9 @@ struct OllamaGenerateRequest {
 struct OllamaChatRequest {
     model: Option<String>,
     messages: Vec<OllamaMessage>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
     #[allow(dead_code)]
     stream: Option<bool>,
     options: Option<OllamaOptions>,
@@ -583,6 +601,7 @@ pub struct McpServeOptions {
     pub defaults: GenerationOptions,
     pub chat_history_path: Option<String>,
     pub chat_history_lock: Arc<Mutex<()>>,
+    pub skill_memory: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Starts the blocking HTTP or HTTPS server loop.
@@ -777,6 +796,9 @@ fn mcp_tools_list() -> serde_json::Value {
                         "repeat_penalty": {"type": "number"},
                         "seed": {"type": "integer"},
                         "system_prompt": {"type": "string"},
+                        "thinking": {"type": "boolean"},
+                        "thinking_prompt": {"type": "string"},
+                        "thinking_max_tokens": {"type": "integer", "minimum": 1},
                         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}
                     }
                 }
@@ -806,6 +828,9 @@ fn mcp_tools_list() -> serde_json::Value {
                         "repeat_penalty": {"type": "number"},
                         "seed": {"type": "integer"},
                         "system_prompt": {"type": "string"},
+                        "thinking": {"type": "boolean"},
+                        "thinking_prompt": {"type": "string"},
+                        "thinking_max_tokens": {"type": "integer", "minimum": 1},
                         "stop": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}
                     }
                 }
@@ -878,7 +903,11 @@ fn mcp_tool_generate(
     let prompt = mcp_arg_string(args, "prompt")
         .ok_or_else(|| (-32602, String::from("generate requires a prompt string")))?;
     let generation = mcp_generation_options(&options.defaults, args);
-    match runner.generate(&prompt, &generation) {
+    let mut skill_memory = options
+        .skill_memory
+        .lock()
+        .expect("MCP skill memory lock poisoned");
+    match runner.generate_with_skill_memory(&prompt, &generation, &mut skill_memory) {
         Ok(result) => {
             let _ = append_mcp_history(
                 options,
@@ -904,7 +933,11 @@ fn mcp_tool_chat(
         .ok_or_else(|| (-32602, String::from("chat requires a messages array")))?;
     let messages = parse_mcp_messages(messages)?;
     let generation = mcp_generation_options(&options.defaults, args);
-    match runner.generate_chat(&messages, &generation) {
+    let mut skill_memory = options
+        .skill_memory
+        .lock()
+        .expect("MCP skill memory lock poisoned");
+    match runner.generate_chat_with_skill_memory(&messages, &generation, &mut skill_memory) {
         Ok(result) => {
             let _ = append_mcp_history(options, "mcp.chat", &messages, &result);
             Ok(mcp_text_result(&result.text))
@@ -978,6 +1011,10 @@ fn mcp_generation_options(
         mcp_arg_u64(args, "seed"),
         mcp_arg_string(args, "system_prompt").or_else(|| mcp_arg_string(args, "instructions")),
         stop,
+        mcp_arg_bool(args, "thinking"),
+        mcp_arg_string(args, "thinking_prompt")
+            .or_else(|| mcp_arg_string(args, "thinking_system_prompt")),
+        mcp_arg_usize(args, "thinking_max_tokens"),
     )
 }
 
@@ -998,6 +1035,11 @@ fn mcp_arg_usize(args: &serde_json::Value, name: &str) -> Option<usize> {
 /// Extracts a u64 argument from a JSON object.
 fn mcp_arg_u64(args: &serde_json::Value, name: &str) -> Option<u64> {
     args.get(name).and_then(|v| v.as_u64())
+}
+
+/// Extracts a bool argument from a JSON object.
+fn mcp_arg_bool(args: &serde_json::Value, name: &str) -> Option<bool> {
+    args.get(name).and_then(|v| v.as_bool())
 }
 
 /// Extracts an f32 argument from a JSON object.
@@ -1321,6 +1363,9 @@ fn route_streaming_request<W: Write>(
                     payload.seed,
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
+                    payload.thinking,
+                    payload.thinking_prompt,
+                    payload.thinking_max_tokens,
                 );
                 apply_response_format_hint(
                     &mut generation_options,
@@ -1363,6 +1408,9 @@ fn route_streaming_request<W: Write>(
                     payload.seed,
                     payload.system_prompt,
                     payload.stop.map(|s| s.into_vec()),
+                    payload.thinking,
+                    payload.thinking_prompt,
+                    payload.thinking_max_tokens,
                 );
                 apply_response_format_hint(
                     &mut generation_options,
@@ -1488,6 +1536,9 @@ fn route_openai_response_stream<W: Write>(
         payload.seed,
         payload.instructions,
         payload.stop.map(|s| s.into_vec()),
+        payload.thinking,
+        payload.thinking_prompt,
+        payload.thinking_max_tokens,
     );
     let format_hint = payload
         .text
@@ -1598,15 +1649,21 @@ fn route_ollama_generate_stream<W: Write>(
     }
     let started = Instant::now();
     write_ndjson_response_header(stream)?;
-    let result = runner.generate_stream(&prompt, &generation, |text| {
-        let chunk = serde_json::json!({
-            "model": model,
-            "created_at": iso_timestamp(),
-            "response": text,
-            "done": false,
-        });
-        let _ = write_json_line(stream, &chunk);
-    });
+    let mut loaded_skills = HashSet::new();
+    let result = runner.generate_stream_with_skill_memory(
+        &prompt,
+        &generation,
+        &mut loaded_skills,
+        |text| {
+            let chunk = serde_json::json!({
+                "model": model,
+                "created_at": iso_timestamp(),
+                "response": text,
+                "done": false,
+            });
+            let _ = write_json_line(stream, &chunk);
+        },
+    );
     match result {
         Ok(result) => {
             let messages = [ChatMessage::user(prompt)];
@@ -1665,15 +1722,21 @@ fn route_ollama_chat_stream<W: Write>(
     let generation = apply_ollama_options(&options.defaults, payload.options);
     let started = Instant::now();
     write_ndjson_response_header(stream)?;
-    let result = runner.generate_chat_stream(&messages, &generation, |text| {
-        let chunk = serde_json::json!({
-            "model": model,
-            "created_at": iso_timestamp(),
-            "message": {"role": "assistant", "content": text},
-            "done": false,
-        });
-        let _ = write_json_line(stream, &chunk);
-    });
+    let mut loaded_skills = HashSet::new();
+    let result = runner.generate_chat_stream_with_skill_memory(
+        &messages,
+        &generation,
+        &mut loaded_skills,
+        |text| {
+            let chunk = serde_json::json!({
+                "model": model,
+                "created_at": iso_timestamp(),
+                "message": {"role": "assistant", "content": text},
+                "done": false,
+            });
+            let _ = write_json_line(stream, &chunk);
+        },
+    );
     match result {
         Ok(result) => {
             let _ = append_chat_history(options, "ollama.chat.stream", &model, &messages, &result);
@@ -2019,6 +2082,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "top_p": { "type": "number", "default": 0.9 },
                         "top_k": { "type": "integer", "default": 40 },
                         "repeat_penalty": { "type": "number", "default": 1.1 },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stop": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
                         "conversation_id": { "type": "string" },
                         "cache_prompt": { "type": "boolean" }
@@ -2034,6 +2100,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "max_completion_tokens": { "type": "integer" },
                         "temperature": { "type": "number" },
                         "top_p": { "type": "number" },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stream": { "type": "boolean" },
                         "response_format": { "type": "object" },
                         "tools": { "type": "array", "items": { "type": "object" } },
@@ -2050,6 +2119,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "max_completion_tokens": { "type": "integer" },
                         "temperature": { "type": "number" },
                         "top_p": { "type": "number" },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stream": { "type": "boolean" },
                         "response_format": { "type": "object" },
                         "tools": { "type": "array", "items": { "type": "object" } },
@@ -2068,6 +2140,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "max_output_tokens": { "type": "integer" },
                         "temperature": { "type": "number" },
                         "top_p": { "type": "number" },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stream": { "type": "boolean" },
                         "text": { "type": "object" },
                         "response_format": { "type": "object" },
@@ -2090,6 +2165,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "model": { "type": "string", "enum": model_ids },
                         "prompt": { "type": "string" },
                         "system": { "type": "string" },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stream": { "type": "boolean" },
                         "options": { "type": "object" },
                         "stop": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] }
@@ -2100,6 +2178,9 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                     "properties": {
                         "model": { "type": "string", "enum": model_ids },
                         "messages": { "type": "array", "items": { "$ref": "#/components/schemas/ChatMessage" } },
+                        "thinking": { "type": "boolean" },
+                        "thinking_prompt": { "type": "string" },
+                        "thinking_max_tokens": { "type": "integer", "minimum": 1 },
                         "stream": { "type": "boolean" },
                         "options": { "type": "object" }
                     }
@@ -2141,11 +2222,22 @@ where
             let max_cached = store.max_cached_tokens();
             let session_arc = store.get_or_create(id, || runner.new_session(max_cached));
             let mut session = session_arc.lock().expect("session lock poisoned");
-            return runner.generate_chat_with_session(messages, generation, &mut session, on_token);
+            return runner.generate_chat_with_session_with_skill_memory(
+                messages,
+                generation,
+                &mut session,
+                on_token,
+            );
         }
     }
     // Stateless fallback.
-    runner.generate_chat_stream(messages, generation, on_token)
+    let mut loaded_skills = HashSet::new();
+    runner.generate_chat_stream_with_skill_memory(
+        messages,
+        generation,
+        &mut loaded_skills,
+        on_token,
+    )
 }
 
 /// Handles the native `/generate` JSON endpoint.
@@ -2162,6 +2254,9 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                 payload.seed,
                 payload.system_prompt,
                 payload.stop.map(|s| s.into_vec()),
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
             );
 
             let use_session = payload.cache_prompt.unwrap_or(false);
@@ -2258,9 +2353,13 @@ fn route_openai_completion(
                 payload.seed,
                 payload.system_prompt,
                 payload.stop.map(|s| s.into_vec()),
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
             );
             apply_response_format_hint(&mut generation, payload.response_format.as_ref());
-            match runner.generate(&prompt, &generation) {
+            let mut loaded_skills = HashSet::new();
+            match runner.generate_with_skill_memory(&prompt, &generation, &mut loaded_skills) {
                 Ok(result) => {
                     let messages = [ChatMessage::user(prompt)];
                     let _ = append_chat_history(
@@ -2321,6 +2420,9 @@ fn route_openai_chat(
                 payload.seed,
                 payload.system_prompt,
                 payload.stop.map(|s| s.into_vec()),
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
             );
             apply_response_format_hint(&mut generation, payload.response_format.as_ref());
             let use_session = payload.cache_prompt.unwrap_or(false);
@@ -2394,6 +2496,9 @@ fn route_openai_response(
                 payload.seed,
                 payload.instructions,
                 payload.stop.map(|s| s.into_vec()),
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
             );
             let format_hint = payload
                 .text
@@ -2888,8 +2993,15 @@ fn route_ollama_generate(
             if let Some(stop) = payload.stop {
                 generation.stop_sequences = stop.into_vec();
             }
+            apply_thinking_overrides(
+                &mut generation,
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
+            );
             let started = Instant::now();
-            match runner.generate(&prompt, &generation) {
+            let mut loaded_skills = HashSet::new();
+            match runner.generate_with_skill_memory(&prompt, &generation, &mut loaded_skills) {
                 Ok(result) => {
                     let messages = [ChatMessage::user(prompt)];
                     let _ =
@@ -2929,9 +3041,17 @@ fn route_ollama_chat(
                 Ok(messages) => messages,
                 Err(err) => return (400, json_error(&err)),
             };
-            let generation = apply_ollama_options(&options.defaults, payload.options);
+            let mut generation = apply_ollama_options(&options.defaults, payload.options);
+            apply_thinking_overrides(
+                &mut generation,
+                payload.thinking,
+                payload.thinking_prompt,
+                payload.thinking_max_tokens,
+            );
             let started = Instant::now();
-            match runner.generate_chat(&messages, &generation) {
+            let mut loaded_skills = HashSet::new();
+            match runner.generate_chat_with_skill_memory(&messages, &generation, &mut loaded_skills)
+            {
                 Ok(result) => {
                     let _ = append_chat_history(options, "ollama.chat", &model, &messages, &result);
                     json_response(serde_json::json!({
@@ -3016,6 +3136,9 @@ fn apply_ollama_options(
         options.seed,
         None,
         options.stop.map(|s| s.into_vec()),
+        None,
+        None,
+        None,
     )
 }
 
@@ -3185,6 +3308,9 @@ fn apply_generation_overrides(
     seed: Option<u64>,
     system_prompt: Option<String>,
     stop_sequences: Option<Vec<String>>,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
 ) -> GenerationOptions {
     let mut generation = defaults.clone();
     if let Some(max_tokens) = max_tokens {
@@ -3211,7 +3337,33 @@ fn apply_generation_overrides(
     if let Some(stop) = stop_sequences {
         generation.stop_sequences = stop;
     }
+    if let Some(enabled) = thinking {
+        generation.thinking.enabled = enabled;
+    }
+    if let Some(prompt) = thinking_prompt {
+        generation.thinking.system_prompt = prompt;
+    }
+    if let Some(max_tokens) = thinking_max_tokens {
+        generation.thinking.max_tokens = max_tokens;
+    }
     generation
+}
+
+fn apply_thinking_overrides(
+    generation: &mut GenerationOptions,
+    thinking: Option<bool>,
+    thinking_prompt: Option<String>,
+    thinking_max_tokens: Option<usize>,
+) {
+    if let Some(enabled) = thinking {
+        generation.thinking.enabled = enabled;
+    }
+    if let Some(prompt) = thinking_prompt {
+        generation.thinking.system_prompt = prompt;
+    }
+    if let Some(max_tokens) = thinking_max_tokens {
+        generation.thinking.max_tokens = max_tokens;
+    }
 }
 
 /// Adds a prompt-level JSON-output hint for OpenAI response-format requests.

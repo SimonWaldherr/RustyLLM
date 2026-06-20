@@ -83,11 +83,61 @@ pub fn resolve_model_path(selection: Option<&str>, model_dir: &Path) -> Result<P
             ));
         }
 
+        if let Some(path) = resolve_model_file_selector(selection, model_dir)? {
+            return Ok(path);
+        }
+
         let entries = discover_models(model_dir)?;
         return select_model(&entries, selection).map(|entry| entry.path.clone());
     }
 
     choose_from_directory(model_dir, None)
+}
+
+/// Resolves selectors that already identify a GGUF path or exact file name.
+///
+/// This intentionally avoids parsing every GGUF in the model directory. It is
+/// the fast path for invocations such as `--model-dir /models --model foo.gguf`.
+pub fn resolve_model_file_selector(
+    selection: &str,
+    model_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let model_dir_path = model_dir.join(selection);
+    if model_dir_path.is_file() {
+        return Ok(Some(model_dir_path));
+    }
+
+    let selector_path = Path::new(selection);
+    let file_name = match selector_path.file_name().and_then(|name| name.to_str()) {
+        Some(name)
+            if name
+                .rsplit_once('.')
+                .map(|(_, ext)| ext.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false) =>
+        {
+            name
+        }
+        _ => return Ok(None),
+    };
+
+    let mut matches = Vec::new();
+    collect_matching_gguf_files(model_dir, file_name, &mut matches)
+        .map_err(|err| format!("Failed to scan {}: {}", model_dir.display(), err))?;
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(format!(
+            "Found multiple GGUF files named '{}'. Pass an exact path instead.\n\n{}",
+            selection,
+            matches
+                .iter()
+                .take(16)
+                .map(|path| format!("  - {}", path.display()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
 }
 
 /// Selects one supported model entry from discovered candidates.
@@ -198,6 +248,31 @@ fn collect_gguf_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()>
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| ext.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Collects GGUF files with an exact file-name match.
+fn collect_matching_gguf_files(
+    dir: &Path,
+    file_name: &str,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_matching_gguf_files(&path, file_name, out)?;
+        } else if file_type.is_file()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == file_name)
                 .unwrap_or(false)
         {
             out.push(path);
@@ -327,6 +402,7 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Builds a compact catalog entry fixture for selector tests.
     fn entry(id: &str, arch: &str, is_projector: bool) -> ModelEntry {
@@ -373,5 +449,52 @@ mod tests {
         let err = select_model(&entries, "phi").unwrap_err();
 
         assert!(err.contains("matched multiple"));
+    }
+
+    #[test]
+    /// Verifies exact GGUF file names resolve without metadata parsing.
+    fn resolve_model_file_selector_finds_unique_nested_filename() {
+        let root = temp_model_dir("unique");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let model = repo.join("model.gguf");
+        fs::write(&model, b"not a real gguf").unwrap();
+
+        let resolved = resolve_model_file_selector("model.gguf", &root)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved, model);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    /// Verifies duplicate exact file-name matches stay explicit.
+    fn resolve_model_file_selector_rejects_duplicate_filenames() {
+        let root = temp_model_dir("duplicate");
+        let repo_a = root.join("a");
+        let repo_b = root.join("b");
+        fs::create_dir_all(&repo_a).unwrap();
+        fs::create_dir_all(&repo_b).unwrap();
+        fs::write(repo_a.join("model.gguf"), b"not a real gguf").unwrap();
+        fs::write(repo_b.join("model.gguf"), b"not a real gguf").unwrap();
+
+        let err = resolve_model_file_selector("model.gguf", &root).unwrap_err();
+
+        assert!(err.contains("Found multiple GGUF files"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_model_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rusty-llm-catalog-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            nanos
+        ))
     }
 }

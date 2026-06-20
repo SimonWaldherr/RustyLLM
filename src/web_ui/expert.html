@@ -82,6 +82,21 @@
               <textarea id="systemPrompt" rows="2" placeholder="Optional system prompt" autocomplete="off"></textarea>
             </div>
 
+            <label class="inline">
+              <input id="thinking" type="checkbox" autocomplete="off">
+              Thinking
+            </label>
+
+            <div class="field">
+              <label for="thinkingPrompt">Thinking prompt</label>
+              <textarea id="thinkingPrompt" rows="3" placeholder="Optional meta-prompt override" autocomplete="off"></textarea>
+            </div>
+
+            <div class="field">
+              <label for="thinkingMaxTokens">Thinking max tokens</label>
+              <input id="thinkingMaxTokens" type="number" min="1" max="1024" value="192" inputmode="numeric" autocomplete="off">
+            </div>
+
             <div class="row">
               <div class="field">
                 <label for="maxTokens">Max tokens</label>

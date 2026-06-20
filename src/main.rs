@@ -12,7 +12,8 @@
 use rusty_llm::catalog::{ModelEntry, select_model};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::catalog::{
-    default_model_dir, discover_models, print_model_list, resolve_model_path,
+    default_model_dir, discover_models, print_model_list, resolve_model_file_selector,
+    resolve_model_path,
 };
 use rusty_llm::gguf::GGUFFile;
 #[cfg(not(target_family = "wasm"))]
@@ -25,7 +26,7 @@ use rusty_llm::runtime::{
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, McpServeOptions, ServeOptions};
 use rusty_llm::simd;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fmt::Display;
 use std::io::{self, BufRead, Read, Write};
@@ -51,6 +52,7 @@ fn print_usage(name: &str) {
     eprintln!("  --list-models            List GGUF files in --model-dir and exit");
     eprintln!("  --prompt <text>           Input prompt (interactive if omitted)");
     eprintln!("  --repl                    Start an interactive REPL session");
+    eprintln!("  --verbose                 Print startup timing details");
     #[cfg(feature = "server")]
     eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
     #[cfg(feature = "server")]
@@ -87,6 +89,14 @@ fn print_usage(name: &str) {
     eprintln!("  --sliding-window <N>      Override sliding-window size for runtime planning");
     eprintln!("  --no-flash-attn           Disable online-softmax attention optimization marker");
     eprintln!("  --system-prompt <T>       Override the default system prompt");
+    eprintln!(
+        "  --thinking                Rewrite each prompt with the built-in meta-prompt before answering"
+    );
+    eprintln!("  --thinking-prompt <T>     Override the Thinking meta-prompt");
+    eprintln!("  --thinking-max-tokens <N> Max tokens for the Thinking rewrite (default: 192)");
+    eprintln!("  --skills-dir <path>       Directory containing prompt-selected SKILL.md files");
+    eprintln!("  --max-skills <N>          Max new skills to load per prompt (default: 3)");
+    eprintln!("  --skill-max-bytes <N>     Max bytes loaded from each SKILL.md (default: 16384)");
     eprintln!("  --stop <text>             Stop generation when this string appears");
     eprintln!("  --embed                   Embed prompt and print the vector (RAG mode)");
     eprintln!("  --bench                   Run a non-streaming generation benchmark");
@@ -133,6 +143,63 @@ fn set_model_selector(
     }
     *current = Some(value);
     Ok(())
+}
+
+/// Reports whether a selector already names a concrete model file.
+fn is_existing_file(selection: &str) -> bool {
+    let path = Path::new(selection);
+    path.exists() && path.is_file()
+}
+
+/// Prints a compact startup timing breakdown for performance tuning.
+fn print_startup_timing(
+    total_time: Duration,
+    model_resolution_time: Duration,
+    model_catalog_time: Option<Duration>,
+    load_info: &LoadInfo,
+) {
+    eprintln!("Startup timing:");
+    if let Some(duration) = model_catalog_time {
+        eprintln!("  model catalog:       {}", format_duration_ms(duration));
+    }
+    eprintln!(
+        "  model resolution:    {}",
+        format_duration_ms(model_resolution_time)
+    );
+    eprintln!(
+        "  mmap open:           {}",
+        format_duration_ms(load_info.mmap_time)
+    );
+    eprintln!(
+        "  GGUF parse:          {}",
+        format_duration_ms(load_info.parse_time)
+    );
+    eprintln!(
+        "  compatibility check: {}",
+        format_duration_ms(load_info.compatibility_time)
+    );
+    eprintln!(
+        "  tokenizer build:     {}",
+        format_duration_ms(load_info.tokenizer_time)
+    );
+    eprintln!(
+        "  weight views:        {}",
+        format_duration_ms(load_info.weights_time)
+    );
+    eprintln!(
+        "  runner init:         {}",
+        format_duration_ms(load_info.runner_time)
+    );
+    eprintln!(
+        "  model load total:    {}",
+        format_duration_ms(load_info.load_time)
+    );
+    eprintln!("  process startup:     {}", format_duration_ms(total_time));
+    eprintln!();
+}
+
+fn format_duration_ms(duration: Duration) -> String {
+    format!("{:.2} ms", duration.as_secs_f64() * 1000.0)
 }
 
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
@@ -201,6 +268,7 @@ fn main() {
 
 /// Executes a queued worker-pool job and waits for completion.
 fn run() -> Result<(), String> {
+    let startup_start = Instant::now();
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -244,6 +312,7 @@ fn run() -> Result<(), String> {
     let mut inspect_mode = false;
     let mut chat_history_path: Option<String> = None;
     let mut bench_runs = 3usize;
+    let mut verbose = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -275,6 +344,9 @@ fn run() -> Result<(), String> {
             }
             "--repl" => {
                 repl_mode = true;
+            }
+            "--verbose" | "-v" => {
+                verbose = true;
             }
             "--serve" => {
                 serve_addr = Some(parse_arg::<String>(&args, &mut i, "--serve")?);
@@ -381,6 +453,31 @@ fn run() -> Result<(), String> {
             }
             "--system-prompt" => {
                 options.system_prompt = parse_arg::<String>(&args, &mut i, "--system-prompt")?;
+            }
+            "--thinking" => {
+                options.thinking.enabled = true;
+            }
+            "--no-thinking" => {
+                options.thinking.enabled = false;
+            }
+            "--thinking-prompt" | "--thinking-system-prompt" => {
+                options.thinking.system_prompt =
+                    parse_arg::<String>(&args, &mut i, "--thinking-prompt")?;
+            }
+            "--thinking-max-tokens" => {
+                options.thinking.max_tokens =
+                    parse_arg::<usize>(&args, &mut i, "--thinking-max-tokens")?;
+            }
+            "--skills-dir" => {
+                options.skills.directory =
+                    Some(parse_arg::<String>(&args, &mut i, "--skills-dir")?);
+            }
+            "--max-skills" => {
+                options.skills.max_skills = parse_arg::<usize>(&args, &mut i, "--max-skills")?;
+            }
+            "--skill-max-bytes" => {
+                options.skills.max_bytes_per_skill =
+                    parse_arg::<usize>(&args, &mut i, "--skill-max-bytes")?;
             }
             "--stop" => {
                 options
@@ -526,6 +623,13 @@ fn run() -> Result<(), String> {
         eprintln!("Worker threads: {}", n);
     }
 
+    let model_resolution_start = Instant::now();
+    let mut model_catalog_time: Option<Duration> = None;
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let exact_model_file = model_selector
+        .as_deref()
+        .map(is_existing_file)
+        .unwrap_or(false);
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
     let server_model_dir = model_selector
         .as_deref()
@@ -534,10 +638,25 @@ fn run() -> Result<(), String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| model_dir.clone());
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
-    let discovered_server_models = if serve_addr.is_some() {
+    let fast_model_path = if exact_model_file {
+        Some(PathBuf::from(
+            model_selector.as_deref().expect("exact file has selector"),
+        ))
+    } else if let Some(selection) = model_selector.as_deref() {
+        resolve_model_file_selector(selection, &server_model_dir)?
+    } else {
+        None
+    };
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let discovered_server_models = if serve_addr.is_some() && fast_model_path.is_none() {
+        let catalog_start = Instant::now();
         match discover_models(&server_model_dir) {
-            Ok(entries) => Some(entries),
+            Ok(entries) => {
+                model_catalog_time = Some(catalog_start.elapsed());
+                Some(entries)
+            }
             Err(err) => {
+                model_catalog_time = Some(catalog_start.elapsed());
                 eprintln!("Warning: model catalog unavailable: {}", err);
                 None
             }
@@ -546,13 +665,16 @@ fn run() -> Result<(), String> {
         None
     };
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
-    let model_path = if let Some(entries) = discovered_server_models.as_deref() {
+    let model_path = if let Some(path) = fast_model_path {
+        path
+    } else if let Some(entries) = discovered_server_models.as_deref() {
         resolve_model_path_from_discovered(model_selector.as_deref(), &server_model_dir, entries)?
     } else {
         resolve_model_path(model_selector.as_deref(), &model_dir)?
     };
     #[cfg(not(all(not(target_family = "wasm"), feature = "server")))]
     let model_path = resolve_model_path(model_selector.as_deref(), &model_dir)?;
+    let model_resolution_time = model_resolution_start.elapsed();
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
     let model_catalog = discovered_server_models.map(|entries| server::ModelCatalogSnapshot {
         model_dir: server_model_dir.display().to_string(),
@@ -590,6 +712,14 @@ fn run() -> Result<(), String> {
         load_info.load_time.as_secs_f32(),
         file_mb / load_info.load_time.as_secs_f64()
     );
+    if verbose {
+        print_startup_timing(
+            startup_start.elapsed(),
+            model_resolution_time,
+            model_catalog_time,
+            &load_info,
+        );
+    }
 
     if options.speculative.enabled {
         if let Some(assistant_path) = options.speculative.assistant_path.as_deref() {
@@ -763,6 +893,7 @@ fn run() -> Result<(), String> {
                 defaults: options.clone(),
                 chat_history_path: chat_history_path.clone(),
                 chat_history_lock: Arc::new(std::sync::Mutex::new(())),
+                skill_memory: Arc::new(std::sync::Mutex::new(HashSet::new())),
             };
             server::serve_mcp_stdio(Arc::new(runner), mcp_options)?;
             return Ok(());
@@ -798,10 +929,16 @@ fn run() -> Result<(), String> {
         return Err(String::from("No prompt provided."));
     }
 
-    let result = runner.generate_stream(&prompt, &options, |text| {
-        print!("{}", text);
-        let _ = io::stdout().flush();
-    })?;
+    let mut loaded_skills = HashSet::new();
+    let result = runner.generate_stream_with_skill_memory(
+        &prompt,
+        &options,
+        &mut loaded_skills,
+        |text| {
+            print!("{}", text);
+            let _ = io::stdout().flush();
+        },
+    )?;
     append_cli_history(
         chat_history_path.as_deref(),
         &runner,
@@ -971,7 +1108,8 @@ fn run_benchmark(
         }
 
         let wall_start = Instant::now();
-        let result = runner.generate(prompt, &run_options)?;
+        let mut loaded_skills = HashSet::new();
+        let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
         let wall = wall_start.elapsed();
         let decode_tok_s = result.stats.generated_tokens as f64
             / result.stats.decode_time.as_secs_f64().max(0.001);
@@ -1082,7 +1220,8 @@ fn run_benchmark_json(
         }
 
         let wall_start = Instant::now();
-        let result = runner.generate(prompt, &run_options)?;
+        let mut loaded_skills = HashSet::new();
+        let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
         let wall = wall_start.elapsed();
         let decode_tok_s = result.stats.generated_tokens as f64
             / result.stats.decode_time.as_secs_f64().max(0.001);
@@ -1302,6 +1441,7 @@ fn run_repl(
     eprintln!("REPL mode. Commands: /exit, /quit, /clear, /help");
     let stdin = io::stdin();
     let mut history: Vec<ChatMessage> = Vec::new();
+    let mut loaded_skills = HashSet::new();
 
     loop {
         eprint!("repl> ");
@@ -1325,6 +1465,7 @@ fn run_repl(
             "/exit" | "/quit" => break,
             "/clear" => {
                 history.clear();
+                loaded_skills.clear();
                 eprintln!("History cleared.");
                 continue;
             }
@@ -1337,10 +1478,15 @@ fn run_repl(
         }
 
         history.push(ChatMessage::user(line));
-        let result = runner.generate_chat_stream(&history, options, |text| {
-            print!("{}", text);
-            let _ = io::stdout().flush();
-        });
+        let result = runner.generate_chat_stream_with_skill_memory(
+            &history,
+            options,
+            &mut loaded_skills,
+            |text| {
+                print!("{}", text);
+                let _ = io::stdout().flush();
+            },
+        );
 
         match result {
             Ok(result) => {

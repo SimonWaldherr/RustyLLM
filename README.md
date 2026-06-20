@@ -71,6 +71,8 @@ Additional documentation:
   Set `RUSTY_LLM_METAL=0` to force the CPU path.
 - One-shot generation, interactive REPL mode, benchmark mode, JSON benchmark
   output, and append-only chat history logging.
+- Prompt-selected `SKILL.md` loading via `--skills-dir`, with per-session
+  de-duplication so long chats do not inject the same skill repeatedly.
 - OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`,
   `/v1/responses`, and `/v1/embeddings` routes.
 - LM Studio-style `/api/v0/*` aliases and Ollama-style `/api/*` compatibility
@@ -189,6 +191,35 @@ The explorer shows GGUF metadata, tokenizer output, token-embedding vectors,
 nearest vocabulary neighbors, the tensor directory, and the model catalog
 discovered from the configured `--model-dir`.
 
+The Chat and Expert views expose a model-independent Thinking toggle. When
+enabled, RustyLLM first asks the loaded model to rewrite the latest user prompt
+with a compact meta-prompt, then uses that rewritten prompt for the final answer.
+
+Optional Skills can be enabled by pointing RustyLLM at a directory tree that
+contains `SKILL.md` files:
+
+```bash
+./target/release/rusty-llm ./models/model.gguf \
+  --skills-dir ./skills/default \
+  --repl
+```
+
+RustyLLM indexes skill names and descriptions, loads only the matching
+`SKILL.md` bodies for each prompt, and remembers loaded skill paths inside the
+REPL or server session. The repository includes self-contained example Skills
+under `skills/default`:
+
+- `rust-code-review`
+- `local-llm-troubleshooting`
+- `skill-authoring`
+- `german-technical-writing`
+
+RustyLLM does not execute skill scripts or lazily read `references/` files; keep
+Skills self-contained unless the user explicitly provides additional context.
+
+When serving an exact `.gguf` file path, RustyLLM skips the recursive startup
+catalog scan so the server can start loading the requested model immediately.
+
 ## Model Discovery
 
 The general CLI form is:
@@ -209,6 +240,10 @@ You can also select a model from a directory:
 rusty-llm --model-dir ./models --list-models
 rusty-llm --model-dir ./models --model phi-4 --prompt "Write a Rust enum example"
 ```
+
+When `--model` is an exact `.gguf` file name or a path relative to
+`--model-dir`, RustyLLM resolves it with a lightweight file scan before falling
+back to full metadata discovery.
 
 If no model directory is provided, RustyLLM uses:
 
@@ -238,6 +273,8 @@ Model and inspection options:
 - `--list-models` lists discovered models and exits.
 - `--inspect` prints a JSON compatibility report without loading weights.
 - `--list-tensors` loads the model and prints tensor names, dtypes, and shapes.
+- `--verbose` or `-v` prints startup timing details, including model
+  resolution, mmap open, GGUF parsing, tokenizer build, and weight setup.
 
 Execution modes:
 
@@ -260,6 +297,17 @@ Generation options:
 - `--repeat-penalty <F>` applies a repetition penalty to recent tokens.
 - `--seed <N>` sets the RNG seed. `0` uses the default time-based behavior.
 - `--system-prompt <text>` overrides the default chat system prompt.
+- `--thinking` rewrites each prompt with the built-in Thinking meta-prompt
+  before answering.
+- `--thinking-prompt <text>` overrides the Thinking meta-prompt.
+- `--thinking-max-tokens <N>` caps the internal Thinking rewrite.
+- `--skills-dir <path>` enables prompt-selected Skills from a directory tree of
+  `SKILL.md` files. Use `--skills-dir skills/default` to try the bundled
+  examples.
+- `--max-skills <N>` limits new Skills loaded for one prompt. The default is
+  `3`.
+- `--skill-max-bytes <N>` caps the loaded bytes per `SKILL.md`. The default is
+  `16384`.
 - `--stop <text>` stops generation when the text appears. The flag can be
   repeated.
 - `--threads <N>` overrides the SIMD worker thread count.
@@ -808,7 +856,10 @@ make wasm
 ```
 
 The release profile uses `opt-level = 3`, fat LTO, one codegen unit, stripping,
-and `panic = "abort"`.
+and `panic = "abort"`. The bench profile mirrors the release optimizer while
+keeping line-table debug info for profiler output. For smaller WebAssembly
+artifacts, `cargo build --profile wasm-release --no-default-features --features wasm --target wasm32-unknown-unknown --lib`
+uses size-oriented optimization.
 
 ## GitHub Pages WASM Demo
 
