@@ -4,14 +4,17 @@
 [![CI](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/SimonWaldherr/RustyLLM)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Crates.io](https://img.shields.io/crates/v/rusty-llm)](https://crates.io/crates/rusty-llm)
+[![docs.rs](https://img.shields.io/docsrs/rusty-llm)](https://docs.rs/rusty-llm)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 
 → **[Benchmark results](BENCHMARK.md)** — compatibility and speed for 14 tested models on Apple M2 Max.
 
-RustyLLM is a lightweight, educational AI-inference project for developers who
-want to understand how a local language-model runner works. You do not need AI
+RustyLLM is an educational GGUF inference runner for developers who want to
+understand how a local language-model runtime works. You do not need AI
 experience to read the project: the code is organized as ordinary file parsing,
-arrays, math kernels, state management, and HTTP routing.
+arrays, math kernels, state management, HTTP routing, and optional browser/WASM
+experiments.
 
 At a high level, RustyLLM reads a `.gguf` model file, converts input text into
 integer token IDs, repeatedly runs those IDs through model weights to predict

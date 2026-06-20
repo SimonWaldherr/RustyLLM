@@ -1,5 +1,6 @@
 target
 Cargo.lock
+.DS_Store
 demo/wasm/pkg/*wasm
 .bench_raw
 model_benchmark_202*

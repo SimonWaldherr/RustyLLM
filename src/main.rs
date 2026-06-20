@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 /// Prints CLI usage text.
 fn print_usage(name: &str) {
-    eprintln!("rusty-llm v0.3.0");
+    eprintln!("rusty-llm v{}", env!("CARGO_PKG_VERSION"));
     eprintln!();
     eprintln!(
         "Usage: {} [model.gguf|model-name|model-dir] [options]",

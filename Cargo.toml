@@ -3,15 +3,39 @@ name = "rusty-llm"
 version = "5.0.2"
 edition = "2024"
 rust-version = "1.95"
-description = "Lightweight, educational GGUF AI-inference runner in Rust"
+description = "Educational GGUF inference runner with a CLI, HTTP API, embeddings, and optional Metal acceleration"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/SimonWaldherr/RustyLLM"
+homepage = "https://github.com/SimonWaldherr/RustyLLM"
+documentation = "https://docs.rs/rusty-llm"
 keywords = ["gguf", "llm", "inference", "metal", "wasm"]
-categories = ["command-line-utilities", "science"]
+categories = ["command-line-utilities", "science", "web-programming::http-server", "wasm"]
 build = "build.rs"
 default-run = "rusty-llm"
 resolver = "3"
+include = [
+    "src/**/*.rs",
+    "src/**/*.html",
+    "src/**/*.css",
+    "src/**/*.js",
+    "src/**/*.m",
+    "docs/*.md",
+    "skills/default/*/SKILL.md",
+    "demo/wasm/index.html",
+    "README.md",
+    "BENCHMARK.md",
+    "LICENSE",
+    "Cargo.toml",
+    "build.rs",
+    "Makefile",
+    "rust-toolchain.toml",
+    "bench_models.sh",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]

@@ -1772,7 +1772,13 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
         ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") | ("GET", "/ready") => {
             (200, String::from("{\"status\":\"ok\"}"))
         }
-        ("GET", "/api/version") => (200, String::from("{\"version\":\"rusty-llm-0.3.0\"}")),
+        ("GET", "/api/version") => (
+            200,
+            format!(
+                "{{\"version\":\"rusty-llm-{}\"}}",
+                env!("CARGO_PKG_VERSION")
+            ),
+        ),
         ("GET", "/api/explorer/model") => route_explorer_model(runner, options),
         ("GET", "/openapi.json") | ("GET", "/swagger.json") => {
             route_openapi_document(runner, &model_ids)
