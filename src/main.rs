@@ -8,6 +8,8 @@
     clippy::useless_conversion
 )]
 
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+use rusty_llm::catalog::{ModelEntry, select_model};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_path,
@@ -21,7 +23,7 @@ use rusty_llm::runtime::{
     compatibility_report,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
-use rusty_llm::server::{self, ServeOptions};
+use rusty_llm::server::{self, McpServeOptions, ServeOptions};
 use rusty_llm::simd;
 use std::collections::BTreeMap;
 use std::env;
@@ -52,7 +54,9 @@ fn print_usage(name: &str) {
     #[cfg(feature = "server")]
     eprintln!("  --serve <addr>            Start HTTP(S) API server, e.g. 127.0.0.1:8080");
     #[cfg(feature = "server")]
-    eprintln!("  --chat                    Enable the minimal Web UI at /chat with --serve");
+    eprintln!("  --mcp                     Start a Model Context Protocol stdio server");
+    #[cfg(feature = "server")]
+    eprintln!("  --chat                    Enable Web UIs at /chat, /chat?expert, and /explorer");
     #[cfg(feature = "server")]
     eprintln!("  --tls-cert <path>         PEM certificate for HTTPS");
     #[cfg(feature = "server")]
@@ -131,6 +135,62 @@ fn set_model_selector(
     Ok(())
 }
 
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+fn resolve_model_path_from_discovered(
+    selection: Option<&str>,
+    model_dir: &Path,
+    entries: &[ModelEntry],
+) -> Result<PathBuf, String> {
+    if let Some(selection) = selection {
+        let selected_path = Path::new(selection);
+        if selected_path.exists() {
+            if selected_path.is_file() {
+                return Ok(selected_path.to_path_buf());
+            }
+            if selected_path.is_dir() {
+                return choose_single_discovered_model(entries, selected_path);
+            }
+            return Err(format!(
+                "Model path is neither a file nor a directory: {}",
+                selection
+            ));
+        }
+
+        return select_model(entries, selection).map(|entry| entry.path.clone());
+    }
+
+    choose_single_discovered_model(entries, model_dir)
+}
+
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+fn choose_single_discovered_model(entries: &[ModelEntry], dir: &Path) -> Result<PathBuf, String> {
+    let usable = entries
+        .iter()
+        .filter(|entry| entry.is_supported && !entry.is_projector)
+        .collect::<Vec<_>>();
+
+    match usable.len() {
+        0 => Err(format!(
+            "No supported text GGUF models found in {}.",
+            dir.display()
+        )),
+        1 => Ok(usable[0].path.clone()),
+        _ => {
+            let choices = usable
+                .iter()
+                .take(16)
+                .map(|entry| format!("  - {}", entry.id))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Err(format!(
+                "Found multiple GGUF models in {}. Choose one with --model <name> or pass an exact .gguf path.\n\n{}",
+                dir.display(),
+                choices
+            ))
+        }
+    }
+}
+
 /// runs the CLI and prints fatal errors.
 fn main() {
     if let Err(err) = run() {
@@ -164,6 +224,7 @@ fn run() -> Result<(), String> {
     let mut threads_override: Option<usize> = None;
     let mut repl_mode = false;
     let mut serve_addr: Option<String> = None;
+    let mut mcp_mode = false;
     let mut chat_ui = false;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
@@ -217,6 +278,9 @@ fn run() -> Result<(), String> {
             }
             "--serve" => {
                 serve_addr = Some(parse_arg::<String>(&args, &mut i, "--serve")?);
+            }
+            "--mcp" => {
+                mcp_mode = true;
             }
             "--chat" => {
                 chat_ui = true;
@@ -390,6 +454,14 @@ fn run() -> Result<(), String> {
     if chat_ui && serve_addr.is_none() {
         return Err(String::from("--chat requires --serve <addr>."));
     }
+    if mcp_mode && serve_addr.is_some() {
+        return Err(String::from("--mcp cannot be combined with --serve."));
+    }
+    if mcp_mode && (embed_mode || repl_mode) {
+        return Err(String::from(
+            "--mcp cannot be combined with --embed or --repl.",
+        ));
+    }
     #[cfg(not(feature = "tls"))]
     if tls_cert.is_some() || tls_key.is_some() {
         return Err(String::from(
@@ -454,7 +526,42 @@ fn run() -> Result<(), String> {
         eprintln!("Worker threads: {}", n);
     }
 
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let server_model_dir = model_selector
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path.exists() && path.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| model_dir.clone());
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let discovered_server_models = if serve_addr.is_some() {
+        match discover_models(&server_model_dir) {
+            Ok(entries) => Some(entries),
+            Err(err) => {
+                eprintln!("Warning: model catalog unavailable: {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let model_path = if let Some(entries) = discovered_server_models.as_deref() {
+        resolve_model_path_from_discovered(model_selector.as_deref(), &server_model_dir, entries)?
+    } else {
+        resolve_model_path(model_selector.as_deref(), &model_dir)?
+    };
+    #[cfg(not(all(not(target_family = "wasm"), feature = "server")))]
     let model_path = resolve_model_path(model_selector.as_deref(), &model_dir)?;
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    let model_catalog = discovered_server_models.map(|entries| server::ModelCatalogSnapshot {
+        model_dir: server_model_dir.display().to_string(),
+        loaded_model_path: model_path.display().to_string(),
+        entries: entries
+            .into_iter()
+            .map(server::ModelCatalogEntry::from)
+            .collect(),
+    });
 
     if inspect_mode {
         inspect_model_file(&model_path)?;
@@ -524,9 +631,9 @@ fn run() -> Result<(), String> {
     }
 
     if bench_mode {
-        if embed_mode || repl_mode || serve_addr.is_some() {
+        if embed_mode || repl_mode || serve_addr.is_some() || mcp_mode {
             return Err(String::from(
-                "--bench cannot be combined with --embed, --repl, or --serve.",
+                "--bench cannot be combined with --embed, --repl, --serve, or --mcp.",
             ));
         }
         let bench_prompt = if prompt.trim().is_empty() {
@@ -547,9 +654,9 @@ fn run() -> Result<(), String> {
     }
 
     if kernel_bench {
-        if embed_mode || repl_mode || serve_addr.is_some() {
+        if embed_mode || repl_mode || serve_addr.is_some() || mcp_mode {
             return Err(String::from(
-                "--kernel-bench cannot be combined with --embed, --repl, or --serve.",
+                "--kernel-bench cannot be combined with --embed, --repl, --serve, or --mcp.",
             ));
         }
         run_kernel_benchmark(
@@ -605,11 +712,11 @@ fn run() -> Result<(), String> {
             eprintln!("{} endpoint listening on {}", protocol, addr);
             if chat_ui {
                 eprintln!(
-                    "Routes: GET /chat, GET /chat?expert, GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+                    "Routes: GET /chat, GET /chat?expert, GET /explorer, GET /docs, GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/responses, POST /v1/embeddings."
                 );
             } else {
                 eprintln!(
-                    "Routes: GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/embeddings."
+                    "Routes: GET /docs, GET /health, POST /generate, GET /v1/models, POST /v1/completions, POST /v1/chat/completions, POST /v1/responses, POST /v1/embeddings."
                 );
             }
             eprintln!("Max concurrent connections: {}", max_connections);
@@ -631,11 +738,33 @@ fn run() -> Result<(), String> {
                 tls_key_path: tls_key,
                 max_concurrent_connections: max_connections,
                 chat_ui,
+                model_catalog,
                 chat_history_path: chat_history_path.clone(),
                 chat_history_lock: Arc::new(std::sync::Mutex::new(())),
                 session_store,
             };
             server::serve(Arc::new(runner), serve_options)?;
+            return Ok(());
+        }
+    }
+
+    if mcp_mode {
+        #[cfg(not(feature = "server"))]
+        {
+            return Err(String::from(
+                "--mcp requires a binary built with the `server` feature.",
+            ));
+        }
+
+        #[cfg(feature = "server")]
+        {
+            eprintln!("MCP stdio server ready");
+            let mcp_options = McpServeOptions {
+                defaults: options.clone(),
+                chat_history_path: chat_history_path.clone(),
+                chat_history_lock: Arc::new(std::sync::Mutex::new(())),
+            };
+            server::serve_mcp_stdio(Arc::new(runner), mcp_options)?;
             return Ok(());
         }
     }
@@ -791,9 +920,10 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
             "unsupported_layouts": compatibility.unsupported_layouts,
         },
         "api_compatibility": {
-            "openai": ["/v1/models", "/v1/completions", "/v1/chat/completions", "/v1/embeddings"],
+            "openai": ["/v1/models", "/v1/completions", "/v1/chat/completions", "/v1/responses", "/v1/embeddings"],
             "lm_studio": ["/api/v0/models", "/api/v0/completions", "/api/v0/chat/completions", "/api/v0/embeddings"],
             "ollama": ["/api/tags", "/api/generate", "/api/chat", "/api/embeddings"],
+            "openapi": ["/openapi.json", "/swagger.json", "/docs"],
         }
     });
     let body = serde_json::to_string_pretty(&report)

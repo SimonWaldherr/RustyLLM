@@ -901,7 +901,9 @@ impl Runner {
     pub fn token_embedding_query(&self, text: &str) -> Result<(Vec<f32>, Vec<u32>), String> {
         let tokens = self.tok.encode_without_bos(text);
         if tokens.is_empty() {
-            return Err(String::from("token_embedding_query: input tokenised to zero tokens"));
+            return Err(String::from(
+                "token_embedding_query: input tokenised to zero tokens",
+            ));
         }
 
         let mut sum = vec![0.0f32; self.config.dim];
@@ -1015,8 +1017,7 @@ impl Runner {
         if raw.starts_with("<0x") {
             return true;
         }
-        (raw.starts_with('<') && raw.ends_with('>'))
-            || (raw.starts_with('[') && raw.ends_with(']'))
+        (raw.starts_with('<') && raw.ends_with('>')) || (raw.starts_with('[') && raw.ends_with(']'))
     }
 
     /// Attaches a verified assistant checkpoint for greedy speculative decoding.

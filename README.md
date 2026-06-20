@@ -71,16 +71,19 @@ Additional documentation:
   Set `RUSTY_LLM_METAL=0` to force the CPU path.
 - One-shot generation, interactive REPL mode, benchmark mode, JSON benchmark
   output, and append-only chat history logging.
-- OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`, and
-  `/v1/embeddings` routes.
+- OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`,
+  `/v1/responses`, and `/v1/embeddings` routes.
 - LM Studio-style `/api/v0/*` aliases and Ollama-style `/api/*` compatibility
   routes.
 - Server-Sent Events streaming for OpenAI-compatible completions and chat
-  completions.
+  completions, plus Responses API streaming and Ollama-style NDJSON streaming.
+- OpenAPI 3.1 document at `/openapi.json` with Swagger UI at `/docs`.
+- Model Context Protocol stdio mode with `generate`, `chat`, `embed`, and
+  `models` tools.
 - Text embeddings via `Runner::embed`, mean-pooled over the last transformer
   layer and L2-normalized for cosine similarity.
-- Minimal browser chat UI served from `/chat` and an expert UI from
-  `/chat?expert`.
+- Minimal browser chat UI served from `/chat`, an expert UI from
+  `/chat?expert`, and a GGUF explorer from `/explorer`.
 - Library API for embedding RustyLLM in other Rust applications.
 - `wasm32-unknown-unknown` check support for the no-default-features WASM build.
 
@@ -180,6 +183,11 @@ Then open:
 
 - `http://127.0.0.1:8080/chat`
 - `http://127.0.0.1:8080/chat?expert`
+- `http://127.0.0.1:8080/explorer`
+
+The explorer shows GGUF metadata, tokenizer output, token-embedding vectors,
+nearest vocabulary neighbors, the tensor directory, and the model catalog
+discovered from the configured `--model-dir`.
 
 ## Model Discovery
 
@@ -236,7 +244,9 @@ Execution modes:
 - `--prompt <text>` or `-p <text>` runs one-shot generation.
 - `--repl` starts an interactive chat session.
 - `--serve <addr>` starts the HTTP(S) server, for example `127.0.0.1:8080`.
-- `--chat` enables the built-in web UI at `/chat` and `/chat?expert`.
+- `--mcp` starts a Model Context Protocol stdio server for the loaded model.
+- `--chat` enables the built-in web UIs at `/chat`, `/chat?expert`, and
+  `/explorer`.
 - `--embed` embeds `--prompt` and prints the embedding vector.
 - `--bench` runs a non-streaming generation benchmark.
 - `--bench-json` runs benchmark mode and emits a machine-readable JSON report.
@@ -338,15 +348,19 @@ Health and metadata routes:
 
 - `GET /`, `GET /health`, `GET /healthz`, `GET /ready`
 - `GET /api/version`
+- `GET /openapi.json`, `GET /swagger.json`, `GET /docs`
 - `GET /v1/models`
 - `GET /api/v0/models`
 - `GET /api/tags`
+- `GET /api/explorer/model` (loaded model metadata, tensor inventory, and
+  discovered model catalog)
 
 Generation and embedding routes:
 
 - `POST /generate`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
+- `POST /v1/responses`
 - `POST /v1/embeddings`
 - `POST /api/v0/completions`
 - `POST /api/v0/chat/completions`
@@ -355,6 +369,9 @@ Generation and embedding routes:
 - `POST /api/chat`
 - `POST /api/embeddings`
 - `POST /api/embed`
+- `POST /api/explorer/tokenize`
+- `POST /api/explorer/vector`
+- `POST /api/explorer/neighbors`
 
 All `POST` routes require `Content-Type: application/json`. Requests are bounded
 by header and body limits and a per-connection I/O timeout. CORS headers are
@@ -467,6 +484,27 @@ curl -X POST http://127.0.0.1:8080/v1/completions \
 Streaming is also supported on `/v1/completions` and `/api/v0/completions` with
 `"stream": true`.
 
+### OpenAI-Compatible Responses
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
+    "instructions": "You are concise.",
+    "input": "Explain GGUF in one sentence.",
+    "max_output_tokens": 64
+  }'
+```
+
+Streaming is supported with `"stream": true` and emits Responses-style SSE
+events ending in `data: [DONE]`.
+
+RustyLLM accepts `response_format`, `text.format`, `tools`, and `tool_choice`
+fields for OpenAI client compatibility. JSON response formats add a prompt-level
+instruction to produce valid JSON; RustyLLM does not yet enforce JSON schemas
+token by token, and tool definitions are not executed by the model server.
+
 ### Multimodal Message Format
 
 RustyLLM accepts OpenAI-style multimodal `content` arrays on chat routes:
@@ -575,8 +613,35 @@ curl -X POST http://127.0.0.1:8080/api/chat \
   }'
 ```
 
-Ollama `stream: true` requests are accepted, but RustyLLM currently returns a
-single final JSON response for Ollama-style routes.
+Ollama `stream: true` requests on `/api/generate` and `/api/chat` return
+newline-delimited JSON chunks with a final `done: true` object:
+
+```bash
+curl -N -X POST http://127.0.0.1:8080/api/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "local", "prompt": "Say hello.", "stream": true}'
+```
+
+### OpenAPI and Swagger
+
+The server exposes a machine-readable OpenAPI document and a browser docs page:
+
+- `GET /openapi.json`
+- `GET /swagger.json`
+- `GET /docs`
+
+`/docs` loads Swagger UI from a CDN and uses `/openapi.json` as its spec source.
+
+### Model Context Protocol
+
+Start a stdio MCP server for the loaded model:
+
+```bash
+rusty-llm ./models/model.gguf --mcp
+```
+
+The MCP server exposes `generate`, `chat`, `embed`, and `models` tools. It uses
+newline-delimited JSON-RPC on stdin/stdout and writes boot logs to stderr.
 
 ## Benchmarking
 

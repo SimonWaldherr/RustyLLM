@@ -6,6 +6,7 @@
   <title>RustyLLM — WebAssembly Demo</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { min-height: 100%; }
 
     :root {
       --bg:       #0f1117;
@@ -25,6 +26,7 @@
       background: var(--bg);
       color: var(--text);
       font-family: system-ui, -apple-system, sans-serif;
+      line-height: 1.45;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
@@ -36,6 +38,8 @@
       display: flex;
       align-items: center;
       gap: 14px;
+      min-width: 0;
+      flex-wrap: wrap;
     }
 
     header svg { flex-shrink: 0; }
@@ -44,6 +48,7 @@
       font-size: 1.25rem;
       font-weight: 700;
       letter-spacing: 0;
+      overflow-wrap: anywhere;
     }
 
     .header-text p {
@@ -81,6 +86,8 @@
       border: 1px solid var(--border);
       border-radius: var(--radius);
       padding: 24px;
+      min-width: 0;
+      overflow: hidden;
     }
 
     .loader-card h2 {
@@ -90,6 +97,7 @@
 
     .loader-tabs {
       display: flex; border-bottom: 1px solid var(--border); margin-bottom: 16px;
+      overflow-x: auto;
     }
     .loader-tab {
       background: none; border: none; border-bottom: 2px solid transparent;
@@ -121,6 +129,7 @@
     .drop-zone strong { color: var(--text); }
 
     .url-row { display: flex; gap: 10px; }
+    .url-row input { min-width: 0; }
     .url-row input { flex: 1; }
     .url-row button { flex-shrink: 0; }
     .url-hint { font-size: 0.75rem; color: var(--muted); margin-top: 8px; line-height: 1.5; }
@@ -150,7 +159,7 @@
     /* ── Tabs ── */
     .tabs { display: none; flex-direction: column; gap: 0; }
     .tabs.visible { display: flex; }
-    .tab-bar { display: flex; border-bottom: 1px solid var(--border); }
+    .tab-bar { display: flex; border-bottom: 1px solid var(--border); overflow-x: auto; }
     .tab-btn {
       background: none; border: none; border-bottom: 2px solid transparent;
       color: var(--muted); cursor: pointer; font-size: 0.88rem; font-weight: 500;
@@ -172,6 +181,8 @@
     .card {
       background: var(--surface); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 22px; margin-bottom: 16px;
+      min-width: 0;
+      overflow: hidden;
     }
     .card:last-child { margin-bottom: 0; }
 
@@ -187,6 +198,12 @@
     }
     textarea { resize: vertical; min-height: 80px; }
     textarea:focus, input:focus { border-color: var(--accent); }
+    button:focus-visible,
+    input:focus-visible,
+    textarea:focus-visible {
+      outline: 2px solid var(--accent2);
+      outline-offset: 2px;
+    }
 
     button.primary {
       background: var(--accent); border: none; border-radius: 8px; color: #fff;
@@ -236,7 +253,7 @@
 
     /* ── Similarity matrix ── */
     .sim-matrix { overflow-x: auto; margin-top: 16px; }
-    table { border-collapse: collapse; width: 100%; font-size: 0.83rem; }
+    table { border-collapse: collapse; width: 100%; min-width: 420px; font-size: 0.83rem; }
     th, td { padding: 8px 14px; text-align: center; border: 1px solid var(--border); }
     th { background: var(--bg); color: var(--muted); font-weight: 600; font-family: var(--font-mono); }
     td { font-family: var(--font-mono); }
@@ -287,6 +304,7 @@
       background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
       padding: 14px; min-height: 120px; font-size: 0.88rem; line-height: 1.7;
       white-space: pre-wrap; font-family: var(--font-mono); color: var(--text);
+      overflow-wrap: anywhere;
     }
     .output-box.placeholder { color: var(--muted); font-style: italic; font-family: inherit; }
 
@@ -340,12 +358,31 @@
       .score-wrap { grid-column: 2; align-items: stretch; }
       .score-bar { width: 100%; }
     }
+    @media (max-width: 560px) {
+      header { align-items: flex-start; }
+      header svg { width: 32px; height: 32px; }
+      .header-text { min-width: 0; flex: 1; }
+      .loader-card, .card { padding: 16px; }
+      .loader-tabs, .tab-bar { gap: 4px; }
+      .loader-tab, .tab-btn { flex: 0 0 auto; padding-inline: 12px; }
+      .text-entry {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 8px;
+      }
+      .text-entry textarea { grid-column: 1 / -1; }
+      .gen-controls { gap: 10px; }
+      .output-header { align-items: flex-start; gap: 10px; flex-direction: column; }
+      .output-actions { width: 100%; }
+      .output-actions button { flex: 1; }
+      .copy-toast { left: 16px; right: 16px; bottom: 16px; text-align: center; }
+    }
   </style>
 </head>
 <body>
 
 <header>
-  <svg width="36" height="36" viewBox="0 0 36 36" fill="none">
+  <svg width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true" focusable="false">
     <rect width="36" height="36" rx="8" fill="#e05c2e"/>
     <text x="18" y="25" text-anchor="middle" font-size="18" font-weight="bold" fill="white" font-family="monospace">R</text>
   </svg>
@@ -362,8 +399,8 @@
   <div class="loader-card">
     <h2>Load Model</h2>
     <div class="loader-tabs">
-      <button class="loader-tab active" data-ltab="file">Local file</button>
-      <button class="loader-tab" data-ltab="url">From URL</button>
+      <button class="loader-tab active" type="button" data-ltab="file">Local file</button>
+      <button class="loader-tab" type="button" data-ltab="url">From URL</button>
     </div>
 
     <div class="loader-panel active" id="ltab-file">
@@ -377,7 +414,7 @@
     <div class="loader-panel" id="ltab-url">
       <div class="url-row">
         <input type="url" id="urlInput" placeholder="https://…/model.gguf">
-        <button class="primary" id="urlLoadBtn">Load</button>
+        <button class="primary" id="urlLoadBtn" type="button">Load</button>
       </div>
       <p class="url-hint">The server must send <code>Access-Control-Allow-Origin: *</code>.<br>
         Many models on <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a> GGUF CDN support CORS.</p>
@@ -401,8 +438,8 @@
   <!-- Tabs -->
   <div class="tabs" id="tabs">
     <div class="tab-bar">
-      <button class="tab-btn active" data-tab="embedding">Embedding Search</button>
-      <button class="tab-btn" data-tab="generation">Text Generation</button>
+      <button class="tab-btn active" type="button" data-tab="embedding">Embedding Search</button>
+      <button class="tab-btn" type="button" data-tab="generation">Text Generation</button>
     </div>
 
     <!-- Embedding tab -->
@@ -414,27 +451,27 @@
             <div class="text-entry">
               <div class="label-bubble">A</div>
               <textarea>Albert Einstein was a theoretical physicist who developed the theory of relativity.</textarea>
-              <button class="remove-btn" title="Remove">×</button>
+              <button class="remove-btn" type="button" title="Remove">×</button>
             </div>
             <div class="text-entry">
               <div class="label-bubble">B</div>
               <textarea>Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.</textarea>
-              <button class="remove-btn" title="Remove">×</button>
+              <button class="remove-btn" type="button" title="Remove">×</button>
             </div>
             <div class="text-entry">
               <div class="label-bubble">C</div>
               <textarea>Bananas are sweet tropical fruit often used in smoothies and baked desserts.</textarea>
-              <button class="remove-btn" title="Remove">×</button>
+              <button class="remove-btn" type="button" title="Remove">×</button>
             </div>
             <div class="text-entry">
               <div class="label-bubble">D</div>
               <textarea>Retrieval augmented generation finds relevant documents before asking a language model to answer.</textarea>
-              <button class="remove-btn" title="Remove">×</button>
+              <button class="remove-btn" type="button" title="Remove">×</button>
             </div>
           </div>
           <div class="text-entry-footer">
             <div class="entry-actions">
-              <button class="add-text-btn" id="addTextBtn">+ Add text</button>
+              <button class="add-text-btn" id="addTextBtn" type="button">+ Add text</button>
               <button class="secondary" id="sampleTextsBtn" type="button">Samples</button>
               <button class="secondary" id="clearTextsBtn" type="button">Clear</button>
             </div>
@@ -456,7 +493,7 @@
 
       <div class="embedding-controls">
         <span class="stat"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
-        <button class="primary" id="embedBtn" disabled>Run retrieval</button>
+        <button class="primary" id="embedBtn" type="button" disabled>Run retrieval</button>
       </div>
 
       <div class="card" id="simCard" style="display:none">
@@ -484,7 +521,7 @@
           </div>
           <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
             <span class="stat"><span class="kbd">Ctrl</span>+<span class="kbd">Enter</span></span>
-            <button class="primary" id="generateBtn" disabled>Generate</button>
+            <button class="primary" id="generateBtn" type="button" disabled>Generate</button>
           </div>
         </div>
       </div>
@@ -493,8 +530,8 @@
         <div class="output-header">
           <label style="margin-bottom:0">Output</label>
           <div class="output-actions">
-            <button class="secondary" id="copyBtn">Copy</button>
-            <button class="secondary" id="clearBtn">Clear</button>
+            <button class="secondary" id="copyBtn" type="button">Copy</button>
+            <button class="secondary" id="clearBtn" type="button">Clear</button>
           </div>
         </div>
         <div class="output-box" id="genOutput"></div>
@@ -712,7 +749,7 @@
       entry.innerHTML = `
         <div class="label-bubble"></div>
         <textarea></textarea>
-        <button class="remove-btn" title="Remove">×</button>`;
+        <button class="remove-btn" type="button" title="Remove">×</button>`;
       entry.querySelector('textarea').value = text;
       grid.appendChild(entry);
       attachTextEvents(entry);
@@ -723,7 +760,7 @@
       entry.innerHTML = `
         <div class="label-bubble"></div>
         <textarea placeholder="Enter text…"></textarea>
-        <button class="remove-btn" title="Remove">×</button>`;
+        <button class="remove-btn" type="button" title="Remove">×</button>`;
       grid.appendChild(entry);
       attachTextEvents(entry);
     }
@@ -753,7 +790,7 @@
     entry.innerHTML = `
       <div class="label-bubble"></div>
       <textarea placeholder="Enter text…"></textarea>
-      <button class="remove-btn" title="Remove">×</button>`;
+      <button class="remove-btn" type="button" title="Remove">×</button>`;
     grid.appendChild(entry);
     attachTextEvents(entry);
     syncTextUI();

@@ -30,7 +30,11 @@
     <div class="top">
       <button id="history-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="Toggle chat history">History</button>
       <button id="new-chat" class="ghost" type="button" aria-label="Start new chat">+ New</button>
-      <a href="/chat?expert">Expert UI</a>
+      <nav class="page-nav" aria-label="RustyLLM web views">
+        <a href="/chat" aria-current="page">Chat</a>
+        <a href="/chat?expert">Expert</a>
+        <a href="/explorer">Explorer</a>
+      </nav>
       <div id="status" class="status" role="status" aria-live="polite">Ready</div>
     </div>
   </header>

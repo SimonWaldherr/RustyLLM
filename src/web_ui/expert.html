@@ -27,7 +27,14 @@
 <div class="app">
   <header role="banner">
     <h1>RustyLLM Expert UI</h1>
-    <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+    <div class="top">
+      <nav class="page-nav" aria-label="RustyLLM web views">
+        <a href="/chat">Chat</a>
+        <a href="/chat?expert" aria-current="page">Expert</a>
+        <a href="/explorer">Explorer</a>
+      </nav>
+      <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+    </div>
   </header>
 
   <div class="workspace">

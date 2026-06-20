@@ -73,6 +73,13 @@ function attachCopyButton(el, onCopied) {
   return btn;
 }
 
+function apiErrorMessage(parsed, text, status) {
+  if (parsed?.error?.message) return parsed.error.message;
+  if (typeof parsed?.error === "string") return parsed.error;
+  if (parsed?.message) return parsed.message;
+  return text || ("HTTP " + status);
+}
+
 /* ════════════════════════════════
    Expert UI
    ════════════════════════════════ */
@@ -221,7 +228,7 @@ function initExpert() {
     const text = await response.text();
     let parsed = null;
     try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
-    if (!response.ok) throw new Error(parsed?.error || text || ("HTTP " + response.status));
+    if (!response.ok) throw new Error(apiErrorMessage(parsed, text, response.status));
     return parsed;
   }
 
@@ -271,7 +278,8 @@ function initExpert() {
         if (!line) continue;
         const data = line.slice(6).trim();
         if (data === "[DONE]") continue;
-        const evt = JSON.parse(data);
+        let evt;
+        try { evt = JSON.parse(data); } catch (_) { continue; }
         const token = mode === "chat"
           ? evt.choices?.[0]?.delta?.content || ""
           : evt.choices?.[0]?.text || "";
@@ -856,7 +864,9 @@ function initChat() {
           if (!line) continue;
           const data = line.slice(6).trim();
           if (data === "[DONE]") continue;
-          const token = JSON.parse(data).choices?.[0]?.delta?.content || "";
+          let evt;
+          try { evt = JSON.parse(data); } catch (_) { continue; }
+          const token = evt.choices?.[0]?.delta?.content || "";
           if (token) {
             assistantText += token;
             tokenCount++;

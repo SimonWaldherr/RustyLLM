@@ -17,9 +17,15 @@
   <header role="banner">
     <div class="top">
       <h1>RustyLLM GGUF Explorer</h1>
-      <a href="/chat?expert">Expert UI</a>
     </div>
-    <div id="status" class="status" role="status" aria-live="polite">Loading model...</div>
+    <div class="top">
+      <nav class="page-nav" aria-label="RustyLLM web views">
+        <a href="/chat">Chat</a>
+        <a href="/chat?expert">Expert</a>
+        <a href="/explorer" aria-current="page">Explorer</a>
+      </nav>
+      <div id="status" class="status" role="status" aria-live="polite">Loading model...</div>
+    </div>
   </header>
 
   <div class="workspace">
@@ -57,6 +63,14 @@
         <h2 id="modelTitle">Model</h2>
         <div id="modelFacts" class="fact-grid compact"></div>
       </section>
+
+      <section class="explorer-side-section" aria-labelledby="catalogTitle">
+        <div class="panel-head compact-head">
+          <h2 id="catalogTitle">Available GGUFs</h2>
+          <span id="catalogCount" class="panel-note"></span>
+        </div>
+        <div id="modelCatalog" class="model-catalog"></div>
+      </section>
     </aside>
 
     <main aria-label="GGUF explorer results">
@@ -91,6 +105,7 @@
             <h2 id="neighborTitle">Nearest Tokens</h2>
             <span id="neighborNote" class="panel-note"></span>
           </div>
+          <p class="explainer">Static token-vector neighbors; contextual model reasoning can differ.</p>
           <div class="neighbor-layout">
             <div id="neighborMap" class="neighbor-map" role="img" aria-label="2D projection of nearest token vectors"></div>
             <div id="neighbors" class="neighbor-list"></div>
@@ -100,7 +115,11 @@
         <article class="explorer-panel wide" aria-labelledby="tensorTitle">
           <div class="panel-head">
             <h2 id="tensorTitle">Tensor Directory</h2>
-            <span class="panel-note">first 80 tensors</span>
+            <span id="tensorNote" class="panel-note"></span>
+          </div>
+          <div class="field tensor-filter">
+            <label for="tensorFilter">Filter tensors</label>
+            <input id="tensorFilter" type="search" autocomplete="off" spellcheck="false" placeholder="name, family, dtype, dimension">
           </div>
           <div id="tensorTable" class="tensor-table"></div>
         </article>
