@@ -1,5 +1,6 @@
 # RustyLLM
 
+[![DOI](https://zenodo.org/badge/1201177634.svg)](https://doi.org/10.5281/zenodo.20772661)
 [![CI](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml/badge.svg)](https://github.com/SimonWaldherr/RustyLLM/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/SimonWaldherr/RustyLLM)](LICENSE)
 [![GitHub release](https://img.shields.io/github/v/release/SimonWaldherr/RustyLLM)](https://github.com/SimonWaldherr/RustyLLM/releases)
