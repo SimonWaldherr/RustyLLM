@@ -2572,9 +2572,8 @@ pub(crate) fn online_attention_grouped(
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
         for g in 0..kv_mul {
-            let q_sub = unsafe {
-                queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
-            };
+            let q_sub =
+                unsafe { queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim) };
             let score = simd::dot_f32(q_sub, keys_sub) * scale;
             let out_sub = unsafe {
                 out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)

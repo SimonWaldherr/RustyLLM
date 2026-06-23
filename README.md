@@ -321,6 +321,13 @@ Generation options:
 - `--stop <text>` stops generation when the text appears. The flag can be
   repeated.
 - `--threads <N>` overrides the SIMD worker thread count.
+- `--threads-batch <N>` overrides the SIMD worker thread count only during
+  prompt/prefill processing, mirroring llama.cpp's split between generation
+  threads and batch/prompt threads.
+- `--bench-threads <LIST>` runs the same benchmark across comma-separated SIMD
+  worker counts, for example `--bench-threads 1,2,4,8`. This follows the
+  llama.cpp tuning practice of measuring thread oversubscription instead of
+  assuming that all logical CPUs are fastest.
 - `--profile <name>` selects runtime planning: `auto`, `mistral`,
   `mistral-ultra`, or `gemma`. `mistral-ultra` is an experimental aggressive
   Metal mode for Mistral/Ministral-style GGUFs; it lowers Metal dispatch
@@ -711,8 +718,26 @@ rusty-llm ./models/model.gguf \
   --bench-runs 5 \
   --max-tokens 64 \
   --threads 8 \
+  --threads-batch 12 \
   --prompt "Explain local LLM inference performance in one concise paragraph."
 ```
+
+Thread tuning sweep:
+
+```bash
+rusty-llm ./models/model.gguf \
+  --bench \
+  --bench-runs 3 \
+  --bench-threads 1,2,4,8 \
+  --max-tokens 128 \
+  --temp 0 \
+  --seed 42 \
+  --prompt "Explain local LLM inference performance in one concise paragraph."
+```
+
+Use the best measured decode throughput for that model, backend, prompt shape,
+and machine. For long prompts, compare `--threads-batch` separately because the
+fastest prefill setting can differ from the fastest decode setting.
 
 Emit JSON for scripts or CI artifacts:
 

@@ -1,7 +1,7 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::model::{
-    self, apply_rope_qk, online_attention, rms_norm_into, silu, Config, DecodeBuffer, ExpertWeight,
-    GptOssWeights, KVCache, ModelWeights, Weight,
+    self, Config, DecodeBuffer, ExpertWeight, GptOssWeights, KVCache, ModelWeights, Weight,
+    apply_rope_qk, online_attention, rms_norm_into, silu,
 };
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -212,6 +212,7 @@ pub struct RuntimeOptConfig {
     pub flash_attention: bool,
     pub sliding_window_size: Option<usize>,
     pub max_context: Option<usize>,
+    pub batch_threads: Option<usize>,
     pub profile: RuntimeProfile,
 }
 
@@ -223,6 +224,7 @@ impl Default for RuntimeOptConfig {
             flash_attention: true,
             sliding_window_size: None,
             max_context: None,
+            batch_threads: None,
             profile: RuntimeProfile::Auto,
         }
     }
@@ -288,6 +290,9 @@ impl GenerationOptions {
         }
         if matches!(self.runtime.max_context, Some(0)) {
             return Err(String::from("--max-context must be greater than 0."));
+        }
+        if matches!(self.runtime.batch_threads, Some(0)) {
+            return Err(String::from("--threads-batch must be greater than 0."));
         }
         if matches!(self.runtime.sliding_window_size, Some(0)) {
             return Err(String::from("--sliding-window must be greater than 0."));
@@ -1180,6 +1185,9 @@ impl Runner {
         if let Some(window) = self.effective_sliding_window(options) {
             items.push(format!("sliding-window={} tokens", window));
         }
+        if let Some(threads) = options.runtime.batch_threads {
+            items.push(format!("threads-batch={}", threads));
+        }
         items.push(format!(
             "max-context={} tokens",
             self.effective_max_context(options)
@@ -1962,12 +1970,20 @@ impl Runner {
         let t_prefill = Instant::now();
         let mut logits = Vec::new();
         let last_prompt_pos = tokens.len() - 1;
+        let decode_threads = options.runtime.batch_threads.map(|threads| {
+            let previous = crate::simd::num_threads();
+            crate::simd::set_num_threads(threads);
+            previous
+        });
         for (pos, &tok_id) in tokens.iter().enumerate() {
             if pos == last_prompt_pos {
                 self.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);
             } else {
                 let _ = self.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
             }
+        }
+        if let Some(threads) = decode_threads {
+            crate::simd::set_num_threads(threads);
         }
         let prefill_time = t_prefill.elapsed();
 
@@ -3593,9 +3609,9 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_thinking_prompt, cosine_similarity, l2_normalize_in_place, mean_pool_in_place,
-        push_recent_token, recent_token_tail, trailing_char_boundary_start, RuntimeProfile,
-        RECENT_TOKEN_LIMIT,
+        RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt, cosine_similarity,
+        l2_normalize_in_place, mean_pool_in_place, push_recent_token, recent_token_tail,
+        trailing_char_boundary_start,
     };
 
     #[test]

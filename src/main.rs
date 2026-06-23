@@ -8,20 +8,20 @@
     clippy::useless_conversion
 )]
 
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+use rusty_llm::catalog::{ModelEntry, select_model};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_file_selector,
     resolve_model_path,
 };
-#[cfg(all(not(target_family = "wasm"), feature = "server"))]
-use rusty_llm::catalog::{select_model, ModelEntry};
 use rusty_llm::gguf::GGUFFile;
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::metal;
 use rusty_llm::model::Config;
 use rusty_llm::runtime::{
-    compatibility_report, ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner,
-    RuntimeProfile,
+    ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
+    compatibility_report,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, McpServeOptions, ServeOptions};
@@ -78,6 +78,7 @@ fn print_usage(name: &str) {
     eprintln!("  --repeat-penalty <F>      Repetition penalty (default: 1.1)");
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
+    eprintln!("  --threads-batch <N>       Override prompt/prefill thread count");
     eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");
     eprintln!("  --mtp-tokens <N>          Max speculative draft tokens (default: 4)");
     eprintln!("  --mtp-min-accept-rate <F> Disable MTP below this accept rate (default: 0.5)");
@@ -436,6 +437,10 @@ fn run() -> Result<(), String> {
             }
             "--threads" => {
                 threads_override = Some(parse_arg::<usize>(&args, &mut i, "--threads")?);
+            }
+            "--threads-batch" => {
+                options.runtime.batch_threads =
+                    Some(parse_arg::<usize>(&args, &mut i, "--threads-batch")?);
             }
             "--mtp-assistant" => {
                 options.speculative.assistant_path =
@@ -1368,6 +1373,7 @@ fn run_benchmark_thread_sweep(
             "architecture": runner.architecture(),
             "load_ms": load_info.load_time.as_millis(),
             "max_tokens": options.max_tokens,
+            "batch_threads": options.runtime.batch_threads,
             "best_threads_by_decode_tok_s": best_threads,
             "best_decode_tok_s": best_decode_tok_s,
             "threads": summaries,
@@ -1510,6 +1516,7 @@ fn run_benchmark_json(
                 "flash_attention": options.runtime.flash_attention,
                 "sliding_window_size": options.runtime.sliding_window_size,
                 "max_context": options.runtime.max_context,
+                "batch_threads": options.runtime.batch_threads,
             },
         },
         "results": run_values,
