@@ -1970,11 +1970,16 @@ impl Runner {
         let t_prefill = Instant::now();
         let mut logits = Vec::new();
         let last_prompt_pos = tokens.len() - 1;
-        let decode_threads = options.runtime.batch_threads.map(|threads| {
-            let previous = crate::simd::num_threads();
-            crate::simd::set_num_threads(threads);
-            previous
-        });
+        let current_threads = crate::simd::num_threads();
+        let decode_threads = options
+            .runtime
+            .batch_threads
+            .filter(|&threads| threads != current_threads)
+            .map(|threads| {
+                let previous = current_threads;
+                crate::simd::set_num_threads(threads);
+                previous
+            });
         for (pos, &tok_id) in tokens.iter().enumerate() {
             if pos == last_prompt_pos {
                 self.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);

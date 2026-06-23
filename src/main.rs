@@ -812,16 +812,16 @@ fn run() -> Result<(), String> {
             prompt.trim()
         };
         if let Some(thread_counts) = bench_threads.as_deref() {
-            run_benchmark_thread_sweep(
-                &runner,
-                &load_info,
-                bench_prompt,
-                &options,
-                bench_runs,
+            run_benchmark_thread_sweep(BenchmarkThreadSweep {
+                runner: &runner,
+                load_info: &load_info,
+                prompt: bench_prompt,
+                options: &options,
+                runs: bench_runs,
                 thread_counts,
-                bench_json,
-                bench_output,
-            )?;
+                json: bench_json,
+                output: bench_output,
+            })?;
             return Ok(());
         }
         run_benchmark(
@@ -1238,17 +1238,29 @@ fn run_benchmark(
     Ok(())
 }
 
-/// Runs the same generation benchmark across several worker counts.
-fn run_benchmark_thread_sweep(
-    runner: &Runner,
-    load_info: &LoadInfo,
-    prompt: &str,
-    options: &GenerationOptions,
+struct BenchmarkThreadSweep<'a> {
+    runner: &'a Runner,
+    load_info: &'a LoadInfo,
+    prompt: &'a str,
+    options: &'a GenerationOptions,
     runs: usize,
-    thread_counts: &[usize],
+    thread_counts: &'a [usize],
     json: bool,
     output: bool,
-) -> Result<(), String> {
+}
+
+/// Runs the same generation benchmark across several worker counts.
+fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), String> {
+    let BenchmarkThreadSweep {
+        runner,
+        load_info,
+        prompt,
+        options,
+        runs,
+        thread_counts,
+        json,
+        output,
+    } = config;
     let mut summaries = Vec::with_capacity(thread_counts.len());
 
     if !json {
