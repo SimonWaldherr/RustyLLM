@@ -2536,6 +2536,82 @@ pub(crate) fn online_attention(
     }
 }
 
+#[inline]
+/// Runs online attention for all `kv_mul` query heads that share one KV head
+/// at once, reading each cached key/value row exactly once instead of once
+/// per query head. Under GQA (`kv_mul` > 1) this avoids re-streaming the same
+/// K/V cache rows `kv_mul` times, which otherwise evicts them from L1/L2
+/// between repeated per-head passes over long contexts.
+pub(crate) fn online_attention_grouped(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(queries.len(), kv_mul * key_head_dim);
+    debug_assert_eq!(out.len(), kv_mul * value_head_dim);
+
+    let mut max_score = [f32::NEG_INFINITY; MAX_KV_MUL];
+    let mut denom = [0.0f32; MAX_KV_MUL];
+    let kv_mul = kv_mul.min(MAX_KV_MUL);
+
+    for t in start_t..=end_t {
+        let slot = t % slot_count;
+        let k_off = slot * key_stride;
+        let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
+        let v_off = slot * value_stride;
+        let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
+
+        for g in 0..kv_mul {
+            let q_sub = unsafe {
+                queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
+            };
+            let score = simd::dot_f32(q_sub, keys_sub) * scale;
+            let out_sub = unsafe {
+                out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
+            };
+            if score > max_score[g] {
+                let old_scale = if max_score[g].is_finite() {
+                    exp_attn(max_score[g] - score)
+                } else {
+                    0.0
+                };
+                simd::scale_add_f32(out_sub, old_scale, value_row);
+                denom[g] = denom[g] * old_scale + 1.0;
+                max_score[g] = score;
+            } else {
+                let weight = exp_attn(score - max_score[g]);
+                simd::axpy_f32(out_sub, weight, value_row);
+                denom[g] += weight;
+            }
+        }
+    }
+
+    for g in 0..kv_mul {
+        if denom[g] > 0.0 {
+            let inv = 1.0 / denom[g];
+            let out_sub = unsafe {
+                out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
+            };
+            simd::scale_f32(out_sub, inv);
+        }
+    }
+}
+
+/// Upper bound on GQA group size (`n_heads / n_kv_heads`) across supported
+/// architectures; backs the fixed-size scratch arrays in
+/// `online_attention_grouped` so it stays allocation-free.
+const MAX_KV_MUL: usize = 16;
+
 /// SiLU activation
 #[inline(always)]
 /// Computes the SiLU activation.
@@ -2920,12 +2996,11 @@ pub fn forward_into(
             pos,
             scale,
         ) {
-            for h in 0..config.n_heads {
-                let kv_h = h / kv_mul;
-                let q_off = h * head_dim;
-                let out_off = h * config.value_dim;
-                online_attention(
-                    &buf.q[q_off..q_off + head_dim],
+            for kv_h in 0..config.n_kv_heads {
+                let q_off = kv_h * kv_mul * head_dim;
+                let out_off = kv_h * kv_mul * config.value_dim;
+                online_attention_grouped(
+                    &buf.q[q_off..q_off + kv_mul * head_dim],
                     &cache.k[l][kv_h * config.head_dim..],
                     &cache.v[l][kv_h * config.value_dim..],
                     kv_k_dim,
@@ -2933,10 +3008,11 @@ pub fn forward_into(
                     cache.storage_len,
                     head_dim,
                     config.value_dim,
+                    kv_mul,
                     attn_window,
                     pos,
                     scale,
-                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                    &mut buf.attn_out[out_off..out_off + kv_mul * config.value_dim],
                 );
             }
         }
@@ -3251,12 +3327,11 @@ pub fn forward_gemma4_into(
             pos,
             scale,
         ) {
-            for h in 0..config.n_heads {
-                let kv_h = h / kv_mul_l;
-                let q_off = h * head_dim_l;
-                let out_off = h * value_dim_l;
-                online_attention(
-                    &buf.q[q_off..q_off + head_dim_l],
+            for kv_h in 0..n_kv_heads_l {
+                let q_off = kv_h * kv_mul_l * head_dim_l;
+                let out_off = kv_h * kv_mul_l * value_dim_l;
+                online_attention_grouped(
+                    &buf.q[q_off..q_off + kv_mul_l * head_dim_l],
                     &cache.k[kv_cache_layer][kv_h * head_dim_l..],
                     &cache.v[kv_cache_layer][kv_h * value_dim_l..],
                     cache.per_pos_k_dim,
@@ -3264,10 +3339,11 @@ pub fn forward_gemma4_into(
                     cache.storage_len,
                     head_dim_l,
                     value_dim_l,
+                    kv_mul_l,
                     attn_window,
                     pos,
                     scale,
-                    &mut buf.attn_out[out_off..out_off + value_dim_l],
+                    &mut buf.attn_out[out_off..out_off + kv_mul_l * value_dim_l],
                 );
             }
         }
@@ -4233,12 +4309,11 @@ pub fn forward_hidden<'a>(
             pos,
             scale,
         ) {
-            for h in 0..config.n_heads {
-                let kv_h = h / kv_mul;
-                let q_off = h * head_dim;
-                let out_off = h * config.value_dim;
-                online_attention(
-                    &buf.q[q_off..q_off + head_dim],
+            for kv_h in 0..config.n_kv_heads {
+                let q_off = kv_h * kv_mul * head_dim;
+                let out_off = kv_h * kv_mul * config.value_dim;
+                online_attention_grouped(
+                    &buf.q[q_off..q_off + kv_mul * head_dim],
                     &cache.k[l][kv_h * config.head_dim..],
                     &cache.v[l][kv_h * config.value_dim..],
                     kv_k_dim,
@@ -4246,10 +4321,11 @@ pub fn forward_hidden<'a>(
                     cache.storage_len,
                     head_dim,
                     config.value_dim,
+                    kv_mul,
                     attn_window,
                     pos,
                     scale,
-                    &mut buf.attn_out[out_off..out_off + config.value_dim],
+                    &mut buf.attn_out[out_off..out_off + kv_mul * config.value_dim],
                 );
             }
         }
@@ -4590,12 +4666,11 @@ pub fn forward_hidden_gemma4<'a>(
             pos,
             scale,
         ) {
-            for h in 0..config.n_heads {
-                let kv_h = h / kv_mul_l;
-                let q_off = h * head_dim_l;
-                let out_off = h * value_dim_l;
-                online_attention(
-                    &buf.q[q_off..q_off + head_dim_l],
+            for kv_h in 0..n_kv_heads_l {
+                let q_off = kv_h * kv_mul_l * head_dim_l;
+                let out_off = kv_h * kv_mul_l * value_dim_l;
+                online_attention_grouped(
+                    &buf.q[q_off..q_off + kv_mul_l * head_dim_l],
                     &cache.k[kv_cache_layer][kv_h * head_dim_l..],
                     &cache.v[kv_cache_layer][kv_h * value_dim_l..],
                     cache.per_pos_k_dim,
@@ -4603,10 +4678,11 @@ pub fn forward_hidden_gemma4<'a>(
                     cache.storage_len,
                     head_dim_l,
                     value_dim_l,
+                    kv_mul_l,
                     attn_window,
                     pos,
                     scale,
-                    &mut buf.attn_out[out_off..out_off + value_dim_l],
+                    &mut buf.attn_out[out_off..out_off + kv_mul_l * value_dim_l],
                 );
             }
         }

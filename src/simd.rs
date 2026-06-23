@@ -2266,8 +2266,9 @@ pub fn dequant_row_q4_1_into(qrow: &[u8], out: &mut [f32]) {
         let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         for i in 0..16 {
             let byte = block[4 + i];
-            out[b * 32 + i * 2] = scale * (byte & 0x0F) as f32 + min;
-            out[b * 32 + i * 2 + 1] = scale * (byte >> 4) as f32 + min;
+            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            out[b * 32 + i] = scale * (byte & 0x0F) as f32 + min;
+            out[b * 32 + i + 16] = scale * (byte >> 4) as f32 + min;
         }
     }
 }
@@ -2289,8 +2290,9 @@ pub fn dequant_row_q5_0_into(qrow: &[u8], out: &mut [f32]) {
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
             let lo = (((byte & 0x0F) | lo_hi) as i32 - 16) as f32;
             let hi = (((byte >> 4) | hi_hi) as i32 - 16) as f32;
-            out[b * 32 + i * 2] = scale * lo;
-            out[b * 32 + i * 2 + 1] = scale * hi;
+            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            out[b * 32 + i] = scale * lo;
+            out[b * 32 + i + 16] = scale * hi;
         }
     }
 }
@@ -2313,8 +2315,9 @@ pub fn dequant_row_q5_1_into(qrow: &[u8], out: &mut [f32]) {
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
             let lo = ((byte & 0x0F) | lo_hi) as f32;
             let hi = ((byte >> 4) | hi_hi) as f32;
-            out[b * 32 + i * 2] = scale * lo + min;
-            out[b * 32 + i * 2 + 1] = scale * hi + min;
+            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            out[b * 32 + i] = scale * lo + min;
+            out[b * 32 + i + 16] = scale * hi + min;
         }
     }
 }
@@ -2562,8 +2565,8 @@ fn dot_q4_1_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         let mut xsum = 0.0f32;
         for i in 0..16 {
             let byte = block[4 + i];
-            let x0 = x[b * 32 + i * 2];
-            let x1 = x[b * 32 + i * 2 + 1];
+            let x0 = x[b * 32 + i];
+            let x1 = x[b * 32 + i + 16];
             qsum += (byte & 0x0F) as f32 * x0;
             qsum += (byte >> 4) as f32 * x1;
             xsum += x0 + x1;
@@ -2592,8 +2595,8 @@ fn dot_q5_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
             let lo = (((byte & 0x0F) | lo_hi) as i32 - 16) as f32;
             let hi = (((byte >> 4) | hi_hi) as i32 - 16) as f32;
-            block_sum += lo * x[b * 32 + i * 2];
-            block_sum += hi * x[b * 32 + i * 2 + 1];
+            block_sum += lo * x[b * 32 + i];
+            block_sum += hi * x[b * 32 + i + 16];
         }
         sum += scale * block_sum;
     }
@@ -2619,8 +2622,8 @@ fn dot_q5_1_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
             let byte = qs[i];
             let lo_hi = if ((qh >> i) & 1) != 0 { 16 } else { 0 };
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
-            let x0 = x[b * 32 + i * 2];
-            let x1 = x[b * 32 + i * 2 + 1];
+            let x0 = x[b * 32 + i];
+            let x1 = x[b * 32 + i + 16];
             qsum += ((byte & 0x0F) | lo_hi) as f32 * x0;
             qsum += ((byte >> 4) | hi_hi) as f32 * x1;
             xsum += x0 + x1;
@@ -3584,6 +3587,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn q4_1_dequant_uses_split_layout() {
+        let mut block = vec![0u8; 20];
+        block[0] = 0x00;
+        block[1] = 0x3c; // f16 scale = 1.0
+        block[2] = 0x00;
+        block[3] = 0x00; // f16 min = 0.0
+        for i in 0..16usize {
+            let lo = i as u8;
+            let hi = (15 - i) as u8;
+            block[4 + i] = (hi << 4) | lo;
+        }
+        let got = dequant_row_q4_1(&block, 32);
+        let mut expected = [0.0f32; 32];
+        for i in 0..16usize {
+            expected[i] = i as f32;
+            expected[i + 16] = (15 - i) as f32;
+        }
+        for k in 0..32 {
+            assert_eq!(got[k], expected[k], "weight[{k}] mismatch");
+        }
+    }
+
+    #[test]
+    fn q4_1_dot_matches_reference_dequant() {
+        let mut block = vec![0u8; 20];
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        block[2] = 0x00;
+        block[3] = 0x00;
+        for i in 0..16usize {
+            block[4 + i] = (((15 - i) as u8) << 4) | (i as u8);
+        }
+        let weights = dequant_row_q4_1(&block, 32);
+        let x: Vec<f32> = (0..32).map(|k| (k as f32) * 0.5 - 7.0).collect();
+        let reference: f32 = weights.iter().zip(&x).map(|(w, xv)| w * xv).sum();
+        let fused = dot_q4_1_f32(&block, &x, 32);
+        assert!(
+            (fused - reference).abs() < 1e-3,
+            "fused {fused} vs reference {reference}"
+        );
+    }
+
+    #[test]
+    fn q5_0_dequant_uses_split_layout() {
+        let mut block = vec![0u8; 22];
+        block[0] = 0x00;
+        block[1] = 0x3c; // f16 scale = 1.0
+        // qh = 0 -> no high bits set
+        for i in 0..16usize {
+            let lo = i as u8;
+            let hi = (15 - i) as u8;
+            block[6 + i] = (hi << 4) | lo;
+        }
+        let got = dequant_row_q5_0(&block, 32);
+        let mut expected = [0.0f32; 32];
+        for i in 0..16usize {
+            expected[i] = i as f32 - 16.0;
+            expected[i + 16] = (15 - i) as f32 - 16.0;
+        }
+        for k in 0..32 {
+            assert_eq!(got[k], expected[k], "weight[{k}] mismatch");
+        }
+    }
+
+    #[test]
+    fn q5_0_dot_matches_reference_dequant() {
+        let mut block = vec![0u8; 22];
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        for i in 0..16usize {
+            block[6 + i] = (((15 - i) as u8) << 4) | (i as u8);
+        }
+        let weights = dequant_row_q5_0(&block, 32);
+        let x: Vec<f32> = (0..32).map(|k| (k as f32) * 0.5 - 7.0).collect();
+        let reference: f32 = weights.iter().zip(&x).map(|(w, xv)| w * xv).sum();
+        let fused = dot_q5_0_f32(&block, &x, 32);
+        assert!(
+            (fused - reference).abs() < 1e-3,
+            "fused {fused} vs reference {reference}"
+        );
+    }
+
+    #[test]
+    fn q5_1_dequant_uses_split_layout() {
+        let mut block = vec![0u8; 24];
+        block[0] = 0x00;
+        block[1] = 0x3c; // f16 scale = 1.0
+        block[2] = 0x00;
+        block[3] = 0x00; // f16 min = 0.0
+        // qh = 0 -> no high bits set
+        for i in 0..16usize {
+            let lo = i as u8;
+            let hi = (15 - i) as u8;
+            block[8 + i] = (hi << 4) | lo;
+        }
+        let got = dequant_row_q5_1(&block, 32);
+        let mut expected = [0.0f32; 32];
+        for i in 0..16usize {
+            expected[i] = i as f32;
+            expected[i + 16] = (15 - i) as f32;
+        }
+        for k in 0..32 {
+            assert_eq!(got[k], expected[k], "weight[{k}] mismatch");
+        }
+    }
+
+    #[test]
+    fn q5_1_dot_matches_reference_dequant() {
+        let mut block = vec![0u8; 24];
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        block[2] = 0x00;
+        block[3] = 0x00;
+        for i in 0..16usize {
+            block[8 + i] = (((15 - i) as u8) << 4) | (i as u8);
+        }
+        let weights = dequant_row_q5_1(&block, 32);
+        let x: Vec<f32> = (0..32).map(|k| (k as f32) * 0.5 - 7.0).collect();
+        let reference: f32 = weights.iter().zip(&x).map(|(w, xv)| w * xv).sum();
+        let fused = dot_q5_1_f32(&block, &x, 32);
+        assert!(
+            (fused - reference).abs() < 1e-3,
+            "fused {fused} vs reference {reference}"
+        );
+    }
+
     /// Builds deterministic synthetic Q4_K weights for fused-kernel tests.
     fn make_q4k_weights(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
         let row_bytes = (cols / 256) * 144;
@@ -3678,8 +3808,8 @@ mod tests {
 
         let deq = dequant_row_q5_0(&row, 32);
         assert_eq!(deq[0], 0.0);
-        assert_eq!(deq[1], 15.0);
-        assert_eq!(deq[30], 15.0);
+        assert_eq!(deq[16], 15.0);
+        assert_eq!(deq[15], 15.0);
         assert_eq!(deq[31], 0.0);
 
         let x = vec![1.0f32; 32];
@@ -3703,9 +3833,9 @@ mod tests {
 
         let deq = dequant_row_q5_1(&row, 32);
         assert_eq!(deq[0], 16.5);
-        assert_eq!(deq[1], 16.5);
-        assert_eq!(deq[2], 1.5);
-        assert_eq!(deq[3], 1.5);
+        assert_eq!(deq[16], 16.5);
+        assert_eq!(deq[1], 1.5);
+        assert_eq!(deq[17], 1.5);
 
         let x = vec![0.25f32; 32];
         let expected: f32 = deq.iter().map(|v| v * 0.25).sum();
