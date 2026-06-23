@@ -117,6 +117,12 @@ Q4_0 QAT GGUFs such as `google/gemma-4-12B-it-qat-q4_0-gguf` are supported by
 the same path and use fused CPU Q/K/V and Gate/Up projection jobs when Metal is
 not selected for those projections.
 
+Mistral 3 / Ministral 3 instruction GGUFs use their native
+`[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]` and `[INST]...[/INST]` chat formatting when
+the tokenizer template exposes those markers. The startup optimization summary
+prints the selected renderer, for example `chat-template=mistral3-inst`, so you
+can quickly spot whether a model uses a native template or the plain fallback.
+
 ## Requirements
 
 - Rust 1.95 or newer. The repository pins `1.95.0` in
@@ -834,6 +840,11 @@ Mistral Ultra mode:
 RUSTY_LLM_METAL=1 rusty-llm --model-dir ./models --model Ministral \
   --profile mistral-ultra --prompt "Explain metal inference briefly."
 ```
+
+Treat `mistral-ultra` as an experiment, not a default. On the measured
+Ministral 3 3B Q4_K_M model, the standard Metal profile was faster and more
+stable for short-context decode; benchmark both profiles before keeping ultra
+mode in normal runs.
 
 For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with

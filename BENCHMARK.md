@@ -1,8 +1,24 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-06-17 23:02 CEST**
+Updated: **2026-06-23 23:33 CEST**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
+
+## Focus: Ministral 3 3B Instruct 2512
+
+Focused tuning run for `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` on Apple M2 Max, 12 logical cores, 32 GB RAM, macOS 26.5.1, rustc 1.95.0. The benchmark used 3 runs with up to 128 generated tokens, `--temp 0`, `--seed 42`, and the prompt `Explain local LLM inference performance in one concise paragraph.` Metal runs must execute outside the Codex filesystem sandbox; inside the sandbox the same binary reports `Metal: unavailable, using CPU`.
+
+| Profile | Extra env / args | Decode tok/s | Prefill tok/s | Load | Result |
+|---|---|---:|---:|---:|---|
+| CPU | `RUSTY_LLM_METAL=0` | 9.3 | 11.4 | 254 ms | baseline |
+| Metal standard | `RUSTY_LLM_METAL=1` | 27.8 | 27.6 | 235 ms | best stable path |
+| Metal ultra | `RUSTY_LLM_METAL=1 --profile mistral-ultra` | 25.4 | 26.9 | 258 ms | slower/less stable |
+| Metal post-FFN fusion | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_POST_FFN=1` | 23.2 | 23.2 | 205 ms | slower |
+| Metal fast attention approx | `RUSTY_LLM_METAL=1 RUSTY_LLM_FAST_ATTN=1` | 20.6 | 19.6 | 288 ms | slower |
+
+Optimized operating point: use the standard Metal path and leave `mistral-ultra`, `RUSTY_LLM_METAL_POST_FFN`, and `RUSTY_LLM_FAST_ATTN` disabled for this model on this hardware. That gives a measured decode speedup of **2.98x** over the CPU baseline.
+
+Isolated layer-0 kernel timing with Metal standard shows the main decode cost is projection-heavy: fused Q/K/V takes 0.57 ms, the fused FFN block takes 0.72 ms, and the tied-vocabulary output projection takes 2.02 ms per token. There is no smaller compatible local MTP draft model available in the tested model directory, so speculative decoding was not enabled.
 
 ## Run Configuration
 

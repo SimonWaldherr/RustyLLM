@@ -1,7 +1,7 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::model::{
-    self, Config, DecodeBuffer, ExpertWeight, GptOssWeights, KVCache, ModelWeights, Weight,
-    apply_rope_qk, online_attention, rms_norm_into, silu,
+    self, apply_rope_qk, online_attention, rms_norm_into, silu, Config, DecodeBuffer, ExpertWeight,
+    GptOssWeights, KVCache, ModelWeights, Weight,
 };
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -1158,6 +1158,12 @@ impl Runner {
     pub fn optimization_summary(&self, options: &GenerationOptions) -> Vec<String> {
         let mut items = Vec::new();
         items.push(format!("profile={}", options.runtime.profile.as_str()));
+        let chat_template = if self.arch == "gpt-oss" {
+            "gpt-oss"
+        } else {
+            self.chat_template_kind().unwrap_or("plain")
+        };
+        items.push(format!("chat-template={}", chat_template));
         items.push(match options.runtime.kv_cache_dtype {
             KvCacheDType::Auto => String::from("kv-cache=f32(auto)"),
             KvCacheDType::F32 => String::from("kv-cache=f32"),
@@ -1234,6 +1240,23 @@ impl Runner {
         if profile == RuntimeProfile::MistralUltra && !crate::metal::enabled() {
             warnings.push(String::from(
                 "Mistral ultra profile requested, but Metal is unavailable or disabled; falling back to native SIMD CPU kernels.",
+            ));
+        } else if profile == RuntimeProfile::MistralUltra && self.arch == "mistral3" {
+            warnings.push(String::from(
+                "Mistral ultra is experimental; for Ministral 3 short-context decode, benchmark against the default Metal profile because ultra can be slower.",
+            ));
+        }
+        if self
+            .gguf
+            .metadata
+            .get("tokenizer.chat_template")
+            .and_then(|value| value.as_str())
+            .is_some()
+            && self.chat_template_kind().is_none()
+            && self.arch != "gpt-oss"
+        {
+            warnings.push(String::from(
+                "Tokenizer has a chat template, but RustyLLM does not recognize it yet; falling back to plain role-prefixed chat formatting.",
             ));
         }
         if options.speculative.enabled
@@ -2420,6 +2443,11 @@ impl Runner {
                 return tokens;
             }
         }
+        if matches!(self.chat_template_kind(), Some("mistral3-inst")) {
+            if let Some(tokens) = self.render_mistral3_inst_messages(messages, system_prompt) {
+                return tokens;
+            }
+        }
         if matches!(self.chat_template_kind(), Some("header-chat")) {
             if let Some(tokens) = self.render_header_chat_messages(messages, system_prompt) {
                 return tokens;
@@ -2588,6 +2616,64 @@ impl Runner {
         Some(tokens)
     }
 
+    /// Renders Mistral 3 / Ministral 3 instruction templates.
+    ///
+    /// Current Ministral 3 GGUFs expose a Jinja template of the form:
+    /// BOS, optional `[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`, alternating
+    /// `[INST]user[/INST]` turns, assistant text followed by EOS.
+    fn render_mistral3_inst_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+    ) -> Option<Vec<u32>> {
+        let inst = self.tok.special_id("[INST]")?;
+        let end_inst = self.tok.special_id("[/INST]")?;
+        let system_start = self.tok.special_id("[SYSTEM_PROMPT]")?;
+        let system_end = self.tok.special_id("[/SYSTEM_PROMPT]")?;
+
+        let mut tokens = Vec::new();
+        tokens.push(self.tok.bos_id);
+
+        let mut system_parts = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            system_parts.push(system_prompt.trim().to_string());
+        }
+        for message in messages {
+            if matches!(message.role, ChatRole::System) && !message.content.trim().is_empty() {
+                system_parts.push(message.content.trim().to_string());
+            }
+        }
+        let system = system_parts.join("\n\n");
+        if !system.is_empty() {
+            tokens.push(system_start);
+            tokens.extend(self.tok.encode_without_bos(&system));
+            tokens.push(system_end);
+        }
+
+        let mut last_role: Option<ChatRole> = None;
+        for message in messages {
+            match message.role {
+                ChatRole::System => {}
+                ChatRole::User => {
+                    if matches!(last_role.as_ref(), Some(ChatRole::User)) {
+                        tokens.extend(self.tok.encode_without_bos("\n"));
+                    }
+                    tokens.push(inst);
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.push(end_inst);
+                    last_role = Some(ChatRole::User);
+                }
+                ChatRole::Assistant => {
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.push(self.tok.eos_id);
+                    last_role = Some(ChatRole::Assistant);
+                }
+            }
+        }
+
+        Some(tokens)
+    }
+
     fn push_gemma_role(&self, role: &str, out: &mut Vec<u32>) {
         if let Some(role_id) = self.tok.special_id(role) {
             out.push(role_id);
@@ -2669,12 +2755,22 @@ impl Runner {
             .metadata
             .get("tokenizer.chat_template")?
             .as_str()?;
+        Self::chat_template_kind_from_template(template)
+    }
+
+    fn chat_template_kind_from_template(template: &str) -> Option<&'static str> {
         if template.contains("<|start_header_id|>") && template.contains("<|eot_id|>") {
             Some("header-chat")
         } else if (template.contains("<start_of_turn>") && template.contains("<end_of_turn>"))
             || (template.contains("<|turn>") && template.contains("<turn|>"))
         {
             Some("gemma-turn")
+        } else if template.contains("[SYSTEM_PROMPT]")
+            && template.contains("[/SYSTEM_PROMPT]")
+            && template.contains("[INST]")
+            && template.contains("[/INST]")
+        {
+            Some("mistral3-inst")
         } else {
             None
         }
@@ -3497,9 +3593,9 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt, cosine_similarity,
-        l2_normalize_in_place, mean_pool_in_place, push_recent_token, recent_token_tail,
-        trailing_char_boundary_start,
+        clean_thinking_prompt, cosine_similarity, l2_normalize_in_place, mean_pool_in_place,
+        push_recent_token, recent_token_tail, trailing_char_boundary_start, RuntimeProfile,
+        RECENT_TOKEN_LIMIT,
     };
 
     #[test]
@@ -3626,6 +3722,35 @@ mod tests {
             );
         }
         assert_eq!(RuntimeProfile::MistralUltra.as_str(), "mistral-ultra");
+    }
+
+    #[test]
+    /// Verifies that Mistral 3 / Ministral 3 instruction templates use the native renderer.
+    fn chat_template_kind_detects_mistral3_inst() {
+        let template = "{%- if messages[0]['role'] == 'system' -%}\
+            {{ '[SYSTEM_PROMPT]' }}{{ messages[0]['content'] }}{{ '[/SYSTEM_PROMPT]' }}\
+            {%- endif -%}{{ '[INST]' + message['content'] + '[/INST]' }}";
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(template),
+            Some("mistral3-inst")
+        );
+    }
+
+    #[test]
+    /// Verifies that Gemma and header-chat templates keep their established renderers.
+    fn chat_template_kind_keeps_existing_renderers() {
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(
+                "{{ '<start_of_turn>' + role + '<end_of_turn>' }}"
+            ),
+            Some("gemma-turn")
+        );
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(
+                "{{ '<|start_header_id|>' + role + '<|eot_id|>' }}"
+            ),
+            Some("header-chat")
+        );
     }
 
     #[test]

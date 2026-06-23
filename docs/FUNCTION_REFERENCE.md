@@ -246,8 +246,9 @@ the high-level runtime API.
 - `Runner::embed` returns a mean-pooled, L2-normalized embedding.
 - `Runner::is_stop_token` checks built-in stop tokens.
 - `Runner::render_messages`, `render_plain_messages`,
-  `render_gpt_oss_messages`, `render_gemma_turn_messages`, and
-  `render_header_chat_messages` convert chat messages into prompt token IDs.
+  `render_gpt_oss_messages`, `render_gemma_turn_messages`,
+  `render_mistral3_inst_messages`, and `render_header_chat_messages` convert
+  chat messages into prompt token IDs.
 - `Runner::chat_template_kind` classifies supported chat template styles.
 - `Runner::longest_common_prefix` finds reusable KV-cache prefix length.
 - `Runner::kv_dims` returns cache dimensions for the active model family.
