@@ -52,7 +52,7 @@ pub fn set_num_threads(n: usize) {
 
 #[inline]
 /// Returns the configured matrix-vector worker count.
-fn num_threads() -> usize {
+pub fn num_threads() -> usize {
     let configured = NUM_THREADS.load(Ordering::Relaxed);
     if configured > 0 {
         configured

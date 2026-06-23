@@ -8,20 +8,20 @@
     clippy::useless_conversion
 )]
 
-#[cfg(all(not(target_family = "wasm"), feature = "server"))]
-use rusty_llm::catalog::{ModelEntry, select_model};
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::catalog::{
     default_model_dir, discover_models, print_model_list, resolve_model_file_selector,
     resolve_model_path,
 };
+#[cfg(all(not(target_family = "wasm"), feature = "server"))]
+use rusty_llm::catalog::{select_model, ModelEntry};
 use rusty_llm::gguf::GGUFFile;
 #[cfg(not(target_family = "wasm"))]
 use rusty_llm::metal;
 use rusty_llm::model::Config;
 use rusty_llm::runtime::{
-    ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
-    compatibility_report,
+    compatibility_report, ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner,
+    RuntimeProfile,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, McpServeOptions, ServeOptions};
@@ -103,6 +103,7 @@ fn print_usage(name: &str) {
     eprintln!("  --bench-json              Run benchmark and emit machine-readable JSON");
     eprintln!("  --bench-output            Include generated text for each benchmark run");
     eprintln!("  --bench-runs <N>          Number of benchmark runs (default: 3)");
+    eprintln!("  --bench-threads <LIST>    Benchmark comma-separated worker counts, e.g. 1,2,4,8");
     eprintln!("  --kernel-bench            Run isolated kernel benchmark");
     eprintln!("  --kernel-bench-json       Emit isolated kernel benchmark JSON");
     eprintln!("  --kernel-bench-runs <N>   Number of kernel benchmark runs (default: 25)");
@@ -127,6 +128,32 @@ where
     args[*i]
         .parse::<T>()
         .map_err(|err| format!("Invalid {} value '{}': {}", flag, args[*i], err))
+}
+
+/// Parses a comma-separated thread-count list for benchmark sweeps.
+fn parse_thread_list(raw: &str) -> Result<Vec<usize>, String> {
+    let mut values = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err(String::from("--bench-threads contains an empty value."));
+        }
+        let value = trimmed
+            .parse::<usize>()
+            .map_err(|err| format!("Invalid --bench-threads value '{}': {}", trimmed, err))?;
+        if value == 0 {
+            return Err(String::from(
+                "--bench-threads values must be greater than 0.",
+            ));
+        }
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    if values.is_empty() {
+        return Err(String::from("--bench-threads requires at least one value."));
+    }
+    Ok(values)
 }
 
 /// Records a model selector while rejecting conflicting selectors.
@@ -305,6 +332,7 @@ fn run() -> Result<(), String> {
     let mut bench_mode = false;
     let mut bench_json = false;
     let mut bench_output = false;
+    let mut bench_threads: Option<Vec<usize>> = None;
     let mut kernel_bench = false;
     let mut kernel_bench_json = false;
     let mut kernel_bench_runs = 25usize;
@@ -500,6 +528,11 @@ fn run() -> Result<(), String> {
             "--bench-runs" => {
                 bench_runs = parse_arg::<usize>(&args, &mut i, "--bench-runs")?;
             }
+            "--bench-threads" => {
+                let value = parse_arg::<String>(&args, &mut i, "--bench-threads")?;
+                bench_mode = true;
+                bench_threads = Some(parse_thread_list(&value)?);
+            }
             "--kernel-bench" => {
                 kernel_bench = true;
             }
@@ -621,6 +654,8 @@ fn run() -> Result<(), String> {
     if let Some(n) = threads_override {
         simd::set_num_threads(n);
         eprintln!("Worker threads: {}", n);
+    } else {
+        eprintln!("Worker threads: {} (auto)", simd::num_threads());
     }
 
     let model_resolution_start = Instant::now();
@@ -771,6 +806,19 @@ fn run() -> Result<(), String> {
         } else {
             prompt.trim()
         };
+        if let Some(thread_counts) = bench_threads.as_deref() {
+            run_benchmark_thread_sweep(
+                &runner,
+                &load_info,
+                bench_prompt,
+                &options,
+                bench_runs,
+                thread_counts,
+                bench_json,
+                bench_output,
+            )?;
+            return Ok(());
+        }
         run_benchmark(
             &runner,
             &load_info,
@@ -1181,6 +1229,159 @@ fn run_benchmark(
         "aggregate_decode_tok_s={:.2}",
         total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001)
     );
+
+    Ok(())
+}
+
+/// Runs the same generation benchmark across several worker counts.
+fn run_benchmark_thread_sweep(
+    runner: &Runner,
+    load_info: &LoadInfo,
+    prompt: &str,
+    options: &GenerationOptions,
+    runs: usize,
+    thread_counts: &[usize],
+    json: bool,
+    output: bool,
+) -> Result<(), String> {
+    let mut summaries = Vec::with_capacity(thread_counts.len());
+
+    if !json {
+        println!("Benchmark Thread Sweep");
+        println!("model={}", runner.model_name().unwrap_or("unknown"));
+        println!("architecture={}", runner.architecture());
+        println!("load_ms={}", load_info.load_time.as_millis());
+        println!("runs={}", runs);
+        println!("max_tokens={}", options.max_tokens);
+        println!();
+        println!(
+            "threads,avg_prompt_tokens,avg_generated_tokens,avg_prefill_ms,avg_decode_ms,avg_total_ms,avg_wall_ms,aggregate_prefill_tok_s,aggregate_decode_tok_s"
+        );
+    }
+
+    let mut best_threads = 0usize;
+    let mut best_decode_tok_s = 0.0f64;
+
+    for &threads in thread_counts {
+        simd::set_num_threads(threads);
+
+        let mut total_prompt_tokens = 0usize;
+        let mut total_generated_tokens = 0usize;
+        let mut total_prefill = Duration::from_secs(0);
+        let mut total_decode = Duration::from_secs(0);
+        let mut total_model = Duration::from_secs(0);
+        let mut total_wall = Duration::from_secs(0);
+        let mut run_values = Vec::with_capacity(runs);
+
+        for run in 0..runs {
+            let mut run_options = options.clone();
+            if options.seed != 0 {
+                run_options.seed = options.seed.wrapping_add(run as u64);
+            }
+
+            let wall_start = Instant::now();
+            let mut loaded_skills = HashSet::new();
+            let result =
+                runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
+            let wall = wall_start.elapsed();
+
+            if json {
+                let decode_tok_s = result.stats.generated_tokens as f64
+                    / result.stats.decode_time.as_secs_f64().max(0.001);
+                let prefill_tok_s = result.stats.prompt_tokens as f64
+                    / result.stats.prefill_time.as_secs_f64().max(0.001);
+                let mut run_value = serde_json::json!({
+                    "run": run + 1,
+                    "prompt_tokens": result.stats.prompt_tokens,
+                    "generated_tokens": result.stats.generated_tokens,
+                    "prefill_ms": result.stats.prefill_time.as_millis(),
+                    "decode_ms": result.stats.decode_time.as_millis(),
+                    "total_ms": result.stats.total_time.as_millis(),
+                    "wall_ms": wall.as_millis(),
+                    "prefill_tok_s": prefill_tok_s,
+                    "decode_tok_s": decode_tok_s,
+                });
+                if output {
+                    run_value["text"] = serde_json::json!(result.text);
+                }
+                run_values.push(run_value);
+            } else if output {
+                println!(
+                    "threads {} run {} output: {}",
+                    threads,
+                    run + 1,
+                    result.text
+                );
+            }
+
+            total_prompt_tokens += result.stats.prompt_tokens;
+            total_generated_tokens += result.stats.generated_tokens;
+            total_prefill += result.stats.prefill_time;
+            total_decode += result.stats.decode_time;
+            total_model += result.stats.total_time;
+            total_wall += wall;
+        }
+
+        let prefill_tok_s = total_prompt_tokens as f64 / total_prefill.as_secs_f64().max(0.001);
+        let decode_tok_s = total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001);
+        if decode_tok_s > best_decode_tok_s {
+            best_decode_tok_s = decode_tok_s;
+            best_threads = threads;
+        }
+
+        let summary = serde_json::json!({
+            "threads": threads,
+            "runs": runs,
+            "avg_prompt_tokens": total_prompt_tokens as f64 / runs as f64,
+            "avg_generated_tokens": total_generated_tokens as f64 / runs as f64,
+            "avg_prefill_ms": total_prefill.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_decode_ms": total_decode.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_total_ms": total_model.as_secs_f64() * 1000.0 / runs as f64,
+            "avg_wall_ms": total_wall.as_secs_f64() * 1000.0 / runs as f64,
+            "aggregate_prefill_tok_s": prefill_tok_s,
+            "aggregate_decode_tok_s": decode_tok_s,
+            "runs_detail": run_values,
+        });
+
+        if !json {
+            println!(
+                "{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
+                threads,
+                total_prompt_tokens as f64 / runs as f64,
+                total_generated_tokens as f64 / runs as f64,
+                total_prefill.as_secs_f64() * 1000.0 / runs as f64,
+                total_decode.as_secs_f64() * 1000.0 / runs as f64,
+                total_model.as_secs_f64() * 1000.0 / runs as f64,
+                total_wall.as_secs_f64() * 1000.0 / runs as f64,
+                prefill_tok_s,
+                decode_tok_s
+            );
+        }
+
+        summaries.push(summary);
+    }
+
+    if json {
+        let report = serde_json::json!({
+            "type": "rusty-llm.benchmark_thread_sweep",
+            "model": runner.model_name(),
+            "architecture": runner.architecture(),
+            "load_ms": load_info.load_time.as_millis(),
+            "max_tokens": options.max_tokens,
+            "best_threads_by_decode_tok_s": best_threads,
+            "best_decode_tok_s": best_decode_tok_s,
+            "threads": summaries,
+        });
+        let body = serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("Failed to serialize benchmark JSON: {}", err))?;
+        println!("{}", body);
+    } else {
+        println!();
+        println!(
+            "best_threads_by_decode_tok_s={} ({:.2} tok/s)",
+            best_threads, best_decode_tok_s
+        );
+    }
 
     Ok(())
 }
