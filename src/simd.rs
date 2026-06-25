@@ -3334,26 +3334,63 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 unsafe fn dot_q8_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
-    let mut sum_acc = vdupq_n_f32(0.0);
-    for b in 0..n_blocks {
+    let mut sum_acc0 = vdupq_n_f32(0.0);
+    let mut sum_acc1 = vdupq_n_f32(0.0);
+    let mut b = 0usize;
+
+    while b + 1 < n_blocks {
         let block = qdata.as_ptr().add(b * 34);
         let scale = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
-        let scale_v = vdupq_n_f32(scale);
-        let q = block.add(2) as *const i8;
-        let xp = x.as_ptr().add(b * 32);
-        let mut bacc = vdupq_n_f32(0.0);
-        // 32 i8 values in 4 groups of 8
-        for i in 0..4_usize {
-            let qi8 = vld1_s8(q.add(i * 8));
-            let qi16 = vmovl_s8(qi8);
-            let qlo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
-            let qhi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
-            bacc = vmlaq_f32(bacc, qlo, vld1q_f32(xp.add(i * 8)));
-            bacc = vmlaq_f32(bacc, qhi, vld1q_f32(xp.add(i * 8 + 4)));
-        }
-        sum_acc = vmlaq_f32(sum_acc, bacc, scale_v);
+        let block_next = qdata.as_ptr().add((b + 1) * 34);
+        let scale_next = f16_to_f32(u16::from_le_bytes([*block_next, *block_next.add(1)]));
+        let xptr = x.as_ptr().add(b * 32);
+
+        sum_acc0 = vmlaq_f32(
+            sum_acc0,
+            dot_q8_0_block_f32_neon(block, xptr),
+            vdupq_n_f32(scale),
+        );
+        sum_acc1 = vmlaq_f32(
+            sum_acc1,
+            dot_q8_0_block_f32_neon(block_next, xptr.add(32)),
+            vdupq_n_f32(scale_next),
+        );
+        b += 2;
     }
-    vaddvq_f32(sum_acc)
+
+    if b < n_blocks {
+        let block = qdata.as_ptr().add(b * 34);
+        let scale = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        sum_acc0 = vmlaq_f32(
+            sum_acc0,
+            dot_q8_0_block_f32_neon(block, x.as_ptr().add(b * 32)),
+            vdupq_n_f32(scale),
+        );
+    }
+
+    vaddvq_f32(vaddq_f32(sum_acc0, sum_acc1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q8_0_block_f32_neon(
+    block: *const u8,
+    xp: *const f32,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let q = block.add(2) as *const i8;
+    let mut bacc = vdupq_n_f32(0.0);
+
+    for i in 0..4_usize {
+        let qi8 = vld1_s8(q.add(i * 8));
+        let qi16 = vmovl_s8(qi8);
+        let qlo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(qi16)));
+        let qhi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(qi16)));
+        bacc = vmlaq_f32(bacc, qlo, vld1q_f32(xp.add(i * 8)));
+        bacc = vmlaq_f32(bacc, qhi, vld1q_f32(xp.add(i * 8 + 4)));
+    }
+
+    bacc
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -3363,51 +3400,83 @@ unsafe fn dot_q4_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     // ggml split layout: lo nibble of byte i → weight[i], hi nibble → weight[i+16].
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
-    let mut sum_acc = vdupq_n_f32(0.0);
+    let mut sum_acc0 = vdupq_n_f32(0.0);
+    let mut sum_acc1 = vdupq_n_f32(0.0);
     let mask_low = vdupq_n_u8(0x0F);
     let eight = vdupq_n_u8(8);
+    let mut b = 0usize;
 
-    for b in 0..n_blocks {
+    while b + 1 < n_blocks {
         let block = qdata.as_ptr().add(b * 18);
         let scale = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
-        let scale_v = vdupq_n_f32(scale);
+        let block_next = qdata.as_ptr().add((b + 1) * 18);
+        let scale_next = f16_to_f32(u16::from_le_bytes([*block_next, *block_next.add(1)]));
+        let xptr = x.as_ptr().add(b * 32);
 
-        // Load 16 nibble bytes
-        let nib = vld1q_u8(block.add(2));
-        // lo nibbles (bits[3:0]): byte i → weight[i]      (weights 0..16)
-        let lo_i8 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(nib, mask_low), eight));
-        // hi nibbles (bits[7:4]): byte i → weight[i+16]   (weights 16..32)
-        let hi_i8 = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(nib, 4), eight));
-
-        // Widen to i16 (8 each per half), preserving weight order.
-        let w0_8 = vmovl_s8(vget_low_s8(lo_i8)); // weights 0..8
-        let w8_16 = vmovl_s8(vget_high_s8(lo_i8)); // weights 8..16
-        let w16_24 = vmovl_s8(vget_low_s8(hi_i8)); // weights 16..24
-        let w24_32 = vmovl_s8(vget_high_s8(hi_i8)); // weights 24..32
-
-        let xp = x.as_ptr().add(b * 32);
-        let mut bacc = vdupq_n_f32(0.0);
-
-        // Each chunk multiplies 4 contiguous weights by 4 contiguous x values.
-        macro_rules! chunk {
-            ($w4:expr, $xoff:expr) => {{
-                let wf = vcvtq_f32_s32(vmovl_s16($w4));
-                let xv = vld1q_f32(xp.add($xoff));
-                bacc = vmlaq_f32(bacc, wf, xv);
-            }};
-        }
-        chunk!(vget_low_s16(w0_8), 0);
-        chunk!(vget_high_s16(w0_8), 4);
-        chunk!(vget_low_s16(w8_16), 8);
-        chunk!(vget_high_s16(w8_16), 12);
-        chunk!(vget_low_s16(w16_24), 16);
-        chunk!(vget_high_s16(w16_24), 20);
-        chunk!(vget_low_s16(w24_32), 24);
-        chunk!(vget_high_s16(w24_32), 28);
-
-        sum_acc = vmlaq_f32(sum_acc, bacc, scale_v);
+        sum_acc0 = vmlaq_f32(
+            sum_acc0,
+            dot_q4_0_block_f32_neon(block, xptr, mask_low, eight),
+            vdupq_n_f32(scale),
+        );
+        sum_acc1 = vmlaq_f32(
+            sum_acc1,
+            dot_q4_0_block_f32_neon(block_next, xptr.add(32), mask_low, eight),
+            vdupq_n_f32(scale_next),
+        );
+        b += 2;
     }
-    vaddvq_f32(sum_acc)
+
+    if b < n_blocks {
+        let block = qdata.as_ptr().add(b * 18);
+        let scale = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        sum_acc0 = vmlaq_f32(
+            sum_acc0,
+            dot_q4_0_block_f32_neon(block, x.as_ptr().add(b * 32), mask_low, eight),
+            vdupq_n_f32(scale),
+        );
+    }
+
+    vaddvq_f32(vaddq_f32(sum_acc0, sum_acc1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q4_0_block_f32_neon(
+    block: *const u8,
+    xp: *const f32,
+    mask_low: std::arch::aarch64::uint8x16_t,
+    eight: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let nib = vld1q_u8(block.add(2));
+    let lo_i8 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(nib, mask_low), eight));
+    let hi_i8 = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(nib, 4), eight));
+
+    let w0_8 = vmovl_s8(vget_low_s8(lo_i8));
+    let w8_16 = vmovl_s8(vget_high_s8(lo_i8));
+    let w16_24 = vmovl_s8(vget_low_s8(hi_i8));
+    let w24_32 = vmovl_s8(vget_high_s8(hi_i8));
+
+    let mut bacc = vdupq_n_f32(0.0);
+
+    macro_rules! chunk {
+        ($w4:expr, $xoff:expr) => {{
+            let wf = vcvtq_f32_s32(vmovl_s16($w4));
+            let xv = vld1q_f32(xp.add($xoff));
+            bacc = vmlaq_f32(bacc, wf, xv);
+        }};
+    }
+    chunk!(vget_low_s16(w0_8), 0);
+    chunk!(vget_high_s16(w0_8), 4);
+    chunk!(vget_low_s16(w8_16), 8);
+    chunk!(vget_high_s16(w8_16), 12);
+    chunk!(vget_low_s16(w16_24), 16);
+    chunk!(vget_high_s16(w16_24), 20);
+    chunk!(vget_low_s16(w24_32), 24);
+    chunk!(vget_high_s16(w24_32), 28);
+
+    bacc
 }
 
 #[cfg(target_arch = "aarch64")]

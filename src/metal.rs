@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 pub const Q4K_MIN_METAL_ROWS: usize = 8_192;
 pub const Q4K_MIN_METAL_COLS: usize = 4_096;
 pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
+pub const FUSED_KQUANT_MIN_METAL_ROWS: usize = 512;
 pub const ATTENTION_MIN_METAL_TOKENS: usize = 8_192;
 pub const ULTRA_ATTENTION_MIN_METAL_TOKENS: usize = 512;
 pub const ULTRA_Q4K_MIN_METAL_ROWS: usize = 512;
@@ -524,7 +525,10 @@ pub fn q4k_matvec2_into(
     }
     let (weights_a, rows_a, cols_a) = a;
     let (weights_b, rows_b, cols_b) = b;
-    if cols_a != cols_b || cols_a != x.len() {
+    if cols_a != cols_b
+        || cols_a != x.len()
+        || !fused_kquant_should_use_metal(rows_a + rows_b, cols_a)
+    {
         return false;
     }
     out_a.resize(rows_a, 0.0);
@@ -550,7 +554,11 @@ pub fn q4k_matvec3_into(
     let (weights_a, rows_a, cols_a) = a;
     let (weights_b, rows_b, cols_b) = b;
     let (weights_c, rows_c, cols_c) = c;
-    if cols_a != cols_b || cols_a != cols_c || cols_a != x.len() {
+    if cols_a != cols_b
+        || cols_a != cols_c
+        || cols_a != x.len()
+        || !fused_kquant_should_use_metal(rows_a + rows_b + rows_c, cols_a)
+    {
         return false;
     }
     out_a.resize(rows_a, 0.0);
@@ -577,7 +585,11 @@ pub fn q4k_q4k_q6k_matvec3_into(
     let (weights_a, rows_a, cols_a) = a;
     let (weights_b, rows_b, cols_b) = b;
     let (weights_c, rows_c, cols_c) = c;
-    if cols_a != cols_b || cols_a != cols_c || cols_a != x.len() {
+    if cols_a != cols_b
+        || cols_a != cols_c
+        || cols_a != x.len()
+        || !fused_kquant_should_use_metal(rows_a + rows_b + rows_c, cols_a)
+    {
         return false;
     }
     out_a.resize(rows_a, 0.0);
@@ -658,6 +670,16 @@ fn q6k_min_metal_rows() -> usize {
     } else {
         Q6K_MIN_METAL_ROWS
     }
+}
+
+/// Decides whether a fused K-quant projection is large enough to amortize Metal dispatch.
+fn fused_kquant_should_use_metal(total_rows: usize, cols: usize) -> bool {
+    let min_rows = if ultra_mode_enabled() {
+        ultra_q4k_min_metal_rows()
+    } else {
+        FUSED_KQUANT_MIN_METAL_ROWS
+    };
+    total_rows >= min_rows || cols >= Q4K_MIN_METAL_COLS
 }
 
 /// Decides whether a full attention scan is large enough for Metal dispatch.
@@ -1366,6 +1388,17 @@ mod tests {
         assert!(!super::q4k_single_should_use_metal(1024, 3072));
         assert!(super::q4k_single_should_use_metal(9216, 3072));
         assert!(super::q4k_single_should_use_metal(3072, 4096));
+    }
+
+    #[test]
+    /// Verifies that tiny fused K-quant projections stay on CPU.
+    fn fused_kquant_metal_heuristic_skips_tiny_projections() {
+        assert!(!super::fused_kquant_should_use_metal(128, 3072));
+        assert!(super::fused_kquant_should_use_metal(
+            super::FUSED_KQUANT_MIN_METAL_ROWS,
+            3072
+        ));
+        assert!(super::fused_kquant_should_use_metal(128, 4096));
     }
 
     #[test]

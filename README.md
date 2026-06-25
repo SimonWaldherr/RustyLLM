@@ -335,6 +335,9 @@ Generation options:
 - Large CPU matvec jobs use llama.cpp-style dynamic row chunks: workers take
   64-row chunks from a shared atomic counter and fall back to static row ranges
   when a matrix is too small for chunking to pay off.
+- Fused K-quant Metal projections also keep tiny shapes on CPU, matching
+  llama.cpp's practice of shape-gating GPU dispatch instead of paying command
+  buffer overhead for every small kernel.
 - `--cpu-affinity` enables best-effort SIMD worker affinity on supported
   operating systems.
 - `--mlock` asks the OS to keep mapped model pages resident in RAM. This is
