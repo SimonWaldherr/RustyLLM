@@ -11,6 +11,7 @@ use std::os::unix::io::AsRawFd;
 pub struct MmapFile {
     ptr: *mut u8,
     len: usize,
+    locked: bool,
 }
 
 // SAFETY: The mmap'd region is read-only and lives for the lifetime of MmapFile.
@@ -48,7 +49,21 @@ impl MmapFile {
         Ok(Self {
             ptr: ptr as *mut u8,
             len,
+            locked: false,
         })
+    }
+
+    /// Best-effort lock for mapped model pages, matching llama.cpp's optional mlock path.
+    pub fn lock_in_memory(&mut self) -> io::Result<()> {
+        if self.locked {
+            return Ok(());
+        }
+        let rc = unsafe { libc_mlock(self.ptr as *const std::ffi::c_void, self.len) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.locked = true;
+        Ok(())
     }
 
     /// Get the full memory-mapped region as a byte slice
@@ -76,6 +91,9 @@ impl Drop for MmapFile {
     /// Releases the resource represented by this guard or mapping.
     fn drop(&mut self) {
         unsafe {
+            if self.locked {
+                let _ = libc_munlock(self.ptr as *const std::ffi::c_void, self.len);
+            }
             libc_munmap(self.ptr as *mut std::ffi::c_void, self.len);
         }
     }
@@ -108,6 +126,12 @@ unsafe extern "C" {
 
     /// Provides sequential-read and prefetch advice for the mapped model bytes.
     fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+
+    /// Pins mapped model pages in physical memory when the OS allows it.
+    fn mlock(addr: *const std::ffi::c_void, len: usize) -> i32;
+
+    /// Releases a previous memory lock.
+    fn munlock(addr: *const std::ffi::c_void, len: usize) -> i32;
 }
 
 unsafe fn libc_mmap(
@@ -127,4 +151,12 @@ unsafe fn libc_munmap(addr: *mut std::ffi::c_void, len: usize) -> i32 {
 
 unsafe fn libc_madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32 {
     unsafe { madvise(addr, len, advice) }
+}
+
+unsafe fn libc_mlock(addr: *const std::ffi::c_void, len: usize) -> i32 {
+    unsafe { mlock(addr, len) }
+}
+
+unsafe fn libc_munlock(addr: *const std::ffi::c_void, len: usize) -> i32 {
+    unsafe { munlock(addr, len) }
 }

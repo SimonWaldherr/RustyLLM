@@ -13,13 +13,23 @@
 // On Apple Silicon, NEON is always available — no feature detection needed.
 // On x86_64, we runtime-detect AVX2 and fall back to scalar.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_family = "wasm"))]
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 #[cfg(not(target_family = "wasm"))]
 use std::thread;
 
 static NUM_THREADS: AtomicUsize = AtomicUsize::new(0);
+static CPU_AFFINITY: AtomicBool = AtomicBool::new(false);
+static WORKER_POLL_SPINS: AtomicUsize = AtomicUsize::new(2_000);
+#[cfg(not(target_family = "wasm"))]
+const MATVEC_CHUNK_ROWS: usize = 64;
+#[cfg(not(target_family = "wasm"))]
+const MIN_DYNAMIC_CHUNKS_PER_WORKER: usize = 4;
+
+#[cfg(not(target_family = "wasm"))]
+#[repr(align(64))]
+struct CachePadded<T>(T);
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -50,6 +60,70 @@ pub fn set_num_threads(n: usize) {
     NUM_THREADS.store(n.max(1), Ordering::Relaxed);
 }
 
+#[cfg(not(target_family = "wasm"))]
+/// Returns the operating-system reported parallelism.
+pub fn available_threads() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(target_family = "wasm")]
+/// Returns the operating-system reported parallelism.
+pub fn available_threads() -> usize {
+    1
+}
+
+/// Enables best-effort worker CPU affinity for supported operating systems.
+pub fn set_cpu_affinity_enabled(enabled: bool) {
+    CPU_AFFINITY.store(enabled, Ordering::Relaxed);
+}
+
+/// Reports whether worker CPU affinity was requested.
+pub fn cpu_affinity_enabled() -> bool {
+    CPU_AFFINITY.load(Ordering::Relaxed)
+}
+
+/// Sets how long worker threads poll for new micro-jobs before sleeping.
+pub fn set_worker_poll_spins(spins: usize) {
+    WORKER_POLL_SPINS.store(spins, Ordering::Relaxed);
+}
+
+/// Returns the configured worker-poll spin count.
+pub fn worker_poll_spins() -> usize {
+    WORKER_POLL_SPINS.load(Ordering::Relaxed)
+}
+
+/// Pins the current compute thread when the target OS exposes a stable API.
+pub fn pin_current_thread(worker_idx: usize) -> bool {
+    if !cpu_affinity_enabled() {
+        return false;
+    }
+    pin_current_thread_impl(worker_idx)
+}
+
+#[cfg(target_os = "macos")]
+fn pin_current_thread_impl(worker_idx: usize) -> bool {
+    const THREAD_AFFINITY_POLICY: i32 = 4;
+    let tag = (worker_idx as i32).saturating_add(1);
+    unsafe {
+        let thread = mach_thread_self();
+        thread_policy_set(thread, THREAD_AFFINITY_POLICY, &tag as *const i32, 1) == 0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pin_current_thread_impl(_worker_idx: usize) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mach_thread_self() -> u32;
+    fn thread_policy_set(thread: u32, flavor: i32, policy_info: *const i32, count: u32) -> i32;
+}
+
 #[inline]
 /// Returns the configured matrix-vector worker count.
 pub fn num_threads() -> usize {
@@ -62,11 +136,7 @@ pub fn num_threads() -> usize {
         #[cfg(not(target_family = "wasm"))]
         {
             static DEFAULT_THREADS: OnceLock<usize> = OnceLock::new();
-            *DEFAULT_THREADS.get_or_init(|| {
-                thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-            })
+            *DEFAULT_THREADS.get_or_init(available_threads)
         }
         #[cfg(target_family = "wasm")]
         {
@@ -522,10 +592,46 @@ unsafe impl Send for MatvecJob {}
 unsafe impl Sync for MatvecJob {}
 
 #[cfg(not(target_family = "wasm"))]
+#[inline]
+fn matvec_chunk_count(work_items: usize) -> usize {
+    work_items.div_ceil(MATVEC_CHUNK_ROWS)
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn use_dynamic_chunks(work_items: usize, workers: usize) -> bool {
+    matvec_chunk_count(work_items) >= workers.saturating_mul(MIN_DYNAMIC_CHUNKS_PER_WORKER)
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl MatvecJob {
-    unsafe fn run_worker(self, worker_idx: usize) {
+    unsafe fn run_static_worker(self, worker_idx: usize) {
         let start = self.rows * worker_idx / self.workers;
         let end = self.rows * (worker_idx + 1) / self.workers;
+        self.run_rows(start, end);
+    }
+
+    unsafe fn run_dynamic_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
+        let chunks = matvec_chunk_count(self.rows);
+        let mut chunk_idx = worker_idx;
+
+        while chunk_idx < chunks {
+            let start = chunk_idx * MATVEC_CHUNK_ROWS;
+            let end = (start + MATVEC_CHUNK_ROWS).min(self.rows);
+            self.run_rows(start, end);
+            chunk_idx = current_chunk.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    unsafe fn run_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
+        if use_dynamic_chunks(self.rows, self.workers) {
+            self.run_dynamic_worker(worker_idx, current_chunk);
+        } else {
+            self.run_static_worker(worker_idx);
+        }
+    }
+
+    unsafe fn run_rows(self, start: usize, end: usize) {
         for row in start..end {
             *self.out.add(row) =
                 dot_row(self.kind, self.data, self.x, row, self.cols, self.row_span);
@@ -569,11 +675,35 @@ impl Q4KMatvec3Job {
         self.rows_a + self.rows_b + self.rows_c
     }
 
-    unsafe fn run_worker(self, worker_idx: usize) {
+    unsafe fn run_static_worker(self, worker_idx: usize) {
         let total = self.work_items();
         let start = total * worker_idx / self.workers;
         let end = total * (worker_idx + 1) / self.workers;
+        self.run_items(start, end);
+    }
 
+    unsafe fn run_dynamic_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
+        let total = self.work_items();
+        let chunks = matvec_chunk_count(total);
+        let mut chunk_idx = worker_idx;
+
+        while chunk_idx < chunks {
+            let start = chunk_idx * MATVEC_CHUNK_ROWS;
+            let end = (start + MATVEC_CHUNK_ROWS).min(total);
+            self.run_items(start, end);
+            chunk_idx = current_chunk.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    unsafe fn run_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
+        if use_dynamic_chunks(self.work_items(), self.workers) {
+            self.run_dynamic_worker(worker_idx, current_chunk);
+        } else {
+            self.run_static_worker(worker_idx);
+        }
+    }
+
+    unsafe fn run_items(self, start: usize, end: usize) {
         let (a_start, a_end) = clipped_range(start, end, 0, self.rows_a);
         q4k_matvec3_rows(
             self.kind_a,
@@ -665,10 +795,10 @@ impl WorkerJob {
     }
 
     #[inline]
-    unsafe fn run_worker(self, worker_idx: usize) {
+    unsafe fn run_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
         match self {
-            WorkerJob::Matvec(job) => job.run_worker(worker_idx),
-            WorkerJob::Q4KMatvec3(job) => job.run_worker(worker_idx),
+            WorkerJob::Matvec(job) => job.run_worker(worker_idx, current_chunk),
+            WorkerJob::Q4KMatvec3(job) => job.run_worker(worker_idx, current_chunk),
         }
     }
 }
@@ -683,7 +813,9 @@ struct WorkerState {
 struct WorkerPool {
     state: Mutex<WorkerState>,
     work_available: Condvar,
-    completed: AtomicUsize,
+    completed: CachePadded<AtomicUsize>,
+    current_chunk: CachePadded<AtomicUsize>,
+    published_job_id: CachePadded<AtomicU64>,
     max_workers: usize,
 }
 
@@ -697,7 +829,9 @@ impl WorkerPool {
                 job_id: 0,
             }),
             work_available: Condvar::new(),
-            completed: AtomicUsize::new(0),
+            completed: CachePadded(AtomicUsize::new(0)),
+            current_chunk: CachePadded(AtomicUsize::new(0)),
+            published_job_id: CachePadded(AtomicU64::new(0)),
             max_workers,
         });
 
@@ -735,7 +869,7 @@ impl WorkerPool {
         if job.workers <= 1 || rows < job.workers * 8 {
             job.workers = 1;
             unsafe {
-                job.run_worker(0);
+                job.run_static_worker(0);
             }
             return;
         }
@@ -750,8 +884,12 @@ impl WorkerPool {
             let mut state = self.state.lock().expect("worker pool mutex poisoned");
             if state.job.is_none() {
                 state.job_id = state.job_id.wrapping_add(1);
-                self.completed.store(0, Ordering::Release);
+                self.completed.0.store(0, Ordering::Release);
+                self.current_chunk.0.store(workers, Ordering::Release);
                 state.job = Some(job);
+                self.published_job_id
+                    .0
+                    .store(state.job_id, Ordering::Release);
                 self.work_available.notify_all();
                 break;
             }
@@ -763,7 +901,7 @@ impl WorkerPool {
         // This is a micro-job, so sleeping via Condvar is too slow for LLM latencies.
         let mut spins = 0;
         loop {
-            if self.completed.load(Ordering::Acquire) == workers {
+            if self.completed.0.load(Ordering::Acquire) == workers {
                 break;
             }
 
@@ -784,8 +922,17 @@ impl WorkerPool {
 #[cfg(not(target_family = "wasm"))]
 /// Processes worker-pool jobs on one background thread.
 fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
+    let _ = pin_current_thread(worker_idx);
     let mut last_job_id = 0u64;
     loop {
+        let poll_spins = worker_poll_spins();
+        for _ in 0..poll_spins {
+            if pool.published_job_id.0.load(Ordering::Acquire) != last_job_id {
+                break;
+            }
+            std::hint::spin_loop();
+        }
+
         let job = {
             let mut state = pool.state.lock().expect("worker pool mutex poisoned");
             while state.job_id == last_job_id || state.job.is_none() {
@@ -800,9 +947,9 @@ fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
 
         if worker_idx < job.workers() {
             unsafe {
-                job.run_worker(worker_idx);
+                job.run_worker(worker_idx, &pool.current_chunk.0);
             }
-            pool.completed.fetch_add(1, Ordering::Release);
+            pool.completed.0.fetch_add(1, Ordering::Release);
         }
     }
 }

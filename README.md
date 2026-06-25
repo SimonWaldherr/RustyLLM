@@ -324,6 +324,23 @@ Generation options:
 - `--threads-batch <N>` overrides the SIMD worker thread count only during
   prompt/prefill processing, mirroring llama.cpp's split between generation
   threads and batch/prompt threads.
+- `--ubatch <N>` sets the logical prefill chunk size. This is the runtime
+  planning layer for llama.cpp-style microbatch prefill; current kernels still
+  evaluate tokens sequentially inside each chunk.
+- `--no-auto-batch-threads` disables automatic widening of prefill worker
+  threads when decode was configured with fewer workers than the machine offers.
+- `--poll <N>` controls how many spin iterations SIMD worker threads use while
+  waiting for the next micro-job before sleeping. This ports llama.cpp's
+  threadpool polling idea; use `--poll 0` for the lowest idle CPU use.
+- Large CPU matvec jobs use llama.cpp-style dynamic row chunks: workers take
+  64-row chunks from a shared atomic counter and fall back to static row ranges
+  when a matrix is too small for chunking to pay off.
+- `--cpu-affinity` enables best-effort SIMD worker affinity on supported
+  operating systems.
+- `--mlock` asks the OS to keep mapped model pages resident in RAM. This is
+  best-effort and can be limited by user or system lock limits.
+- `--backend <name>` selects runtime dispatch policy: `auto`, `cpu`, `metal`, or
+  `metal-ultra`.
 - `--bench-threads <LIST>` runs the same benchmark across comma-separated SIMD
   worker counts, for example `--bench-threads 1,2,4,8`. This follows the
   llama.cpp tuning practice of measuring thread oversubscription instead of
@@ -870,6 +887,10 @@ Treat `mistral-ultra` as an experiment, not a default. On the measured
 Ministral 3 3B Q4_K_M model, the standard Metal profile was faster and more
 stable for short-context decode; benchmark both profiles before keeping ultra
 mode in normal runs.
+
+Use `--backend cpu` for CPU-only A/B checks without changing environment
+variables. `--backend metal-ultra` enables the same aggressive per-thread Metal
+routing as `--profile mistral-ultra` while leaving the model profile explicit.
 
 For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with

@@ -206,6 +206,37 @@ impl RuntimeProfile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendPolicy {
+    Auto,
+    Cpu,
+    Metal,
+    MetalUltra,
+}
+
+impl BackendPolicy {
+    /// Parses a runtime backend dispatch policy name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "cpu" | "native" => Some(Self::Cpu),
+            "metal" | "gpu" => Some(Self::Metal),
+            "metal-ultra" | "metal_ultra" | "ultra" => Some(Self::MetalUltra),
+            _ => None,
+        }
+    }
+
+    /// Returns the stable display name used in boot logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Metal => "metal",
+            Self::MetalUltra => "metal-ultra",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeOptConfig {
     pub kv_cache_dtype: KvCacheDType,
@@ -213,7 +244,13 @@ pub struct RuntimeOptConfig {
     pub sliding_window_size: Option<usize>,
     pub max_context: Option<usize>,
     pub batch_threads: Option<usize>,
+    pub prefill_ubatch: Option<usize>,
+    pub auto_batch_threads: bool,
+    pub worker_poll_spins: Option<usize>,
     pub profile: RuntimeProfile,
+    pub backend_policy: BackendPolicy,
+    pub lock_model: bool,
+    pub cpu_affinity: bool,
 }
 
 impl Default for RuntimeOptConfig {
@@ -225,7 +262,13 @@ impl Default for RuntimeOptConfig {
             sliding_window_size: None,
             max_context: None,
             batch_threads: None,
+            prefill_ubatch: None,
+            auto_batch_threads: true,
+            worker_poll_spins: None,
             profile: RuntimeProfile::Auto,
+            backend_policy: BackendPolicy::Auto,
+            lock_model: false,
+            cpu_affinity: false,
         }
     }
 }
@@ -293,6 +336,9 @@ impl GenerationOptions {
         }
         if matches!(self.runtime.batch_threads, Some(0)) {
             return Err(String::from("--threads-batch must be greater than 0."));
+        }
+        if matches!(self.runtime.prefill_ubatch, Some(0)) {
+            return Err(String::from("--ubatch must be greater than 0."));
         }
         if matches!(self.runtime.sliding_window_size, Some(0)) {
             return Err(String::from("--sliding-window must be greater than 0."));
@@ -366,6 +412,40 @@ pub struct KernelBenchRow {
     pub runs: usize,
     pub avg_ms: f64,
     pub total_ms: f64,
+}
+
+struct SimdThreadGuard {
+    previous: Option<usize>,
+}
+
+impl SimdThreadGuard {
+    fn set_temporarily(target: Option<usize>) -> Self {
+        let Some(target) = target else {
+            return Self { previous: None };
+        };
+        let current = crate::simd::num_threads();
+        if target == current {
+            return Self { previous: None };
+        }
+        crate::simd::set_num_threads(target);
+        Self {
+            previous: Some(current),
+        }
+    }
+}
+
+impl Drop for SimdThreadGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            crate::simd::set_num_threads(previous);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimePhase {
+    Prefill,
+    Decode,
 }
 
 const RECENT_TOKEN_LIMIT: usize = 64;
@@ -907,10 +987,27 @@ impl Runner {
     #[cfg(not(target_family = "wasm"))]
     /// Loads a runner by memory-mapping a GGUF file path.
     pub fn from_path(path: &str) -> Result<(Self, LoadInfo), String> {
+        Self::from_path_with_options(path, &GenerationOptions::default())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    /// Loads a runner by memory-mapping a GGUF file path with runtime load options.
+    pub fn from_path_with_options(
+        path: &str,
+        options: &GenerationOptions,
+    ) -> Result<(Self, LoadInfo), String> {
         let t0 = Instant::now();
         let t_mmap = Instant::now();
-        let mmap = crate::mmap::MmapFile::open(path)
+        let mut mmap = crate::mmap::MmapFile::open(path)
             .map_err(|err| format!("Failed to open model: {}", err))?;
+        if options.runtime.lock_model {
+            if let Err(err) = mmap.lock_in_memory() {
+                eprintln!(
+                    "Warning: --mlock requested, but model pages could not be locked: {}",
+                    err
+                );
+            }
+        }
         let mmap_time = t_mmap.elapsed();
         let file_size_bytes = mmap.len();
         let t_parse = Instant::now();
@@ -1163,6 +1260,10 @@ impl Runner {
     pub fn optimization_summary(&self, options: &GenerationOptions) -> Vec<String> {
         let mut items = Vec::new();
         items.push(format!("profile={}", options.runtime.profile.as_str()));
+        items.push(format!(
+            "backend={}",
+            self.effective_backend_policy(options).as_str()
+        ));
         let chat_template = if self.arch == "gpt-oss" {
             "gpt-oss"
         } else {
@@ -1178,7 +1279,7 @@ impl Runner {
             ),
         });
         if options.runtime.flash_attention {
-            items.push(String::from("flash-attn=online-softmax"));
+            items.push(String::from("flash-attn=online-softmax+linear-kv"));
         } else {
             items.push(String::from("flash-attn=off"));
         }
@@ -1187,6 +1288,25 @@ impl Runner {
         }
         if let Some(threads) = options.runtime.batch_threads {
             items.push(format!("threads-batch={}", threads));
+        } else if options.runtime.auto_batch_threads {
+            items.push(String::from("threads-batch=auto"));
+        }
+        if let Some(spins) = options.runtime.worker_poll_spins {
+            items.push(format!("worker-poll={}", spins));
+        } else {
+            items.push(format!("worker-poll={}", crate::simd::worker_poll_spins()));
+        }
+        let ubatch = options
+            .runtime
+            .prefill_ubatch
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| String::from("auto"));
+        items.push(format!("ubatch={}", ubatch));
+        if options.runtime.lock_model {
+            items.push(String::from("mlock=best-effort"));
+        }
+        if options.runtime.cpu_affinity {
+            items.push(String::from("cpu-affinity=best-effort"));
         }
         items.push(format!(
             "max-context={} tokens",
@@ -1252,6 +1372,15 @@ impl Runner {
         } else if profile == RuntimeProfile::MistralUltra && self.arch == "mistral3" {
             warnings.push(String::from(
                 "Mistral ultra is experimental; for Ministral 3 short-context decode, benchmark against the default Metal profile because ultra can be slower.",
+            ));
+        }
+        if matches!(
+            self.effective_backend_policy(options),
+            BackendPolicy::Metal | BackendPolicy::MetalUltra
+        ) && !crate::metal::enabled()
+        {
+            warnings.push(String::from(
+                "Metal backend policy was requested, but Metal is unavailable or disabled; native CPU kernels will run.",
             ));
         }
         if self
@@ -1367,8 +1496,29 @@ impl Runner {
         self.config.max_seq_len.max(1)
     }
 
-    fn effective_metal_ultra(&self, options: &GenerationOptions) -> bool {
-        self.effective_profile(options) == RuntimeProfile::MistralUltra
+    fn effective_backend_policy(&self, options: &GenerationOptions) -> BackendPolicy {
+        if options.runtime.backend_policy != BackendPolicy::Auto {
+            return options.runtime.backend_policy;
+        }
+        if self.effective_profile(options) == RuntimeProfile::MistralUltra {
+            BackendPolicy::MetalUltra
+        } else {
+            BackendPolicy::Auto
+        }
+    }
+
+    fn scoped_backend_dispatch(
+        &self,
+        options: &GenerationOptions,
+        _phase: RuntimePhase,
+    ) -> crate::metal::DispatchPolicyGuard {
+        match self.effective_backend_policy(options) {
+            BackendPolicy::Cpu => crate::metal::scoped_dispatch_policy(true, false),
+            BackendPolicy::MetalUltra => crate::metal::scoped_dispatch_policy(false, true),
+            BackendPolicy::Auto | BackendPolicy::Metal => {
+                crate::metal::scoped_dispatch_policy(false, false)
+            }
+        }
     }
 
     fn effective_sliding_window(&self, options: &GenerationOptions) -> Option<usize> {
@@ -1376,6 +1526,39 @@ impl Runner {
             .runtime
             .sliding_window_size
             .or_else(|| (self.config.sliding_window > 0).then_some(self.config.sliding_window))
+    }
+
+    fn effective_prefill_ubatch(&self, options: &GenerationOptions, prompt_tokens: usize) -> usize {
+        let tokens = prompt_tokens.max(1);
+        options
+            .runtime
+            .prefill_ubatch
+            .unwrap_or({
+                if tokens >= 1024 {
+                    256
+                } else if tokens >= 256 {
+                    128
+                } else {
+                    64
+                }
+            })
+            .clamp(1, tokens)
+    }
+
+    fn effective_prefill_threads(
+        &self,
+        options: &GenerationOptions,
+        prompt_tokens: usize,
+    ) -> Option<usize> {
+        if let Some(threads) = options.runtime.batch_threads {
+            return Some(threads);
+        }
+        if !options.runtime.auto_batch_threads || prompt_tokens < 32 {
+            return None;
+        }
+        let available = crate::simd::available_threads();
+        let current = crate::simd::num_threads();
+        (available > current).then_some(available)
     }
 
     /// Benchmarks representative projection kernels for the loaded model.
@@ -1397,8 +1580,7 @@ impl Runner {
         if runs == 0 {
             return Err(String::from("--kernel-bench-runs must be greater than 0."));
         }
-        let _metal_ultra_guard =
-            crate::metal::scoped_ultra_mode(self.effective_metal_ultra(options));
+        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
         match &self.weights {
             LoadedWeights::Standard(weights) => {
                 self.standard_kernel_benchmark(weights, runs, requested_layer)
@@ -1925,8 +2107,8 @@ impl Runner {
             .lock()
             .expect("generation lock poisoned");
         let mut on_token = on_token;
-        let _metal_ultra_guard =
-            crate::metal::scoped_ultra_mode(self.effective_metal_ultra(options));
+        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
+        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
 
         if messages.is_empty() {
             return Err(String::from("No prompt provided."));
@@ -1969,27 +2151,7 @@ impl Runner {
         // cache; incremental decoding starts from the last prompt logits.
         let t_prefill = Instant::now();
         let mut logits = Vec::new();
-        let last_prompt_pos = tokens.len() - 1;
-        let current_threads = crate::simd::num_threads();
-        let decode_threads = options
-            .runtime
-            .batch_threads
-            .filter(|&threads| threads != current_threads)
-            .map(|threads| {
-                let previous = current_threads;
-                crate::simd::set_num_threads(threads);
-                previous
-            });
-        for (pos, &tok_id) in tokens.iter().enumerate() {
-            if pos == last_prompt_pos {
-                self.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);
-            } else {
-                let _ = self.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
-            }
-        }
-        if let Some(threads) = decode_threads {
-            crate::simd::set_num_threads(threads);
-        }
+        self.prefill_prompt_tokens(&mut cache, &mut buf, &tokens, 0, &mut logits, options);
         let prefill_time = t_prefill.elapsed();
 
         let mut speculative = self.prepare_speculative_state(options, &tokens, cache_len);
@@ -2099,6 +2261,34 @@ impl Runner {
         })
     }
 
+    fn prefill_prompt_tokens(
+        &self,
+        cache: &mut KVCache,
+        buf: &mut DecodeBuffer,
+        tokens: &[u32],
+        start_pos: usize,
+        logits: &mut Vec<f32>,
+        options: &GenerationOptions,
+    ) {
+        if tokens.is_empty() {
+            return;
+        }
+        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Prefill);
+        let _thread_guard =
+            SimdThreadGuard::set_temporarily(self.effective_prefill_threads(options, tokens.len()));
+        let last_idx = tokens.len() - 1;
+        let ubatch = self.effective_prefill_ubatch(options, tokens.len());
+
+        for (chunk_idx, chunk) in tokens[..last_idx].chunks(ubatch).enumerate() {
+            let chunk_start = chunk_idx * ubatch;
+            for (idx, &tok_id) in chunk.iter().enumerate() {
+                self.forward_prefill_token(cache, buf, tok_id, start_pos + chunk_start + idx);
+            }
+        }
+
+        self.forward_token_into(cache, buf, tokens[last_idx], start_pos + last_idx, logits);
+    }
+
     /// Runs the model-independent Thinking pre-pass over the latest user turn.
     fn apply_thinking_to_messages(
         &self,
@@ -2181,15 +2371,8 @@ impl Runner {
             max_value_dim,
         );
         let mut logits = Vec::new();
-        let last_prompt_pos = tokens.len() - 1;
         let t_draft = Instant::now();
-        for (pos, &tok_id) in tokens.iter().enumerate() {
-            if pos == last_prompt_pos {
-                assistant.forward_token_into(&mut cache, &mut buf, tok_id, pos, &mut logits);
-            } else {
-                let _ = assistant.forward_hidden_token(&mut cache, &mut buf, tok_id, pos);
-            }
-        }
+        assistant.prefill_prompt_tokens(&mut cache, &mut buf, tokens, 0, &mut logits, options);
 
         Some(SpeculativeState {
             assistant,
@@ -2390,6 +2573,28 @@ impl Runner {
             }
             LoadedWeights::Standard(weights) => {
                 model::forward_hidden(&self.config, weights, cache, buf, token, pos)
+            }
+        }
+    }
+
+    /// Advances the model state for one prompt token without computing logits
+    /// or a final normalized hidden state.
+    fn forward_prefill_token(
+        &self,
+        cache: &mut KVCache,
+        buf: &mut DecodeBuffer,
+        token: u32,
+        pos: usize,
+    ) {
+        match &self.weights {
+            LoadedWeights::GptOss(weights) => {
+                model::forward_prefill_gpt_oss(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::Gemma4(weights) => {
+                model::forward_prefill_gemma4(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::Standard(weights) => {
+                model::forward_prefill(&self.config, weights, cache, buf, token, pos)
             }
         }
     }
@@ -2979,25 +3184,14 @@ impl Runner {
             }
         } else {
             // Prefill only the suffix that differs from the cached prefix.
-            for (idx, &tok_id) in tokens[prefix_len..].iter().enumerate() {
-                let pos = prefix_len + idx;
-                if pos == last_prompt_pos {
-                    self.forward_token_into(
-                        &mut session.kv_cache,
-                        &mut session.decode_buf,
-                        tok_id,
-                        pos,
-                        &mut logits,
-                    );
-                } else {
-                    let _ = self.forward_hidden_token(
-                        &mut session.kv_cache,
-                        &mut session.decode_buf,
-                        tok_id,
-                        pos,
-                    );
-                }
-            }
+            self.prefill_prompt_tokens(
+                &mut session.kv_cache,
+                &mut session.decode_buf,
+                &tokens[prefix_len..],
+                prefix_len,
+                &mut logits,
+                options,
+            );
         }
         let prefill_time = t_prefill.elapsed();
 
@@ -3614,9 +3808,9 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt, cosine_similarity,
-        l2_normalize_in_place, mean_pool_in_place, push_recent_token, recent_token_tail,
-        trailing_char_boundary_start,
+        BackendPolicy, RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt,
+        cosine_similarity, l2_normalize_in_place, mean_pool_in_place, push_recent_token,
+        recent_token_tail, trailing_char_boundary_start,
     };
 
     #[test]
@@ -3677,6 +3871,20 @@ mod tests {
             clean_thinking_prompt("```text\nRewritten prompt: Compare TCP and UDP.\n```"),
             "Compare TCP and UDP."
         );
+    }
+
+    #[test]
+    /// Verifies backend policy aliases used by the CLI/API.
+    fn backend_policy_parses_runtime_aliases() {
+        assert_eq!(BackendPolicy::parse("auto"), Some(BackendPolicy::Auto));
+        assert_eq!(BackendPolicy::parse("cpu"), Some(BackendPolicy::Cpu));
+        assert_eq!(BackendPolicy::parse("metal"), Some(BackendPolicy::Metal));
+        assert_eq!(
+            BackendPolicy::parse("metal_ultra"),
+            Some(BackendPolicy::MetalUltra)
+        );
+        assert_eq!(BackendPolicy::parse("unknown"), None);
+        assert_eq!(BackendPolicy::MetalUltra.as_str(), "metal-ultra");
     }
 
     #[test]

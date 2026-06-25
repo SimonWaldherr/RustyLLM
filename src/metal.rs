@@ -15,6 +15,7 @@ static ULTRA_Q6K_MIN_METAL_ROWS_RUNTIME: OnceLock<usize> = OnceLock::new();
 
 thread_local! {
     static ULTRA_MODE: Cell<bool> = const { Cell::new(false) };
+    static CPU_ONLY_MODE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Restores the previous per-thread Metal ultra-mode flag when dropped.
@@ -25,6 +26,19 @@ pub struct UltraModeGuard {
 impl Drop for UltraModeGuard {
     fn drop(&mut self) {
         ULTRA_MODE.with(|flag| flag.set(self.previous));
+    }
+}
+
+/// Restores the previous per-thread backend dispatch policy when dropped.
+pub struct DispatchPolicyGuard {
+    previous_ultra: bool,
+    previous_cpu_only: bool,
+}
+
+impl Drop for DispatchPolicyGuard {
+    fn drop(&mut self) {
+        ULTRA_MODE.with(|flag| flag.set(self.previous_ultra));
+        CPU_ONLY_MODE.with(|flag| flag.set(self.previous_cpu_only));
     }
 }
 
@@ -78,9 +92,24 @@ pub fn scoped_ultra_mode(enabled: bool) -> UltraModeGuard {
     })
 }
 
+/// Sets the Metal dispatch policy for the current runtime call.
+pub fn scoped_dispatch_policy(cpu_only: bool, ultra: bool) -> DispatchPolicyGuard {
+    let previous_ultra = ULTRA_MODE.with(|flag| flag.replace(ultra));
+    let previous_cpu_only = CPU_ONLY_MODE.with(|flag| flag.replace(cpu_only));
+    DispatchPolicyGuard {
+        previous_ultra,
+        previous_cpu_only,
+    }
+}
+
 /// Reports whether the current thread is using aggressive Metal routing.
 pub fn ultra_mode_enabled() -> bool {
     ULTRA_MODE.with(Cell::get)
+}
+
+/// Reports whether Metal kernels may be dispatched on this thread.
+pub fn dispatch_enabled() -> bool {
+    enabled() && !CPU_ONLY_MODE.with(Cell::get)
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
@@ -302,7 +331,7 @@ pub fn requested() -> Option<bool> {
 
 /// Reads the environment flag for experimental Q6_K Metal acceleration.
 pub fn q6k_enabled() -> bool {
-    enabled()
+    dispatch_enabled()
 }
 
 /// Reports whether the Metal backend should prefer Shared/NoCopy host buffers.
@@ -406,7 +435,7 @@ pub fn q4k_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || !q4k_single_should_use_metal(rows, cols) {
+    if !dispatch_enabled() || !q4k_single_should_use_metal(rows, cols) {
         return false;
     }
     out.resize(rows, 0.0);
@@ -421,7 +450,7 @@ pub fn q6k_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < q6k_min_metal_rows() {
+    if !dispatch_enabled() || rows < q6k_min_metal_rows() {
         return false;
     }
     out.resize(rows, 0.0);
@@ -436,7 +465,7 @@ pub fn q6k_matvec2_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() {
+    if !dispatch_enabled() {
         return false;
     }
     let (weights_a, rows_a, cols_a) = a;
@@ -461,7 +490,7 @@ pub fn q6k_matvec3_into(
     out_b: &mut Vec<f32>,
     out_c: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() {
+    if !dispatch_enabled() {
         return false;
     }
     let (weights_a, rows_a, cols_a) = a;
@@ -490,7 +519,7 @@ pub fn q4k_matvec2_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() {
+    if !dispatch_enabled() {
         return false;
     }
     let (weights_a, rows_a, cols_a) = a;
@@ -515,7 +544,7 @@ pub fn q4k_matvec3_into(
     out_b: &mut Vec<f32>,
     out_c: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() {
+    if !dispatch_enabled() {
         return false;
     }
     let (weights_a, rows_a, cols_a) = a;
@@ -542,7 +571,7 @@ pub fn q4k_q4k_q6k_matvec3_into(
     out_b: &mut Vec<f32>,
     out_c: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() {
+    if !dispatch_enabled() {
         return false;
     }
     let (weights_a, rows_a, cols_a) = a;
@@ -567,7 +596,7 @@ pub fn q4k_q4k_q6k_ffn_into(
     x: &[f32],
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || !fused_ffn_enabled() {
+    if !dispatch_enabled() || !fused_ffn_enabled() {
         return false;
     }
     let (gate_weights, gate_rows, gate_cols) = gate;
@@ -680,7 +709,7 @@ fn attention_raw(
     end_t: usize,
     scale: f32,
 ) -> bool {
-    if !enabled()
+    if !dispatch_enabled()
         || !attention_scan_should_use_metal(start_t, end_t)
         || heads == 0
         || kv_mul == 0
@@ -1186,7 +1215,7 @@ pub fn mistral_post_attention_ffn_into(
     ffn_norm: &[f32],
     rms_eps: f32,
 ) -> bool {
-    if !enabled() || !post_attention_ffn_enabled() {
+    if !dispatch_enabled() || !post_attention_ffn_enabled() {
         return false;
     }
     let (wo_weights, wo_rows, wo_cols) = wo;
@@ -1237,7 +1266,7 @@ pub fn q4_0_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < Q4_0_MIN_METAL_ROWS || (cols % 32) != 0 {
+    if !dispatch_enabled() || rows < Q4_0_MIN_METAL_ROWS || (cols % 32) != 0 {
         return false;
     }
     out.resize(rows, 0.0);
@@ -1252,7 +1281,7 @@ pub fn q8_0_matvec_into(
     cols: usize,
     out: &mut Vec<f32>,
 ) -> bool {
-    if !enabled() || rows < Q8_0_MIN_METAL_ROWS || (cols % 32) != 0 {
+    if !dispatch_enabled() || rows < Q8_0_MIN_METAL_ROWS || (cols % 32) != 0 {
         return false;
     }
     out.resize(rows, 0.0);
@@ -1348,6 +1377,17 @@ mod tests {
             assert!(super::ultra_mode_enabled());
             assert!(super::q4k_single_should_use_metal(1024, 3072));
             assert_eq!(super::q6k_min_metal_rows(), super::ULTRA_Q6K_MIN_METAL_ROWS);
+        }
+        assert!(!super::ultra_mode_enabled());
+    }
+
+    #[test]
+    /// Verifies that the scoped dispatch policy restores the previous ultra state.
+    fn dispatch_policy_restores_previous_ultra_state() {
+        assert!(!super::ultra_mode_enabled());
+        {
+            let _guard = super::scoped_dispatch_policy(false, true);
+            assert!(super::ultra_mode_enabled());
         }
         assert!(!super::ultra_mode_enabled());
     }

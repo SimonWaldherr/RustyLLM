@@ -950,10 +950,16 @@ fn attention_start_pos(pos: usize, sliding_window: usize) -> usize {
     }
 }
 
+#[inline]
+fn attention_uses_linear_slots(start_t: usize, end_t: usize, slot_count: usize) -> bool {
+    start_t <= end_t && end_t < slot_count
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        KVCache, apply_rope_qk_neox, attention_start_pos, build_rope_inv_freq_with_factors,
+        KVCache, apply_rope_qk_neox, attention_start_pos, attention_uses_linear_slots,
+        build_rope_inv_freq_with_factors,
     };
 
     #[test]
@@ -968,6 +974,14 @@ mod tests {
     fn sliding_attention_start_zero_disables_windowing() {
         assert_eq!(attention_start_pos(0, 0), 0);
         assert_eq!(attention_start_pos(128, 0), 0);
+    }
+
+    #[test]
+    fn attention_linear_slots_detects_non_wrapping_cache_ranges() {
+        assert!(attention_uses_linear_slots(0, 7, 8));
+        assert!(attention_uses_linear_slots(3, 7, 8));
+        assert!(!attention_uses_linear_slots(3, 8, 8));
+        assert!(!attention_uses_linear_slots(4, 3, 8));
     }
 
     #[test]
@@ -2452,9 +2466,10 @@ pub(crate) fn online_attention_with_sink(
 ) {
     let mut max_score = sink_score;
     let mut denom = 1.0f32;
+    let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
 
     for t in start_t..=end_t {
-        let slot = t % slot_count;
+        let slot = if linear_slots { t } else { t % slot_count };
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
@@ -2503,9 +2518,10 @@ pub(crate) fn online_attention(
 ) {
     let mut max_score = f32::NEG_INFINITY;
     let mut denom = 0.0f32;
+    let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
 
     for t in start_t..=end_t {
-        let slot = t % slot_count;
+        let slot = if linear_slots { t } else { t % slot_count };
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
@@ -2563,9 +2579,10 @@ pub(crate) fn online_attention_grouped(
     let mut max_score = [f32::NEG_INFINITY; MAX_KV_MUL];
     let mut denom = [0.0f32; MAX_KV_MUL];
     let kv_mul = kv_mul.min(MAX_KV_MUL);
+    let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
 
     for t in start_t..=end_t {
-        let slot = t % slot_count;
+        let slot = if linear_slots { t } else { t % slot_count };
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let v_off = slot * value_stride;
@@ -4240,13 +4257,14 @@ pub fn load_gemma4_model(
 
 /// Forward for standard (LLaMA-style) models; returns the normalized hidden
 /// state of dimension `config.dim` instead of vocabulary logits.
-pub fn forward_hidden<'a>(
+fn forward_hidden_impl<'a>(
     config: &Config,
     weights: &ModelWeights,
     cache: &mut KVCache,
     buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
+    final_norm: bool,
 ) -> &'a [f32] {
     let dim = config.dim;
     let head_dim = config.head_dim;
@@ -4352,24 +4370,55 @@ pub fn forward_hidden<'a>(
         }
     }
 
-    // Apply final norm but skip the output projection — return the hidden state.
-    rms_norm_into(
-        &buf.x,
-        &weights.output_norm,
-        config.rms_norm_eps,
-        &mut buf.xn,
-    );
-    &buf.xn
+    if final_norm {
+        // Embedding-style callers need the final normalized residual stream.
+        rms_norm_into(
+            &buf.x,
+            &weights.output_norm,
+            config.rms_norm_eps,
+            &mut buf.xn,
+        );
+        &buf.xn
+    } else {
+        &buf.x
+    }
+}
+
+/// Forward for standard (LLaMA-style) models; returns the normalized hidden
+/// state of dimension `config.dim` instead of vocabulary logits.
+pub fn forward_hidden<'a>(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_hidden_impl(config, weights, cache, buf, token, pos, true)
+}
+
+/// Advances the KV cache for one standard-model prompt token without
+/// computing a final normalized hidden state.
+pub fn forward_prefill(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    let _ = forward_hidden_impl(config, weights, cache, buf, token, pos, false);
 }
 
 /// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
-pub fn forward_hidden_gpt_oss<'a>(
+fn forward_hidden_gpt_oss_impl<'a>(
     config: &Config,
     weights: &GptOssWeights,
     cache: &mut KVCache,
     buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
+    final_norm: bool,
 ) -> &'a [f32] {
     weights
         .token_embd
@@ -4520,23 +4569,53 @@ pub fn forward_hidden_gpt_oss<'a>(
         }
     }
 
-    rms_norm_into(
-        &buf.x,
-        &weights.output_norm,
-        config.rms_norm_eps,
-        &mut buf.xn,
-    );
-    &buf.xn
+    if final_norm {
+        rms_norm_into(
+            &buf.x,
+            &weights.output_norm,
+            config.rms_norm_eps,
+            &mut buf.xn,
+        );
+        &buf.xn
+    } else {
+        &buf.x
+    }
+}
+
+/// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
+pub fn forward_hidden_gpt_oss<'a>(
+    config: &Config,
+    weights: &GptOssWeights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_hidden_gpt_oss_impl(config, weights, cache, buf, token, pos, true)
+}
+
+/// Advances the KV cache for one GPT-OSS prompt token without computing a
+/// final normalized hidden state.
+pub fn forward_prefill_gpt_oss(
+    config: &Config,
+    weights: &GptOssWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    let _ = forward_hidden_gpt_oss_impl(config, weights, cache, buf, token, pos, false);
 }
 
 /// Forward for Gemma-4 models; returns the normalized hidden state.
-pub fn forward_hidden_gemma4<'a>(
+fn forward_hidden_gemma4_impl<'a>(
     config: &Config,
     weights: &Gemma4Weights,
     cache: &mut KVCache,
     buf: &'a mut DecodeBuffer,
     token: u32,
     pos: usize,
+    final_norm: bool,
 ) -> &'a [f32] {
     let dim = config.dim;
 
@@ -4738,11 +4817,40 @@ pub fn forward_hidden_gemma4<'a>(
         }
     }
 
-    rms_norm_into(
-        &buf.x,
-        &weights.output_norm,
-        config.rms_norm_eps,
-        &mut buf.xn,
-    );
-    &buf.xn
+    if final_norm {
+        rms_norm_into(
+            &buf.x,
+            &weights.output_norm,
+            config.rms_norm_eps,
+            &mut buf.xn,
+        );
+        &buf.xn
+    } else {
+        &buf.x
+    }
+}
+
+/// Forward for Gemma-4 models; returns the normalized hidden state.
+pub fn forward_hidden_gemma4<'a>(
+    config: &Config,
+    weights: &Gemma4Weights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_hidden_gemma4_impl(config, weights, cache, buf, token, pos, true)
+}
+
+/// Advances the KV cache for one Gemma-4 prompt token without computing a
+/// final normalized hidden state.
+pub fn forward_prefill_gemma4(
+    config: &Config,
+    weights: &Gemma4Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    let _ = forward_hidden_gemma4_impl(config, weights, cache, buf, token, pos, false);
 }

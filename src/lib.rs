@@ -44,6 +44,6 @@ pub mod skills;
 pub mod tokenizer;
 
 pub use runtime::{
-    ChatMessage, ChatRole, EmbeddingResult, GenerationOptions, GenerationResult, GenerationStats,
-    LoadInfo, Runner, TokenNeighbor, cosine_similarity,
+    BackendPolicy, ChatMessage, ChatRole, EmbeddingResult, GenerationOptions, GenerationResult,
+    GenerationStats, LoadInfo, Runner, TokenNeighbor, cosine_similarity,
 };

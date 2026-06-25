@@ -20,7 +20,7 @@ use rusty_llm::gguf::GGUFFile;
 use rusty_llm::metal;
 use rusty_llm::model::Config;
 use rusty_llm::runtime::{
-    ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
+    BackendPolicy, ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
     compatibility_report,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
@@ -79,6 +79,12 @@ fn print_usage(name: &str) {
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
     eprintln!("  --threads-batch <N>       Override prompt/prefill thread count");
+    eprintln!("  --ubatch <N>              Logical prefill microbatch/chunk size");
+    eprintln!("  --no-auto-batch-threads   Disable automatic prefill thread widening");
+    eprintln!("  --poll <N>                Worker spin-poll iterations before sleeping");
+    eprintln!("  --cpu-affinity            Best-effort pinning for SIMD worker threads");
+    eprintln!("  --mlock                   Best-effort lock mapped model pages in RAM");
+    eprintln!("  --backend <name>          Backend policy: auto, cpu, metal, metal-ultra");
     eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");
     eprintln!("  --mtp-tokens <N>          Max speculative draft tokens (default: 4)");
     eprintln!("  --mtp-min-accept-rate <F> Disable MTP below this accept rate (default: 0.5)");
@@ -442,6 +448,28 @@ fn run() -> Result<(), String> {
                 options.runtime.batch_threads =
                     Some(parse_arg::<usize>(&args, &mut i, "--threads-batch")?);
             }
+            "--ubatch" | "--prefill-ubatch" => {
+                options.runtime.prefill_ubatch =
+                    Some(parse_arg::<usize>(&args, &mut i, "--ubatch")?);
+            }
+            "--no-auto-batch-threads" => {
+                options.runtime.auto_batch_threads = false;
+            }
+            "--poll" | "--worker-poll" => {
+                options.runtime.worker_poll_spins =
+                    Some(parse_arg::<usize>(&args, &mut i, "--poll")?);
+            }
+            "--cpu-affinity" => {
+                options.runtime.cpu_affinity = true;
+            }
+            "--mlock" => {
+                options.runtime.lock_model = true;
+            }
+            "--backend" => {
+                let value = parse_arg::<String>(&args, &mut i, "--backend")?;
+                options.runtime.backend_policy = BackendPolicy::parse(&value)
+                    .ok_or_else(|| format!("Invalid --backend value '{}'.", value))?;
+            }
             "--mtp-assistant" => {
                 options.speculative.assistant_path =
                     Some(parse_arg::<String>(&args, &mut i, "--mtp-assistant")?);
@@ -662,6 +690,22 @@ fn run() -> Result<(), String> {
     } else {
         eprintln!("Worker threads: {} (auto)", simd::num_threads());
     }
+    if let Some(spins) = options.runtime.worker_poll_spins {
+        simd::set_worker_poll_spins(spins);
+    }
+    eprintln!("Worker poll: {} spins", simd::worker_poll_spins());
+    if options.runtime.cpu_affinity {
+        simd::set_cpu_affinity_enabled(true);
+        let pinned = simd::pin_current_thread(0);
+        eprintln!(
+            "CPU affinity: requested{}",
+            if pinned {
+                ""
+            } else {
+                " (best-effort/no-op on this target)"
+            }
+        );
+    }
 
     let model_resolution_start = Instant::now();
     let mut model_catalog_time: Option<Duration> = None;
@@ -734,7 +778,7 @@ fn run() -> Result<(), String> {
     let model_path_str = model_path
         .to_str()
         .ok_or_else(|| format!("Non-UTF-8 model path: {}", model_path.display()))?;
-    let (mut runner, load_info) = Runner::from_path(model_path_str)?;
+    let (mut runner, load_info) = Runner::from_path_with_options(model_path_str, &options)?;
     let file_mb = load_info.file_size_bytes as f64 / (1024.0 * 1024.0);
     eprintln!("File size: {:.1} MB", file_mb);
     if let Some(name) = runner.model_name() {
@@ -764,7 +808,8 @@ fn run() -> Result<(), String> {
     if options.speculative.enabled {
         if let Some(assistant_path) = options.speculative.assistant_path.as_deref() {
             eprintln!("Loading MTP assistant: {}", assistant_path);
-            let (assistant, assistant_info) = Runner::from_path(assistant_path)?;
+            let (assistant, assistant_info) =
+                Runner::from_path_with_options(assistant_path, &options)?;
             runner.attach_speculative_assistant(assistant)?;
             let assistant_mb = assistant_info.file_size_bytes as f64 / (1024.0 * 1024.0);
             let assistant_ratio =
@@ -1385,7 +1430,16 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
             "architecture": runner.architecture(),
             "load_ms": load_info.load_time.as_millis(),
             "max_tokens": options.max_tokens,
-            "batch_threads": options.runtime.batch_threads,
+            "runtime": {
+                "profile": options.runtime.profile.as_str(),
+                "backend": options.runtime.backend_policy.as_str(),
+                "batch_threads": options.runtime.batch_threads,
+                "auto_batch_threads": options.runtime.auto_batch_threads,
+                "worker_poll_spins": options.runtime.worker_poll_spins,
+                "prefill_ubatch": options.runtime.prefill_ubatch,
+                "mlock": options.runtime.lock_model,
+                "cpu_affinity": options.runtime.cpu_affinity,
+            },
             "best_threads_by_decode_tok_s": best_threads,
             "best_decode_tok_s": best_decode_tok_s,
             "threads": summaries,
@@ -1524,11 +1578,17 @@ fn run_benchmark_json(
             },
             "runtime": {
                 "profile": options.runtime.profile.as_str(),
+                "backend": options.runtime.backend_policy.as_str(),
                 "kv_cache_dtype": options.runtime.kv_cache_dtype.as_str(),
                 "flash_attention": options.runtime.flash_attention,
                 "sliding_window_size": options.runtime.sliding_window_size,
                 "max_context": options.runtime.max_context,
                 "batch_threads": options.runtime.batch_threads,
+                "auto_batch_threads": options.runtime.auto_batch_threads,
+                "worker_poll_spins": options.runtime.worker_poll_spins,
+                "prefill_ubatch": options.runtime.prefill_ubatch,
+                "mlock": options.runtime.lock_model,
+                "cpu_affinity": options.runtime.cpu_affinity,
             },
         },
         "results": run_values,
