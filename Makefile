@@ -32,7 +32,7 @@ CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 _MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
 _RUN_ARGS  := --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)"
 
-.PHONY: all build release run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
+.PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
 
 all: check release
 
@@ -41,6 +41,9 @@ build:
 
 release:
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) build --release
+
+release-max:
+	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) build --profile release-max
 
 run: release
 	$(BIN) $(_RUN_ARGS)
@@ -160,7 +163,8 @@ help:
 	@printf "Targets:\n"
 	@printf "  make all                             Run check and release build\n"
 	@printf "  make build                           Build debug binary\n"
-	@printf "  make release                         Build optimized native binary\n"
+	@printf "  make release                         Build optimized native binary with faster ThinLTO\n"
+	@printf "  make release-max                     Build slower FatLTO binary for final benchmarking\n"
 	@printf "  make run MODEL=... PROMPT='...'      Generate from a one-shot prompt\n"
 	@printf "  make repl MODEL=...                  Start interactive REPL mode\n"
 	@printf "  make serve MODEL=... CHAT=1          Start HTTP API / optional web UI\n"

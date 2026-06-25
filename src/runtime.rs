@@ -1260,10 +1260,12 @@ impl Runner {
     pub fn optimization_summary(&self, options: &GenerationOptions) -> Vec<String> {
         let mut items = Vec::new();
         items.push(format!("profile={}", options.runtime.profile.as_str()));
-        items.push(format!(
-            "backend={}",
-            self.effective_backend_policy(options).as_str()
-        ));
+        let backend = self.effective_backend_policy(options);
+        if options.runtime.backend_policy == BackendPolicy::Auto && backend != BackendPolicy::Auto {
+            items.push(format!("backend={} (auto)", backend.as_str()));
+        } else {
+            items.push(format!("backend={}", backend.as_str()));
+        }
         let chat_template = if self.arch == "gpt-oss" {
             "gpt-oss"
         } else {
@@ -1371,7 +1373,7 @@ impl Runner {
             ));
         } else if profile == RuntimeProfile::MistralUltra && self.arch == "mistral3" {
             warnings.push(String::from(
-                "Mistral ultra is experimental; for Ministral 3 short-context decode, benchmark against the default Metal profile because ultra can be slower.",
+                "Mistral ultra uses aggressive Metal routing; use --backend metal or --backend cpu for A/B checks if it regresses on this machine.",
             ));
         }
         if matches!(
@@ -1500,7 +1502,9 @@ impl Runner {
         if options.runtime.backend_policy != BackendPolicy::Auto {
             return options.runtime.backend_policy;
         }
-        if self.effective_profile(options) == RuntimeProfile::MistralUltra {
+        if self.effective_profile(options) == RuntimeProfile::MistralUltra
+            || (self.arch == "mistral3" && crate::metal::enabled())
+        {
             BackendPolicy::MetalUltra
         } else {
             BackendPolicy::Auto

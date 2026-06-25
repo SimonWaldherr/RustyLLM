@@ -1618,16 +1618,24 @@ fn run_kernel_benchmark(
     layer: usize,
     json: bool,
 ) -> Result<(), String> {
-    let ultra_profile = options.runtime.profile == RuntimeProfile::MistralUltra;
-    let metal_q4k_min_rows = if ultra_profile {
+    let ultra_backend = options.runtime.backend_policy == BackendPolicy::MetalUltra
+        || (options.runtime.backend_policy == BackendPolicy::Auto
+            && (options.runtime.profile == RuntimeProfile::MistralUltra
+                || (runner.architecture() == "mistral3" && metal::enabled())));
+    let metal_q4k_min_rows = if ultra_backend {
         metal::ultra_q4k_min_metal_rows()
     } else {
         metal::Q4K_MIN_METAL_ROWS
     };
-    let metal_q6k_min_rows = if ultra_profile {
+    let metal_q6k_min_rows = if ultra_backend {
         metal::ultra_q6k_min_metal_rows()
     } else {
         metal::Q6K_MIN_METAL_ROWS
+    };
+    let metal_attention_min_tokens = if ultra_backend {
+        metal::ultra_attention_min_metal_tokens()
+    } else {
+        metal::attention_min_metal_tokens()
     };
     let (layer, rows) = runner.kernel_benchmark_with_options(runs, layer, options)?;
     if json {
@@ -1660,7 +1668,7 @@ fn run_kernel_benchmark(
             "metal": {
                 "available": metal::available(),
                 "enabled": metal::enabled(),
-                "ultra": ultra_profile,
+                "ultra": ultra_backend,
                 "nocopy": metal::nocopy_enabled(),
                 "fused_ffn": metal::fused_ffn_enabled(),
                 "q4_k": metal::enabled(),
@@ -1668,7 +1676,7 @@ fn run_kernel_benchmark(
                 "q4_k_min_rows": metal_q4k_min_rows,
                 "q4_k_min_cols": metal::Q4K_MIN_METAL_COLS,
                 "q6_k_min_rows": metal_q6k_min_rows,
-                "attention_min_tokens": metal::attention_min_metal_tokens(),
+                "attention_min_tokens": metal_attention_min_tokens,
                 "ultra_q4_k_min_rows": metal::ultra_q4k_min_metal_rows(),
                 "ultra_q6_k_min_rows": metal::ultra_q6k_min_metal_rows(),
                 "ultra_attention_min_tokens": metal::ultra_attention_min_metal_tokens(),
@@ -1692,7 +1700,7 @@ fn run_kernel_benchmark(
         "Metal available={} enabled={} ultra={} nocopy={} fused_ffn={} q4_k={} q6_k={} q4_k_min_rows={} q4_k_min_cols={} q6_k_min_rows={} attention_min_tokens={} ultra_attention_min_tokens={}",
         metal::available(),
         metal::enabled(),
-        ultra_profile,
+        ultra_backend,
         metal::nocopy_enabled(),
         metal::fused_ffn_enabled(),
         metal::enabled(),

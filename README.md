@@ -157,11 +157,16 @@ The Makefile wraps the common commands:
 ```bash
 make help
 make release
+make release-max
 make run MODEL=/path/to/model.gguf PROMPT="Explain GGUF in one paragraph"
 make repl MODEL=/path/to/model.gguf
 make serve MODEL=/path/to/model.gguf ADDR=127.0.0.1:8080 CHAT=1
 make bench MODEL=/path/to/model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
 ```
+
+`make release` uses the default release profile with ThinLTO for faster rebuilds.
+Use `make release-max` only when you explicitly want the slower FatLTO profile
+for final A/B measurements.
 
 ## Quick Start
 
@@ -349,10 +354,11 @@ Generation options:
   llama.cpp tuning practice of measuring thread oversubscription instead of
   assuming that all logical CPUs are fastest.
 - `--profile <name>` selects runtime planning: `auto`, `mistral`,
-  `mistral-ultra`, or `gemma`. `mistral-ultra` is an experimental aggressive
-  Metal mode for Mistral/Ministral-style GGUFs; it lowers Metal dispatch
-  thresholds for Q4_K/Q6_K projections and attention scans, with native SIMD
-  fallback for kernels that still run on CPU.
+  `mistral-ultra`, or `gemma`. `mistral-ultra` is the aggressive Metal mode for
+  Mistral/Ministral-style GGUFs; it lowers Metal dispatch thresholds for
+  Q4_K/Q6_K projections and attention scans, with native SIMD fallback for
+  kernels that still run on CPU. With `RUSTY_LLM_METAL=1`, `auto` enables this
+  backend for Ministral 3 models.
 - `--mtp-assistant <path>` loads a smaller assistant GGUF for greedy
   speculative decoding.
 - `--mtp-tokens <N>` sets the maximum speculative draft tokens.
@@ -886,10 +892,10 @@ RUSTY_LLM_METAL=1 rusty-llm --model-dir ./models --model Ministral \
   --profile mistral-ultra --prompt "Explain metal inference briefly."
 ```
 
-Treat `mistral-ultra` as an experiment, not a default. On the measured
-Ministral 3 3B Q4_K_M model, the standard Metal profile was faster and more
-stable for short-context decode; benchmark both profiles before keeping ultra
-mode in normal runs.
+With `RUSTY_LLM_METAL=1`, `--backend auto` promotes Ministral 3 models to the
+same aggressive Metal routing used by `metal-ultra`, because short-context
+decode benefits from lower Q4_K/Q6_K GPU dispatch thresholds on Apple Silicon.
+Use `--backend metal` to force the conservative Metal gates when comparing.
 
 Use `--backend cpu` for CPU-only A/B checks without changing environment
 variables. `--backend metal-ultra` enables the same aggressive per-thread Metal
