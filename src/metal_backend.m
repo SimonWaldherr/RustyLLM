@@ -52,6 +52,7 @@ static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
 static id<MTLComputePipelineState> gResidualRmsPipeline;
 static id<MTLComputePipelineState> gResidualAddPipeline;
+static id<MTLComputePipelineState> gRopeStorePipeline;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gWeightBuffers;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gSharedBuffers;
 static const float gAttentionZero = 0.0f;
@@ -376,6 +377,55 @@ static NSString *const kResidualSource =
 "    x[gid] += residual[gid];\n"
 "}\n";
 
+// RoPE applied in-place to q and k, with rotated k and copied v written straight
+// into the GPU-resident KV cache slot for this position. Handles both the
+// interleaved (pairs i,i+1) and NeoX (pairs i,i+half) rotation conventions and
+// grouped-query attention (n_kv_heads <= n_heads). Used by the resident decoder.
+static NSString *const kRopeStoreSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct RopeParams { uint pos; uint head_dim; uint half; uint n_heads; uint n_kv_heads;\n"
+"                    uint value_dim; uint kv_k_dim; uint kv_v_dim; uint slot; uint neox; };\n"
+"kernel void rope_store(device float* q [[buffer(0)]],\n"
+"                       device float* k [[buffer(1)]],\n"
+"                       device const float* v [[buffer(2)]],\n"
+"                       device const float* inv_freq [[buffer(3)]],\n"
+"                       device float* k_cache [[buffer(4)]],\n"
+"                       device float* v_cache [[buffer(5)]],\n"
+"                       constant RopeParams& p [[buffer(6)]],\n"
+"                       uint gid [[thread_position_in_grid]]) {\n"
+"    uint pairs_per_head = p.half;\n"
+"    uint total = p.n_heads * pairs_per_head;\n"
+"    if (gid < total) {\n"
+"        uint h = gid / pairs_per_head;\n"
+"        uint i = gid % pairs_per_head;\n"
+"        float angle = float(p.pos) * inv_freq[i];\n"
+"        float ca = cos(angle);\n"
+"        float sa = sin(angle);\n"
+"        uint off = h * p.head_dim;\n"
+"        uint i0 = p.neox != 0 ? off + i : off + 2 * i;\n"
+"        uint i1 = p.neox != 0 ? off + i + p.half : off + 2 * i + 1;\n"
+"        float v0 = q[i0];\n"
+"        float v1 = q[i1];\n"
+"        q[i0] = v0 * ca - v1 * sa;\n"
+"        q[i1] = v0 * sa + v1 * ca;\n"
+"        if (h < p.n_kv_heads) {\n"
+"            float w0 = k[i0];\n"
+"            float w1 = k[i1];\n"
+"            float r0 = w0 * ca - w1 * sa;\n"
+"            float r1 = w0 * sa + w1 * ca;\n"
+"            k[i0] = r0;\n"
+"            k[i1] = r1;\n"
+"            k_cache[p.slot * p.kv_k_dim + i0] = r0;\n"
+"            k_cache[p.slot * p.kv_k_dim + i1] = r1;\n"
+"        }\n"
+"    }\n"
+"    // Copy V (unrotated) into the cache slot; one thread per element.\n"
+"    if (gid < p.kv_v_dim) {\n"
+"        v_cache[p.slot * p.kv_v_dim + gid] = v[gid];\n"
+"    }\n"
+"}\n";
+
 static BOOL rusty_metal_init(void) {
     static dispatch_once_t once;
     static BOOL ok = NO;
@@ -501,6 +551,21 @@ static BOOL rusty_metal_init(void) {
         gResidualAddPipeline = [gDevice newComputePipelineStateWithFunction:residual_add_function error:&error];
         if (!gResidualAddPipeline) {
             rusty_metal_log_error("create residual_add pipeline", error);
+            return;
+        }
+        id<MTLLibrary> rope_library = [gDevice newLibraryWithSource:kRopeStoreSource options:nil error:&error];
+        if (!rope_library) {
+            rusty_metal_log_error("compile rope_store library", error);
+            return;
+        }
+        id<MTLFunction> rope_function = [rope_library newFunctionWithName:@"rope_store"];
+        if (!rope_function) {
+            rusty_metal_log_error("load rope_store function", nil);
+            return;
+        }
+        gRopeStorePipeline = [gDevice newComputePipelineStateWithFunction:rope_function error:&error];
+        if (!gRopeStorePipeline) {
+            rusty_metal_log_error("create rope_store pipeline", error);
             return;
         }
         gQueue = [gDevice newCommandQueue];
