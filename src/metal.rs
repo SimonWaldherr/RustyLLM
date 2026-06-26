@@ -338,7 +338,7 @@ pub fn q6k_enabled() -> bool {
 /// Reports whether the Metal backend should prefer Shared/NoCopy host buffers.
 pub fn nocopy_enabled() -> bool {
     static NOCOPY_ENABLED: OnceLock<bool> = OnceLock::new();
-    *NOCOPY_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_NOCOPY") != Some(false))
+    *NOCOPY_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_NOCOPY") == Some(true))
 }
 
 /// Reports whether Mistral-style fused Metal FFN blocks are enabled.
@@ -350,7 +350,7 @@ pub fn fused_ffn_enabled() -> bool {
 /// Reports whether the experimental fused Mistral post-attention/FFN block is enabled.
 pub fn post_attention_ffn_enabled() -> bool {
     static POST_ATTENTION_FFN_ENABLED: OnceLock<bool> = OnceLock::new();
-    *POST_ATTENTION_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_POST_FFN") == Some(true))
+    *POST_ATTENTION_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_POST_FFN") != Some(false))
 }
 
 /// Attempts a Metal attention scan across all query heads.

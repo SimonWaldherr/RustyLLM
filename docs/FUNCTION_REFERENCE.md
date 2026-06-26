@@ -67,6 +67,8 @@ the high-level runtime API.
 ## `src/mmap.rs`
 
 - `MmapFile::open` opens and memory-maps a model file on native targets.
+- `MmapFile::lock_in_memory` requests best-effort `mlock` residency for mapped
+  model pages.
 - `MmapFile::as_slice` returns the mapped bytes.
 - `MmapFile::len` returns the mapping length.
 - `MmapFile::is_empty` reports whether the mapping has zero length.
@@ -109,13 +111,22 @@ the high-level runtime API.
 - `has_avx2_fma` detects x86_64 AVX2/FMA support.
 - `f16_to_f32` converts IEEE-754 half precision bits to `f32`.
 - `set_num_threads` sets the global worker count for parallel kernels.
+- `available_threads` returns the OS-reported native parallelism.
+- `set_cpu_affinity_enabled`, `cpu_affinity_enabled`, and
+  `pin_current_thread` manage best-effort compute-thread affinity.
+- `set_worker_poll_spins` and `worker_poll_spins` configure llama.cpp-style
+  worker polling before Condvar sleep.
 - `num_threads` returns the configured worker count.
 - `f16_lookup` returns the lazy half-to-float lookup table.
 - `parallel_matvec_f32`, `parallel_matvec_u8`, and `parallel_matvec` dispatch
   matrix-vector work across the worker pool.
+- `matvec_chunk_count` and `use_dynamic_chunks` select llama.cpp-style dynamic
+  row chunking for large matrix-vector jobs.
+- `MatvecJob::run_dynamic_worker` and `Q4KMatvec3Job::run_dynamic_worker` let
+  workers claim 64-row chunks from the shared worker-pool counter.
 - `Q4KMatvec3Job::work_items` reports how many rows a fused Q4_K triple-matvec
   job contains.
-- `clipped_range` maps a global worker range onto one output slice.
+- `clipped_range` maps a global worker or chunk range onto one output slice.
 - `WorkerJob::workers` returns the worker count requested by a queued job.
 - `WorkerPool::new` creates the reusable worker pool.
 - `WorkerPool::run`, `run_q4k_matvec3`, and `run_job` execute queued matvec
@@ -159,8 +170,11 @@ the high-level runtime API.
 - `fused_ffn_enabled` checks whether Mistral-style Q4_K/Q4_K/Q6_K FFN blocks
   should be fused into one Metal command buffer.
 - `ultra_q4k_min_metal_rows`, `ultra_q6k_min_metal_rows`,
-  `ultra_attention_min_metal_tokens`, `scoped_ultra_mode`, and
-  `ultra_mode_enabled` manage the per-thread Mistral Ultra routing mode.
+  `ultra_attention_min_metal_tokens`, `scoped_ultra_mode`,
+  `scoped_dispatch_policy`, `dispatch_enabled`, and `ultra_mode_enabled` manage
+  per-thread Metal routing mode.
+- `fused_kquant_should_use_metal` shape-gates fused K-quant Metal dispatches so
+  very small projections stay on the CPU path.
 - `q4k_matvec_into`, `q6k_matvec_into`, `q4k_matvec2_into`, and
   `q4k_matvec3_into` try selected Metal matrix-vector kernels and fall back by
   returning `false`.
@@ -184,7 +198,12 @@ the high-level runtime API.
   quantized projections when feature/target gates allow them.
 - `ExpertWeight::matvec_expert` and `matvec_expert_into` run one expert slice
   from a mixture-of-experts tensor.
+- `forward_prefill`, `forward_prefill_gpt_oss`, and
+  `forward_prefill_gemma4` advance prompt tokens without the final
+  embedding/logit-side normalization.
 - `KVCache::new` allocates per-layer key/value cache storage.
+- `attention_uses_linear_slots` detects non-wrapping KV-cache ranges that can
+  skip ring-buffer modulo work in attention.
 - `build_rope_inv_freq` builds rotary embedding inverse frequencies.
 - `build_rope_inv_freq_gpt_oss` builds GPT-OSS rotary frequencies and scaling.
 - `DecodeBuffer::new` allocates reusable temporary buffers for decoding.
@@ -231,6 +250,8 @@ the high-level runtime API.
   Gemma loader and runtime profile.
 - `Runner::from_gguf_bytes` builds a runner from in-memory GGUF bytes.
 - `Runner::from_path` memory-maps and loads a runner from a GGUF file path.
+- `Runner::from_path_with_options` applies load-time runtime options such as
+  best-effort model `mlock`.
 - `Runner::architecture`, `model_name`, `tokenizer`, `gguf`, and `config`
   expose loaded model metadata.
 - `Runner::kernel_benchmark` benchmarks representative matrix-vector kernels.
@@ -241,7 +262,11 @@ the high-level runtime API.
 - `Runner::generate_stream` produces tokens and calls a callback as text
   becomes available.
 - `Runner::generate_chat_stream` streams a chat response.
+- `Runner::prefill_prompt_tokens` processes prompt tokens through the shared
+  prefill chunk/thread/backend scheduler.
 - `Runner::forward_token_into` runs one token through the active model family.
+- `Runner::forward_prefill_token` advances one prompt token without computing a
+  final hidden state.
 - `Runner::forward_hidden_token` returns one token hidden state for embeddings.
 - `Runner::embed` returns a mean-pooled, L2-normalized embedding.
 - `Runner::is_stop_token` checks built-in stop tokens.
@@ -326,11 +351,14 @@ the high-level runtime API.
 
 - `print_usage` prints CLI help.
 - `parse_arg` parses the value following a typed CLI flag.
+- `parse_thread_list` parses comma-separated benchmark worker counts.
 - `set_model_selector` records the positional or flag-selected model.
 - `main` runs the CLI and prints fatal errors.
 - `run` parses CLI arguments and dispatches the selected mode.
 - `inspect_model_file` prints a JSON compatibility report for a GGUF file.
 - `run_benchmark` runs a text-generation benchmark.
+- `run_benchmark_thread_sweep` benchmarks the same prompt across several SIMD
+  worker counts.
 - `run_benchmark_json` runs the benchmark and prints JSON.
 - `run_kernel_benchmark` runs kernel-level benchmarks.
 - `run_repl` runs the interactive chat loop.

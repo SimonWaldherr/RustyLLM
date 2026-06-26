@@ -1502,10 +1502,10 @@ impl Runner {
         if options.runtime.backend_policy != BackendPolicy::Auto {
             return options.runtime.backend_policy;
         }
-        if self.effective_profile(options) == RuntimeProfile::MistralUltra
-            || (self.arch == "mistral3" && crate::metal::enabled())
-        {
+        if self.effective_profile(options) == RuntimeProfile::MistralUltra {
             BackendPolicy::MetalUltra
+        } else if self.arch == "mistral3" && crate::metal::enabled() {
+            BackendPolicy::Metal
         } else {
             BackendPolicy::Auto
         }

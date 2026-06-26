@@ -1620,8 +1620,7 @@ fn run_kernel_benchmark(
 ) -> Result<(), String> {
     let ultra_backend = options.runtime.backend_policy == BackendPolicy::MetalUltra
         || (options.runtime.backend_policy == BackendPolicy::Auto
-            && (options.runtime.profile == RuntimeProfile::MistralUltra
-                || (runner.architecture() == "mistral3" && metal::enabled())));
+            && options.runtime.profile == RuntimeProfile::MistralUltra);
     let metal_q4k_min_rows = if ultra_backend {
         metal::ultra_q4k_min_metal_rows()
     } else {

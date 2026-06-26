@@ -892,10 +892,10 @@ RUSTY_LLM_METAL=1 rusty-llm --model-dir ./models --model Ministral \
   --profile mistral-ultra --prompt "Explain metal inference briefly."
 ```
 
-With `RUSTY_LLM_METAL=1`, `--backend auto` promotes Ministral 3 models to the
-same aggressive Metal routing used by `metal-ultra`, because short-context
-decode benefits from lower Q4_K/Q6_K GPU dispatch thresholds on Apple Silicon.
-Use `--backend metal` to force the conservative Metal gates when comparing.
+With `RUSTY_LLM_METAL=1`, `--backend auto` uses the standard Metal route for
+Ministral 3 models. That is the measured faster default for the current 3B
+Q4_K_M benchmark. Use `--backend metal-ultra` or `--profile mistral-ultra` only
+when explicitly comparing the more aggressive dispatch thresholds on your Mac.
 
 Use `--backend cpu` for CPU-only A/B checks without changing environment
 variables. `--backend metal-ultra` enables the same aggressive per-thread Metal
@@ -905,11 +905,17 @@ For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with
 `RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS`, `RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS`, and
 `RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal
-matvec and attention calls prefer Shared/NoCopy host buffers by default to avoid
-extra Rust/Metal memcpy traffic; set `RUSTY_LLM_METAL_NOCOPY=0` to benchmark the
-older copy-buffer path. Mistral-style Q4_K/Q4_K/Q6_K FFN blocks are fused into
-one Metal command buffer by default; set `RUSTY_LLM_METAL_FUSED_FFN=0` to compare
-against the older Gate/Up, CPU SwiGLU, Down sequence.
+matvec and attention calls use reusable copy buffers by default, which is faster
+on the current Ministral 3B Q4_K_M benchmark than Shared/NoCopy wrapping. Set
+`RUSTY_LLM_METAL_NOCOPY=1` only when benchmarking the no-copy path on your Mac.
+Immutable Metal weight buffers use private storage by default for better decode
+throughput; set `RUSTY_LLM_METAL_PRIVATE_WEIGHTS=0` if memory pressure matters
+more than speed. Mistral-style Q4_K/Q4_K/Q6_K FFN blocks and post-attention FFN
+blocks are fused into fewer Metal command buffers by default; set
+`RUSTY_LLM_METAL_FUSED_FFN=0` or `RUSTY_LLM_METAL_POST_FFN=0` to compare against
+the older split-dispatch paths. Set `RUSTY_LLM_METAL_PROFILE=1` to print aggregate
+Metal command-buffer, dispatch, transfer, allocation, CPU encode, and GPU timing
+counters at process exit.
 
 Optional feature:
 
