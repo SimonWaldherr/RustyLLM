@@ -290,7 +290,231 @@ mod ffi {
             scale: f32,
             use_sink: i32,
         ) -> i32;
+
+        /// Configures the GPU-resident decoder (allocates resident buffers).
+        pub fn rusty_metal_resident_configure(
+            n_layers: u32,
+            dim: u32,
+            n_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            value_dim: u32,
+            hidden_dim: u32,
+            vocab: u32,
+            storage_len: u32,
+            eps: f32,
+            neox: u32,
+        ) -> i32;
+        /// Registers one transformer layer's weights with the resident decoder.
+        pub fn rusty_metal_resident_set_layer(l: u32, desc: *const super::ResidentLayerDesc)
+        -> i32;
+        /// Registers the output norm/projection and RoPE frequencies.
+        pub fn rusty_metal_resident_set_output(
+            output_norm: *const f32,
+            output_w: *const u8,
+            output_w_len: usize,
+            output_rows: u32,
+            output_dt: u32,
+            inv_freq: *const f32,
+            inv_freq_len: u32,
+        ) -> i32;
+        /// Runs one full token forward pass entirely on the GPU (one command buffer).
+        pub fn rusty_metal_resident_decode(
+            x_embed: *const f32,
+            pos: u32,
+            start_t: u32,
+            logits_out: *mut f32,
+        ) -> i32;
     }
+}
+
+/// C-compatible descriptor for one transformer layer, passed to the resident
+/// decoder. Field order and types must match `RustyResidentLayerDesc` in
+/// `metal_backend.m`. Weight order: wq, wk, wv, wo, gate(w1), up(w3), down(w2).
+/// Each `w_dt` is 0 for Q4_K, 1 for Q6_K.
+#[repr(C)]
+pub struct ResidentLayerDesc {
+    pub w: [*const u8; 7],
+    pub w_len: [usize; 7],
+    pub w_rows: [u32; 7],
+    pub w_dt: [u32; 7],
+    pub attn_norm: *const f32,
+    pub ffn_norm: *const f32,
+    pub bq: *const f32,
+    pub bq_len: u32,
+    pub bk: *const f32,
+    pub bk_len: u32,
+    pub bv: *const f32,
+    pub bv_len: u32,
+}
+
+/// Reports whether the experimental GPU-resident single-command-buffer decoder
+/// is enabled (`RUSTY_LLM_METAL_RESIDENT=1`). Off by default: it keeps its own
+/// GPU-resident KV cache in static buffers, so only one exclusive decode
+/// stream may use it at a time (safe for CLI use, not for concurrent server
+/// sessions beyond serializing them).
+pub fn resident_enabled() -> bool {
+    static RESIDENT_ENABLED: OnceLock<bool> = OnceLock::new();
+    *RESIDENT_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_RESIDENT") == Some(true))
+}
+
+/// One transformer layer's weights, borrowed just long enough to register
+/// them with the resident decoder. `w_dt` is 0 for Q4_K, 1 for Q6_K.
+pub struct ResidentLayerInput<'a> {
+    pub w: [&'a [u8]; 7],
+    pub w_rows: [u32; 7],
+    pub w_dt: [u32; 7],
+    pub attn_norm: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub bq: &'a [f32],
+    pub bk: &'a [f32],
+    pub bv: &'a [f32],
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Allocates the resident decoder's per-layer GPU buffers for a new model.
+pub fn resident_configure(
+    n_layers: usize,
+    dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    value_dim: usize,
+    hidden_dim: usize,
+    vocab: usize,
+    storage_len: usize,
+    eps: f32,
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_resident_configure(
+            n_layers as u32,
+            dim as u32,
+            n_heads as u32,
+            n_kv_heads as u32,
+            head_dim as u32,
+            value_dim as u32,
+            hidden_dim as u32,
+            vocab as u32,
+            storage_len as u32,
+            eps,
+            0,
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub fn resident_configure(
+    _n_layers: usize,
+    _dim: usize,
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _value_dim: usize,
+    _hidden_dim: usize,
+    _vocab: usize,
+    _storage_len: usize,
+    _eps: f32,
+) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Registers one transformer layer's weights with the resident decoder.
+pub fn resident_set_layer(l: usize, input: &ResidentLayerInput) -> bool {
+    let desc = ResidentLayerDesc {
+        w: std::array::from_fn(|i| input.w[i].as_ptr()),
+        w_len: std::array::from_fn(|i| input.w[i].len()),
+        w_rows: input.w_rows,
+        w_dt: input.w_dt,
+        attn_norm: input.attn_norm.as_ptr(),
+        ffn_norm: input.ffn_norm.as_ptr(),
+        bq: if input.bq.is_empty() {
+            std::ptr::null()
+        } else {
+            input.bq.as_ptr()
+        },
+        bq_len: input.bq.len() as u32,
+        bk: if input.bk.is_empty() {
+            std::ptr::null()
+        } else {
+            input.bk.as_ptr()
+        },
+        bk_len: input.bk.len() as u32,
+        bv: if input.bv.is_empty() {
+            std::ptr::null()
+        } else {
+            input.bv.as_ptr()
+        },
+        bv_len: input.bv.len() as u32,
+    };
+    unsafe { ffi::rusty_metal_resident_set_layer(l as u32, &desc) != 0 }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub fn resident_set_layer(_l: usize, _input: &ResidentLayerInput) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Registers the output norm/projection and RoPE frequency table.
+pub fn resident_set_output(
+    output_norm: &[f32],
+    output_w: &[u8],
+    output_rows: usize,
+    output_dt: u32,
+    inv_freq: &[f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_resident_set_output(
+            output_norm.as_ptr(),
+            output_w.as_ptr(),
+            output_w.len(),
+            output_rows as u32,
+            output_dt,
+            inv_freq.as_ptr(),
+            inv_freq.len() as u32,
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub fn resident_set_output(
+    _output_norm: &[f32],
+    _output_w: &[u8],
+    _output_rows: usize,
+    _output_dt: u32,
+    _inv_freq: &[f32],
+) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Runs one full token forward pass on the GPU-resident decoder (embedding
+/// already computed on the CPU side; everything else happens in one command
+/// buffer). `start_t` is always 0 since resident mode requires a disabled
+/// sliding window.
+pub fn resident_decode_into(
+    x_embed: &[f32],
+    pos: usize,
+    vocab: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    logits.resize(vocab, 0.0);
+    unsafe {
+        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, logits.as_mut_ptr()) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub fn resident_decode_into(
+    _x_embed: &[f32],
+    _pos: usize,
+    _vocab: usize,
+    _logits: &mut Vec<f32>,
+) -> bool {
+    false
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
@@ -348,9 +572,13 @@ pub fn fused_ffn_enabled() -> bool {
 }
 
 /// Reports whether the experimental fused Mistral post-attention/FFN block is enabled.
+///
+/// Opt-in (like `RUSTY_LLM_METAL_NOCOPY`): BENCHMARK.md measured this fusion
+/// as slower than the standard path on Ministral/M2 Max, so it must not be on
+/// by default just because the model shape matches.
 pub fn post_attention_ffn_enabled() -> bool {
     static POST_ATTENTION_FFN_ENABLED: OnceLock<bool> = OnceLock::new();
-    *POST_ATTENTION_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_POST_FFN") != Some(false))
+    *POST_ATTENTION_FFN_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_POST_FFN") == Some(true))
 }
 
 /// Attempts a Metal attention scan across all query heads.

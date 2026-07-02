@@ -7,8 +7,15 @@
 
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+thread_local! {
+    // TEMP debug scaffolding for the resident-decoder correctness check;
+    // remove once RUSTY_LLM_METAL_RESIDENT is validated.
+    static RESIDENT_DEBUG_LOGITS: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -2920,6 +2927,219 @@ pub fn forward_gpt_oss_into(
     weights.output.matvec_into(&buf.xn, logits);
 }
 
+/// Maps a quantized weight's dtype to the resident decoder's `w_dt` code, or
+/// `None` if the resident kernels don't support it (only Q4_K/Q6_K today).
+fn resident_dtype_code(dtype: GGMLType) -> Option<u32> {
+    match dtype {
+        GGMLType::Q4_K => Some(0),
+        GGMLType::Q6_K => Some(1),
+        _ => None,
+    }
+}
+
+/// Fingerprints a model+cache combination so the (process-lifetime, one-shot)
+/// resident-decoder setup below is never reused across a different model.
+fn resident_fingerprint(config: &Config, weights: &ModelWeights, storage_len: usize) -> u64 {
+    let ptr = match &weights.token_embd {
+        Weight::Quantized { data, .. } => data.as_slice().as_ptr() as usize as u64,
+        Weight::F32(v) => v.as_ptr() as usize as u64,
+    };
+    [
+        ptr,
+        config.n_layers as u64,
+        config.dim as u64,
+        config.hidden_dim as u64,
+        config.n_heads as u64,
+        config.n_kv_heads as u64,
+        config.head_dim as u64,
+        config.value_dim as u64,
+        config.vocab_size as u64,
+        storage_len as u64,
+    ]
+    .into_iter()
+    .fold(0xcbf29ce484222325u64, |h, part| {
+        (h ^ part).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Registers every layer's weights (and the tied output projection) with the
+/// experimental GPU-resident decoder. Runs once per process; returns whether
+/// setup succeeded so the caller can fall back to the normal per-op path.
+fn resident_configure_once(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &KVCache,
+    buf: &DecodeBuffer,
+) -> bool {
+    let attn_dim = config.n_heads * config.value_dim;
+    let expected_cols = [
+        config.dim,
+        config.dim,
+        config.dim,
+        attn_dim,
+        config.dim,
+        config.dim,
+        config.hidden_dim,
+    ];
+    let expected_rows = [
+        config.n_heads * config.head_dim,
+        config.n_kv_heads * config.head_dim,
+        config.n_kv_heads * config.value_dim,
+        config.dim,
+        config.hidden_dim,
+        config.hidden_dim,
+        config.dim,
+    ];
+
+    if buf.rope_inv_freq.len() < config.head_dim / 2 {
+        return false;
+    }
+    let (output_bytes, output_dt) = match &weights.output {
+        Weight::Quantized {
+            data,
+            dtype,
+            rows,
+            cols,
+        } if *rows == config.vocab_size && *cols == config.dim => {
+            match resident_dtype_code(*dtype) {
+                Some(dt) => (data.as_slice(), dt),
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+
+    if !crate::metal::resident_configure(
+        config.n_layers,
+        config.dim,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        config.value_dim,
+        config.hidden_dim,
+        config.vocab_size,
+        cache.storage_len,
+        config.rms_norm_eps,
+    ) {
+        return false;
+    }
+
+    for (l, layer) in weights.layers.iter().enumerate() {
+        let ws = [
+            &layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w1, &layer.w3, &layer.w2,
+        ];
+        let mut w_bytes: [&[u8]; 7] = [&[]; 7];
+        let mut w_rows = [0u32; 7];
+        let mut w_dt = [0u32; 7];
+        for i in 0..7 {
+            match ws[i] {
+                Weight::Quantized {
+                    data,
+                    dtype,
+                    rows,
+                    cols,
+                } if *cols == expected_cols[i] && *rows == expected_rows[i] => {
+                    match resident_dtype_code(*dtype) {
+                        Some(dt) => {
+                            w_bytes[i] = data.as_slice();
+                            w_rows[i] = *rows as u32;
+                            w_dt[i] = dt;
+                        }
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        if layer.attn_norm.len() != config.dim || layer.ffn_norm.len() != config.dim {
+            return false;
+        }
+        let input = crate::metal::ResidentLayerInput {
+            w: w_bytes,
+            w_rows,
+            w_dt,
+            attn_norm: &layer.attn_norm,
+            ffn_norm: &layer.ffn_norm,
+            bq: &layer.bq,
+            bk: &layer.bk,
+            bv: &layer.bv,
+        };
+        if !crate::metal::resident_set_layer(l, &input) {
+            return false;
+        }
+    }
+
+    crate::metal::resident_set_output(
+        &weights.output_norm,
+        output_bytes,
+        config.vocab_size,
+        output_dt,
+        &buf.rope_inv_freq,
+    )
+}
+
+/// Prepares the resident decoder for this exact model, doing the (fairly
+/// expensive) GPU buffer setup at most once per process. A mismatched
+/// fingerprint (a different model loaded in the same process) safely
+/// disables the fast path instead of reusing another model's GPU buffers.
+fn resident_ready(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &KVCache,
+    buf: &DecodeBuffer,
+) -> bool {
+    if !crate::metal::resident_enabled() || !crate::metal::dispatch_enabled() {
+        return false;
+    }
+    if config.sliding_window != 0
+        || config.n_layers == 0
+        || config.n_layers > 200
+        || config.dim == 0
+        || config.dim % 256 != 0
+        || config.hidden_dim == 0
+        || config.hidden_dim % 256 != 0
+        || config.head_dim == 0
+        || config.head_dim > 256
+        || config.value_dim == 0
+        || config.value_dim > 256
+        || config.n_kv_heads == 0
+        || config.n_heads % config.n_kv_heads != 0
+    {
+        return false;
+    }
+    static RESIDENT_READY: OnceLock<(u64, bool)> = OnceLock::new();
+    let fingerprint = resident_fingerprint(config, weights, cache.storage_len);
+    let (ready_fingerprint, ready) = *RESIDENT_READY.get_or_init(|| {
+        (
+            fingerprint,
+            resident_configure_once(config, weights, cache, buf),
+        )
+    });
+    ready_fingerprint == fingerprint && ready
+}
+
+/// Attempts one full token forward pass on the experimental GPU-resident
+/// decoder. A global lock serializes calls: the decoder keeps its working
+/// buffers and KV cache in static GPU memory, so two forward passes must
+/// never run concurrently.
+fn resident_forward_attempt(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    if pos >= cache.storage_len || !resident_ready(config, weights, cache, buf) {
+        return false;
+    }
+    static RESIDENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = RESIDENT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::metal::resident_decode_into(&buf.x, pos, config.vocab_size, logits)
+}
+
 /// Single forward pass for one token at position `pos`
 pub fn forward(
     config: &Config,
@@ -2952,6 +3172,25 @@ pub fn forward_into(
 
     // Token embedding
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
+
+    let resident_debug = std::env::var("RUSTY_LLM_METAL_RESIDENT_DEBUG").is_ok();
+    if resident_debug {
+        let mut resident_logits = Vec::new();
+        let ok = resident_forward_attempt(config, weights, cache, buf, pos, &mut resident_logits);
+        eprintln!(
+            "[resident-debug] pos={} ok={} len={}",
+            pos,
+            ok,
+            resident_logits.len()
+        );
+        RESIDENT_DEBUG_LOGITS
+            .with(|cell| *cell.borrow_mut() = if ok { Some(resident_logits) } else { None });
+    } else if active_sliding_window(config, cache) == 0
+        && resident_forward_attempt(config, weights, cache, buf, pos, logits)
+    {
+        return;
+    }
+
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
@@ -3083,6 +3322,37 @@ pub fn forward_into(
         &mut buf.xn,
     );
     weights.output.matvec_into(&buf.xn, logits);
+
+    if resident_debug {
+        RESIDENT_DEBUG_LOGITS.with(|cell| {
+            if let Some(resident_logits) = cell.borrow_mut().take() {
+                let n = resident_logits.len().min(logits.len());
+                let mut max_abs_diff = 0.0f32;
+                let mut sum_abs_diff = 0.0f64;
+                for i in 0..n {
+                    let d = (resident_logits[i] - logits[i]).abs();
+                    max_abs_diff = max_abs_diff.max(d);
+                    sum_abs_diff += d as f64;
+                }
+                let cpu_argmax = logits
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::MIN), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
+                let resident_argmax = resident_logits
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::MIN), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
+                eprintln!(
+                    "[resident-debug] n={} max_abs_diff={:.4} mean_abs_diff={:.6} cpu_argmax={:?} resident_argmax={:?}",
+                    n,
+                    max_abs_diff,
+                    sum_abs_diff / n as f64,
+                    cpu_argmax,
+                    resident_argmax
+                );
+            }
+        });
+    }
 }
 
 /// Forward pass for Gemma-4 models (initial implementation mirroring the
@@ -4407,6 +4677,19 @@ pub fn forward_prefill(
     token: u32,
     pos: usize,
 ) {
+    // The resident decoder keeps its own GPU-side KV cache instead of
+    // `cache.k`/`cache.v`, so prompt tokens must also flow through it here —
+    // otherwise decode would attend over never-written (garbage) GPU cache
+    // slots for every prefilled position.
+    if active_sliding_window(config, cache) == 0 {
+        weights
+            .token_embd
+            .row_into(token as usize, config.dim, &mut buf.x);
+        let mut discard = Vec::new();
+        if resident_forward_attempt(config, weights, cache, buf, pos, &mut discard) {
+            return;
+        }
+    }
     let _ = forward_hidden_impl(config, weights, cache, buf, token, pos, false);
 }
 

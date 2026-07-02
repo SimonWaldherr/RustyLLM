@@ -46,6 +46,19 @@ typedef struct {
 } RustyResidentAttentionParams;
 
 typedef struct {
+    uint32_t pos;
+    uint32_t head_dim;
+    uint32_t half_dim;
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t value_dim;
+    uint32_t kv_k_dim;
+    uint32_t kv_v_dim;
+    uint32_t slot;
+    uint32_t neox;
+} RustyRopeParams;
+
+typedef struct {
     uint32_t len;
 } RustyUnaryParams;
 
@@ -1823,6 +1836,266 @@ int rusty_metal_attention(const float *query,
         if ([command_buffer status] != MTLCommandBufferStatusCompleted) return 0;
 
         if (out_needs_copy) memcpy(out, [out_buffer contents], out_bytes);
+        return 1;
+    }
+}
+
+// ─── GPU-resident single-command-buffer decoder ─────────────────────────────
+//
+// Runs an entire token's forward pass (embedding → N layers → final norm →
+// logits) as ONE command buffer with ONE waitUntilCompleted, keeping all
+// intermediates and the KV cache resident on the GPU. This removes the per-op
+// CPU↔GPU serialization that otherwise makes hybrid decode slower than the CPU.
+// Supports the standard LLaMA-style transformer with Q4_K/Q6_K projections.
+
+#define RUSTY_MAX_RESIDENT_LAYERS 200
+
+// Layout mirrors the Rust `ResidentLayerDesc` (see metal.rs).
+typedef struct {
+    const uint8_t *w[7]; // wq,wk,wv,wo,gate,up,down
+    uintptr_t w_len[7];
+    uint32_t w_rows[7];
+    uint32_t w_dt[7]; // 0 = Q4_K, 1 = Q6_K
+    const float *attn_norm;
+    const float *ffn_norm;
+    const float *bq; uint32_t bq_len;
+    const float *bk; uint32_t bk_len;
+    const float *bv; uint32_t bv_len;
+} RustyResidentLayerDesc;
+
+typedef struct {
+    __strong id<MTLBuffer> w[7];
+    uint32_t rows[7];
+    uint32_t cols[7];
+    uint32_t dt[7];
+    __strong id<MTLBuffer> attn_norm;
+    __strong id<MTLBuffer> ffn_norm;
+    __strong id<MTLBuffer> bias[3];
+    uint32_t bias_len[3];
+    __strong id<MTLBuffer> k_cache;
+    __strong id<MTLBuffer> v_cache;
+} ResidentLayer;
+
+static BOOL gResidentReady;
+static uint32_t gR_nlayers, gR_dim, gR_nheads, gR_nkv, gR_headdim, gR_valuedim;
+static uint32_t gR_hidden, gR_vocab, gR_storage;
+static uint32_t gR_qdim, gR_kdim, gR_vdim, gR_attndim, gR_half;
+static float gR_eps;
+static uint32_t gR_neox, gR_outrows, gR_outdt;
+static ResidentLayer gRLayers[RUSTY_MAX_RESIDENT_LAYERS];
+static __strong id<MTLBuffer> gR_x, gR_xn, gR_q, gR_k, gR_v, gR_attn;
+static __strong id<MTLBuffer> gR_gate, gR_up, gR_hiddenbuf, gR_proj, gR_logits;
+static __strong id<MTLBuffer> gR_zero, gR_invfreq, gR_outnorm, gR_outw;
+
+static id<MTLBuffer> resident_alloc(NSUInteger bytes) {
+    return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+}
+
+static id<MTLBuffer> resident_floats(const float *data, uint32_t len) {
+    return [gDevice newBufferWithBytes:data
+                               length:(NSUInteger)len * sizeof(float)
+                              options:MTLResourceStorageModeShared];
+}
+
+static void resident_matvec(id<MTLComputeCommandEncoder> enc, uint32_t dt,
+                            id<MTLBuffer> w, id<MTLBuffer> x, id<MTLBuffer> out,
+                            uint32_t rows, uint32_t cols) {
+    if (dt == 1) {
+        rusty_metal_encode_q6k(enc, w, x, out, rows, cols);
+    } else {
+        rusty_metal_encode_q4k(enc, w, x, out, rows, cols);
+    }
+}
+
+static void resident_rms(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
+                         id<MTLBuffer> residual, id<MTLBuffer> weight,
+                         id<MTLBuffer> out, uint32_t len, float eps) {
+    RustyResidualNormParams p = { .len = len, .eps = eps };
+    [enc setComputePipelineState:gResidualRmsPipeline];
+    [enc setBuffer:x offset:0 atIndex:0];
+    [enc setBuffer:residual offset:0 atIndex:1];
+    [enc setBuffer:weight offset:0 atIndex:2];
+    [enc setBuffer:out offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void resident_add(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
+                         id<MTLBuffer> residual, uint32_t len) {
+    RustyUnaryParams p = { .len = len };
+    [enc setComputePipelineState:gResidualAddPipeline];
+    [enc setBuffer:x offset:0 atIndex:0];
+    [enc setBuffer:residual offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    NSUInteger groups = ((NSUInteger)len + 255) / 256;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void resident_silu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate,
+                          id<MTLBuffer> up, id<MTLBuffer> out, uint32_t len) {
+    RustyUnaryParams p = { .len = len };
+    [enc setComputePipelineState:gSiluMulPipeline];
+    [enc setBuffer:gate offset:0 atIndex:0];
+    [enc setBuffer:up offset:0 atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    NSUInteger groups = ((NSUInteger)len + 255) / 256;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void resident_rope(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
+                          uint32_t pos, uint32_t slot) {
+    RustyRopeParams p = {
+        .pos = pos, .head_dim = gR_headdim, .half_dim = gR_half,
+        .n_heads = gR_nheads, .n_kv_heads = gR_nkv, .value_dim = gR_valuedim,
+        .kv_k_dim = gR_kdim, .kv_v_dim = gR_vdim, .slot = slot, .neox = gR_neox,
+    };
+    [enc setComputePipelineState:gRopeStorePipeline];
+    [enc setBuffer:gR_q offset:0 atIndex:0];
+    [enc setBuffer:gR_k offset:0 atIndex:1];
+    [enc setBuffer:gR_v offset:0 atIndex:2];
+    [enc setBuffer:gR_invfreq offset:0 atIndex:3];
+    [enc setBuffer:L->k_cache offset:0 atIndex:4];
+    [enc setBuffer:L->v_cache offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    uint32_t work = gR_nheads * gR_half;
+    if (gR_vdim > work) work = gR_vdim;
+    NSUInteger groups = ((NSUInteger)work + 255) / 256;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
+                          uint32_t start_t, uint32_t end_t, float scale) {
+    RustyResidentAttentionParams p = {
+        .heads = gR_nheads, .kv_mul = gR_nheads / gR_nkv, .head_dim = gR_headdim,
+        .value_dim = gR_valuedim, .key_stride = gR_kdim, .value_stride = gR_vdim,
+        .start_t = start_t, .end_t = end_t, .scale = scale,
+    };
+    [enc setComputePipelineState:gResidentAttentionPipeline];
+    [enc setBuffer:gR_q offset:0 atIndex:0];
+    [enc setBuffer:L->k_cache offset:0 atIndex:1];
+    [enc setBuffer:L->v_cache offset:0 atIndex:2];
+    [enc setBuffer:gR_attn offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_heads,
+                                   uint32_t n_kv_heads, uint32_t head_dim, uint32_t value_dim,
+                                   uint32_t hidden_dim, uint32_t vocab, uint32_t storage_len,
+                                   float eps, uint32_t neox) {
+    if (!rusty_metal_init()) return 0;
+    if (n_layers == 0 || n_layers > RUSTY_MAX_RESIDENT_LAYERS) return 0;
+    if (n_kv_heads == 0 || (n_heads % n_kv_heads) != 0) return 0;
+    if (head_dim == 0 || head_dim > 256 || value_dim == 0 || value_dim > 256) return 0;
+    if ((dim % 256) != 0 || (hidden_dim % 256) != 0 || storage_len == 0) return 0;
+    gResidentReady = NO;
+    gR_nlayers = n_layers; gR_dim = dim; gR_nheads = n_heads; gR_nkv = n_kv_heads;
+    gR_headdim = head_dim; gR_valuedim = value_dim; gR_hidden = hidden_dim;
+    gR_vocab = vocab; gR_storage = storage_len; gR_eps = eps; gR_neox = neox;
+    gR_qdim = n_heads * head_dim; gR_kdim = n_kv_heads * head_dim;
+    gR_vdim = n_kv_heads * value_dim; gR_attndim = n_heads * value_dim;
+    gR_half = head_dim / 2;
+    gR_x = resident_alloc((NSUInteger)dim * sizeof(float));
+    gR_xn = resident_alloc((NSUInteger)dim * sizeof(float));
+    gR_q = resident_alloc((NSUInteger)gR_qdim * sizeof(float));
+    gR_k = resident_alloc((NSUInteger)gR_kdim * sizeof(float));
+    gR_v = resident_alloc((NSUInteger)gR_vdim * sizeof(float));
+    gR_attn = resident_alloc((NSUInteger)gR_attndim * sizeof(float));
+    gR_gate = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
+    gR_up = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
+    gR_hiddenbuf = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
+    gR_proj = resident_alloc((NSUInteger)dim * sizeof(float));
+    gR_logits = resident_alloc((NSUInteger)vocab * sizeof(float));
+    gR_zero = resident_alloc((NSUInteger)dim * sizeof(float));
+    if (!gR_x || !gR_xn || !gR_q || !gR_k || !gR_v || !gR_attn || !gR_gate || !gR_up ||
+        !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_zero) {
+        return 0;
+    }
+    memset([gR_zero contents], 0, (NSUInteger)dim * sizeof(float));
+    return 1;
+}
+
+int rusty_metal_resident_set_layer(uint32_t l, const RustyResidentLayerDesc *d) {
+    if (!gDevice || !d || l >= gR_nlayers) return 0;
+    ResidentLayer *L = &gRLayers[l];
+    uint32_t cols[7] = { gR_dim, gR_dim, gR_dim, gR_attndim, gR_dim, gR_dim, gR_hidden };
+    for (int i = 0; i < 7; ++i) {
+        if (!d->w[i] || (cols[i] % 256) != 0) return 0;
+        id<MTLBuffer> wb = rusty_metal_weight_buffer(d->w[i], d->w_len[i]);
+        if (!wb) return 0;
+        L->w[i] = wb;
+        L->rows[i] = d->w_rows[i];
+        L->cols[i] = cols[i];
+        L->dt[i] = d->w_dt[i];
+    }
+    if (!d->attn_norm || !d->ffn_norm) return 0;
+    L->attn_norm = resident_floats(d->attn_norm, gR_dim);
+    L->ffn_norm = resident_floats(d->ffn_norm, gR_dim);
+    L->bias[0] = d->bq ? resident_floats(d->bq, d->bq_len) : nil;
+    L->bias[1] = d->bk ? resident_floats(d->bk, d->bk_len) : nil;
+    L->bias[2] = d->bv ? resident_floats(d->bv, d->bv_len) : nil;
+    L->bias_len[0] = d->bq ? d->bq_len : 0;
+    L->bias_len[1] = d->bk ? d->bk_len : 0;
+    L->bias_len[2] = d->bv ? d->bv_len : 0;
+    L->k_cache = resident_alloc((NSUInteger)gR_storage * gR_kdim * sizeof(float));
+    L->v_cache = resident_alloc((NSUInteger)gR_storage * gR_vdim * sizeof(float));
+    if (!L->attn_norm || !L->ffn_norm || !L->k_cache || !L->v_cache) return 0;
+    return 1;
+}
+
+int rusty_metal_resident_set_output(const float *output_norm, const uint8_t *output_w,
+                                    uintptr_t output_w_len, uint32_t output_rows,
+                                    uint32_t output_dt, const float *inv_freq,
+                                    uint32_t inv_freq_len) {
+    if (!gDevice || !output_norm || !output_w || !inv_freq) return 0;
+    gR_outnorm = resident_floats(output_norm, gR_dim);
+    id<MTLBuffer> ow = rusty_metal_weight_buffer(output_w, output_w_len);
+    if (!ow) return 0;
+    gR_outw = ow;
+    gR_outrows = output_rows;
+    gR_outdt = output_dt;
+    gR_invfreq = resident_floats(inv_freq, inv_freq_len);
+    if (!gR_outnorm || !gR_invfreq) return 0;
+    gResidentReady = YES;
+    return 1;
+}
+
+int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t start_t,
+                                float *logits_out) {
+    if (!gResidentReady || !x_embed || !logits_out || pos >= gR_storage) return 0;
+    @autoreleasepool {
+        memcpy([gR_x contents], x_embed, (NSUInteger)gR_dim * sizeof(float));
+        uint32_t slot = pos;
+        float scale = 1.0f / sqrt((float)gR_headdim);
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        for (uint32_t l = 0; l < gR_nlayers; ++l) {
+            ResidentLayer *L = &gRLayers[l];
+            id<MTLBuffer> resid = (l == 0) ? gR_zero : gR_proj;
+            resident_rms(enc, gR_x, resid, L->attn_norm, gR_xn, gR_dim, gR_eps);
+            resident_matvec(enc, L->dt[0], L->w[0], gR_xn, gR_q, L->rows[0], L->cols[0]);
+            resident_matvec(enc, L->dt[1], L->w[1], gR_xn, gR_k, L->rows[1], L->cols[1]);
+            resident_matvec(enc, L->dt[2], L->w[2], gR_xn, gR_v, L->rows[2], L->cols[2]);
+            if (L->bias_len[0]) resident_add(enc, gR_q, L->bias[0], L->bias_len[0]);
+            if (L->bias_len[1]) resident_add(enc, gR_k, L->bias[1], L->bias_len[1]);
+            if (L->bias_len[2]) resident_add(enc, gR_v, L->bias[2], L->bias_len[2]);
+            resident_rope(enc, L, pos, slot);
+            resident_attn(enc, L, start_t, pos, scale);
+            resident_matvec(enc, L->dt[3], L->w[3], gR_attn, gR_proj, L->rows[3], L->cols[3]);
+            resident_rms(enc, gR_x, gR_proj, L->ffn_norm, gR_xn, gR_dim, gR_eps);
+            resident_matvec(enc, L->dt[4], L->w[4], gR_xn, gR_gate, L->rows[4], L->cols[4]);
+            resident_matvec(enc, L->dt[5], L->w[5], gR_xn, gR_up, L->rows[5], L->cols[5]);
+            resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
+            resident_matvec(enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj, L->rows[6], L->cols[6]);
+        }
+        resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
+        resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
+        memcpy(logits_out, [gR_logits contents], (NSUInteger)gR_vocab * sizeof(float));
         return 1;
     }
 }

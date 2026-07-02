@@ -1,24 +1,38 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-06-23 23:33 CEST**
+Updated: **2026-07-02 (Ministral focus section); 2026-06-23 23:33 CEST (multi-model tables below)**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
 
 ## Focus: Ministral 3 3B Instruct 2512
 
-Focused tuning run for `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` on Apple M2 Max, 12 logical cores, 32 GB RAM, macOS 26.5.1, rustc 1.95.0. The benchmark used 3 runs with up to 128 generated tokens, `--temp 0`, `--seed 42`, and the prompt `Explain local LLM inference performance in one concise paragraph.` Metal runs must execute outside the Codex filesystem sandbox; inside the sandbox the same binary reports `Metal: unavailable, using CPU`.
+Focused tuning run for `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` on Apple M2 Max, 12 logical cores, 32 GB RAM, macOS 26.5.1, rustc 1.95.0. The benchmark used 6 runs with up to 128 generated tokens, `--temp 0`, `--seed 42`, and the prompt `Explain local LLM inference performance in one concise paragraph.`, with an 15s cooldown between profiles (M2 Max shows real ±15-30% run-to-run throughput swings from thermal/clock scaling; single un-averaged runs are not reliable for backend comparisons).
+
+**Note on the CPU number:** the CPU path has gotten substantially faster since this doc was first written (SIMD work landed in commits after 2026-06-23), so the old CPU baseline of 9.3 tok/s below is stale — re-measured today it's **26.2 tok/s**, which changes the Metal/CPU speedup story a lot for this model. The multi-model tables further down have *not* been re-verified and likely understate CPU throughput for the same reason.
 
 | Profile | Extra env / args | Decode tok/s | Prefill tok/s | Load | Result |
 |---|---|---:|---:|---:|---|
-| CPU | `RUSTY_LLM_METAL=0` | 9.3 | 11.4 | 254 ms | baseline |
-| Metal standard | `RUSTY_LLM_METAL=1` | 27.8 | 27.6 | 235 ms | best stable path |
-| Metal ultra | `RUSTY_LLM_METAL=1 --profile mistral-ultra` | 25.4 | 26.9 | 258 ms | slower/less stable |
-| Metal post-FFN fusion | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_POST_FFN=1` | 23.2 | 23.2 | 205 ms | slower |
-| Metal fast attention approx | `RUSTY_LLM_METAL=1 RUSTY_LLM_FAST_ATTN=1` | 20.6 | 19.6 | 288 ms | slower |
+| CPU | `RUSTY_LLM_METAL=0` | 26.2 | 31.6 | 284 ms | baseline (re-measured; was 9.3 in the 2026-06-23 run) |
+| Metal standard | `RUSTY_LLM_METAL=1` | 27.9 | 28.0 | 257 ms | best previously-known-good path; only ~1.07x over CPU now |
+| **Metal resident decoder** | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_RESIDENT=1` | **42.9** | **49.1** | 273 ms | new, opt-in, fastest — see below |
+| Metal ultra *(not re-verified since 2026-06-23)* | `RUSTY_LLM_METAL=1 --profile mistral-ultra` | 25.4 | 26.9 | 258 ms | slower/less stable |
+| Metal post-FFN fusion *(not re-verified; flag is now opt-in, see note)* | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_POST_FFN=1` | 23.2 | 23.2 | 205 ms | slower |
+| Metal fast attention approx *(not re-verified since 2026-06-23)* | `RUSTY_LLM_METAL=1 RUSTY_LLM_FAST_ATTN=1` | 20.6 | 19.6 | 288 ms | slower |
 
-Optimized operating point: use the standard Metal path and leave `mistral-ultra`, `RUSTY_LLM_METAL_POST_FFN`, and `RUSTY_LLM_FAST_ATTN` disabled for this model on this hardware. That gives a measured decode speedup of **2.98x** over the CPU baseline.
+Optimized operating point today: **`RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_RESIDENT=1`**, a **1.64x** decode speedup over the re-measured CPU baseline (1.54x over standard Metal). Leave `mistral-ultra` and `RUSTY_LLM_FAST_ATTN` disabled.
 
-Isolated layer-0 kernel timing with Metal standard shows the main decode cost is projection-heavy: fused Q/K/V takes 0.57 ms, the fused FFN block takes 0.72 ms, and the tied-vocabulary output projection takes 2.02 ms per token. There is no smaller compatible local MTP draft model available in the tested model directory, so speculative decoding was not enabled.
+`RUSTY_LLM_METAL_POST_FFN` was found to default to *enabled* (`env_flag(...) != Some(false)`) despite being documented as experimental and measured slower here — inconsistent with the otherwise-equivalent `RUSTY_LLM_METAL_NOCOPY`, which correctly defaults off. Fixed in [`metal.rs`](src/metal.rs) so it now requires an explicit `RUSTY_LLM_METAL_POST_FFN=1` to enable.
+
+### New: GPU-resident single-command-buffer decoder
+
+`RUSTY_LLM_METAL_RESIDENT=1` runs an entire token's forward pass (embedding → all layers → final norm → logits) as **one Metal command buffer** with **one `waitUntilCompleted`**, keeping the KV cache and all intermediates GPU-resident instead of round-tripping per matvec/attention op. This removes most of the CPU↔GPU synchronization overhead that otherwise limits the standard path.
+
+- Verified byte-identical greedy-decode output against the standard Metal path across multiple prompts/seeds/lengths (temp 0).
+- Off by default; opt-in only. It keeps a single static GPU-resident KV cache and working buffer set, so it serializes concurrent decode calls (a lock enforces this) and is intended for a single exclusive decode stream (CLI use), not for concurrent multi-session serving.
+- Requires: no sliding window, ≤200 layers, `dim`/`hidden_dim` multiples of 256, `head_dim`/`value_dim` ≤ 256, GQA-compatible head counts, and Q4_K/Q6_K weights throughout. Falls back to the standard path automatically if any of this doesn't hold.
+- Falls back safely (never reuses stale GPU buffers) if a different model's shape/pointer fingerprint is detected in the same process.
+
+Isolated layer-0 kernel timing with Metal standard shows the main decode cost is projection-heavy: fused Q/K/V takes 0.61 ms, the fused FFN block takes 0.98 ms, and the tied-vocabulary output projection takes 2.32 ms per token. The resident decoder collapses all of this (across all 26 layers) plus RoPE/attention/KV-cache writes into one submission per token, which is why its prefill also nearly doubles (49.1 vs 28.0 tok/s) — prefill here is a sequence of single-token forward passes (23 prompt tokens), so per-call dispatch overhead matters just as much as in decode. There is no smaller compatible local MTP draft model available in the tested model directory, so speculative decoding was not enabled.
 
 ## Run Configuration
 
@@ -56,6 +70,8 @@ Isolated layer-0 kernel timing with Metal standard shows the main decode cost is
 | Metal GPU | 11 | 0 | 3 | 27.7 | 15.1 |
 
 ## CPU vs Metal
+
+*(Table below is from the 2026-06-23 multi-model sweep and has not been re-verified. The Ministral 3B CPU number in it, 10.1 tok/s, is now known stale — see the Ministral focus section above, which re-measured 26.2 tok/s on 2026-07-02. CPU-path SIMD work landed after this sweep, so other models' `Metal/CPU` speedup ratios here are likely overstated too; re-run `bench_models.sh` for current numbers.)*
 
 Each speed cell is `decode / prefill` in tokens per second. Speedup uses decode throughput.
 

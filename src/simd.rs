@@ -707,8 +707,15 @@ impl MatvecJob {
 
     unsafe fn run_rows(self, start: usize, end: usize, xq: XQuant) {
         for row in start..end {
-            *self.out.add(row) =
-                dot_row(self.kind, self.data, self.x, xq, row, self.cols, self.row_span);
+            *self.out.add(row) = dot_row(
+                self.kind,
+                self.data,
+                self.x,
+                xq,
+                row,
+                self.cols,
+                self.row_span,
+            );
         }
     }
 }
@@ -4650,8 +4657,7 @@ mod tests {
                 data[base + 2] = 0x00;
                 data[base + 3] = 0x38; // f16 0.5 (dmin)
                 for i in 0..12 {
-                    data[base + 4 + i] =
-                        seed.wrapping_add((row * 5 + block * 7 + i * 11) as u8);
+                    data[base + 4 + i] = seed.wrapping_add((row * 5 + block * 7 + i * 11) as u8);
                 }
                 for i in 0..128 {
                     data[base + 16 + i] =
