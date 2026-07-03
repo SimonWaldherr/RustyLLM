@@ -2,6 +2,7 @@ APP        ?= rusty-llm
 CARGO      ?= cargo
 MODEL_DIR  ?= $(shell FIND_MODEL_DIR_ONLY=1 ./bench_models.sh 2>/dev/null || printf '%s\n' "$(HOME)/.lmstudio/models/lmstudio-community")
 MODEL      ?=
+BENCH_MODEL ?= Ministral-3-3B-Instruct-2512-Q4_K_M.gguf
 PROMPT     ?= Wer war Albert Einstein?
 SYNONYM_PROMPT ?= Nenne ein Synonym für Synonym und antworte nur mit diesem einen Wort.
 NATO_PROMPT ?= Output exactly the 26 NATO phonetic alphabet code words from A to Z, one word per line. No letters, numbers, punctuation, parentheses, or explanation.
@@ -30,6 +31,8 @@ RUSTFLAGS  ?= -C target-cpu=native
 BIN        := ./target/release/$(APP)
 CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 _MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
+_BENCH_MODEL := $(or $(MODEL),$(BENCH_MODEL))
+_BENCH_MODEL_ARG := $(if $(_BENCH_MODEL),--model "$(_BENCH_MODEL)",)
 _RUN_ARGS  := --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)"
 
 .PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
@@ -81,17 +84,17 @@ cargo-bench:
 	$(CARGO) bench
 
 bench-model: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
 bench-model-metal: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
 bench-model-ultra: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--profile mistral-ultra --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
@@ -102,17 +105,17 @@ benchmark-report:
 	REPORT_ONLY=1 ./bench_models.sh
 
 synonym-bench: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--prompt "$(SYNONYM_PROMPT)" --max-tokens "8" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
 nato-bench: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
 nato-bench-metal: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
@@ -175,16 +178,16 @@ help:
 	@printf "  make list-models                     List GGUFs in MODEL_DIR\n"
 	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
 	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
-	@printf "  make bench MODEL=...                 Run generation benchmark with tokens/sec JSON\n"
+	@printf "  make bench [BENCH_MODEL=...]         Run generation benchmark with tokens/sec JSON\n"
 	@printf "  make cargo-bench                     Run Rust benchmark harness\n"
-	@printf "  make bench-model MODEL=...           Run CLI generation benchmark JSON with per-run output\n"
-	@printf "  make bench-model-metal MODEL=...     Run generation benchmark with RUSTY_LLM_METAL=1\n"
-	@printf "  make bench-model-ultra MODEL=...     Run Mistral Ultra benchmark with aggressive Metal routing\n"
+	@printf "  make bench-model [BENCH_MODEL=...]   Run CLI generation benchmark JSON with per-run output\n"
+	@printf "  make bench-model-metal [BENCH_MODEL=...] Run generation benchmark with RUSTY_LLM_METAL=1\n"
+	@printf "  make bench-model-ultra [BENCH_MODEL=...] Run Mistral Ultra benchmark with aggressive Metal routing\n"
 	@printf "  make bench-models                    Refresh BENCHMARK.md across discovered models\n"
 	@printf "  make benchmark-report                Rebuild BENCHMARK.md from existing .bench_raw TSV files\n"
-	@printf "  make synonym-bench MODEL=...         Run fixed one-word synonym prompt benchmark\n"
-	@printf "  make nato-bench MODEL=...            Run fixed NATO alphabet prompt benchmark\n"
-	@printf "  make nato-bench-metal MODEL=...      Run NATO benchmark with RUSTY_LLM_METAL=1\n"
+	@printf "  make synonym-bench [BENCH_MODEL=...] Run fixed one-word synonym prompt benchmark\n"
+	@printf "  make nato-bench [BENCH_MODEL=...]    Run fixed NATO alphabet prompt benchmark\n"
+	@printf "  make nato-bench-metal [BENCH_MODEL=...] Run NATO benchmark with RUSTY_LLM_METAL=1\n"
 	@printf "  make kernel-bench MODEL=...          Run isolated kernel benchmark JSON\n"
 	@printf "  make kernel-bench-metal MODEL=...    Run isolated kernel benchmark with RUSTY_LLM_METAL=1\n"
 	@printf "  make kernel-bench-ultra MODEL=...    Run isolated Mistral Ultra kernel benchmark\n"
