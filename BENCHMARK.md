@@ -14,21 +14,21 @@ Focused tuning run for `Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` on Apple M2 Ma
 |---|---|---:|---:|---:|---|
 | CPU | `RUSTY_LLM_METAL=0` | 26.2 | 31.6 | 284 ms | baseline (re-measured; was 9.3 in the 2026-06-23 run) |
 | Metal standard | `RUSTY_LLM_METAL=1` | 27.9 | 28.0 | 257 ms | best previously-known-good path; only ~1.07x over CPU now |
-| **Metal resident decoder** | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_RESIDENT=1` | **42.9** | **49.1** | 273 ms | new, opt-in, fastest — see below |
+| **Metal resident decoder** | `RUSTY_LLM_METAL=1` (auto-enabled for CLI/REPL/`--bench`) | **42.9** | **49.1** | 273 ms | new, fastest — see below |
 | Metal ultra *(not re-verified since 2026-06-23)* | `RUSTY_LLM_METAL=1 --profile mistral-ultra` | 25.4 | 26.9 | 258 ms | slower/less stable |
 | Metal post-FFN fusion *(not re-verified; flag is now opt-in, see note)* | `RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_POST_FFN=1` | 23.2 | 23.2 | 205 ms | slower |
 | Metal fast attention approx *(not re-verified since 2026-06-23)* | `RUSTY_LLM_METAL=1 RUSTY_LLM_FAST_ATTN=1` | 20.6 | 19.6 | 288 ms | slower |
 
-Optimized operating point today: **`RUSTY_LLM_METAL=1 RUSTY_LLM_METAL_RESIDENT=1`**, a **1.64x** decode speedup over the re-measured CPU baseline (1.54x over standard Metal). Leave `mistral-ultra` and `RUSTY_LLM_FAST_ATTN` disabled.
+Optimized operating point today: plain **`RUSTY_LLM_METAL=1`** now gets the resident decoder automatically outside server mode, a **1.64x** decode speedup over the re-measured CPU baseline (1.54x over standard Metal). Leave `mistral-ultra` and `RUSTY_LLM_FAST_ATTN` disabled.
 
 `RUSTY_LLM_METAL_POST_FFN` was found to default to *enabled* (`env_flag(...) != Some(false)`) despite being documented as experimental and measured slower here — inconsistent with the otherwise-equivalent `RUSTY_LLM_METAL_NOCOPY`, which correctly defaults off. Fixed in [`metal.rs`](src/metal.rs) so it now requires an explicit `RUSTY_LLM_METAL_POST_FFN=1` to enable.
 
 ### New: GPU-resident single-command-buffer decoder
 
-`RUSTY_LLM_METAL_RESIDENT=1` runs an entire token's forward pass (embedding → all layers → final norm → logits) as **one Metal command buffer** with **one `waitUntilCompleted`**, keeping the KV cache and all intermediates GPU-resident instead of round-tripping per matvec/attention op. This removes most of the CPU↔GPU synchronization overhead that otherwise limits the standard path.
+The resident decoder runs an entire token's forward pass (embedding → all layers → final norm → logits) as **one Metal command buffer** with **one `waitUntilCompleted`**, keeping the KV cache and all intermediates GPU-resident instead of round-tripping per matvec/attention op. This removes most of the CPU↔GPU synchronization overhead that otherwise limits the standard path.
 
 - Verified byte-identical greedy-decode output against the standard Metal path across multiple prompts/seeds/lengths (temp 0).
-- Off by default; opt-in only. It keeps a single static GPU-resident KV cache and working buffer set, so it serializes concurrent decode calls (a lock enforces this) and is intended for a single exclusive decode stream (CLI use), not for concurrent multi-session serving.
+- It keeps a single static GPU-resident KV cache and working buffer set indexed only by token position, so it's only safe for one exclusive conversation at a time — a lock prevents data races, but two interleaved conversations would still silently overwrite each other's KV slots. Because of that it **auto-enables for CLI/REPL/`--bench`/`--mcp`** (all single- or sequential-conversation) but **auto-disables under `--serve`** (concurrent multi-session HTTP API, per `session.rs`/`server.rs`). `RUSTY_LLM_METAL_RESIDENT=0|1` always overrides the auto-detection either way.
 - Requires: no sliding window, ≤200 layers, `dim`/`hidden_dim` multiples of 256, `head_dim`/`value_dim` ≤ 256, GQA-compatible head counts, and Q4_K/Q6_K weights throughout. Falls back to the standard path automatically if any of this doesn't hold.
 - Falls back safely (never reuses stale GPU buffers) if a different model's shape/pointer fingerprint is detected in the same process.
 

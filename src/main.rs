@@ -930,6 +930,10 @@ fn run() -> Result<(), String> {
 
         #[cfg(feature = "server")]
         {
+            // Multiple connections can generate concurrently here, so the
+            // resident decoder (one global GPU-resident KV cache) must not
+            // auto-enable; RUSTY_LLM_METAL_RESIDENT can still force it on.
+            metal::disable_auto_resident_for_server();
             let protocol = if tls_cert.is_some() && tls_key.is_some() {
                 "HTTPS"
             } else {

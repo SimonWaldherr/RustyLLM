@@ -7,15 +7,8 @@
 
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-
-thread_local! {
-    // TEMP debug scaffolding for the resident-decoder correctness check;
-    // remove once RUSTY_LLM_METAL_RESIDENT is validated.
-    static RESIDENT_DEBUG_LOGITS: RefCell<Option<Vec<f32>>> = const { RefCell::new(None) };
-}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -3173,19 +3166,7 @@ pub fn forward_into(
     // Token embedding
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
-    let resident_debug = std::env::var("RUSTY_LLM_METAL_RESIDENT_DEBUG").is_ok();
-    if resident_debug {
-        let mut resident_logits = Vec::new();
-        let ok = resident_forward_attempt(config, weights, cache, buf, pos, &mut resident_logits);
-        eprintln!(
-            "[resident-debug] pos={} ok={} len={}",
-            pos,
-            ok,
-            resident_logits.len()
-        );
-        RESIDENT_DEBUG_LOGITS
-            .with(|cell| *cell.borrow_mut() = if ok { Some(resident_logits) } else { None });
-    } else if active_sliding_window(config, cache) == 0
+    if active_sliding_window(config, cache) == 0
         && resident_forward_attempt(config, weights, cache, buf, pos, logits)
     {
         return;
@@ -3322,37 +3303,6 @@ pub fn forward_into(
         &mut buf.xn,
     );
     weights.output.matvec_into(&buf.xn, logits);
-
-    if resident_debug {
-        RESIDENT_DEBUG_LOGITS.with(|cell| {
-            if let Some(resident_logits) = cell.borrow_mut().take() {
-                let n = resident_logits.len().min(logits.len());
-                let mut max_abs_diff = 0.0f32;
-                let mut sum_abs_diff = 0.0f64;
-                for i in 0..n {
-                    let d = (resident_logits[i] - logits[i]).abs();
-                    max_abs_diff = max_abs_diff.max(d);
-                    sum_abs_diff += d as f64;
-                }
-                let cpu_argmax = logits
-                    .iter()
-                    .enumerate()
-                    .fold((0usize, f32::MIN), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
-                let resident_argmax = resident_logits
-                    .iter()
-                    .enumerate()
-                    .fold((0usize, f32::MIN), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
-                eprintln!(
-                    "[resident-debug] n={} max_abs_diff={:.4} mean_abs_diff={:.6} cpu_argmax={:?} resident_argmax={:?}",
-                    n,
-                    max_abs_diff,
-                    sum_abs_diff / n as f64,
-                    cpu_argmax,
-                    resident_argmax
-                );
-            }
-        });
-    }
 }
 
 /// Forward pass for Gemma-4 models (initial implementation mirroring the

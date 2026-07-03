@@ -2112,7 +2112,6 @@ impl Runner {
             .expect("generation lock poisoned");
         let mut on_token = on_token;
         let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
-        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
 
         if messages.is_empty() {
             return Err(String::from("No prompt provided."));
@@ -2154,7 +2153,7 @@ impl Runner {
         // Prefill runs the full prompt through the model once to seed the KV
         // cache; incremental decoding starts from the last prompt logits.
         let t_prefill = Instant::now();
-        let mut logits = Vec::new();
+        let mut logits = Vec::with_capacity(self.config.vocab_size);
         self.prefill_prompt_tokens(&mut cache, &mut buf, &tokens, 0, &mut logits, options);
         let prefill_time = t_prefill.elapsed();
 
@@ -2162,7 +2161,7 @@ impl Runner {
 
         // Decode advances one sampled token at a time while reusing the cache.
         let t_decode = Instant::now();
-        let mut output = String::new();
+        let mut output = String::with_capacity(options.max_tokens.saturating_mul(4));
         let mut generated_tokens = 0usize;
         let mut pos = tokens.len();
         let mut recent = recent_token_tail(&tokens);
@@ -2374,7 +2373,7 @@ impl Runner {
             max_n_kv_heads,
             max_value_dim,
         );
-        let mut logits = Vec::new();
+        let mut logits = Vec::with_capacity(assistant.config.vocab_size);
         let t_draft = Instant::now();
         assistant.prefill_prompt_tokens(&mut cache, &mut buf, tokens, 0, &mut logits, options);
 
@@ -3168,7 +3167,7 @@ impl Runner {
 
         // ── Prefill ──────────────────────────────────────────────────────────
         let t_prefill = Instant::now();
-        let mut logits = Vec::new();
+        let mut logits = Vec::with_capacity(self.config.vocab_size);
         let last_prompt_pos = tokens.len() - 1;
 
         if prefix_len == tokens.len() {
@@ -3208,7 +3207,7 @@ impl Runner {
 
         // ── Decode ───────────────────────────────────────────────────────────
         let t_decode = Instant::now();
-        let mut output = String::new();
+        let mut output = String::with_capacity(options.max_tokens.saturating_mul(4));
         let mut generated_tokens = 0usize;
         let mut pos = prompt_len;
 

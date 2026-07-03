@@ -1887,8 +1887,12 @@ static __strong id<MTLBuffer> gR_x, gR_xn, gR_q, gR_k, gR_v, gR_attn;
 static __strong id<MTLBuffer> gR_gate, gR_up, gR_hiddenbuf, gR_proj, gR_logits;
 static __strong id<MTLBuffer> gR_zero, gR_invfreq, gR_outnorm, gR_outw;
 
-static id<MTLBuffer> resident_alloc(NSUInteger bytes) {
+static id<MTLBuffer> resident_alloc_shared(NSUInteger bytes) {
     return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+}
+
+static id<MTLBuffer> resident_alloc_private(NSUInteger bytes) {
+    return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
 }
 
 static id<MTLBuffer> resident_floats(const float *data, uint32_t len) {
@@ -1996,18 +2000,18 @@ int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_h
     gR_qdim = n_heads * head_dim; gR_kdim = n_kv_heads * head_dim;
     gR_vdim = n_kv_heads * value_dim; gR_attndim = n_heads * value_dim;
     gR_half = head_dim / 2;
-    gR_x = resident_alloc((NSUInteger)dim * sizeof(float));
-    gR_xn = resident_alloc((NSUInteger)dim * sizeof(float));
-    gR_q = resident_alloc((NSUInteger)gR_qdim * sizeof(float));
-    gR_k = resident_alloc((NSUInteger)gR_kdim * sizeof(float));
-    gR_v = resident_alloc((NSUInteger)gR_vdim * sizeof(float));
-    gR_attn = resident_alloc((NSUInteger)gR_attndim * sizeof(float));
-    gR_gate = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
-    gR_up = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
-    gR_hiddenbuf = resident_alloc((NSUInteger)hidden_dim * sizeof(float));
-    gR_proj = resident_alloc((NSUInteger)dim * sizeof(float));
-    gR_logits = resident_alloc((NSUInteger)vocab * sizeof(float));
-    gR_zero = resident_alloc((NSUInteger)dim * sizeof(float));
+    gR_x = resident_alloc_shared((NSUInteger)dim * sizeof(float));
+    gR_xn = resident_alloc_private((NSUInteger)dim * sizeof(float));
+    gR_q = resident_alloc_private((NSUInteger)gR_qdim * sizeof(float));
+    gR_k = resident_alloc_private((NSUInteger)gR_kdim * sizeof(float));
+    gR_v = resident_alloc_private((NSUInteger)gR_vdim * sizeof(float));
+    gR_attn = resident_alloc_private((NSUInteger)gR_attndim * sizeof(float));
+    gR_gate = resident_alloc_private((NSUInteger)hidden_dim * sizeof(float));
+    gR_up = resident_alloc_private((NSUInteger)hidden_dim * sizeof(float));
+    gR_hiddenbuf = resident_alloc_private((NSUInteger)hidden_dim * sizeof(float));
+    gR_proj = resident_alloc_private((NSUInteger)dim * sizeof(float));
+    gR_logits = resident_alloc_shared((NSUInteger)vocab * sizeof(float));
+    gR_zero = resident_alloc_shared((NSUInteger)dim * sizeof(float));
     if (!gR_x || !gR_xn || !gR_q || !gR_k || !gR_v || !gR_attn || !gR_gate || !gR_up ||
         !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_zero) {
         return 0;
@@ -2038,8 +2042,8 @@ int rusty_metal_resident_set_layer(uint32_t l, const RustyResidentLayerDesc *d) 
     L->bias_len[0] = d->bq ? d->bq_len : 0;
     L->bias_len[1] = d->bk ? d->bk_len : 0;
     L->bias_len[2] = d->bv ? d->bv_len : 0;
-    L->k_cache = resident_alloc((NSUInteger)gR_storage * gR_kdim * sizeof(float));
-    L->v_cache = resident_alloc((NSUInteger)gR_storage * gR_vdim * sizeof(float));
+    L->k_cache = resident_alloc_private((NSUInteger)gR_storage * gR_kdim * sizeof(float));
+    L->v_cache = resident_alloc_private((NSUInteger)gR_storage * gR_vdim * sizeof(float));
     if (!L->attn_norm || !L->ffn_norm || !L->k_cache || !L->v_cache) return 0;
     return 1;
 }

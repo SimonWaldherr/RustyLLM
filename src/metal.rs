@@ -348,14 +348,34 @@ pub struct ResidentLayerDesc {
     pub bv_len: u32,
 }
 
-/// Reports whether the experimental GPU-resident single-command-buffer decoder
-/// is enabled (`RUSTY_LLM_METAL_RESIDENT=1`). Off by default: it keeps its own
-/// GPU-resident KV cache in static buffers, so only one exclusive decode
-/// stream may use it at a time (safe for CLI use, not for concurrent server
-/// sessions beyond serializing them).
+static AUTO_RESIDENT_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Marks the process as serving multiple potentially-concurrent conversations
+/// (the HTTP/HTTPS `--serve` API with its per-connection threads and
+/// `SessionStore`), so auto-enabling the resident decoder is unsafe: it keeps
+/// one global GPU-resident KV cache indexed only by position, so two
+/// interleaved sessions would silently overwrite each other's slots even
+/// though no single call ever races (the resident lock only prevents data
+/// races, not cross-session slot collisions). Must be called before the
+/// first generation request; an explicit `RUSTY_LLM_METAL_RESIDENT` still
+/// overrides this. The `--mcp` stdio server is exempt: it processes one
+/// request at a time in a single loop, so sequential reuse is safe.
+pub fn disable_auto_resident_for_server() {
+    AUTO_RESIDENT_ALLOWED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reports whether the experimental GPU-resident single-command-buffer
+/// decoder is enabled. It keeps its own GPU-resident KV cache in static
+/// buffers, so only one exclusive decode stream may safely reuse it at a
+/// time. An explicit `RUSTY_LLM_METAL_RESIDENT=0|1` always wins; otherwise it
+/// auto-enables unless the process called `disable_auto_resident_for_server`.
 pub fn resident_enabled() -> bool {
     static RESIDENT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *RESIDENT_ENABLED.get_or_init(|| env_flag("RUSTY_LLM_METAL_RESIDENT") == Some(true))
+    *RESIDENT_ENABLED.get_or_init(|| match env_flag("RUSTY_LLM_METAL_RESIDENT") {
+        Some(explicit) => explicit,
+        None => AUTO_RESIDENT_ALLOWED.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 /// One transformer layer's weights, borrowed just long enough to register
