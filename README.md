@@ -373,6 +373,11 @@ Server options:
 - `--tls-key <path>` enables HTTPS with a PEM private key.
 - `--max-connections <N>` caps concurrent server connections. The default is
   `max(16, available_threads * 8)`.
+- `--max-sessions 0` disables persistent conversation caches. On compatible
+  Mistral/Ministral Metal models this also permits the GPU-resident decoder,
+  which serializes stateless generation but provides the fastest single-stream
+  throughput. Combine it with `--max-connections 1` to handle the request in
+  the listener thread and avoid a per-request worker-thread handoff.
 - `--chat-history <path>` or `--chat-log <path>` appends CLI and server turns to
   a JSON file.
 
@@ -905,6 +910,9 @@ For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with
 `RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS`, `RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS`, and
 `RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal
+Q6_K kernels use two rows per threadgroup by default, which improves current
+Ministral 3 Q4_K_M decode latency. Set `RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP` to
+`2`, `4`, `6`, or `8` for hardware-specific A/B tests. Metal
 matvec and attention calls use reusable copy buffers by default, which is faster
 on the current Ministral 3B Q4_K_M benchmark than Shared/NoCopy wrapping. Set
 `RUSTY_LLM_METAL_NOCOPY=1` only when benchmarking the no-copy path on your Mac.

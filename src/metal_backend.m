@@ -862,8 +862,12 @@ static NSUInteger rusty_metal_q6k_rows_per_group(NSUInteger rows) {
             return (NSUInteger)parsed;
         }
     }
+    // Q6_K projections in Ministral-style Q4_K_M GGUFs are dominated by the
+    // large output and FFN-down matrices.  Two rows per threadgroup improves
+    // occupancy and reduces tail latency on Apple Silicon; callers can still
+    // override this with RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP for A/B testing.
     (void)rows;
-    return 8;
+    return 2;
 }
 
 static BOOL rusty_metal_ensure_buffer(id<MTLBuffer> __strong *buffer, NSUInteger size) {

@@ -4574,17 +4574,24 @@ fn forward_hidden_impl<'a>(
 
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
-            layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
-            layer.w3.matvec_into(&buf.xn2, &mut buf.up);
-        }
+        // Keep prefill on the same fused Mistral FFN path as decode.  This is
+        // particularly important for Ministral Q4_K_M GGUFs: every prompt
+        // token except the final one reaches this function, so falling back to
+        // three independent projections needlessly adds Metal command-buffer
+        // and host-buffer traffic.
+        if !try_metal_mistral_ffn_into(&layer.w1, &layer.w3, &layer.w2, &buf.xn2, &mut buf.proj) {
+            if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
+                layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
+                layer.w3.matvec_into(&buf.xn2, &mut buf.up);
+            }
 
-        buf.hidden.resize(config.hidden_dim, 0.0);
-        for i in 0..config.hidden_dim {
-            buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
-        }
+            buf.hidden.resize(config.hidden_dim, 0.0);
+            for i in 0..config.hidden_dim {
+                buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
+            }
 
-        layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
+            layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
+        }
         for i in 0..dim {
             buf.x[i] += buf.proj[i];
         }

@@ -6,3 +6,4 @@ demo/wasm/pkg/*wasm
 model_benchmark_202*
 /models
 settings.local.json
+mini-ministral

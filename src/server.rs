@@ -643,14 +643,23 @@ pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
                         let runner = Arc::clone(&runner);
                         let options = options.clone();
                         let tls_config = Arc::clone(&tls_config);
-                        thread::spawn(move || {
+                        if max_connections == 1 {
                             let _guard = guard;
                             if let Err(err) =
                                 handle_tls_connection(stream, runner, &options, tls_config)
                             {
                                 eprintln!("HTTPS connection error: {}", err);
                             }
-                        });
+                        } else {
+                            thread::spawn(move || {
+                                let _guard = guard;
+                                if let Err(err) =
+                                    handle_tls_connection(stream, runner, &options, tls_config)
+                                {
+                                    eprintln!("HTTPS connection error: {}", err);
+                                }
+                            });
+                        }
                     }
                     Err(err) => eprintln!("Accept error: {}", err),
                 }
@@ -675,12 +684,19 @@ pub fn serve(runner: Arc<Runner>, options: ServeOptions) -> Result<(), String> {
 
                     let runner = Arc::clone(&runner);
                     let options = options.clone();
-                    thread::spawn(move || {
+                    if max_connections == 1 {
                         let _guard = guard;
                         if let Err(err) = handle_plain_connection(stream, runner, &options) {
                             eprintln!("HTTP connection error: {}", err);
                         }
-                    });
+                    } else {
+                        thread::spawn(move || {
+                            let _guard = guard;
+                            if let Err(err) = handle_plain_connection(stream, runner, &options) {
+                                eprintln!("HTTP connection error: {}", err);
+                            }
+                        });
+                    }
                 }
                 Err(err) => eprintln!("Accept error: {}", err),
             }

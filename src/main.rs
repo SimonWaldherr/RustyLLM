@@ -930,10 +930,15 @@ fn run() -> Result<(), String> {
 
         #[cfg(feature = "server")]
         {
-            // Multiple connections can generate concurrently here, so the
-            // resident decoder (one global GPU-resident KV cache) must not
-            // auto-enable; RUSTY_LLM_METAL_RESIDENT can still force it on.
-            metal::disable_auto_resident_for_server();
+            // A session-enabled server needs one independent KV cache per
+            // conversation, while the resident decoder owns one global GPU KV
+            // cache.  Stateless requests, however, are serialized by
+            // `Runner::generation_lock` and always start at position zero, so
+            // they can safely use the resident path for substantially faster
+            // Ministral/Mistral Metal inference.
+            if max_sessions > 0 {
+                metal::disable_auto_resident_for_server();
+            }
             let protocol = if tls_cert.is_some() && tls_key.is_some() {
                 "HTTPS"
             } else {
