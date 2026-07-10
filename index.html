@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="RustyLLM is an inspectable, local-first GGUF inference runner written in Rust.">
+    <meta name="theme-color" content="#111411">
+    <meta property="og:title" content="RustyLLM — Local inference, made inspectable">
+    <meta property="og:description" content="A compact Rust GGUF runner with a CLI, local API, benchmarks, and optional Metal acceleration.">
+    <title>RustyLLM — Local inference, made inspectable</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <header class="header wrap">
+      <a class="brand" href="#top" aria-label="RustyLLM home"><b>R/</b>RustyLLM</a>
+      <nav><a href="#why" data-de="Warum">Why</a><a href="#path" data-de="Ablauf">Workflow</a><a href="#speed" data-de="Performance">Performance</a></nav>
+      <div class="head-actions"><button class="language" data-language aria-label="Switch language">EN <i></i> DE</button><a class="small-link" href="https://github.com/SimonWaldherr/RustyLLM">GitHub ↗</a></div>
+    </header>
+
+    <main id="top">
+      <section class="hero wrap">
+        <div class="hero-copy">
+          <p class="eyebrow"><span></span><span data-de="LOKALE LLM-INFRASTRUKTUR">LOCAL-FIRST LLM INFRASTRUCTURE</span></p>
+          <h1 data-i18n-html data-en="Local inference.<br><em>Made inspectable.</em>" data-de="Lokale Inferenz.<br><em>Nachvollziehbar.</em>">Local inference.<br><em>Made inspectable.</em></h1>
+          <p class="lede" data-de="Führe GGUF-Modelle direkt in Rust aus – vom gemappten Gewicht bis zum generierten Token, mit lokaler API und reproduzierbaren Benchmarks.">Run GGUF models directly in Rust — with a clear path from mapped weights to generated tokens, a local API, and benchmarks you can reproduce.</p>
+          <div class="actions"><a class="button" href="#start" data-de="In Minuten starten →">Get running in minutes →</a><a class="underlined" href="https://github.com/SimonWaldherr/RustyLLM" data-de="Quellcode erkunden ↗">Explore the source ↗</a></div>
+          <div class="proof"><div><strong>GGUF</strong><small data-de="native geladen">native loading</small></div><div><strong>Rust</strong><small data-de="kompakter Stack">one compact stack</small></div><div><strong>HTTP</strong><small data-de="OpenAI-kompatible API">OpenAI-compatible API</small></div></div>
+        </div>
+        <div class="terminal" aria-label="RustyLLM terminal example">
+          <div class="terminal-top"><i></i><i></i><i></i><span>rusty-llm — local</span></div>
+          <div class="terminal-body"><p><b>$</b> rusty-llm model.gguf --prompt</p><p class="terminal-string" data-de="&quot;Erkläre Inferenz in einem Satz.&quot;">"Explain inference in one sentence."</p><hr><small>RUSTYLLM</small><p class="terminal-answer" data-de="Inferenz wandelt deinen Prompt in Tokens um, führt sie durch Modellgewichte und sagt das nächste Token voraus – komplett lokal.">Inference turns your prompt into tokens, runs them through model weights, and predicts the next token — locally.</p><footer><span><em></em> Metal: enabled</span><span data-de="GGUF · lokal · bereit">GGUF · local · ready</span></footer></div>
+        </div>
+      </section>
+
+      <div class="ticker"><div>GGUF <b>✦</b> RUST <b>✦</b> METAL <b>✦</b> LOCAL API <b>✦</b> BENCHMARKS <b>✦</b> EMBEDDINGS <b>✦</b> GGUF <b>✦</b> RUST <b>✦</b> METAL <b>✦</b> LOCAL API <b>✦</b> BENCHMARKS <b>✦</b></div></div>
+
+      <section class="section wrap" id="why">
+        <p class="section-label"><b>01</b><span data-de="WARUM RUSTYLLM">WHY RUSTYLLM</span></p>
+        <div class="split intro"><h2 data-i18n-html data-en="The shortest path<br>from <em>weights</em> to insight." data-de="Der kürzeste Weg<br>von <em>Gewichten</em> zu Erkenntnis.">The shortest path<br>from <em>weights</em> to insight.</h2><div><p class="large" data-de="RustyLLM macht den kompletten Inferenzpfad sichtbar: GGUF-Parsing, Zero-Copy-Modellzugriff, quantisierte Matrix-Vektor-Kernel, KV-Cache, Sampling und HTTP-Routing.">RustyLLM keeps the full inference path visible: GGUF parsing, zero-copy model access, quantized matrix-vector kernels, KV caching, sampling, and HTTP routing.</p><p data-de="Praktisch genug für einen lokalen Assistenten – und kompakt genug, um ihn ohne ausuferndes Framework zu verstehen, anzupassen und zu benchmarken.">It is practical enough to run a local assistant — and compact enough to understand, modify, and benchmark without a sprawling framework.</p></div></div>
+        <div class="features"><article><b>01</b><h3 data-de="Native GGUF">Native GGUF</h3><p data-de="Lies Gewichte direkt von der Platte per Memory Mapping und inspiziere Tensoren, Metadaten und Tokenisierung.">Read weights directly from disk with memory mapping and inspect tensors, metadata, and tokenization.</p></article><article><b>02</b><h3 data-de="Für lokal gebaut">Built for local</h3><p data-de="Modelle, Prompts und Embeddings bleiben auf deinem Rechner. Kein gehosteter Runtime-Dienst nötig.">Keep models, prompts, and embeddings on your own machine. No hosted runtime required.</p></article><article><b>03</b><h3 data-de="Den Stack messen">Measure the stack</h3><p data-de="Vergleiche Prefill und Decode, untersuche Kernel und entscheide Optimierungen anhand von Daten.">Compare prefill and decode throughput, inspect kernels, and make optimisation decisions from data.</p></article></div>
+      </section>
+
+      <section class="section wrap workflow" id="path">
+        <p class="section-label"><b>02</b><span data-de="DER INFERENZPFAD">THE INFERENCE PATH</span></p>
+        <div class="workflow-head"><h2 data-de="Keine Black Box.">No mystery layers.</h2><p data-de="Jede Stufe hat einen Platz im Code und einen nachvollziehbaren Zweck.">Every stage has a home in the source and a reason to exist.</p></div>
+        <ol><li><b>01</b><div><h3 data-de="Modell mappen">Map the model</h3><p data-de="Öffne eine GGUF-Datei, parse ihre Metadaten und halte quantisierte Tensoren nah an ihren Original-Bytes.">Open a GGUF file, parse its metadata, and keep quantized tensors close to the original bytes.</p></div><code>GGUF → mmap</code></li><li><b>02</b><div><h3 data-de="Text in Tokens umwandeln">Turn text into tokens</h3><p data-de="Wende Tokenizer-Regeln und das native Chat-Template des Modells an, bevor die Inferenz startet.">Apply tokenizer rules and the model's native chat template before inference begins.</p></div><code>text → ids</code></li><li><b>03</b><div><h3>Prefill &amp; Decode</h3><p data-de="Baue den KV-Cache auf, nutze ihn bei passenden Folgerunden wieder und generiere Token für Token.">Build the KV cache, reuse it across turns when appropriate, then generate one next token at a time.</p></div><code>KV → logits</code></li><li><b>04</b><div><h3 data-de="Produktiv nutzen">Put it to work</h3><p data-de="Nutze CLI, lokale Web-UI, Embeddings-API oder OpenAI-kompatible HTTP-Endpunkte.">Use the CLI, local web UI, embeddings API, or OpenAI-compatible HTTP endpoints.</p></div><code>logits → response</code></li></ol>
+      </section>
+
+      <section class="performance" id="speed"><div class="wrap split"><div><p class="section-label light"><b>03</b><span data-de="PERFORMANCE MIT KONTEXT">PERFORMANCE, WITH CONTEXT</span></p><h2 data-i18n-html data-en="Fast is useful.<br><em>Explainable</em> is better." data-de="Schnell ist gut.<br><em>Erklärbar</em> ist besser.">Fast is useful.<br><em>Explainable</em> is better.</h2><p data-de="RustyLLM zeigt getrennte Prefill- und Decode-Zeiten, Kernel-Benchmarks, Backend-Policies und Metal-Telemetrie – damit eine Optimierung mehr als ein hoffnungsvoller Schalter ist.">RustyLLM exposes separate prefill and decode timings, kernel benchmarks, backend policies, and Metal telemetry — so an optimisation is more than a hopeful toggle.</p><a class="underlined lime" href="https://github.com/SimonWaldherr/RustyLLM/blob/main/BENCHMARK.md" data-de="Benchmark-Notizen ansehen ↗">See benchmark notes ↗</a></div><div class="metrics"><article><small data-de="MINISTRAL 3 3B · Q4_K_M">MINISTRAL 3 3B · Q4_K_M</small><strong>55 <span>tok/s</span></strong><p data-de="Gemessener lokaler CLI-Decode, Metal auto, kurzer Prompt.">Measured local CLI decode, Metal auto, short prompt.</p></article><article class="dark-card"><small data-de="MISS, WAS SICH ÄNDERT">MEASURE WHAT CHANGES</small><strong>prefill <i>≠</i> decode</strong><p data-de="Optimiere den Pfad, den dein Workload tatsächlich nutzt.">Tune the path your workload actually uses.</p></article></div></div></section>
+
+      <section class="section wrap usecases"><p class="section-label"><b>04</b><span data-de="MACH ES ZU DEINEM">MAKE IT YOURS</span></p><div class="cards"><article class="featured"><small data-de="DURCH LESEN LERNEN">LEARN BY READING</small><h3 data-de="Lokale Inferenz von innen verstehen.">Understand local inference from the inside.</h3><p data-de="Verfolge eine Antwort von GGUF-Metadaten bis zu SIMD-Kerneln und KV-Cache-Reuse – ohne dass Abstraktion das System verdeckt.">Trace a response from GGUF metadata to SIMD kernels and KV-cache reuse — without losing the system in abstraction.</p><b class="corner">↗</b></article><article><small data-de="LOKAL BAUEN">BUILD LOCALLY</small><h3 data-de="Einen privaten Assistenten betreiben.">Ship a private local assistant.</h3><p data-de="Starte einen kleinen HTTP-Server für Chat, Completions, Embeddings und vertraute OpenAI-artige Clients.">Start a small HTTP server for chat, completions, embeddings, and familiar OpenAI-style clients.</p></article><article><small data-de="BEWUSST TUNEN">TUNE DELIBERATELY</small><h3 data-de="Deinen Rechner benchmarken.">Benchmark your own machine.</h3><p data-de="Vergleiche CPU- und Metal-Routen, profile Kernel und behalte die Daten, die eine Änderung begründen.">Compare CPU and Metal routes, profile kernels, and keep the data that justified a change.</p></article></div></section>
+
+      <section class="start wrap" id="start"><div><p class="eyebrow"><span></span><span data-de="OPEN SOURCE · MIT-LIZENZ">OPEN SOURCE · MIT LICENSE</span></p><h2 data-i18n-html data-en="Run your first<br><em>local token.</em>" data-de="Starte deinen ersten<br><em>lokalen Token.</em>">Run your first<br><em>local token.</em></h2><p data-de="Bring eine kompatible GGUF-Datei mit. RustyLLM erledigt den Rest – transparent.">Bring a compatible GGUF file. RustyLLM handles the rest — transparently.</p></div><div class="install"><header><small data-de="TERMINAL">TERMINAL</small><button data-copy data-de="Kopieren">Copy</button></header><pre><code>cargo install --git https://github.com/SimonWaldherr/RustyLLM rusty-llm
+rusty-llm ./model.gguf --prompt "Hello local inference."</code></pre><a class="button full" href="https://github.com/SimonWaldherr/RustyLLM" data-de="RustyLLM auf GitHub ansehen →">View RustyLLM on GitHub →</a></div></section>
+    </main>
+
+    <footer class="footer wrap"><a class="brand" href="#top"><b>R/</b>RustyLLM</a><p data-de="Lokale Modelle. Klare Systeme. Rust.">Local models. Clear systems. Rust.</p><div><a href="https://github.com/SimonWaldherr/RustyLLM">GitHub</a><a href="https://github.com/SimonWaldherr/RustyLLM/blob/main/LICENSE">MIT</a></div></footer>
+    <script src="app.js"></script>
+  </body>
+</html>
