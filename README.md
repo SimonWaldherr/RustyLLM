@@ -913,6 +913,10 @@ For repeatable checks, use `make bench-model-ultra MODEL=...` or
 Q6_K kernels use two rows per threadgroup by default, which improves current
 Ministral 3 Q4_K_M decode latency. Set `RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP` to
 `2`, `4`, `6`, or `8` for hardware-specific A/B tests. Metal
+resident decoding groups four GQA query heads once the attention window reaches
+128 tokens, reducing repeated KV-cache traffic during long Ministral 3
+generations. Set `RUSTY_LLM_METAL_GROUPED_GQA=0` to disable this route or `=1`
+to force it for an A/B check. Metal
 matvec and attention calls use reusable copy buffers by default, which is faster
 on the current Ministral 3B Q4_K_M benchmark than Shared/NoCopy wrapping. Set
 `RUSTY_LLM_METAL_NOCOPY=1` only when benchmarking the no-copy path on your Mac.

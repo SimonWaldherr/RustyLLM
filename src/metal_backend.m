@@ -85,6 +85,7 @@ static id<MTLComputePipelineState> gQ4_0Pipeline;
 static id<MTLComputePipelineState> gQ8_0Pipeline;
 static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gResidentAttentionPipeline;
+static id<MTLComputePipelineState> gResidentGroupedAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
 static id<MTLComputePipelineState> gResidualRmsPipeline;
 static id<MTLComputePipelineState> gResidualAddPipeline;
@@ -534,6 +535,61 @@ static NSString *const kResidentAttnSource =
 "    for (uint i = lane; i < p.value_dim; i += 32) orow[i] = osh[i] * inv;\n"
 "}\n";
 
+// Four-head grouped-query attention for the resident decoder. Ministral 3
+// maps four query heads to each KV head, so loading the KV row once into
+// threadgroup memory avoids streaming the same keys and values four times.
+static NSString *const kResidentGroupedAttnSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct AttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim;\n"
+"                    uint kv_k_dim; uint kv_v_dim; uint start_t; uint end_t; float scale; };\n"
+"kernel void resident_gqa4_attention(device const float* q [[buffer(0)]],\n"
+"                                    device const float* k_cache [[buffer(1)]],\n"
+"                                    device const float* v_cache [[buffer(2)]],\n"
+"                                    device float* out [[buffer(3)]],\n"
+"                                    constant AttnParams& p [[buffer(4)]],\n"
+"                                    uint kv_head [[threadgroup_position_in_grid]],\n"
+"                                    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                                    uint lane [[thread_index_in_simdgroup]]) {\n"
+"    threadgroup float qsh[4][256];\n"
+"    threadgroup float osh[4][256];\n"
+"    threadgroup float ksh[256];\n"
+"    threadgroup float vsh[256];\n"
+"    uint head = kv_head * 4 + sg;\n"
+"    const device float* qrow = q + head * p.head_dim;\n"
+"    for (uint i = lane; i < p.head_dim; i += 32) qsh[sg][i] = qrow[i];\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = 0.0f;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float maxs = -INFINITY;\n"
+"    float denom = 0.0f;\n"
+"    uint local = sg * 32 + lane;\n"
+"    for (uint t = p.start_t; t <= p.end_t; ++t) {\n"
+"        const device float* krow = k_cache + t * p.kv_k_dim + kv_head * p.head_dim;\n"
+"        const device float* vrow = v_cache + t * p.kv_v_dim + kv_head * p.value_dim;\n"
+"        for (uint i = local; i < p.head_dim; i += 128) ksh[i] = krow[i];\n"
+"        for (uint i = local; i < p.value_dim; i += 128) vsh[i] = vrow[i];\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        float partial = 0.0f;\n"
+"        for (uint i = lane; i < p.head_dim; i += 32) partial += qsh[sg][i] * ksh[i];\n"
+"        for (ushort o = 16; o > 0; o >>= 1) partial += simd_shuffle_xor(partial, o);\n"
+"        float score = simd_broadcast_first(partial) * p.scale;\n"
+"        if (score > maxs) {\n"
+"            float r = isfinite(maxs) ? exp(maxs - score) : 0.0f;\n"
+"            denom = denom * r + 1.0f;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = osh[sg][i] * r + vsh[i];\n"
+"            maxs = score;\n"
+"        } else {\n"
+"            float w = exp(score - maxs);\n"
+"            denom += w;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] += w * vsh[i];\n"
+"        }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    float inv = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+"    device float* orow = out + head * p.value_dim;\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) orow[i] = osh[sg][i] * inv;\n"
+"}\n";
+
 static BOOL rusty_metal_init(void) {
     static dispatch_once_t once;
     static BOOL ok = NO;
@@ -634,6 +690,21 @@ static BOOL rusty_metal_init(void) {
         gResidentAttentionPipeline = [gDevice newComputePipelineStateWithFunction:resident_attention_function error:&error];
         if (!gResidentAttentionPipeline) {
             rusty_metal_log_error("create resident attention pipeline", error);
+            return;
+        }
+        id<MTLLibrary> grouped_attention_library = [gDevice newLibraryWithSource:kResidentGroupedAttnSource options:options error:&error];
+        if (!grouped_attention_library) {
+            rusty_metal_log_error("compile resident grouped attention library", error);
+            return;
+        }
+        id<MTLFunction> grouped_attention_function = [grouped_attention_library newFunctionWithName:@"resident_gqa4_attention"];
+        if (!grouped_attention_function) {
+            rusty_metal_log_error("load resident grouped attention function", nil);
+            return;
+        }
+        gResidentGroupedAttentionPipeline = [gDevice newComputePipelineStateWithFunction:grouped_attention_function error:&error];
+        if (!gResidentGroupedAttentionPipeline) {
+            rusty_metal_log_error("create resident grouped attention pipeline", error);
             return;
         }
         id<MTLLibrary> silu_library = [gDevice newLibraryWithSource:kSiluMulSource options:options error:&error];
@@ -1974,18 +2045,33 @@ static void resident_rope(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
 
 static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
                           uint32_t start_t, uint32_t end_t, float scale) {
+    uint32_t kv_mul = gR_nheads / gR_nkv;
     RustyResidentAttentionParams p = {
-        .heads = gR_nheads, .kv_mul = gR_nheads / gR_nkv, .head_dim = gR_headdim,
+        .heads = gR_nheads, .kv_mul = kv_mul, .head_dim = gR_headdim,
         .value_dim = gR_valuedim, .key_stride = gR_kdim, .value_stride = gR_vdim,
         .start_t = start_t, .end_t = end_t, .scale = scale,
     };
-    [enc setComputePipelineState:gResidentAttentionPipeline];
+    // At short contexts the extra threadgroup barriers cost more than the KV
+    // reuse saves. Once the attention scan reaches 128 tokens, grouping four
+    // query heads around one KV head avoids enough repeated cache traffic to
+    // win decisively on Ministral 3. The environment flag remains useful for
+    // forcing an A/B comparison on other Apple GPUs.
+    BOOL grouped_override_on = rusty_metal_env_enabled("RUSTY_LLM_METAL_GROUPED_GQA");
+    BOOL grouped_override_off = rusty_metal_env_disabled("RUSTY_LLM_METAL_GROUPED_GQA");
+    uint32_t context_tokens = end_t - start_t + 1;
+    BOOL use_grouped_gqa = kv_mul == 4 && gResidentGroupedAttentionPipeline != nil &&
+                           (grouped_override_on || (!grouped_override_off && context_tokens >= 128));
+    [enc setComputePipelineState:use_grouped_gqa ? gResidentGroupedAttentionPipeline : gResidentAttentionPipeline];
     [enc setBuffer:gR_q offset:0 atIndex:0];
     [enc setBuffer:L->k_cache offset:0 atIndex:1];
     [enc setBuffer:L->v_cache offset:0 atIndex:2];
     [enc setBuffer:gR_attn offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    if (use_grouped_gqa) {
+        [enc dispatchThreadgroups:MTLSizeMake(gR_nkv, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else {
+        [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
 }
 
 int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_heads,
@@ -2076,6 +2162,7 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
         memcpy([gR_x contents], x_embed, (NSUInteger)gR_dim * sizeof(float));
         uint32_t slot = pos;
         float scale = 1.0f / sqrt((float)gR_headdim);
+        double encode_start = rusty_metal_now_seconds();
         id<MTLCommandBuffer> cb = [gQueue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         for (uint32_t l = 0; l < gR_nlayers; ++l) {
@@ -2100,8 +2187,10 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
         resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
         resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
         [enc endEncoding];
+        double encode_end = rusty_metal_now_seconds();
         [cb commit];
         [cb waitUntilCompleted];
+        rusty_metal_profile_command_buffer(cb, encode_start, encode_end);
         if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
         memcpy(logits_out, [gR_logits contents], (NSUInteger)gR_vocab * sizeof(float));
         return 1;
