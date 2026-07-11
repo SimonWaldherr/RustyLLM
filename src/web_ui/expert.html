@@ -27,7 +27,10 @@
 
 <div class="app">
   <header role="banner">
-    <h1>RustyLLM Expert UI</h1>
+    <div class="page-title">
+      <h1>RustyLLM Expert UI</h1>
+      <p>Advanced local model controls</p>
+    </div>
     <div class="top">
       <nav class="page-nav" aria-label="RustyLLM web views">
         <a href="/chat">Chat</a>
@@ -51,6 +54,7 @@
             <option value="embeddings">Embeddings</option>
             <option value="rag">RAG Demo</option>
           </select>
+          <p class="mode-guide" id="modeGuide">Continue a multi-turn conversation with the selected model.</p>
         </div>
 
         <div class="field">
@@ -170,7 +174,9 @@
           aria-relevant="additions"
         >
           <div class="empty" id="empty">
-            Use the controls to try chat, completions, generate, embeddings, model listing, health, and streaming.
+            <p class="eyebrow">Model workspace</p>
+            <h2>Start an experiment</h2>
+            <p>Choose a mode, add an input, and tune the advanced controls only when you need them.</p>
           </div>
         </div>
       </div>

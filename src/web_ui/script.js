@@ -74,10 +74,17 @@ function attachCopyButton(el, onCopied) {
 }
 
 function apiErrorMessage(parsed, text, status) {
-  if (parsed?.error?.message) return parsed.error.message;
-  if (typeof parsed?.error === "string") return parsed.error;
-  if (parsed?.message) return parsed.message;
-  return text || ("HTTP " + status);
+  const message = parsed?.error?.message
+    || (typeof parsed?.error === "string" ? parsed.error : "")
+    || parsed?.message
+    || text;
+  if (!message || /<!doctype|<html[\s>]/i.test(message)) return "Request failed (HTTP " + status + ").";
+  return String(message).slice(0, 280);
+}
+
+function setStatus(statusEl, state, text) {
+  statusEl.dataset.state = state;
+  statusEl.textContent = text;
 }
 
 function makeSessionId(prefix) {
@@ -91,6 +98,7 @@ function makeSessionId(prefix) {
 function initExpert() {
   const form          = document.getElementById("form");
   const modeEl        = document.getElementById("mode");
+  const modeGuideEl   = document.getElementById("modeGuide");
   const modelEl       = document.getElementById("model");
   const modelHintEl   = document.getElementById("modelHint");
   const promptEl      = document.getElementById("prompt");
@@ -147,7 +155,8 @@ function initExpert() {
   function setBusy(busy) {
     sendEl.disabled = busy;
     abortEl.disabled = !busy;
-    statusEl.textContent = busy ? "Generating…" : "Ready";
+    if (busy) setStatus(statusEl, "busy", "Generating…");
+    else if (statusEl.dataset.state === "busy") setStatus(statusEl, "ready", "Ready");
     form.setAttribute("aria-busy", busy ? "true" : "false");
   }
 
@@ -235,6 +244,17 @@ function initExpert() {
     statsEl.textContent = text || "";
   }
 
+  function syncModeGuide() {
+    const guides = {
+      chat: "Continue a multi-turn conversation with the selected model.",
+      completion: "Continue a text prefix without applying chat formatting.",
+      generate: "Use RustyLLM's native generation endpoint for a direct response.",
+      embeddings: "Turn input into a vector for retrieval and similarity work.",
+      rag: "Add passages, search them semantically, then answer from the strongest matches."
+    };
+    modeGuideEl.textContent = guides[modeEl.value] || "Choose how the selected model should process your input.";
+  }
+
   async function fetchJson(path, payload, signal) {
     const response = await fetch(path, {
       method: payload ? "POST" : "GET",
@@ -250,7 +270,7 @@ function initExpert() {
   }
 
   async function loadModels() {
-    statusEl.textContent = "Loading models…";
+    setStatus(statusEl, "busy", "Loading models…");
     try {
       const health = await fetchJson("/health");
       const models = await fetchJson("/v1/models");
@@ -262,10 +282,10 @@ function initExpert() {
         modelEl.appendChild(opt);
       }
       modelHintEl.textContent = (models.data || []).length + " advertised id(s), health: " + health.status;
-      statusEl.textContent = "Ready";
+      setStatus(statusEl, "ready", "Ready");
     } catch (err) {
       modelHintEl.textContent = err.message;
-      statusEl.textContent = "Error";
+      setStatus(statusEl, "error", "Error");
       announce("Failed to load models: " + err.message);
     }
   }
@@ -278,7 +298,7 @@ function initExpert() {
       signal
     });
     if (!response.ok || !response.body) {
-      throw new Error((await response.text()) || ("HTTP " + response.status));
+      throw new Error(apiErrorMessage(null, await response.text(), response.status));
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -474,6 +494,7 @@ function initExpert() {
     ragPanel.hidden = !isRag;
     streamEl.disabled = !(modeEl.value === "chat" || modeEl.value === "completion");
     promptEl.placeholder = modeEl.value === "embeddings" ? "Text to embed" : "Message RustyLLM";
+    syncModeGuide();
   });
 
   promptEl.addEventListener("keydown", (e) => {
@@ -547,7 +568,7 @@ function initExpert() {
         announce("Generation stopped");
       } else {
         addMessage("tool", "Error: " + err.message, "tool");
-        statusEl.textContent = "Error";
+        setStatus(statusEl, "error", "Error");
         announce("Error: " + err.message);
       }
     } finally {
@@ -555,6 +576,7 @@ function initExpert() {
     }
   });
 
+  syncModeGuide();
   loadModels();
 }
 
@@ -798,7 +820,8 @@ function initChat() {
   function setBusy(busy) {
     sendEl.disabled = busy;
     stopEl.disabled = !busy;
-    statusEl.textContent = busy ? "Generating…" : "Ready";
+    if (busy) setStatus(statusEl, "busy", "Generating…");
+    else if (statusEl.dataset.state === "busy") setStatus(statusEl, "ready", "Ready");
   }
 
   function beginTurn() {
@@ -884,7 +907,7 @@ function initChat() {
       });
 
       if (!response.ok || !response.body) {
-        throw new Error((await response.text()) || ("HTTP " + response.status));
+        throw new Error(apiErrorMessage(null, await response.text(), response.status));
       }
 
       const reader = response.body.getReader();
@@ -934,7 +957,7 @@ function initChat() {
       } else {
         assistantEl.dataset.raw = "Error: " + err.message;
         assistantEl.textContent = "Error: " + err.message;
-        statusEl.textContent = "Error";
+        setStatus(statusEl, "error", "Error");
         announce("Error: " + err.message);
       }
     } finally {

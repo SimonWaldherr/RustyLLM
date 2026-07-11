@@ -26,8 +26,9 @@
 
 <div class="app">
   <header role="banner">
-    <div class="top">
+    <div class="page-title">
       <h1>RustyLLM GGUF Explorer</h1>
+      <p>Inspect model structure and token space</p>
     </div>
     <div class="top">
       <nav class="page-nav" aria-label="RustyLLM web views">
@@ -45,7 +46,7 @@
         <div class="field">
           <label for="input">Text or term</label>
           <textarea id="input" rows="4" autocomplete="off" spellcheck="false">local model</textarea>
-          <div class="hint">Text is tokenized without BOS for static token-embedding search.</div>
+          <div class="hint">Use text for tokenization and similarity; enter a token ID for a direct lookup.</div>
         </div>
 
         <div class="row">

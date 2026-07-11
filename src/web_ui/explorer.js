@@ -15,14 +15,17 @@
 
   function announce(message) {
     statusEl.textContent = message;
+    statusEl.dataset.state = message === "Error" ? "error" : message === "Ready" ? "ready" : "busy";
     announceEl.textContent = message;
   }
 
   function apiErrorMessage(data, text, statusText) {
-    if (data?.error?.message) return data.error.message;
-    if (typeof data?.error === "string") return data.error;
-    if (data?.message) return data.message;
-    return text || statusText;
+    const message = data?.error?.message
+      || (typeof data?.error === "string" ? data.error : "")
+      || data?.message
+      || text;
+    if (!message || /<!doctype|<html[\s>]/i.test(message)) return "Request failed (" + statusText + ").";
+    return String(message).slice(0, 280);
   }
 
   async function fetchJson(path, payload) {
@@ -40,7 +43,8 @@
       try {
         data = JSON.parse(text);
       } catch {
-        throw new Error(text);
+        if (!res.ok) throw new Error(apiErrorMessage(null, text, res.statusText));
+        throw new Error("Server returned an invalid response.");
       }
     }
     if (!res.ok) {
@@ -162,6 +166,19 @@
       item.append(k, v);
       target.appendChild(item);
     }
+  }
+
+  function renderError(target, title, message) {
+    target.innerHTML = "";
+    const state = document.createElement("div");
+    state.className = "panel-state error";
+    state.setAttribute("role", "status");
+    const heading = document.createElement("h3");
+    heading.textContent = title;
+    const detail = document.createElement("p");
+    detail.textContent = message;
+    state.append(heading, detail);
+    target.appendChild(state);
   }
 
   function renderModel(data) {
@@ -590,7 +607,7 @@
       announce("Ready");
     } catch (err) {
       announce("Error");
-      $("neighbors").textContent = err.message;
+      renderError($("neighbors"), "Could not refresh token data", err.message);
     } finally {
       form.removeAttribute("aria-busy");
     }
@@ -617,7 +634,7 @@
       await runExplore();
     } catch (err) {
       announce("Error");
-      $("anatomy").textContent = err.message;
+      renderError($("anatomy"), "Could not load model data", err.message);
     }
   }
 

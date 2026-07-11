@@ -27,10 +27,13 @@
 
 <div class="app">
   <header role="banner">
-    <h1>RustyLLM Chat</h1>
+    <div class="page-title">
+      <h1>RustyLLM Chat</h1>
+      <p>Local inference workspace</p>
+    </div>
     <div class="top">
       <button id="history-toggle" class="ghost" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="Toggle chat history">History</button>
-      <button id="new-chat" class="ghost" type="button" aria-label="Start new chat">+ New</button>
+      <button id="new-chat" class="ghost" type="button" aria-label="Start new chat">New chat</button>
       <nav class="page-nav" aria-label="RustyLLM web views">
         <a href="/chat" aria-current="page">Chat</a>
         <a href="/chat?expert">Expert</a>
@@ -42,13 +45,16 @@
 
   <div class="body">
     <nav class="history-panel" id="history-panel" aria-label="Chat history" hidden>
+      <div class="history-heading">Recent chats</div>
       <div id="history-list" class="history-list" role="list" aria-label="Previous conversations"></div>
     </nav>
 
     <main id="scroll" aria-label="Conversation">
       <div class="messages" id="messages" role="log" aria-label="Message history" aria-live="polite" aria-relevant="additions">
         <div class="empty" id="empty">
-          <p>Ask something to start a local chat.</p>
+          <p class="eyebrow">Ready when you are</p>
+          <h2>What would you like to explore?</h2>
+          <p>Start with a prompt below or write your own message.</p>
           <div class="suggestions" aria-label="Example prompts">
             <button type="button" class="suggestion">Explain quantum entanglement in simple terms</button>
             <button type="button" class="suggestion">Write a Python function to reverse a string</button>
