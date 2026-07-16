@@ -203,6 +203,19 @@ fn default_worker_threads() -> usize {
     physical_cores().unwrap_or_else(available_threads).max(1)
 }
 
+/// Public view of the physical-core worker count, used to cap prefill
+/// batch-thread widening at the same SMT-aware limit as the decode default.
+pub fn physical_threads() -> usize {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        default_worker_threads()
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        1
+    }
+}
+
 #[cfg(target_family = "wasm")]
 /// Returns the operating-system reported parallelism.
 pub fn available_threads() -> usize {
@@ -1725,6 +1738,152 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     {
         scale_add_f32_scalar(out, scale, add)
     }
+}
+
+/// Computes `out[i] = silu(gate[i]) * up[i]` — the SwiGLU elementwise combine
+/// between the fused gate/up projections and the down projection. The scalar
+/// `expf` loop this replaces costs ~0.8 ms per layer at Ministral's
+/// hidden_dim 9216 (≈7% of a decode token), so the SIMD paths use a
+/// Cephes-style polynomial `expf` (max relative error ~2e-7, well below
+/// quantization noise).
+pub fn silu_mul_into(gate: &[f32], up: &[f32], out: &mut Vec<f32>) {
+    debug_assert_eq!(gate.len(), up.len());
+    let n = gate.len().min(up.len());
+    out.resize(n, 0.0);
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    {
+        unsafe { silu_mul_neon(&gate[..n], &up[..n], &mut out[..n]) }
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    {
+        if has_avx2_fma() {
+            unsafe { silu_mul_avx2(&gate[..n], &up[..n], &mut out[..n]) }
+        } else {
+            silu_mul_scalar(&gate[..n], &up[..n], &mut out[..n]);
+        }
+        return;
+    }
+    #[cfg(not(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    )))]
+    {
+        silu_mul_scalar(&gate[..n], &up[..n], &mut out[..n]);
+    }
+}
+
+/// Scalar reference for `silu_mul_into` (also the wasm/non-AVX2 path).
+fn silu_mul_scalar(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    for i in 0..out.len() {
+        let g = gate[i];
+        out[i] = g / (1.0 + (-g).exp()) * up[i];
+    }
+}
+
+// Cephes-style expf constants, shared by the AVX2 and NEON kernels. The
+// input is clamped to ±88.376 (beyond which f32 exp over/underflows), split
+// as x = n·ln2 + r with a two-constant Cody–Waite reduction, exp(r) is a
+// degree-5 polynomial, and 2^n is applied through the exponent bits.
+const EXPF_HI: f32 = 88.376_26;
+const EXPF_LO: f32 = -88.376_26;
+const EXPF_LOG2E: f32 = std::f32::consts::LOG2_E;
+const EXPF_C1: f32 = 0.693_359_4; // ln2 high part
+const EXPF_C2: f32 = -2.121_944_4e-4; // ln2 low part
+const EXPF_P0: f32 = 1.987_569_1e-4;
+const EXPF_P1: f32 = 1.398_2e-3;
+const EXPF_P2: f32 = 8.333_452e-3;
+const EXPF_P3: f32 = 4.166_579_6e-2;
+const EXPF_P4: f32 = 1.666_666_5e-1;
+const EXPF_P5: f32 = 0.5;
+
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[inline]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn exp_ps_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let x = _mm256_min_ps(_mm256_set1_ps(EXPF_HI), _mm256_max_ps(_mm256_set1_ps(EXPF_LO), x));
+    // n = round-toward-neg-inf(x * log2(e) + 0.5)
+    let fx = _mm256_fmadd_ps(x, _mm256_set1_ps(EXPF_LOG2E), _mm256_set1_ps(0.5));
+    let fx = _mm256_floor_ps(fx);
+    // r = x - n*ln2 (two-step for accuracy)
+    let x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(EXPF_C1), x);
+    let x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(EXPF_C2), x);
+    // Degree-5 polynomial for exp(r)
+    let mut y = _mm256_set1_ps(EXPF_P0);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(EXPF_P1));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(EXPF_P2));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(EXPF_P3));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(EXPF_P4));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(EXPF_P5));
+    let x2 = _mm256_mul_ps(x, x);
+    let y = _mm256_add_ps(_mm256_fmadd_ps(y, x2, x), _mm256_set1_ps(1.0));
+    // * 2^n via exponent bits
+    let n = _mm256_cvttps_epi32(fx);
+    let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32(
+        _mm256_add_epi32(n, _mm256_set1_epi32(0x7f)),
+        23,
+    ));
+    _mm256_mul_ps(y, pow2n)
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn silu_mul_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8 * 8;
+    let one = _mm256_set1_ps(1.0);
+    let mut i = 0usize;
+    while i < main {
+        let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+        let u = _mm256_loadu_ps(up.as_ptr().add(i));
+        // silu(g) = g / (1 + exp(-g))
+        let e = exp_ps_avx2(_mm256_sub_ps(_mm256_setzero_ps(), g));
+        let s = _mm256_div_ps(g, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_mul_ps(s, u));
+        i += 8;
+    }
+    silu_mul_scalar(&gate[main..], &up[main..], &mut out[main..]);
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[inline]
+unsafe fn exp_ps_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let x = vminq_f32(vdupq_n_f32(EXPF_HI), vmaxq_f32(vdupq_n_f32(EXPF_LO), x));
+    let fx = vrndmq_f32(vfmaq_f32(vdupq_n_f32(0.5), x, vdupq_n_f32(EXPF_LOG2E)));
+    let x = vfmsq_f32(x, fx, vdupq_n_f32(EXPF_C1));
+    let x = vfmsq_f32(x, fx, vdupq_n_f32(EXPF_C2));
+    let mut y = vdupq_n_f32(EXPF_P0);
+    y = vfmaq_f32(vdupq_n_f32(EXPF_P1), y, x);
+    y = vfmaq_f32(vdupq_n_f32(EXPF_P2), y, x);
+    y = vfmaq_f32(vdupq_n_f32(EXPF_P3), y, x);
+    y = vfmaq_f32(vdupq_n_f32(EXPF_P4), y, x);
+    y = vfmaq_f32(vdupq_n_f32(EXPF_P5), y, x);
+    let x2 = vmulq_f32(x, x);
+    let y = vaddq_f32(vfmaq_f32(x, y, x2), vdupq_n_f32(1.0));
+    let n = vcvtq_s32_f32(fx);
+    let pow2n = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(n, vdupq_n_s32(0x7f)), 23));
+    vmulq_f32(y, pow2n)
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+unsafe fn silu_mul_neon(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 4 * 4;
+    let one = vdupq_n_f32(1.0);
+    let mut i = 0usize;
+    while i < main {
+        let g = vld1q_f32(gate.as_ptr().add(i));
+        let u = vld1q_f32(up.as_ptr().add(i));
+        let e = exp_ps_neon(vnegq_f32(g));
+        let s = vdivq_f32(g, vaddq_f32(one, e));
+        vst1q_f32(out.as_mut_ptr().add(i), vmulq_f32(s, u));
+        i += 4;
+    }
+    silu_mul_scalar(&gate[main..], &up[main..], &mut out[main..]);
 }
 
 #[inline]
@@ -6809,6 +6968,33 @@ mod tests {
         dot_q8_0_q8k_avx2,
         [7u8, 42, 133, 240]
     );
+
+    /// The SIMD SiLU-multiply (Cephes expf) must match the scalar libm
+    /// reference within far-below-quantization-noise tolerance, including the
+    /// clamp region (|x| near 90) and a non-multiple-of-lane-width tail.
+    #[test]
+    fn silu_mul_simd_matches_scalar() {
+        let n = 1003usize;
+        let gate: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / (n as f32 - 1.0)) * 180.0 - 90.0)
+            .collect();
+        let up: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.37).sin()) * 2.0).collect();
+        let mut expect = vec![0.0f32; n];
+        silu_mul_scalar(&gate, &up, &mut expect);
+        let mut got = Vec::new();
+        silu_mul_into(&gate, &up, &mut got);
+        assert_eq!(got.len(), n);
+        for i in 0..n {
+            let tol = 1e-5f32.max(expect[i].abs() * 1e-5);
+            assert!(
+                (got[i] - expect[i]).abs() <= tol,
+                "i={i} gate={} got {} expect {}",
+                gate[i],
+                got[i],
+                expect[i]
+            );
+        }
+    }
 
     /// End-to-end: the public Q4_0 matvec (worker pool + caller-side shared
     /// activation quantization) must match per-row dequantized references.

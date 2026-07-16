@@ -1042,6 +1042,15 @@ No generated WASM binaries are written back to the repository branch.
   feature and the backend compiled and is available, Metal is used by default.
   Set `RUSTY_LLM_METAL=0` to force the CPU path; `RUSTY_LLM_METAL=1` keeps it
   explicit.
+- `RUSTY_LLM_BATCH_PREFILL`: batched CPU prompt prefill for standard-path
+  K-quant models (each weight matrix runs once per prompt chunk instead of
+  once per token). On by default whenever Metal is disabled or unavailable;
+  set `RUSTY_LLM_BATCH_PREFILL=0` to force the per-token path, e.g. for A/B
+  measurement.
+- `RUSTY_LLM_ATTN_PARALLEL_MIN_WORK`: minimum attention work
+  (`scanned positions × KV heads`, default 4096) before the decode attention
+  scan fans out across the worker pool. Set very high to force the serial
+  scan.
 
 ## Development
 

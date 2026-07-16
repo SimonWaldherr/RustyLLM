@@ -1,7 +1,7 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::model::{
     self, Config, DecodeBuffer, ExpertWeight, GptOssWeights, KVCache, ModelWeights, Weight,
-    apply_rope_qk, online_attention, rms_norm_into, silu,
+    apply_rope_qk, online_attention, rms_norm_into,
 };
 use crate::sampling::{self, SamplerConfig};
 use crate::tokenizer::Tokenizer;
@@ -667,6 +667,21 @@ pub fn architecture_supported(arch: &str) -> bool {
 }
 
 /// Reports whether an architecture uses the Gemma-family dense decoder path.
+/// Reports whether batched prompt prefill is enabled (default on; set
+/// `RUSTY_LLM_BATCH_PREFILL=0` to force the per-token path, e.g. for A/B
+/// measurement).
+#[cfg(not(target_family = "wasm"))]
+fn batch_prefill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("RUSTY_LLM_BATCH_PREFILL").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 pub(crate) fn is_gemma_arch(arch: &str) -> bool {
     matches!(
         arch,
@@ -1664,9 +1679,14 @@ impl Runner {
         if !options.runtime.auto_batch_threads || prompt_tokens < 32 {
             return None;
         }
-        let available = crate::simd::available_threads();
+        // Widen for long prompts, but never past one thread per physical
+        // core: SMT siblings contend in the vector units and measurably slow
+        // the bandwidth-bound matvec kernels (prefill at 12 logical threads
+        // benchmarked BELOW the 6-physical-core decode default on a 6C/12T
+        // i7). On chips without SMT (Apple Silicon) this is a no-op.
+        let target = crate::simd::available_threads().min(crate::simd::physical_threads());
         let current = crate::simd::num_threads();
-        (available > current).then_some(available)
+        (target > current).then_some(target)
     }
 
     /// Benchmarks representative projection kernels for the loaded model.
@@ -2409,8 +2429,42 @@ impl Runner {
         let last_idx = tokens.len() - 1;
         let ubatch = self.effective_prefill_ubatch(options, tokens.len());
 
+        // Batched prefill runs every weight matrix once per chunk instead of
+        // once per token (see model::forward_prefill_batch). It is gated on
+        // Metal being fully disabled so macOS keeps its per-token fused-Metal
+        // and GPU-resident prefill paths untouched; the batchability check is
+        // hoisted out of the chunk loop so unsupported models skip straight
+        // to the per-token fallback.
+        #[cfg(not(target_family = "wasm"))]
+        let mut batch_state = match &self.weights {
+            LoadedWeights::Standard(weights)
+                if !crate::metal::enabled()
+                    && tokens.len() > 2
+                    && batch_prefill_enabled()
+                    && model::standard_prefill_batchable(weights) =>
+            {
+                Some((weights, model::PrefillBatchBuffer::new(&self.config)))
+            }
+            _ => None,
+        };
+
         for (chunk_idx, chunk) in tokens[..last_idx].chunks(ubatch).enumerate() {
             let chunk_start = chunk_idx * ubatch;
+            #[cfg(not(target_family = "wasm"))]
+            if let Some((weights, batch_buf)) = batch_state.as_mut() {
+                if chunk.len() > 1
+                    && model::forward_prefill_batch(
+                        &self.config,
+                        weights,
+                        cache,
+                        batch_buf,
+                        chunk,
+                        start_pos + chunk_start,
+                    )
+                {
+                    continue;
+                }
+            }
             for (idx, &tok_id) in chunk.iter().enumerate() {
                 self.forward_prefill_token(cache, buf, tok_id, start_pos + chunk_start + idx);
             }
@@ -3928,8 +3982,11 @@ fn measure_attention_scan(
 
 /// Measures the FFN activation path after the gate/up projections.
 fn measure_ffn_activation(name: &str, hidden_dim: usize, runs: usize) -> KernelBenchRow {
-    let mut gate = deterministic_bench_vector(hidden_dim);
+    // Measures the production SwiGLU combine (crate::simd::silu_mul_into),
+    // not a private scalar loop, so the row tracks what decode actually runs.
+    let gate = deterministic_bench_vector(hidden_dim);
     let up = deterministic_bench_vector(hidden_dim);
+    let mut hidden = Vec::with_capacity(hidden_dim);
     measure_kernel_raw(
         name,
         String::from("F32"),
@@ -3937,10 +3994,8 @@ fn measure_ffn_activation(name: &str, hidden_dim: usize, runs: usize) -> KernelB
         hidden_dim,
         runs,
         || {
-            for i in 0..hidden_dim {
-                gate[i] = silu(gate[i]) * up[i];
-            }
-            std::hint::black_box(gate.len() + up.len());
+            crate::simd::silu_mul_into(&gate, &up, &mut hidden);
+            std::hint::black_box(hidden.len());
         },
     )
 }

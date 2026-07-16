@@ -1612,6 +1612,158 @@ mod tests {
         assert!(hs.iter().any(|&v| v.abs() > 1e-6));
     }
 
+    /// Builds a synthetic Q4_K weight (d=1.0, dmin=0.25, patterned scales and
+    /// nibbles) so the batched-prefill parity tests exercise the real K-quant
+    /// batch kernels rather than the F32 fallback.
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_q4k_weight(rows: usize, cols: usize, seed: u8) -> super::Weight {
+        assert_eq!(cols % 256, 0);
+        let blocks_per_row = cols / 256;
+        let mut data = vec![0u8; rows * blocks_per_row * 144];
+        for (block_idx, block) in data.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+            block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // dmin = 0.25
+            for i in 0..12 {
+                block[4 + i] = seed.wrapping_add((block_idx * 7 + i * 5) as u8) & 0x3F;
+            }
+            for i in 0..128 {
+                block[16 + i] = seed.wrapping_add((block_idx * 13 + i * 3) as u8);
+            }
+        }
+        super::Weight::Quantized {
+            data: super::RawTensorData::Owned(data),
+            dtype: crate::gguf::GGMLType::Q4_K,
+            rows,
+            cols,
+        }
+    }
+
+    /// Tiny standard-path (LLaMA-style) model with all-Q4_K projections:
+    /// dim 256, 2 heads (GQA 2:1), hidden 512, 2 layers, vocab 32.
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_standard_model(sliding_window: usize) -> (super::Config, super::ModelWeights) {
+        let dim = 256usize;
+        let hidden = 512usize;
+        let head_dim = 128usize;
+        let config = super::Config {
+            arch: "mistral3".to_string(),
+            dim,
+            hidden_dim: hidden,
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            vocab_size: 32,
+            max_seq_len: 64,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+            head_dim,
+            kv_dim: head_dim,
+            kv_mul: 2,
+            value_dim: head_dim,
+            sliding_window,
+            expert_count: 0,
+            expert_used_count: 0,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        let token_embd = tiny_q4k_weight(config.vocab_size, dim, 3);
+        let layers = (0..config.n_layers)
+            .map(|l| {
+                let s = (l * 31) as u8;
+                super::LayerWeights {
+                    attn_norm: vec![1.0; dim],
+                    wq: tiny_q4k_weight(config.n_heads * head_dim, dim, s.wrapping_add(11)),
+                    bq: Vec::new(),
+                    wk: tiny_q4k_weight(config.n_kv_heads * head_dim, dim, s.wrapping_add(23)),
+                    bk: Vec::new(),
+                    wv: tiny_q4k_weight(config.n_kv_heads * head_dim, dim, s.wrapping_add(37)),
+                    bv: Vec::new(),
+                    wo: tiny_q4k_weight(dim, config.n_heads * head_dim, s.wrapping_add(41)),
+                    ffn_norm: vec![1.0; dim],
+                    w1: tiny_q4k_weight(hidden, dim, s.wrapping_add(53)),
+                    w2: tiny_q4k_weight(dim, hidden, s.wrapping_add(67)),
+                    w3: tiny_q4k_weight(hidden, dim, s.wrapping_add(79)),
+                }
+            })
+            .collect();
+        let weights = super::ModelWeights {
+            token_embd: token_embd.clone(),
+            output_norm: vec![1.0; dim],
+            output: token_embd,
+            layers,
+        };
+        (config, weights)
+    }
+
+    /// The batched prefill must fill the KV cache identically to the
+    /// sequential per-token path (same kernels, same order per token).
+    #[cfg(not(target_family = "wasm"))]
+    fn prefill_batch_parity_case(sliding_window: usize) {
+        let (config, weights) = tiny_standard_model(sliding_window);
+        assert!(super::standard_prefill_batchable(&weights));
+        let tokens: Vec<u32> = (0..17u32).map(|i| (i * 7) % 32).collect();
+        let window = (sliding_window > 0).then_some(sliding_window);
+
+        let mut cache_seq = super::KVCache::with_sliding_window(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            window,
+        );
+        let mut buf = super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        for (pos, &token) in tokens.iter().enumerate() {
+            // Sequential CPU reference: forward_hidden_impl directly, so the
+            // comparison never routes through the GPU-resident path on
+            // Metal-capable machines.
+            let _ = super::forward_hidden_impl(
+                &config, &weights, &mut cache_seq, &mut buf, token, pos, false,
+            );
+        }
+
+        let mut cache_batch = super::KVCache::with_sliding_window(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            window,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        assert!(super::forward_prefill_batch(
+            &config,
+            &weights,
+            &mut cache_batch,
+            &mut batch_buf,
+            &tokens,
+            0,
+        ));
+
+        for l in 0..config.n_layers {
+            for (i, (a, b)) in cache_seq.k[l].iter().zip(cache_batch.k[l].iter()).enumerate() {
+                let tol = 1e-3f32.max(a.abs() * 1e-3);
+                assert!((a - b).abs() <= tol, "k[{l}][{i}] seq {a} batch {b}");
+            }
+            for (i, (a, b)) in cache_seq.v[l].iter().zip(cache_batch.v[l].iter()).enumerate() {
+                let tol = 1e-3f32.max(a.abs() * 1e-3);
+                assert!((a - b).abs() <= tol, "v[{l}][{i}] seq {a} batch {b}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn batched_prefill_matches_sequential() {
+        prefill_batch_parity_case(0);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn batched_prefill_matches_sequential_with_ring_window() {
+        // Window 8 with 17 tokens wraps the ring cache more than once, so
+        // this covers the store→attend interleaving the ring layout requires.
+        prefill_batch_parity_case(8);
+    }
+
     #[test]
     fn nomic_bert_attention_is_bidirectional() {
         // Changing a LATER token must affect an EARLIER token's hidden state —
@@ -4083,10 +4235,11 @@ pub fn forward_into(
                 layer.w3.matvec_into(&buf.xn2, &mut buf.up);
             }
 
-            buf.hidden.resize(config.hidden_dim, 0.0);
-            for i in 0..config.hidden_dim {
-                buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
-            }
+            crate::simd::silu_mul_into(
+                &buf.gate[..config.hidden_dim],
+                &buf.up[..config.hidden_dim],
+                &mut buf.hidden,
+            );
 
             layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         }
@@ -5386,10 +5539,11 @@ fn forward_hidden_impl<'a>(
                 layer.w3.matvec_into(&buf.xn2, &mut buf.up);
             }
 
-            buf.hidden.resize(config.hidden_dim, 0.0);
-            for i in 0..config.hidden_dim {
-                buf.hidden[i] = silu(buf.gate[i]) * buf.up[i];
-            }
+            crate::simd::silu_mul_into(
+                &buf.gate[..config.hidden_dim],
+                &buf.up[..config.hidden_dim],
+                &mut buf.hidden,
+            );
 
             layer.w2.matvec_into(&buf.hidden, &mut buf.proj);
         }
@@ -5449,6 +5603,254 @@ pub fn forward_prefill(
         }
     }
     let _ = forward_hidden_impl(config, weights, cache, buf, token, pos, false);
+}
+
+/// Token-major scratch matrices for the batched standard-path prefill.
+/// Each field holds `batch` rows laid out row-major; capacity is retained
+/// across chunks and layers, so steady-state prefill does not allocate.
+#[cfg(not(target_family = "wasm"))]
+pub struct PrefillBatchBuffer {
+    x: Vec<f32>,
+    xn: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn_out: Vec<f32>,
+    proj: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    hidden: Vec<f32>,
+    embd_row: Vec<f32>,
+    rope_inv_freq: Vec<f32>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl PrefillBatchBuffer {
+    /// Allocates the shared scratch; matrices grow lazily to the chunk size.
+    pub fn new(config: &Config) -> Self {
+        Self {
+            x: Vec::new(),
+            xn: Vec::new(),
+            q: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            attn_out: Vec::new(),
+            proj: Vec::new(),
+            gate: Vec::new(),
+            up: Vec::new(),
+            hidden: Vec::new(),
+            embd_row: Vec::new(),
+            // Matches DecodeBuffer::new for the standard path.
+            rope_inv_freq: build_rope_inv_freq(config.rope_theta, config.head_dim, 1.0),
+        }
+    }
+}
+
+/// Reports whether every per-layer projection of a standard-path model can go
+/// through the K-quant batch kernels. Checked once up front so the batch path
+/// never leaves a chunk half-written to the KV cache before falling back.
+#[cfg(not(target_family = "wasm"))]
+pub fn standard_prefill_batchable(weights: &ModelWeights) -> bool {
+    weights.layers.iter().all(|layer| {
+        kquant_weight_parts(&layer.wq).is_some()
+            && kquant_weight_parts(&layer.wk).is_some()
+            && kquant_weight_parts(&layer.wv).is_some()
+            && kquant_weight_parts(&layer.wo).is_some()
+            && kquant_weight_parts(&layer.w1).is_some()
+            && kquant_weight_parts(&layer.w3).is_some()
+            && kquant_weight_parts(&layer.w2).is_some()
+    })
+}
+
+/// Applies RMSNorm from one matrix row into another (slice output variant of
+/// `rms_norm_into` for the token-major batch buffers).
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+fn rms_norm_slice_into(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
+    let n = x.len();
+    let ss = simd::dot_f32(x, x) / n as f32;
+    let scale = 1.0 / (ss + eps).sqrt();
+    for i in 0..n {
+        out[i] = x[i] * scale * weight[i];
+    }
+}
+
+/// Batched prompt prefill for standard (LLaMA-style) models: advances the KV
+/// cache for `tokens` starting at `start_pos`, running every weight matrix
+/// once per chunk instead of once per token.
+///
+/// The projections (QKV, attention output, gate/up/down) run through the
+/// K-quant batch kernels, which stream each weight row from memory once and
+/// reuse it L1-hot across the whole chunk — prefill's dominant cost is weight
+/// bandwidth, so this divides it by the chunk length. RoPE, the KV-cache
+/// store, and the attention scan stay strictly per-token IN ORDER: with a
+/// sliding-window ring cache, a later token's store may reuse the slot of a
+/// position still inside an earlier token's window, so store→attend must
+/// interleave exactly like the sequential path.
+///
+/// Returns `false` (without touching the cache) when any projection cannot
+/// take the batch path; the caller then uses the per-token fallback.
+#[cfg(not(target_family = "wasm"))]
+pub fn forward_prefill_batch(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut PrefillBatchBuffer,
+    tokens: &[u32],
+    start_pos: usize,
+) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    if !standard_prefill_batchable(weights) {
+        return false;
+    }
+
+    let b = tokens.len();
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let kv_mul = config.kv_mul;
+    let q_rows = config.n_heads * head_dim;
+    let k_rows = config.n_kv_heads * head_dim;
+    let v_rows = config.n_kv_heads * config.value_dim;
+    let attn_dim = config.n_heads * config.value_dim;
+
+    // Residual streams start as the token embeddings.
+    buf.x.resize(b * dim, 0.0);
+    buf.xn.resize(b * dim, 0.0);
+    buf.attn_out.resize(b * attn_dim, 0.0);
+    for (t, &token) in tokens.iter().enumerate() {
+        weights
+            .token_embd
+            .row_into(token as usize, dim, &mut buf.embd_row);
+        buf.x[t * dim..(t + 1) * dim].copy_from_slice(&buf.embd_row);
+    }
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let sliding_window = active_sliding_window(config, cache);
+
+    for l in 0..config.n_layers {
+        let layer = &weights.layers[l];
+
+        for t in 0..b {
+            let x_row = &buf.x[t * dim..(t + 1) * dim];
+            rms_norm_slice_into(
+                x_row,
+                &layer.attn_norm,
+                config.rms_norm_eps,
+                &mut buf.xn[t * dim..(t + 1) * dim],
+            );
+        }
+
+        if !try_kquant_matvec3_batch_into(
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &buf.xn[..b * dim],
+            &mut buf.q,
+            &mut buf.k,
+            &mut buf.v,
+        ) {
+            // standard_prefill_batchable() vetted every layer, so this should
+            // be unreachable. Falling back mid-chunk is still safe: the
+            // per-token path recomputes the whole chunk from the embeddings
+            // and overwrites every cache slot it touches.
+            debug_assert!(false, "batchable QKV rejected by batch kernel");
+            return false;
+        }
+
+        for t in 0..b {
+            let pos = start_pos + t;
+            let q_row = &mut buf.q[t * q_rows..(t + 1) * q_rows];
+            let k_row = &mut buf.k[t * k_rows..(t + 1) * k_rows];
+            let v_row = &mut buf.v[t * v_rows..(t + 1) * v_rows];
+            add_bias_if_present(q_row, &layer.bq);
+            add_bias_if_present(k_row, &layer.bk);
+            add_bias_if_present(v_row, &layer.bv);
+
+            apply_rope_qk(
+                q_row,
+                k_row,
+                pos,
+                head_dim,
+                config.n_heads,
+                config.n_kv_heads,
+                &buf.rope_inv_freq,
+            );
+
+            let kv_k_start = cache.k_offset(pos);
+            let kv_v_start = cache.v_offset(pos);
+            cache.k[l][kv_k_start..kv_k_start + k_rows].copy_from_slice(k_row);
+            cache.v[l][kv_v_start..kv_v_start + v_rows].copy_from_slice(v_row);
+
+            let attn_window = attention_start_pos(pos, sliding_window);
+            attention_over_kv_heads(
+                &buf.q[t * q_rows..(t + 1) * q_rows],
+                &cache.k[l],
+                &cache.v[l],
+                cache.per_pos_k_dim,
+                cache.per_pos_v_dim,
+                cache.storage_len,
+                head_dim,
+                config.value_dim,
+                config.n_kv_heads,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[t * attn_dim..(t + 1) * attn_dim],
+            );
+        }
+
+        if !try_kquant_matvec_batch_into(&layer.wo, &buf.attn_out[..b * attn_dim], &mut buf.proj)
+        {
+            debug_assert!(false, "batchable wo rejected by batch kernel");
+            return false;
+        }
+        for t in 0..b {
+            let proj_row = &buf.proj[t * dim..(t + 1) * dim];
+            let x_row = &mut buf.x[t * dim..(t + 1) * dim];
+            for i in 0..dim {
+                x_row[i] += proj_row[i];
+            }
+        }
+
+        for t in 0..b {
+            let x_row = &buf.x[t * dim..(t + 1) * dim];
+            rms_norm_slice_into(
+                x_row,
+                &layer.ffn_norm,
+                config.rms_norm_eps,
+                &mut buf.xn[t * dim..(t + 1) * dim],
+            );
+        }
+
+        if !try_kquant_matvec2_batch_into(
+            &layer.w1,
+            &layer.w3,
+            &buf.xn[..b * dim],
+            &mut buf.gate,
+            &mut buf.up,
+        ) {
+            debug_assert!(false, "batchable w1/w3 rejected by batch kernel");
+            return false;
+        }
+        let hidden_len = b * config.hidden_dim;
+        simd::silu_mul_into(&buf.gate[..hidden_len], &buf.up[..hidden_len], &mut buf.hidden);
+        if !try_kquant_matvec_batch_into(&layer.w2, &buf.hidden[..hidden_len], &mut buf.proj) {
+            debug_assert!(false, "batchable w2 rejected by batch kernel");
+            return false;
+        }
+        for t in 0..b {
+            let proj_row = &buf.proj[t * dim..(t + 1) * dim];
+            let x_row = &mut buf.x[t * dim..(t + 1) * dim];
+            for i in 0..dim {
+                x_row[i] += proj_row[i];
+            }
+        }
+    }
+
+    true
 }
 
 /// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.
