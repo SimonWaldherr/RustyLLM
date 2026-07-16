@@ -6440,8 +6440,8 @@ fn forward_nomic_bert_hidden_impl(
         if _allow_batched && n >= 8 && nomic_batched_layer_supported(layer, dim, kv_row) {
             // Four batched projection phases plus one batched attention phase
             // replace the old per-token QKV/Wo/gate+up/down jobs. Each
-            // projection quantizes a token activation once on its owning
-            // worker and consumes all output rows before the next token.
+            // projection quantizes every activation once for the batch, then
+            // keeps weight rows hot while dynamic worker chunks consume it.
             assert!(try_kquant_matvec3_batch_into(
                 &layer.wq, &layer.wk, &layer.wv, &hs, &mut q_all, &mut k_all, &mut v_all,
             ));

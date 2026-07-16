@@ -1,6 +1,6 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-07-16 22:27 CEST**
+Updated: **2026-07-16 22:52 CEST**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
 
@@ -40,20 +40,24 @@ release build used `-C target-cpu=native`, 12 workers, two warm-ups, and ten
 measured requests per cell. Latency includes local loopback HTTP, tokenization,
 encoder forward, pooling, and response serialization. The before values are the
 previous `af6af2f` measurement; current values use the token/row-batched
-K-quant encoder scheduler. Each current value is the median; throughput uses
-the unrounded latency. Because the earlier baseline used a different sample
-count, the reported speedups are directional rather than a strict A/B result.
+K-quant encoder scheduler with batch-wide Q8_K activation reuse and dynamic
+32-row work distribution. Each current value is the median; throughput uses the
+unrounded latency. Because the earlier baseline used a different sample count,
+the reported speedups are directional rather than a strict A/B result. Against
+the immediately preceding `93174eb` result, the 222-token rate increased from
+998 to 1,169 tok/s (1.17x).
 
 | Input tokens | CPU before | CPU current | Metal-enabled profile (CPU encoder) | CPU speedup |
 |---:|---:|---:|---:|---:|
-| 16 | 64.3 ms / 248.7 tok/s | **20.1 ms / 795 tok/s** | **19.9 ms / 803 tok/s** | 3.19x |
-| 222 | 997.8 ms / 222.5 tok/s | **222.4 ms / 998 tok/s** | **223.8 ms / 992 tok/s** | 4.49x |
+| 16 | 64.3 ms / 248.7 tok/s | **18.2 ms / 878 tok/s** | **17.1 ms / 937 tok/s** | 3.53x |
+| 222 | 997.8 ms / 222.5 tok/s | **189.8 ms / 1,169 tok/s** | **189.5 ms / 1,172 tok/s** | 5.25x |
 
 `RUSTY_LLM_METAL=1` was enabled for the last column, but these encoder requests
 deliberately submit no Metal work once the batch path is selected: Q5_K QKV has
 no suitable Metal batch kernel, and synchronous per-token GPU dispatches were
 slower. This is therefore a Metal-enabled runtime-profile measurement, not a
-GPU-throughput claim; both profiles are within about 1% end-to-end.
+GPU-throughput claim. The long-input profiles are within 1%; sub-millisecond
+host-side variance is visible in the much shorter 16-token measurement.
 
 ## Summary
 

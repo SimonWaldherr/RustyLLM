@@ -27,6 +27,8 @@ static WORKER_POLL_SPINS: AtomicUsize = AtomicUsize::new(2_000);
 #[cfg(not(target_family = "wasm"))]
 const MATVEC_CHUNK_ROWS: usize = 64;
 #[cfg(not(target_family = "wasm"))]
+const KQUANT_BATCH_CHUNK_ROWS: usize = 32;
+#[cfg(not(target_family = "wasm"))]
 const MIN_DYNAMIC_CHUNKS_PER_WORKER: usize = 4;
 
 #[cfg(not(target_family = "wasm"))]
@@ -1083,10 +1085,11 @@ unsafe fn q4k_matvec3_rows(
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 enum KQuantBatchSchedule {
-    /// One worker owns a complete token and quantizes its activation once.
+    /// One worker owns a complete token and consumes its pre-quantized
+    /// activation across every projection row.
     Tokens,
-    /// One worker owns output rows across every token. This balances short
-    /// batches better, at the cost of per-worker activation quantization.
+    /// One worker owns output rows across every token. This keeps the owned
+    /// weight rows hot while the batch is consumed.
     Rows,
 }
 
@@ -1116,6 +1119,10 @@ struct KQuantBatch3Job {
     tokens: usize,
     workers: usize,
     schedule: KQuantBatchSchedule,
+    batch_qs: *const i8,
+    batch_d: *const f32,
+    batch_bsums: *const i16,
+    batch_blocks: usize,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1125,9 +1132,12 @@ unsafe impl Sync for KQuantBatch3Job {}
 
 #[cfg(not(target_family = "wasm"))]
 impl KQuantBatch3Job {
-    unsafe fn run_worker(self, worker_idx: usize, _current_chunk: &AtomicUsize) {
+    unsafe fn run_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
         match self.schedule {
             KQuantBatchSchedule::Tokens => self.run_token_worker(worker_idx),
+            KQuantBatchSchedule::Rows if self.workers > 1 => {
+                self.run_dynamic_row_worker(worker_idx, current_chunk)
+            }
             KQuantBatchSchedule::Rows => self.run_row_worker(worker_idx),
         }
     }
@@ -1140,7 +1150,7 @@ impl KQuantBatch3Job {
             // This worker owns the token and therefore its thread-local Q8_K
             // scratch. The scratch stays unchanged until all three matrices
             // have consumed the activation.
-            let xq = prepare_xq_kquant(x, self.cols);
+            let xq = self.xq_for_token(token, x);
             if self.rows_a > 0 {
                 self.run_rows(
                     self.kind_a,
@@ -1181,17 +1191,32 @@ impl KQuantBatch3Job {
         let total_rows = self.rows_a + self.rows_b + self.rows_c;
         let start = total_rows * worker_idx / self.workers;
         let end = total_rows * (worker_idx + 1) / self.workers;
+        self.run_row_range(start, end);
+    }
+
+    unsafe fn run_dynamic_row_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
+        let total_rows = self.rows_a + self.rows_b + self.rows_c;
+        let chunks = total_rows.div_ceil(KQUANT_BATCH_CHUNK_ROWS);
+        let mut chunk_idx = worker_idx;
+        while chunk_idx < chunks {
+            let start = chunk_idx * KQUANT_BATCH_CHUNK_ROWS;
+            let end = (start + KQUANT_BATCH_CHUNK_ROWS).min(total_rows);
+            self.run_row_range(start, end);
+            chunk_idx = current_chunk.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    unsafe fn run_row_range(self, start: usize, end: usize) {
         let (a_start, a_end) = clipped_range(start, end, 0, self.rows_a);
         let (b_start, b_end) = clipped_range(start, end, self.rows_a, self.rows_b);
         let (c_start, c_end) = clipped_range(start, end, self.rows_a + self.rows_b, self.rows_c);
 
         for token in 0..self.tokens {
             let x = self.inputs.add(token * self.cols);
-            // Row ownership avoids the short-batch imbalance where only a few
-            // token owners receive a second whole projection. The small extra
-            // Q8_K quantization work is amortized by eliminating per-token
-            // worker-pool rendezvous.
-            let xq = prepare_xq_kquant(x, self.cols);
+            // Row ownership reuses weight rows across tokens. Activations are
+            // pre-quantized once for the whole batch when the architecture has
+            // an integer-dot kernel, avoiding one quantization per worker.
+            let xq = self.xq_for_token(token, x);
             if a_end > a_start {
                 self.run_rows_range(
                     self.kind_a,
@@ -1227,6 +1252,19 @@ impl KQuantBatch3Job {
                     x,
                     xq,
                 );
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn xq_for_token(self, token: usize, x: *const f32) -> XQuant {
+        if self.batch_qs.is_null() {
+            prepare_xq_kquant(x, self.cols)
+        } else {
+            XQuant {
+                qs: self.batch_qs.add(token * self.cols),
+                d: self.batch_d.add(token * self.batch_blocks),
+                bsums: self.batch_bsums.add(token * self.batch_blocks * 8),
             }
         }
     }
@@ -1423,18 +1461,18 @@ impl WorkerPool {
         self.run_job(WorkerJob::Q4KMatvec3(job), job.workers);
     }
 
-    /// Executes a K-quant projection over multiple activation rows. Long
-    /// batches use token ownership; small batches use row ownership to keep
-    /// every worker equally busy.
+    /// Executes a K-quant projection over multiple activation rows. Prefer row
+    /// ownership whenever every worker receives projection rows: reusing those
+    /// weights and the batch-wide quantized activations saves substantially
+    /// more memory traffic than token ownership.
     fn run_kquant_batch3(&self, mut job: KQuantBatch3Job) {
         job.workers = job.workers.min(self.max_workers).min(job.tokens).max(1);
         let projection_rows = job.rows_a + job.rows_b + job.rows_c;
-        job.schedule =
-            if job.tokens < job.workers.saturating_mul(2) && projection_rows >= job.workers {
-                KQuantBatchSchedule::Rows
-            } else {
-                KQuantBatchSchedule::Tokens
-            };
+        job.schedule = if projection_rows >= job.workers {
+            KQuantBatchSchedule::Rows
+        } else {
+            KQuantBatchSchedule::Tokens
+        };
         if job.workers <= 1 {
             unsafe {
                 job.run_worker(0, &self.current_chunk.0);
@@ -2627,6 +2665,11 @@ pub fn matvec_kquant3_batch_into(
     #[cfg(not(target_family = "wasm"))]
     {
         let workers = num_threads().min(tokens);
+        let batch_xq = prepare_batch_xq(inputs, cols_a);
+        let (batch_qs, batch_d, batch_bsums) = batch_xq.as_ref().map_or(
+            (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+            |batch| (batch.qs.as_ptr(), batch.d.as_ptr(), batch.bsums.as_ptr()),
+        );
         worker_pool().run_kquant_batch3(KQuantBatch3Job {
             kind_a: kind_a.matvec_kind(),
             kind_b: kind_b.matvec_kind(),
@@ -2648,6 +2691,10 @@ pub fn matvec_kquant3_batch_into(
             tokens,
             workers,
             schedule: KQuantBatchSchedule::Tokens,
+            batch_qs,
+            batch_d,
+            batch_bsums,
+            batch_blocks: cols_a / 256,
         });
         true
     }
@@ -3915,6 +3962,56 @@ struct XqBuf {
     qs: Vec<i8>,
     d: Vec<f32>,
     bsums: Vec<i16>,
+}
+
+/// Owned Q8_K activations for an entire row-major batch. Batched projections
+/// share this storage across workers, so row scheduling can keep weights hot
+/// without quantizing every activation again on every worker.
+#[cfg(not(target_family = "wasm"))]
+struct BatchXqBuf {
+    qs: Vec<i8>,
+    d: Vec<f32>,
+    bsums: Vec<i16>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn prepare_batch_xq(inputs: &[f32], cols: usize) -> Option<BatchXqBuf> {
+    #[cfg(target_arch = "aarch64")]
+    let supported = has_dotprod();
+    #[cfg(target_arch = "x86_64")]
+    let supported = has_avx2_fma();
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let supported = false;
+
+    if !supported || cols == 0 || cols % 256 != 0 {
+        return None;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let tokens = inputs.len() / cols;
+        let blocks = cols / 256;
+        let mut batch = BatchXqBuf {
+            qs: vec![0; inputs.len()],
+            d: vec![0.0; tokens * blocks],
+            bsums: vec![0; tokens * blocks * 8],
+        };
+        let mut row = XqBuf::default();
+        for token in 0..tokens {
+            let input = &inputs[token * cols..(token + 1) * cols];
+            unsafe { quantize_row_q8k(input, &mut row) };
+            batch.qs[token * cols..(token + 1) * cols].copy_from_slice(&row.qs);
+            batch.d[token * blocks..(token + 1) * blocks].copy_from_slice(&row.d);
+            batch.bsums[token * blocks * 8..(token + 1) * blocks * 8].copy_from_slice(&row.bsums);
+        }
+        Some(batch)
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = inputs;
+        None
+    }
 }
 
 #[cfg(all(
@@ -6237,9 +6334,12 @@ mod tests {
     fn kquant_batched_projections_match_token_matvecs() {
         let cols = 512;
         let tokens = 5;
-        let q = make_q4k_weights(4, cols, 3);
-        let k = make_q5k_weights(3, cols, 13);
-        let v = make_q6k_weights(2, cols, 23);
+        let q_rows = 40;
+        let k_rows = 35;
+        let v_rows = 33;
+        let q = make_q4k_weights(q_rows, cols, 3);
+        let k = make_q5k_weights(k_rows, cols, 13);
+        let v = make_q6k_weights(v_rows, cols, 23);
         let inputs: Vec<f32> = (0..tokens * cols)
             .map(|i| {
                 let token = i / cols;
@@ -6257,9 +6357,9 @@ mod tests {
             let mut k_row = Vec::new();
             let mut v_row = Vec::new();
             assert!(matvec_kquant3_into(
-                (KQuantMatvecKind::Q4K, &q, 4, cols),
-                (KQuantMatvecKind::Q5K, &k, 3, cols),
-                (KQuantMatvecKind::Q6K, &v, 2, cols),
+                (KQuantMatvecKind::Q4K, &q, q_rows, cols),
+                (KQuantMatvecKind::Q5K, &k, k_rows, cols),
+                (KQuantMatvecKind::Q6K, &v, v_rows, cols),
                 input,
                 &mut q_row,
                 &mut k_row,
@@ -6274,9 +6374,9 @@ mod tests {
         let mut out_k = Vec::new();
         let mut out_v = Vec::new();
         assert!(matvec_kquant3_batch_into(
-            (KQuantMatvecKind::Q4K, &q, 4, cols),
-            (KQuantMatvecKind::Q5K, &k, 3, cols),
-            (KQuantMatvecKind::Q6K, &v, 2, cols),
+            (KQuantMatvecKind::Q4K, &q, q_rows, cols),
+            (KQuantMatvecKind::Q5K, &k, k_rows, cols),
+            (KQuantMatvecKind::Q6K, &v, v_rows, cols),
             &inputs,
             &mut out_q,
             &mut out_k,
@@ -6289,13 +6389,13 @@ mod tests {
         let mut out_q_single = Vec::new();
         let mut out_k_pair = Vec::new();
         assert!(matvec_kquant_batch_into(
-            (KQuantMatvecKind::Q4K, &q, 4, cols),
+            (KQuantMatvecKind::Q4K, &q, q_rows, cols),
             &inputs,
             &mut out_q_single,
         ));
         assert!(matvec_kquant2_batch_into(
-            (KQuantMatvecKind::Q4K, &q, 4, cols),
-            (KQuantMatvecKind::Q5K, &k, 3, cols),
+            (KQuantMatvecKind::Q4K, &q, q_rows, cols),
+            (KQuantMatvecKind::Q5K, &k, k_rows, cols),
             &inputs,
             &mut out_q,
             &mut out_k_pair,
