@@ -128,7 +128,11 @@ can quickly spot whether a model uses a native template or the plain fallback.
 - Rust 1.95 or newer. The repository pins `1.95.0` in
   [rust-toolchain.toml](rust-toolchain.toml).
 - A GGUF model file. The runner does not download models.
-- macOS or Linux for native memory-mapped execution.
+- macOS, Linux, or Windows for native memory-mapped execution.
+- On Windows without Visual Studio's C++ Build Tools installed, use the GNU
+  host toolchain instead (`rustup toolchain install 1.95.0-x86_64-pc-windows-gnu`),
+  linked with `rust-lld` so no separate Windows SDK or linker is needed;
+  [make.ps1](make.ps1) detects and applies this automatically.
 - Optional for WebAssembly experiments: `wasm-pack` and the
   `wasm32-unknown-unknown` target.
 - Optional for macOS Metal experiments: Xcode command line tools with `xcrun`,
@@ -167,6 +171,47 @@ make bench MODEL=/path/to/model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
 `make release` uses the default release profile with ThinLTO for faster rebuilds.
 Use `make release-max` only when you explicitly want the slower FatLTO profile
 for final A/B measurements.
+
+### Windows
+
+`make`/bash aren't required on Windows: [make.ps1](make.ps1) is a native
+PowerShell 5.1+ equivalent covering every Makefile target, with the same
+`KEY=value` override style:
+
+```powershell
+.\make.ps1 help
+.\make.ps1 release
+.\make.ps1 release-max
+.\make.ps1 run MODEL=C:\models\model.gguf PROMPT="Explain GGUF in one paragraph"
+.\make.ps1 repl MODEL=C:\models\model.gguf
+.\make.ps1 serve MODEL=C:\models\model.gguf ADDR=127.0.0.1:8080 CHAT=1
+.\make.ps1 bench MODEL=C:\models\model.gguf BENCH_RUNS=5 PROMPT="Explain SIMD briefly"
+```
+
+On a stock Windows install, PowerShell's default execution policy blocks
+running *any* unsigned local `.ps1` file (including this one), failing with
+`... is not digitally signed. You cannot run this script`. Three ways around
+that, in order of convenience:
+
+- Use the bundled [make.cmd](make.cmd) wrapper instead: `.\make.cmd help`.
+  Batch files aren't subject to PowerShell's execution policy at all, so this
+  always works with zero setup, from either `cmd.exe` or PowerShell.
+- Fix it once, for your user only, no admin rights needed:
+  `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`. This
+  keeps requiring downloaded scripts to be signed, but allows scripts you
+  already have locally (like this repo's) to run, so plain `.\make.ps1` works
+  from then on.
+- Run it a single time without changing anything:
+  `powershell -ExecutionPolicy Bypass -File .\make.ps1 <target>`.
+
+It also auto-detects the build environment: if Visual Studio's C++ Build
+Tools aren't installed, it transparently switches to the GNU host toolchain
+with `rust-lld` (installing that toolchain via `rustup` on first use) instead
+of failing with a linker error. `.\make.ps1 bench-models` /
+`.\make.ps1 benchmark-report` sweep local models and refresh
+[BENCHMARK.md](BENCHMARK.md) using [bench_models.ps1](bench_models.ps1), a
+native port of [bench_models.sh](bench_models.sh) that needs no bash,
+python3, or jq (only a `cpu` profile exists here, since Metal is macOS-only).
 
 ## Quick Start
 
@@ -265,9 +310,10 @@ If no model directory is provided, RustyLLM uses:
 1. `RUSTY_LLM_MODEL_DIR`, when set and non-empty.
 2. the default local LM Studio community model cache.
 
-For benchmark automation, `bench_models.sh` and the Makefile's default
-`MODEL_DIR` scan additional common LM Studio, Ollama, GPT4All, Jan, `~/models`,
-and project-local model paths.
+For benchmark automation, `bench_models.sh`/`bench_models.ps1` and the
+Makefile's/`make.ps1`'s default `MODEL_DIR` scan additional common LM Studio,
+Ollama, GPT4All, Jan, `~/models` (or `%USERPROFILE%`/`%LOCALAPPDATA%` on
+Windows), and project-local model paths.
 
 Model selection is intentionally lenient: `--model` can match repository names,
 file names, relative IDs, or GGUF metadata names. If a selector matches multiple

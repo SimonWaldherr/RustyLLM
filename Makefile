@@ -1,5 +1,15 @@
+# Makefile — Unix/Git-Bash workflow wrapper (macOS, Linux, or Git Bash/WSL on
+# Windows). For a native Windows PowerShell equivalent that needs no `make` or
+# bash at all, see make.ps1 (`.\make.ps1 help`).
+MAKEFLAGS += --no-builtin-rules
+
 APP        ?= rusty-llm
 CARGO      ?= cargo
+# `?=` (like plain `=`) is recursively expanded: the $(shell ...) text is
+# stored as-is and only runs when $(MODEL_DIR) is actually textually expanded
+# somewhere. The original Makefile already had this property; what broke it
+# was `_RUN_ARGS :=` below forcing an immediate expansion of $(MODEL_DIR) at
+# parse time for every target, including ones that never use it (see there).
 MODEL_DIR  ?= $(shell FIND_MODEL_DIR_ONLY=1 ./bench_models.sh 2>/dev/null || printf '%s\n' "$(HOME)/.lmstudio/models/lmstudio-community")
 MODEL      ?=
 BENCH_MODEL ?= Ministral-3-3B-Instruct-2512-Q4_K_M.gguf
@@ -33,116 +43,108 @@ CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 _MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
 _BENCH_MODEL := $(or $(MODEL),$(BENCH_MODEL))
 _BENCH_MODEL_ARG := $(if $(_BENCH_MODEL),--model "$(_BENCH_MODEL)",)
-_RUN_ARGS  := --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)"
+# Lazily expanded: only forces MODEL_DIR resolution for targets that actually
+# use it (run/repl/serve/https), not for every make invocation.
+_RUN_ARGS   = --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)"
+_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
+_NATO_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
+_KERNEL_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
 .PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
 
-all: check release
+all: check release ## Run check and release build
 
-build:
+build: ## Build debug binary
 	$(CARGO) build
 
-release:
+release: ## Build optimized native binary with faster ThinLTO
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) build --release
 
-release-max:
+release-max: ## Build slower FatLTO binary for final benchmarking
 	RUSTFLAGS="$(RUSTFLAGS)" $(CARGO) build --profile release-max
 
-run: release
+run: release ## Generate from a one-shot prompt (MODEL=... PROMPT='...')
 	$(BIN) $(_RUN_ARGS)
 
-repl: release
+repl: release ## Start interactive REPL mode (MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --repl
 
-serve: release
+serve: release ## Start HTTP API / optional web UI (MODEL=... CHAT=1)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
-serve-metal: release
+serve-metal: release ## Start server with RUSTY_LLM_METAL=1 (MODEL=...)
 	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
-serve-ultra: release
+serve-ultra: release ## Start Mistral Ultra server with aggressive Metal routing (MODEL=...)
 	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --profile mistral-ultra --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
-https: release
+https: release ## Start HTTPS API with TLS_CERT/TLS_KEY (MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --serve "$(SERVE_ADDR)" --tls-cert "$(TLS_CERT)" --tls-key "$(TLS_KEY)" $(CHAT_FLAG)
 
-find-model-dir:
+find-model-dir: ## Print the auto-detected GGUF model directory
 	@FIND_MODEL_DIR_ONLY=1 ./bench_models.sh
 
-list-models: release
+list-models: release ## List GGUFs in MODEL_DIR
 	$(BIN) --model-dir "$(MODEL_DIR)" --list-models
 
-inspect: release
+inspect: release ## Inspect GGUF metadata and compatibility (MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --inspect
 
-list-tensors: release
+list-tensors: release ## Print tensor inventory (MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --list-tensors
 
-bench: bench-model
+bench: bench-model ## Alias for bench-model (BENCH_MODEL=...)
 
-cargo-bench:
+cargo-bench: ## Run Rust benchmark harness
 	$(CARGO) bench
 
-bench-model: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
-		--profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
-		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
+bench-model: release ## Run CLI generation benchmark JSON with per-run output (BENCH_MODEL=...)
+	$(BIN) --profile "$(PROFILE)" $(_BENCH_COMMON)
 
-bench-model-metal: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
-		--profile "$(PROFILE)" --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
-		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
+bench-model-metal: release ## Run generation benchmark with RUSTY_LLM_METAL=1 (BENCH_MODEL=...)
+	RUSTY_LLM_METAL=1 $(BIN) --profile "$(PROFILE)" $(_BENCH_COMMON)
 
-bench-model-ultra: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
-		--profile mistral-ultra --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
-		--bench --bench-json --bench-runs "$(BENCH_RUNS)"
+bench-model-ultra: release ## Run Mistral Ultra benchmark with aggressive Metal routing (BENCH_MODEL=...)
+	RUSTY_LLM_METAL=1 $(BIN) --profile mistral-ultra $(_BENCH_COMMON)
 
-bench-models: release
+bench-models: release ## Refresh BENCHMARK.md across discovered models
 	BENCH_PROFILES="$(BENCH_PROFILES)" ./bench_models.sh
 
-benchmark-report:
+benchmark-report: ## Rebuild BENCHMARK.md from existing .bench_raw TSV files
 	REPORT_ONLY=1 ./bench_models.sh
 
-synonym-bench: release
+synonym-bench: release ## Run fixed one-word synonym prompt benchmark (BENCH_MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
 		--prompt "$(SYNONYM_PROMPT)" --max-tokens "8" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 
-nato-bench: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
-		--prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" \
-		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
+nato-bench: release ## Run fixed NATO alphabet prompt benchmark (BENCH_MODEL=...)
+	$(BIN) $(_NATO_BENCH_COMMON)
 
-nato-bench-metal: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \
-		--prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" \
-		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
+nato-bench-metal: release ## Run NATO benchmark with RUSTY_LLM_METAL=1 (BENCH_MODEL=...)
+	RUSTY_LLM_METAL=1 $(BIN) $(_NATO_BENCH_COMMON)
 
-kernel-bench: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
-		--profile "$(PROFILE)" --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
+kernel-bench: release ## Run isolated kernel benchmark JSON (MODEL=...)
+	$(BIN) --profile "$(PROFILE)" $(_KERNEL_BENCH_COMMON)
 
-kernel-bench-metal: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
-		--profile "$(PROFILE)" --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
+kernel-bench-metal: release ## Run isolated kernel benchmark with RUSTY_LLM_METAL=1 (MODEL=...)
+	RUSTY_LLM_METAL=1 $(BIN) --profile "$(PROFILE)" $(_KERNEL_BENCH_COMMON)
 
-kernel-bench-ultra: release
-	RUSTY_LLM_METAL=1 $(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
-		--profile mistral-ultra --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
+kernel-bench-ultra: release ## Run isolated Mistral Ultra kernel benchmark (MODEL=...)
+	RUSTY_LLM_METAL=1 $(BIN) --profile mistral-ultra $(_KERNEL_BENCH_COMMON)
 
-fmt:
+fmt: ## Format source with cargo fmt
 	$(CARGO) fmt
 
-test:
+test: ## Run the test suite
 	$(CARGO) test
 
-vet:
+vet: ## Run Clippy with warnings denied
 	$(CARGO) clippy --all-targets -- -D warnings
 
-check: fmt test vet
+check: fmt test vet ## Format, test, and lint
 
-wasm:
+wasm: ## Build stable web wasm package
 	@rustup target list --installed | grep -qx "$(WASM_TARGET)" || rustup target add $(WASM_TARGET)
 	$(CARGO) build --lib --release --target $(WASM_TARGET) --no-default-features --features wasm
 	@if ! command -v $(WASM_BINDGEN) >/dev/null 2>&1 || \
@@ -158,42 +160,14 @@ wasm:
 		printf "Skipping wasm-opt; install binaryen for optional size optimization.\n"; \
 	fi
 
-clean:
+clean: ## Remove build artifacts
 	$(CARGO) clean
 	rm -rf demo/wasm/pkg
 
-help:
+help: ## Show this help
 	@printf "Targets:\n"
-	@printf "  make all                             Run check and release build\n"
-	@printf "  make build                           Build debug binary\n"
-	@printf "  make release                         Build optimized native binary with faster ThinLTO\n"
-	@printf "  make release-max                     Build slower FatLTO binary for final benchmarking\n"
-	@printf "  make run MODEL=... PROMPT='...'      Generate from a one-shot prompt\n"
-	@printf "  make repl MODEL=...                  Start interactive REPL mode\n"
-	@printf "  make serve MODEL=... CHAT=1          Start HTTP API / optional web UI\n"
-	@printf "  make serve-metal MODEL=...           Start server with RUSTY_LLM_METAL=1\n"
-	@printf "  make serve-ultra MODEL=...           Start Mistral Ultra server with aggressive Metal routing\n"
-	@printf "  make https MODEL=...                 Start HTTPS API with TLS_CERT/TLS_KEY\n"
-	@printf "  make find-model-dir                  Print the auto-detected GGUF model directory\n"
-	@printf "  make list-models                     List GGUFs in MODEL_DIR\n"
-	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
-	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
-	@printf "  make bench [BENCH_MODEL=...]         Run generation benchmark with tokens/sec JSON\n"
-	@printf "  make cargo-bench                     Run Rust benchmark harness\n"
-	@printf "  make bench-model [BENCH_MODEL=...]   Run CLI generation benchmark JSON with per-run output\n"
-	@printf "  make bench-model-metal [BENCH_MODEL=...] Run generation benchmark with RUSTY_LLM_METAL=1\n"
-	@printf "  make bench-model-ultra [BENCH_MODEL=...] Run Mistral Ultra benchmark with aggressive Metal routing\n"
-	@printf "  make bench-models                    Refresh BENCHMARK.md across discovered models\n"
-	@printf "  make benchmark-report                Rebuild BENCHMARK.md from existing .bench_raw TSV files\n"
-	@printf "  make synonym-bench [BENCH_MODEL=...] Run fixed one-word synonym prompt benchmark\n"
-	@printf "  make nato-bench [BENCH_MODEL=...]    Run fixed NATO alphabet prompt benchmark\n"
-	@printf "  make nato-bench-metal [BENCH_MODEL=...] Run NATO benchmark with RUSTY_LLM_METAL=1\n"
-	@printf "  make kernel-bench MODEL=...          Run isolated kernel benchmark JSON\n"
-	@printf "  make kernel-bench-metal MODEL=...    Run isolated kernel benchmark with RUSTY_LLM_METAL=1\n"
-	@printf "  make kernel-bench-ultra MODEL=...    Run isolated Mistral Ultra kernel benchmark\n"
-	@printf "  make fmt/test/vet/check              Format, test, lint, or all three\n"
-	@printf "  make wasm                            Build stable web wasm package\n"
-	@printf "  make clean                           Remove build artifacts\n"
+	@awk 'BEGIN {FS = ":[^#]*## "} /^[a-zA-Z0-9_-]+:[^#]*## / { printf "  make %-28s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@printf "\nOn Windows without make/bash, run 'make.ps1 help' in PowerShell instead.\n"
 	@printf "\nVariables:\n"
 	@printf "  MODEL_DIR=%s\n" "$(MODEL_DIR)"
 	@printf "  MODEL=%s\n" "$(MODEL)"

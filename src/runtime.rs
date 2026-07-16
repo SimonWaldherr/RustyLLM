@@ -577,6 +577,8 @@ enum LoadedWeights {
     Standard(ModelWeights),
     GptOss(GptOssWeights),
     Gemma4(crate::model::Gemma4Weights),
+    /// BERT-style encoder (nomic-bert) — embedding-only, no decode path.
+    NomicBert(crate::model::NomicBertWeights),
 }
 
 struct SpeculativeState<'a> {
@@ -657,8 +659,10 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "yi"
             | "arctic"
             | "nomic-bert"
+            | "nomic-bert-moe"
             | "nomic-embed"
             | "text-embedding-nomic-embed-text"
+            | "bert"
     )
 }
 
@@ -667,6 +671,18 @@ pub(crate) fn is_gemma_arch(arch: &str) -> bool {
     matches!(
         arch,
         "gemma" | "gemma2" | "gemma3" | "gemma4" | "gemma4n" | "gemma4-assistant"
+    )
+}
+
+/// Reports whether an architecture uses the nomic-bert / BERT encoder path.
+pub(crate) fn is_nomic_bert_arch(arch: &str) -> bool {
+    matches!(
+        arch,
+        "nomic-bert"
+            | "nomic-bert-moe"
+            | "nomic-embed"
+            | "text-embedding-nomic-embed-text"
+            | "bert"
     )
 }
 
@@ -769,6 +785,10 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
         "gpt-oss" => return,
         _ if is_gemma_arch(arch) => {
             validate_gemma_layout(gguf, &config, report);
+            return;
+        }
+        _ if is_nomic_bert_arch(arch) => {
+            validate_nomic_bert_layout(gguf, &config, report);
             return;
         }
         "deepseek2" | "deepseek-v2" => {
@@ -890,6 +910,69 @@ fn validate_gemma_layout(gguf: &GGUFFile, config: &Config, report: &mut Compatib
     }
 }
 
+/// Validates the tensor layout of a nomic-bert / BERT encoder. Unlike the
+/// decoder path this requires no output head or output_norm; instead it
+/// expects LayerNorm weight+bias pairs and either a fused `attn_qkv` or split
+/// q/k/v. `ffn_gate` is required for the SwiGLU nomic-bert arch and optional
+/// for plain BERT (which uses a GELU FFN).
+fn validate_nomic_bert_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+
+    if config.dim == 0 || config.n_layers == 0 || config.n_heads == 0 {
+        report.unsupported_layouts.push(String::from(
+            "missing required nomic-bert transformer metadata",
+        ));
+        return;
+    }
+
+    for name in [
+        "token_embd.weight",
+        "token_embd_norm.weight",
+        "token_embd_norm.bias",
+    ] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+
+    let arch = gguf.get_str("general.architecture").unwrap_or("nomic-bert");
+    let require_gate = arch == "nomic-bert";
+
+    for layer in 0..config.n_layers {
+        let prefix = format!("blk.{}.", layer);
+        let q = format!("{}attn_q.weight", prefix);
+        let k = format!("{}attn_k.weight", prefix);
+        let v = format!("{}attn_v.weight", prefix);
+        let qkv = format!("{}attn_qkv.weight", prefix);
+        if !(has(&qkv) || (has(&q) && has(&k) && has(&v))) {
+            report.missing_tensors.push(format!(
+                "{}attn_qkv.weight or attn_q/attn_k/attn_v.weight",
+                prefix
+            ));
+        }
+        for suffix in [
+            "attn_output.weight",
+            "attn_output_norm.weight",
+            "attn_output_norm.bias",
+            "ffn_up.weight",
+            "ffn_down.weight",
+            "layer_output_norm.weight",
+            "layer_output_norm.bias",
+        ] {
+            let name = format!("{}{}", prefix, suffix);
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+        if require_gate {
+            let gate = format!("{}ffn_gate.weight", prefix);
+            if !has(&gate) {
+                report.missing_tensors.push(gate);
+            }
+        }
+    }
+}
+
 fn validate_row_count(
     gguf: &GGUFFile,
     name: &str,
@@ -964,6 +1047,10 @@ impl Runner {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
                 (config, LoadedWeights::Gemma4(weights))
             }
+            arch if is_nomic_bert_arch(arch) => {
+                let (config, weights) = model::load_nomic_bert_model(data, &gguf, false);
+                (config, LoadedWeights::NomicBert(weights))
+            }
             // Platzhalter für DeepSeek, weitere Loader können analog ergänzt werden
             _ => {
                 let (config, weights) = model::load_model(data, &gguf, false);
@@ -1037,6 +1124,10 @@ impl Runner {
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::Gemma4(weights))
+            }
+            arch if is_nomic_bert_arch(arch) => {
+                let (config, weights) = model::load_nomic_bert_model(mmap.as_slice(), &gguf, true);
+                (config, LoadedWeights::NomicBert(weights))
             }
             // Platzhalter für DeepSeek, weitere Loader können analog ergänzt werden
             _ => {
@@ -1212,6 +1303,7 @@ impl Runner {
             LoadedWeights::Standard(weights) => &weights.token_embd,
             LoadedWeights::GptOss(weights) => &weights.token_embd,
             LoadedWeights::Gemma4(weights) => &weights.token_embd,
+            LoadedWeights::NomicBert(weights) => &weights.token_embd,
         }
     }
 
@@ -1503,8 +1595,20 @@ impl Runner {
             return options.runtime.backend_policy;
         }
         if self.effective_profile(options) == RuntimeProfile::MistralUltra {
-            BackendPolicy::MetalUltra
-        } else if self.arch == "mistral3" && crate::metal::enabled() {
+            return BackendPolicy::MetalUltra;
+        }
+        // Small Gemma models are dispatch-bound on the per-op Metal path and
+        // measured SLOWER than CPU (gemma-4-E2B 22.0 vs 27.6 t/s, 26B-A4B 19.7
+        // vs 23.8; see BENCHMARK.md), since gemma4 has no resident decoder or
+        // fused FFN. Default them to CPU unless RUSTY_LLM_GEMMA_METAL=1.
+        if is_gemma_arch(&self.arch)
+            && self.config.dim < 3072
+            && crate::metal::enabled()
+            && std::env::var("RUSTY_LLM_GEMMA_METAL").as_deref() != Ok("1")
+        {
+            return BackendPolicy::Cpu;
+        }
+        if self.arch == "mistral3" && crate::metal::enabled() {
             BackendPolicy::Metal
         } else {
             BackendPolicy::Auto
@@ -1594,6 +1698,9 @@ impl Runner {
             }
             LoadedWeights::Gemma4(_) => Err(String::from(
                 "--kernel-bench currently supports standard transformer and gpt-oss MoE weights only.",
+            )),
+            LoadedWeights::NomicBert(_) => Err(String::from(
+                "--kernel-bench does not support nomic-bert encoder weights.",
             )),
         }
     }
@@ -2099,6 +2206,11 @@ impl Runner {
         F: FnMut(&str),
     {
         options.validate()?;
+        if matches!(self.weights, LoadedWeights::NomicBert(_)) {
+            return Err(String::from(
+                "nomic-bert is an encoder-only embedding model; use the embeddings endpoints (/v1/embeddings) instead of text generation.",
+            ));
+        }
         if options.thinking.enabled {
             let prepared_messages = self.apply_thinking_to_messages(messages, options)?;
             let mut generation = options.clone();
@@ -2555,6 +2667,9 @@ impl Runner {
             LoadedWeights::Standard(weights) => {
                 model::forward_into(&self.config, weights, cache, buf, token, pos, logits)
             }
+            LoadedWeights::NomicBert(_) => {
+                unreachable!("nomic-bert is embedding-only; decode is gated before this call")
+            }
         }
     }
 
@@ -2576,6 +2691,9 @@ impl Runner {
             }
             LoadedWeights::Standard(weights) => {
                 model::forward_hidden(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::NomicBert(_) => {
+                unreachable!("nomic-bert uses forward_nomic_bert_hidden, not the decoder path")
             }
         }
     }
@@ -2599,6 +2717,9 @@ impl Runner {
             LoadedWeights::Standard(weights) => {
                 model::forward_prefill(&self.config, weights, cache, buf, token, pos)
             }
+            LoadedWeights::NomicBert(_) => {
+                unreachable!("nomic-bert is embedding-only; prefill is never invoked")
+            }
         }
     }
 
@@ -2613,9 +2734,38 @@ impl Runner {
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
-        let tokens = self.tok.encode(text);
+        let mut tokens = self.tok.encode(text);
         if tokens.is_empty() {
             return Err(String::from("embed: input tokenised to zero tokens"));
+        }
+
+        // nomic-bert / BERT encoders run a dedicated bidirectional forward with
+        // no KV cache; mean-pool over all positions (incl. CLS/SEP), then
+        // L2-normalise — matching llama.cpp's pooling_type=MEAN convention.
+        if let LoadedWeights::NomicBert(weights) = &self.weights {
+            if tokens.len() > self.config.max_seq_len {
+                // Keep the trailing [SEP] when truncating an over-long input.
+                let sep = *tokens.last().expect("non-empty tokens");
+                tokens.truncate(self.config.max_seq_len);
+                if let Some(last) = tokens.last_mut() {
+                    *last = sep;
+                }
+            }
+            let token_count = tokens.len();
+            let dim = self.config.dim;
+            let hs = model::forward_nomic_bert_hidden(&self.config, weights, &tokens);
+            let mut sum = vec![0.0f32; dim];
+            for i in 0..token_count {
+                for j in 0..dim {
+                    sum[j] += hs[i * dim + j];
+                }
+            }
+            mean_pool_in_place(&mut sum, token_count);
+            l2_normalize_in_place(&mut sum);
+            return Ok(EmbeddingResult {
+                embedding: sum,
+                token_count,
+            });
         }
 
         let cache_len = std::cmp::min(self.config.max_seq_len, tokens.len() + 1);
@@ -3115,6 +3265,11 @@ impl Runner {
         F: FnMut(&str),
     {
         options.validate()?;
+        if matches!(self.weights, LoadedWeights::NomicBert(_)) {
+            return Err(String::from(
+                "nomic-bert is an encoder-only embedding model; use the embeddings endpoints (/v1/embeddings) instead of text generation.",
+            ));
+        }
         if options.thinking.enabled {
             let prepared_messages = self.apply_thinking_to_messages(messages, options)?;
             let mut generation = options.clone();

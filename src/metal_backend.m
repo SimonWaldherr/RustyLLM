@@ -87,6 +87,7 @@ static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gResidentAttentionPipeline;
 static id<MTLComputePipelineState> gResidentGroupedAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
+static id<MTLComputePipelineState> gGeluMulPipeline;
 static id<MTLComputePipelineState> gResidualRmsPipeline;
 static id<MTLComputePipelineState> gResidualAddPipeline;
 static id<MTLComputePipelineState> gRopeStorePipeline;

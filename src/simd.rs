@@ -69,6 +69,136 @@ pub fn available_threads() -> usize {
         .max(1)
 }
 
+/// Counts physical processor cores on Windows via
+/// `GetLogicalProcessorInformationEx(RelationProcessorCore)`; each returned
+/// record is one core.
+#[cfg(all(windows, not(target_family = "wasm")))]
+fn physical_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(
+            relationship: u32,
+            buffer: *mut u8,
+            returned_length: *mut u32,
+        ) -> i32;
+    }
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    unsafe {
+        let mut len: u32 = 0;
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+            == 0
+        {
+            return None;
+        }
+        // Walk the variable-size SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
+        // records: u32 Relationship, u32 Size, then a relationship union.
+        let mut count = 0usize;
+        let mut off = 0usize;
+        while off + 8 <= len as usize {
+            let size = u32::from_le_bytes(buf[off + 4..off + 8].try_into().ok()?) as usize;
+            if size == 0 {
+                return None;
+            }
+            count += 1;
+            off += size;
+        }
+        if count > 0 { Some(count) } else { None }
+    }
+}
+
+/// Counts physical cores on Linux from unique `(physical id, core id)` pairs
+/// in `/proc/cpuinfo`; returns `None` when the fields are absent (e.g. ARM).
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+fn physical_cores() -> Option<usize> {
+    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut pairs = std::collections::HashSet::new();
+    let mut phys: Option<u32> = None;
+    let mut core: Option<u32> = None;
+    let mut flush = |phys: &mut Option<u32>,
+                     core: &mut Option<u32>,
+                     pairs: &mut std::collections::HashSet<(u32, u32)>| {
+        if let (Some(p), Some(c)) = (phys.take(), core.take()) {
+            pairs.insert((p, c));
+        }
+    };
+    for line in info.lines() {
+        if line.trim().is_empty() {
+            flush(&mut phys, &mut core, &mut pairs);
+            continue;
+        }
+        let mut split = line.splitn(2, ':');
+        let key = split.next().unwrap_or("").trim();
+        let value = split.next().unwrap_or("").trim();
+        match key {
+            "physical id" => phys = value.parse().ok(),
+            "core id" => core = value.parse().ok(),
+            _ => {}
+        }
+    }
+    flush(&mut phys, &mut core, &mut pairs);
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.len())
+    }
+}
+
+/// Counts physical cores on macOS via `sysctl hw.physicalcpu` (equal to the
+/// logical count on Apple Silicon, lower on hyper-threaded Intel Macs).
+#[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+fn physical_cores() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const std::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let name = c"hw.physicalcpu";
+    let rc = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut i32 as *mut std::ffi::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if rc == 0 && value > 0 {
+        Some(value as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(all(
+    not(windows),
+    not(target_os = "linux"),
+    not(target_os = "macos"),
+    not(target_family = "wasm")
+))]
+fn physical_cores() -> Option<usize> {
+    None
+}
+
+/// Default matvec worker count: one per physical core. The quantized dot
+/// kernels saturate the vector units, so SMT siblings contend rather than
+/// help (measured: Ministral-3B decode 3.64 t/s at 6 threads vs 3.18 at 12 on
+/// a 6C/12T i7-10850H). `--threads` still overrides.
+#[cfg(not(target_family = "wasm"))]
+fn default_worker_threads() -> usize {
+    physical_cores().unwrap_or_else(available_threads).max(1)
+}
+
 #[cfg(target_family = "wasm")]
 /// Returns the operating-system reported parallelism.
 pub fn available_threads() -> usize {
@@ -136,7 +266,7 @@ pub fn num_threads() -> usize {
         #[cfg(not(target_family = "wasm"))]
         {
             static DEFAULT_THREADS: OnceLock<usize> = OnceLock::new();
-            *DEFAULT_THREADS.get_or_init(available_threads)
+            *DEFAULT_THREADS.get_or_init(default_worker_threads)
         }
         #[cfg(target_family = "wasm")]
         {
@@ -537,6 +667,7 @@ fn parallel_matvec(
             kind,
             data,
             x,
+            xq: XQuant::NONE,
             out: out.as_mut_ptr(),
             rows,
             cols,
@@ -546,26 +677,68 @@ fn parallel_matvec(
     }
 }
 
-/// Quantizes the activation vector to int8 for the integer K-quant fast path,
-/// but only for kinds that have an `sdot` kernel (Q4_K / Q6_K). Returns
+/// Reports whether a matvec kind has an integer-dot kernel that consumes the
+/// Q8_K-quantized activation scratch.
+#[inline]
+fn matvec_kind_uses_xq(kind: MatvecKind) -> bool {
+    matches!(
+        kind,
+        MatvecKind::Q4K | MatvecKind::Q5K | MatvecKind::Q6K | MatvecKind::Q4_0 | MatvecKind::Q8_0
+    )
+}
+
+/// Runs `func(ctx, start, end)` over disjoint sub-ranges of `0..len` on the
+/// shared worker pool, blocking until all complete. Lets higher layers
+/// parallelize embarrassingly-parallel loops (e.g. attention over KV heads)
+/// with the same persistent threads used for matvecs.
+///
+/// # Safety
+/// `func` runs on worker threads with the raw `ctx` pointer; the caller must
+/// keep whatever `ctx` points at valid for the duration (this call blocks, so
+/// a stack local is fine) and ensure each `[start, end)` range only touches
+/// disjoint state (no data races across ranges).
+pub unsafe fn parallel_range(len: usize, func: unsafe fn(*const (), usize, usize), ctx: *const ()) {
+    if len == 0 {
+        return;
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        func(ctx, 0, len);
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let workers = num_threads().min(len);
+        worker_pool().run_range(ctx, func, len, workers);
+    }
+}
+
+/// Quantizes the activation vector to int8 for the integer fast path, but only
+/// for kinds that have an integer-dot kernel (K-quants plus Q4_0/Q8_0). Returns
 /// [`XQuant::NONE`] on platforms or CPUs without the fast path so callers
 /// transparently fall back to the f32 kernels.
 #[inline]
 unsafe fn prepare_xq(kind: MatvecKind, x: *const f32, cols: usize) -> XQuant {
-    match kind {
-        MatvecKind::Q4K | MatvecKind::Q6K => prepare_xq_kquant(x, cols),
-        _ => XQuant::NONE,
+    if matvec_kind_uses_xq(kind) {
+        prepare_xq_kquant(x, cols)
+    } else {
+        XQuant::NONE
     }
 }
 
 /// Quantizes the activation vector to the Q8_K layout for any K-quant matvec.
 /// Used by the fused triple/double projections, whose sub-matrices share one
-/// activation vector but may mix Q4_K/Q5_K/Q6_K.
+/// activation vector but may mix Q4_K/Q5_K/Q6_K (or Q4_0/Q8_0).
 #[inline]
 unsafe fn prepare_xq_kquant(x: *const f32, cols: usize) -> XQuant {
     #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
     {
         if cols >= 256 && cols % 256 == 0 && has_dotprod() {
+            return fill_thread_xq_q8k(std::slice::from_raw_parts(x, cols));
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    {
+        if cols >= 256 && cols % 256 == 0 && has_avx2_fma() {
             return fill_thread_xq_q8k(std::slice::from_raw_parts(x, cols));
         }
     }
@@ -594,6 +767,14 @@ unsafe fn dot_row(
         }
         MatvecKind::Q8_0 => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
+            #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q8_0_q8k_neon(row, xq, cols);
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q8_0_q8k_avx2(row, xq, cols);
+            }
             dot_q8_0_f32(row, x, cols)
         }
         MatvecKind::Q8_1 => {
@@ -602,6 +783,14 @@ unsafe fn dot_row(
         }
         MatvecKind::Q4_0 => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
+            #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q4_0_q8k_neon(row, xq, cols);
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q4_0_q8k_avx2(row, xq, cols);
+            }
             dot_q4_0_f32(row, x, cols)
         }
         MatvecKind::Q4_1 => {
@@ -622,10 +811,22 @@ unsafe fn dot_row(
             if xq.present() {
                 return dot_q4_k_q8k_neon(row, xq, cols);
             }
+            #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q4_k_q8k_avx2(row, xq, cols);
+            }
             dot_q4_k_f32(row, x, cols)
         }
         MatvecKind::Q5K => {
             let row = std::slice::from_raw_parts(row_ptr, row_span);
+            #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q5_k_q8k_neon(row, xq, cols);
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q5_k_q8k_avx2(row, xq, cols);
+            }
             dot_q5_k_f32(row, x, cols)
         }
         MatvecKind::Q6K => {
@@ -633,6 +834,10 @@ unsafe fn dot_row(
             #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
             if xq.present() {
                 return dot_q6_k_q8k_neon(row, xq, cols);
+            }
+            #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+            if xq.present() {
+                return dot_q6_k_q8k_avx2(row, xq, cols);
             }
             dot_q6_k_f32(row, x, cols)
         }
@@ -649,6 +854,10 @@ struct MatvecJob {
     kind: MatvecKind,
     data: *const u8,
     x: *const f32,
+    /// Activation quantized once by the publishing thread; workers only read
+    /// it. The pointers stay valid for the job's lifetime because the caller
+    /// blocks in `run_job` until every worker has finished.
+    xq: XQuant,
     out: *mut f32,
     rows: usize,
     cols: usize,
@@ -676,16 +885,16 @@ fn use_dynamic_chunks(work_items: usize, workers: usize) -> bool {
 #[cfg(not(target_family = "wasm"))]
 impl MatvecJob {
     unsafe fn run_static_worker(self, worker_idx: usize) {
-        // Each worker quantizes the shared activation into its own thread-local
-        // scratch once per job, then reuses it across all of its rows.
-        let xq = prepare_xq(self.kind, self.x, self.cols);
+        // The publishing thread quantized the shared activation once into its
+        // own scratch; workers reuse those read-only pointers across all rows.
+        let xq = self.xq;
         let start = self.rows * worker_idx / self.workers;
         let end = self.rows * (worker_idx + 1) / self.workers;
         self.run_rows(start, end, xq);
     }
 
     unsafe fn run_dynamic_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
-        let xq = prepare_xq(self.kind, self.x, self.cols);
+        let xq = self.xq;
         let chunks = matvec_chunk_count(self.rows);
         let mut chunk_idx = worker_idx;
 
@@ -730,6 +939,9 @@ struct Q4KMatvec3Job {
     b_data: *const u8,
     c_data: *const u8,
     x: *const f32,
+    /// Shared activation quantized once by the publishing thread (see
+    /// [`MatvecJob::xq`]).
+    xq: XQuant,
     out_a: *mut f32,
     out_b: *mut f32,
     out_c: *mut f32,
@@ -757,9 +969,9 @@ impl Q4KMatvec3Job {
     }
 
     unsafe fn run_static_worker(self, worker_idx: usize) {
-        // All three projections share the same activation vector, so quantize
-        // it once into this worker's scratch and reuse it across a/b/c rows.
-        let xq = prepare_xq_kquant(self.x, self.cols);
+        // All three projections share one activation vector that the
+        // publishing thread quantized once; workers reuse it across a/b/c rows.
+        let xq = self.xq;
         let total = self.work_items();
         let start = total * worker_idx / self.workers;
         let end = total * (worker_idx + 1) / self.workers;
@@ -767,7 +979,7 @@ impl Q4KMatvec3Job {
     }
 
     unsafe fn run_dynamic_worker(self, worker_idx: usize, current_chunk: &AtomicUsize) {
-        let xq = prepare_xq_kquant(self.x, self.cols);
+        let xq = self.xq;
         let total = self.work_items();
         let chunks = matvec_chunk_count(total);
         let mut chunk_idx = worker_idx;
@@ -865,11 +1077,43 @@ unsafe fn q4k_matvec3_rows(
     }
 }
 
+/// Generic "run a closure over disjoint sub-ranges of `0..len`" job. The
+/// callback is a C-style trampoline (`ctx`, `start`, `end`) so higher layers
+/// (e.g. attention in `model.rs`) can drive the worker pool without the pool
+/// depending on them. Each worker gets a contiguous, non-overlapping range, so
+/// the callback must only touch state disjoint per range.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct RangeJob {
+    ctx: *const (),
+    func: unsafe fn(*const (), usize, usize),
+    len: usize,
+    workers: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Send for RangeJob {}
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Sync for RangeJob {}
+
+#[cfg(not(target_family = "wasm"))]
+impl RangeJob {
+    unsafe fn run_worker(self, worker_idx: usize, _current_chunk: &AtomicUsize) {
+        // Static even split of 0..len; workers that map to an empty range skip.
+        let start = self.len * worker_idx / self.workers;
+        let end = self.len * (worker_idx + 1) / self.workers;
+        if end > start {
+            (self.func)(self.ctx, start, end);
+        }
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 enum WorkerJob {
     Matvec(MatvecJob),
     Q4KMatvec3(Q4KMatvec3Job),
+    Range(RangeJob),
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -880,6 +1124,7 @@ impl WorkerJob {
         match self {
             WorkerJob::Matvec(job) => job.workers,
             WorkerJob::Q4KMatvec3(job) => job.workers,
+            WorkerJob::Range(job) => job.workers,
         }
     }
 
@@ -888,6 +1133,7 @@ impl WorkerJob {
         match self {
             WorkerJob::Matvec(job) => job.run_worker(worker_idx, current_chunk),
             WorkerJob::Q4KMatvec3(job) => job.run_worker(worker_idx, current_chunk),
+            WorkerJob::Range(job) => job.run_worker(worker_idx, current_chunk),
         }
     }
 }
@@ -937,13 +1183,22 @@ impl WorkerPool {
 
     /// Executes a queued worker-pool job and waits for completion.
     fn run(&self, mut job: MatvecJob) {
+        // Quantize the activation once on this thread; the scratch stays valid
+        // until this thread's next job, which starts only after this one ends.
+        job.xq = unsafe { prepare_xq(job.kind, job.x, job.cols) };
         job.workers = job.workers.min(self.max_workers).min(job.rows).max(1);
         if job.workers <= 1 || job.rows < job.workers * 8 {
-            let xq = unsafe { prepare_xq(job.kind, job.x, job.cols) };
             for row in 0..job.rows {
                 unsafe {
-                    *job.out.add(row) =
-                        dot_row(job.kind, job.data, job.x, xq, row, job.cols, job.row_span);
+                    *job.out.add(row) = dot_row(
+                        job.kind,
+                        job.data,
+                        job.x,
+                        job.xq,
+                        row,
+                        job.cols,
+                        job.row_span,
+                    );
                 }
             }
             return;
@@ -954,6 +1209,16 @@ impl WorkerPool {
 
     /// Executes a fused Q4_K triple-matvec job and waits for completion.
     fn run_q4k_matvec3(&self, mut job: Q4KMatvec3Job) {
+        // One shared activation for all three projections: quantize it once on
+        // this thread, and only when a sub-matrix kind actually consumes it.
+        let wants_xq = matvec_kind_uses_xq(job.kind_a)
+            || matvec_kind_uses_xq(job.kind_b)
+            || matvec_kind_uses_xq(job.kind_c);
+        job.xq = if wants_xq {
+            unsafe { prepare_xq_kquant(job.x, job.cols) }
+        } else {
+            XQuant::NONE
+        };
         let rows = job.work_items();
         job.workers = job.workers.min(self.max_workers).min(rows).max(1);
         if job.workers <= 1 || rows < job.workers * 8 {
@@ -965,6 +1230,33 @@ impl WorkerPool {
         }
 
         self.run_job(WorkerJob::Q4KMatvec3(job), job.workers);
+    }
+
+    /// Runs `func` over disjoint sub-ranges of `0..len` across the pool and
+    /// blocks until every range completes.
+    fn run_range(
+        &self,
+        ctx: *const (),
+        func: unsafe fn(*const (), usize, usize),
+        len: usize,
+        workers: usize,
+    ) {
+        let workers = workers.min(self.max_workers).min(len).max(1);
+        if workers <= 1 {
+            unsafe {
+                func(ctx, 0, len);
+            }
+            return;
+        }
+        self.run_job(
+            WorkerJob::Range(RangeJob {
+                ctx,
+                func,
+                len,
+                workers,
+            }),
+            workers,
+        );
     }
 
     /// Publishes a worker job and waits for all selected workers to finish it.
@@ -1741,6 +2033,7 @@ pub fn matvec_q4_k3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -1832,6 +2125,7 @@ pub fn matvec_q4_k2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
@@ -1966,6 +2260,7 @@ pub fn matvec_kquant3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -2090,6 +2385,7 @@ pub fn matvec_quant3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -2188,6 +2484,7 @@ pub fn matvec_quant2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
@@ -2298,6 +2595,7 @@ fn matvec_k2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
+            xq: XQuant::NONE,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
@@ -3232,7 +3530,10 @@ fn has_dotprod() -> bool {
 /// Per-thread scratch holding one activation vector quantized to Q8_K: `qs`
 /// int8 quants, one `d` scale per 256-element super-block, and one signed group
 /// sum per 32 elements (used for the Q4_K/Q5_K `dmin` term).
-#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(target_family = "wasm")
+))]
 #[derive(Default)]
 struct XqBuf {
     qs: Vec<i8>,
@@ -3240,7 +3541,10 @@ struct XqBuf {
     bsums: Vec<i16>,
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(target_family = "wasm")
+))]
 thread_local! {
     static XQ_SCRATCH: std::cell::RefCell<XqBuf> = std::cell::RefCell::new(XqBuf::default());
 }
@@ -3249,7 +3553,10 @@ thread_local! {
 /// returns borrowing pointers. The buffer lives for the thread's lifetime, so
 /// the pointers stay valid until this thread quantizes another vector — which
 /// only happens on its next job, after the current one has fully finished.
-#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(target_family = "wasm")
+))]
 #[inline]
 unsafe fn fill_thread_xq_q8k(x: &[f32]) -> XQuant {
     XQ_SCRATCH.with(|cell| {
@@ -3263,12 +3570,13 @@ unsafe fn fill_thread_xq_q8k(x: &[f32]) -> XQuant {
     })
 }
 
-/// Quantizes one activation row to Q8_K (symmetric, 127-level, per-256 scale).
-#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+/// Resizes the Q8_K scratch for an `n`-element activation (`n % 256 == 0`).
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(target_family = "wasm")
+))]
 #[inline]
-unsafe fn quantize_row_q8k(x: &[f32], buf: &mut XqBuf) {
-    use std::arch::aarch64::*;
-    let n = x.len();
+fn resize_xq_buf(buf: &mut XqBuf, n: usize) {
     let nb = n / 256;
     if buf.qs.len() != n {
         buf.qs.resize(n, 0);
@@ -3279,6 +3587,114 @@ unsafe fn quantize_row_q8k(x: &[f32], buf: &mut XqBuf) {
     if buf.bsums.len() != nb * 8 {
         buf.bsums.resize(nb * 8, 0);
     }
+}
+
+/// Quantizes one activation row to Q8_K (symmetric, 127-level, per-256 scale).
+/// Portable reference used by tests and as the non-AVX2 x86 fallback; rounding
+/// (ties-to-even) matches the NEON `vcvtnq` and AVX2 `cvtps` paths exactly.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(target_family = "wasm")
+))]
+#[allow(dead_code)]
+fn quantize_row_q8k_scalar(x: &[f32], buf: &mut XqBuf) {
+    let n = x.len();
+    let nb = n / 256;
+    resize_xq_buf(buf, n);
+    for b in 0..nb {
+        let xb = &x[b * 256..(b + 1) * 256];
+        let amax = xb.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        buf.d[b] = amax * (1.0 / 127.0);
+        let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        for sub in 0..8 {
+            let mut sum = 0i32;
+            for l in 0..32 {
+                let q = (xb[sub * 32 + l] * id).round_ties_even() as i32;
+                let q = q.clamp(-128, 127) as i8;
+                buf.qs[b * 256 + sub * 32 + l] = q;
+                sum += q as i32;
+            }
+            buf.bsums[b * 8 + sub] = sum as i16;
+        }
+    }
+}
+
+/// Quantizes one activation row to Q8_K (symmetric, 127-level, per-256 scale).
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[inline]
+unsafe fn quantize_row_q8k(x: &[f32], buf: &mut XqBuf) {
+    if has_avx2_fma() {
+        quantize_row_q8k_avx2(x, buf);
+    } else {
+        quantize_row_q8k_scalar(x, buf);
+    }
+}
+
+/// AVX2 Q8_K activation quantizer: per-256 abs-max scale, round-to-nearest-even
+/// int8 quants, and one signed sum per 32-element group.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn quantize_row_q8k_avx2(x: &[f32], buf: &mut XqBuf) {
+    use std::arch::x86_64::*;
+    let n = x.len();
+    let nb = n / 256;
+    resize_xq_buf(buf, n);
+    let xp = x.as_ptr();
+    let qp = buf.qs.as_mut_ptr();
+    let sign_mask = _mm256_set1_ps(-0.0);
+    let perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    for b in 0..nb {
+        let xb = xp.add(b * 256);
+        let mut amax_v = _mm256_setzero_ps();
+        for i in 0..32 {
+            let v = _mm256_loadu_ps(xb.add(i * 8));
+            amax_v = _mm256_max_ps(amax_v, _mm256_andnot_ps(sign_mask, v));
+        }
+        let hi = _mm256_extractf128_ps(amax_v, 1);
+        let m4 = _mm_max_ps(_mm256_castps256_ps128(amax_v), hi);
+        let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+        let m1 = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 0x55));
+        let amax = _mm_cvtss_f32(m1);
+
+        buf.d[b] = amax * (1.0 / 127.0);
+        let id = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let idv = _mm256_set1_ps(id);
+
+        let qb = qp.add(b * 256);
+        let bbase = b * 8;
+        for sub in 0..8 {
+            let off = sub * 32;
+            // Default MXCSR rounding is nearest-even, matching NEON vcvtnq.
+            let i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb.add(off)), idv));
+            let i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb.add(off + 8)), idv));
+            let i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb.add(off + 16)), idv));
+            let i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xb.add(off + 24)), idv));
+
+            let sum_v = _mm256_add_epi32(_mm256_add_epi32(i0, i1), _mm256_add_epi32(i2, i3));
+            let sum_hi = _mm256_extracti128_si256(sum_v, 1);
+            let s4 = _mm_add_epi32(_mm256_castsi256_si128(sum_v), sum_hi);
+            let s2 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
+            let s1 = _mm_add_epi32(s2, _mm_shuffle_epi32(s2, 0x55));
+            buf.bsums[bbase + sub] = _mm_cvtsi128_si32(s1) as i16;
+
+            let p01 = _mm256_packs_epi32(i0, i1);
+            let p23 = _mm256_packs_epi32(i2, i3);
+            let packed = _mm256_packs_epi16(p01, p23);
+            let ordered = _mm256_permutevar8x32_epi32(packed, perm);
+            _mm256_storeu_si256(qb.add(off) as *mut __m256i, ordered);
+        }
+    }
+}
+
+/// Quantizes one activation row to Q8_K (symmetric, 127-level, per-256 scale).
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[inline]
+unsafe fn quantize_row_q8k(x: &[f32], buf: &mut XqBuf) {
+    use std::arch::aarch64::*;
+    let n = x.len();
+    let nb = n / 256;
+    resize_xq_buf(buf, n);
     let xp = x.as_ptr();
     let qp = buf.qs.as_mut_ptr();
 
@@ -3466,6 +3882,166 @@ unsafe fn dot_q6_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             grp_x_base += 128;
         }
         acc += d * dx * isum as f32;
+    }
+    acc
+}
+
+/// Q5_K · Q8_K integer dot product. Mirrors `dot_q5_k_f32_scalar`, keeping the
+/// inner products in int32 via `sdot`; the `dmin` term folds through the
+/// pre-computed per-32 activation group sums like the Q4_K kernel.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q5_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::aarch64::*;
+    let nb = n / 256;
+    let mask = vdupq_n_u8(0x0F);
+    let hbit = vdupq_n_u8(0x10);
+    let mut acc = 0.0f32;
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 176);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q5_k scales size");
+        let qh0 = vld1q_u8(block.add(16));
+        let qh1 = vld1q_u8(block.add(32));
+        let q = block.add(48);
+        let dx = *xq.d.add(b);
+        let xqb = xq.qs.add(b * 256);
+        let bsb = xq.bsums.add(b * 8);
+
+        let mut isum = 0i32;
+        let mut imin = 0i32;
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let u1 = vdupq_n_u8(1u8 << (2 * c));
+            let u2 = vdupq_n_u8(2u8 << (2 * c));
+
+            // 32 nibble-bytes: low nibbles → sub-block A, high nibbles → B;
+            // qh byte l supplies bit 4 for elements A[l] (mask u1) and B[l]
+            // (mask u2). Values stay in 0..=31, safely positive as i8.
+            let n0 = vld1q_u8(q.add(c * 32));
+            let n1 = vld1q_u8(q.add(c * 32 + 16));
+            let a0 = vorrq_u8(vandq_u8(n0, mask), vandq_u8(vtstq_u8(qh0, u1), hbit));
+            let a1 = vorrq_u8(vandq_u8(n1, mask), vandq_u8(vtstq_u8(qh1, u1), hbit));
+            let b0 = vorrq_u8(vshrq_n_u8(n0, 4), vandq_u8(vtstq_u8(qh0, u2), hbit));
+            let b1 = vorrq_u8(vshrq_n_u8(n1, 4), vandq_u8(vtstq_u8(qh1, u2), hbit));
+
+            let xa0 = vld1q_s8(xqb.add(c * 64));
+            let xa1 = vld1q_s8(xqb.add(c * 64 + 16));
+            let xb0 = vld1q_s8(xqb.add(c * 64 + 32));
+            let xb1 = vld1q_s8(xqb.add(c * 64 + 48));
+
+            let qa = vaddvq_s32(sdot(
+                sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(a0), xa0),
+                vreinterpretq_s8_u8(a1),
+                xa1,
+            ));
+            let qb = vaddvq_s32(sdot(
+                sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(b0), xb0),
+                vreinterpretq_s8_u8(b1),
+                xb1,
+            ));
+
+            isum += sc1 as i32 * qa + sc2 as i32 * qb;
+            imin += m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+        }
+        acc += dx * (d * isum as f32 - dmin * imin as f32);
+    }
+    acc
+}
+
+/// Q4_0 · Q8_K integer dot product: the `-8` nibble bias is folded into the
+/// signed weights, so each 32-weight block is exactly two `sdot` instructions.
+/// Eight Q4_0 blocks share one Q8_K activation super-block scale.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q4_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::aarch64::*;
+    let n_super = n / 256;
+    let mask = vdupq_n_u8(0x0F);
+    let eight = vdupq_n_u8(8);
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_super {
+        let dx = *xq.d.add(sb);
+        let xqb = xq.qs.add(sb * 256);
+        let base = qdata.as_ptr().add(sb * 8 * 18);
+        let mut inner0 = 0.0f32;
+        let mut inner1 = 0.0f32;
+        for pair in 0..4usize {
+            let blk = pair * 2;
+            let block0 = base.add(blk * 18);
+            let block1 = base.add((blk + 1) * 18);
+            let d0 = f16_to_f32(u16::from_le_bytes([*block0, *block0.add(1)]));
+            let d1 = f16_to_f32(u16::from_le_bytes([*block1, *block1.add(1)]));
+
+            // lo nibble of byte i → weight[i], hi nibble → weight[i+16]; the
+            // u8 subtract wraps to the same bit pattern as a signed subtract.
+            let nib0 = vld1q_u8(block0.add(2));
+            let a0 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(nib0, mask), eight));
+            let b0 = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(nib0, 4), eight));
+            let nib1 = vld1q_u8(block1.add(2));
+            let a1 = vreinterpretq_s8_u8(vsubq_u8(vandq_u8(nib1, mask), eight));
+            let b1 = vreinterpretq_s8_u8(vsubq_u8(vshrq_n_u8(nib1, 4), eight));
+
+            let x0 = vld1q_s8(xqb.add(blk * 32));
+            let x1 = vld1q_s8(xqb.add(blk * 32 + 16));
+            let x2 = vld1q_s8(xqb.add(blk * 32 + 32));
+            let x3 = vld1q_s8(xqb.add(blk * 32 + 48));
+
+            let s0 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), a0, x0), b0, x1));
+            let s1 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), a1, x2), b1, x3));
+            inner0 += d0 * s0 as f32;
+            inner1 += d1 * s1 as f32;
+        }
+        acc += dx * (inner0 + inner1);
+    }
+    acc
+}
+
+/// Q8_0 · Q8_K integer dot product: two `sdot` instructions per 32-weight
+/// block; eight Q8_0 blocks share one Q8_K activation super-block scale.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q8_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::aarch64::*;
+    let n_super = n / 256;
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_super {
+        let dx = *xq.d.add(sb);
+        let xqb = xq.qs.add(sb * 256);
+        let base = qdata.as_ptr().add(sb * 8 * 34);
+        let mut inner0 = 0.0f32;
+        let mut inner1 = 0.0f32;
+        for pair in 0..4usize {
+            let blk = pair * 2;
+            let block0 = base.add(blk * 34);
+            let block1 = base.add((blk + 1) * 34);
+            let d0 = f16_to_f32(u16::from_le_bytes([*block0, *block0.add(1)]));
+            let d1 = f16_to_f32(u16::from_le_bytes([*block1, *block1.add(1)]));
+
+            let w0 = vld1q_s8(block0.add(2) as *const i8);
+            let w1 = vld1q_s8(block0.add(18) as *const i8);
+            let w2 = vld1q_s8(block1.add(2) as *const i8);
+            let w3 = vld1q_s8(block1.add(18) as *const i8);
+
+            let x0 = vld1q_s8(xqb.add(blk * 32));
+            let x1 = vld1q_s8(xqb.add(blk * 32 + 16));
+            let x2 = vld1q_s8(xqb.add(blk * 32 + 32));
+            let x3 = vld1q_s8(xqb.add(blk * 32 + 48));
+
+            let s0 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), w0, x0), w1, x1));
+            let s1 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), w2, x2), w3, x3));
+            inner0 += d0 * s0 as f32;
+            inner1 += d1 * s1 as f32;
+        }
+        acc += dx * (inner0 + inner1);
     }
     acc
 }
@@ -4019,6 +4595,261 @@ unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
         process8!(_mm_srli_si128(hi, 8), 24); // weights 24..32 · x[24..32]
     }
     hsum_avx(acc)
+}
+
+/// Horizontal sum of the eight int32 lanes of an AVX2 register.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let hi = _mm256_extracti128_si256(v, 1);
+    let s = _mm_add_epi32(_mm256_castsi256_si128(v), hi);
+    let s = _mm_add_epi32(s, _mm_unpackhi_epi64(s, s));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x55));
+    _mm_cvtsi128_si32(s)
+}
+
+/// Q4_K · Q8_K integer dot product on AVX2: unsigned 4-bit weights are
+/// multiplied against the int8 activation via `maddubs`, per-32 scales fold in
+/// through `madd`, and the `dmin` term uses the pre-computed group sums —
+/// mirroring `dot_q4_k_q8k_neon`.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_k_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let mut acc = 0.0f32;
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 144);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q4_k scales size");
+        let q = block.add(16);
+        let dx = *xq.d.add(b);
+        let xqb = xq.qs.add(b * 256);
+        let bsb = xq.bsums.add(b * 8);
+
+        let mut isum_v = _mm256_setzero_si256();
+        let mut imin = 0i32;
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+
+            let raw = _mm256_loadu_si256(q.add(c * 32) as *const __m256i);
+            let lo = _mm256_and_si256(raw, lowmask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(raw, 4), lowmask);
+            let x_lo = _mm256_loadu_si256(xqb.add(c * 64) as *const __m256i);
+            let x_hi = _mm256_loadu_si256(xqb.add(c * 64 + 32) as *const __m256i);
+
+            let p_lo = _mm256_maddubs_epi16(lo, x_lo);
+            let p_hi = _mm256_maddubs_epi16(hi, x_hi);
+            isum_v = _mm256_add_epi32(
+                isum_v,
+                _mm256_madd_epi16(p_lo, _mm256_set1_epi16(sc1 as i16)),
+            );
+            isum_v = _mm256_add_epi32(
+                isum_v,
+                _mm256_madd_epi16(p_hi, _mm256_set1_epi16(sc2 as i16)),
+            );
+            imin += m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+        }
+        let isum = hsum_i32_avx2(isum_v);
+        acc += dx * (d * isum as f32 - dmin * imin as f32);
+    }
+    acc
+}
+
+/// Q5_K · Q8_K integer dot product on AVX2: like the Q4_K kernel with the
+/// fifth weight bit OR'd in from the `qh` plane before `maddubs`.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q5_k_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let hbit = _mm256_set1_epi8(0x10);
+    let mut acc = 0.0f32;
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 176);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q5_k scales size");
+        let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+        let q = block.add(48);
+        let dx = *xq.d.add(b);
+        let xqb = xq.qs.add(b * 256);
+        let bsb = xq.bsums.add(b * 8);
+
+        let mut isum_v = _mm256_setzero_si256();
+        let mut imin = 0i32;
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let u1 = _mm256_set1_epi8((1u8 << (2 * c)) as i8);
+            let u2 = _mm256_set1_epi8((2u8 << (2 * c)) as i8);
+
+            let raw = _mm256_loadu_si256(q.add(c * 32) as *const __m256i);
+            let hi1 = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, u1), u1), hbit);
+            let hi2 = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, u2), u2), hbit);
+            let lo = _mm256_or_si256(_mm256_and_si256(raw, lowmask), hi1);
+            let hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(raw, 4), lowmask), hi2);
+            let x_lo = _mm256_loadu_si256(xqb.add(c * 64) as *const __m256i);
+            let x_hi = _mm256_loadu_si256(xqb.add(c * 64 + 32) as *const __m256i);
+
+            let p_lo = _mm256_maddubs_epi16(lo, x_lo);
+            let p_hi = _mm256_maddubs_epi16(hi, x_hi);
+            isum_v = _mm256_add_epi32(
+                isum_v,
+                _mm256_madd_epi16(p_lo, _mm256_set1_epi16(sc1 as i16)),
+            );
+            isum_v = _mm256_add_epi32(
+                isum_v,
+                _mm256_madd_epi16(p_hi, _mm256_set1_epi16(sc2 as i16)),
+            );
+            imin += m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+        }
+        let isum = hsum_i32_avx2(isum_v);
+        acc += dx * (d * isum as f32 - dmin * imin as f32);
+    }
+    acc
+}
+
+/// Q6_K · Q8_K integer dot product on AVX2. The `-32` bias is folded into the
+/// signed weights, then `abs`/`sign` re-expresses the signed×signed product in
+/// `maddubs` form; per-16 int8 scales fold in through `madd`.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q6_k_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let m3 = _mm256_set1_epi8(0x03);
+    let sub32 = _mm256_set1_epi8(32);
+    let mut acc = 0.0f32;
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 210);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+        let dx = *xq.d.add(b);
+        let xqb = xq.qs.add(b * 256);
+        let sc_base = block.add(192) as *const i8;
+
+        let mut isum_v = _mm256_setzero_si256();
+        for g in 0..2usize {
+            let ql0 = _mm256_loadu_si256(block.add(g * 64) as *const __m256i);
+            let ql1 = _mm256_loadu_si256(block.add(g * 64 + 32) as *const __m256i);
+            let qhv = _mm256_loadu_si256(block.add(128 + g * 32) as *const __m256i);
+            let scs = sc_base.add(g * 8);
+            let x_base = g * 128;
+
+            // Reassemble the four 32-element sub-vectors exactly like the NEON
+            // kernel: x offsets base+0/32/64/96, high bits from 2-bit planes.
+            let q0 = _mm256_or_si256(
+                _mm256_and_si256(ql0, lowmask),
+                _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4),
+            );
+            let q1 = _mm256_or_si256(
+                _mm256_and_si256(ql1, lowmask),
+                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), m3), 4),
+            );
+            let q2 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql0, 4), lowmask),
+                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), m3), 4),
+            );
+            let q3 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(ql1, 4), lowmask),
+                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), m3), 4),
+            );
+
+            for (idx, qv) in [q0, q1, q2, q3].into_iter().enumerate() {
+                let qs = _mm256_sub_epi8(qv, sub32);
+                let xv = _mm256_loadu_si256(xqb.add(x_base + idx * 32) as *const __m256i);
+                let p = _mm256_maddubs_epi16(_mm256_abs_epi8(qs), _mm256_sign_epi8(xv, qs));
+                let sc_a = *scs.add(idx * 2) as i16;
+                let sc_b = *scs.add(idx * 2 + 1) as i16;
+                let sc_v = _mm256_set_m128i(_mm_set1_epi16(sc_b), _mm_set1_epi16(sc_a));
+                isum_v = _mm256_add_epi32(isum_v, _mm256_madd_epi16(p, sc_v));
+            }
+        }
+        acc += dx * d * hsum_i32_avx2(isum_v) as f32;
+    }
+    acc
+}
+
+/// Q4_0 · Q8_K integer dot product on AVX2: `-8` folds into signed weights and
+/// the signed×signed product runs through the `abs`/`sign` `maddubs` form.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_0_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let n_super = n / 256;
+    let lowmask = _mm_set1_epi8(0x0F);
+    let eight = _mm256_set1_epi8(8);
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_super {
+        let dx = *xq.d.add(sb);
+        let xqb = xq.qs.add(sb * 256);
+        let base = qdata.as_ptr().add(sb * 8 * 18);
+        let mut inner = 0.0f32;
+        for blk in 0..8usize {
+            let block = base.add(blk * 18);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+
+            // lo nibble of byte i → weight[i], hi nibble → weight[i+16].
+            let nib = _mm_loadu_si128(block.add(2) as *const __m128i);
+            let lo = _mm_and_si128(nib, lowmask);
+            let hi = _mm_and_si128(_mm_srli_epi16(nib, 4), lowmask);
+            let q = _mm256_sub_epi8(_mm256_set_m128i(hi, lo), eight);
+
+            let xv = _mm256_loadu_si256(xqb.add(blk * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(q), _mm256_sign_epi8(xv, q));
+            let s = _mm256_madd_epi16(p, ones);
+            inner += d * hsum_i32_avx2(s) as f32;
+        }
+        acc += dx * inner;
+    }
+    acc
+}
+
+/// Q8_0 · Q8_K integer dot product on AVX2 via the `abs`/`sign` `maddubs` form.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q8_0_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let n_super = n / 256;
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = 0.0f32;
+
+    for sb in 0..n_super {
+        let dx = *xq.d.add(sb);
+        let xqb = xq.qs.add(sb * 256);
+        let base = qdata.as_ptr().add(sb * 8 * 34);
+        let mut inner = 0.0f32;
+        for blk in 0..8usize {
+            let block = base.add(blk * 34);
+            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+
+            let w = _mm256_loadu_si256(block.add(2) as *const __m256i);
+            let xv = _mm256_loadu_si256(xqb.add(blk * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(xv, w));
+            let s = _mm256_madd_epi16(p, ones);
+            inner += d * hsum_i32_avx2(s) as f32;
+        }
+        acc += dx * inner;
+    }
+    acc
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -4645,7 +5476,10 @@ mod tests {
 
     /// Like `make_q4k_weights` but with a non-zero `dmin` so the `bsums`-based
     /// min term of the integer Q4_K kernel is actually exercised.
-    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
     fn make_q4k_weights_dmin(rows: usize, cols: usize, seed: u8) -> Vec<u8> {
         let row_bytes = (cols / 256) * 144;
         let mut data = vec![0u8; rows * row_bytes];
@@ -4851,6 +5685,429 @@ mod tests {
             assert!(
                 (*actual - *expected).abs() <= tolerance,
                 "value[{idx}] actual {actual} expected {expected} tolerance {tolerance}"
+            );
+        }
+    }
+
+    // ─── Int8 (Q8_K activation) fast-path parity tests ──────────────────────
+
+    /// Exact f16 bit patterns so synthetic scales survive the round trip.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    const F16_SCALES: [u16; 6] = [0x3C00, 0x3800, 0x3400, 0x3E00, 0x4000, 0xB800];
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn build_xq(x: &[f32], buf: &mut XqBuf) -> XQuant {
+        unsafe { quantize_row_q8k(x, buf) };
+        XQuant {
+            qs: buf.qs.as_ptr(),
+            d: buf.d.as_ptr(),
+            bsums: buf.bsums.as_ptr(),
+        }
+    }
+
+    /// Builds one Q4_0 row with per-block varying scales and nibble data.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn make_q4_0_row_scaled(cols: usize, seed: u8) -> Vec<u8> {
+        let blocks = cols / 32;
+        let mut data = vec![0u8; blocks * 18];
+        for b in 0..blocks {
+            let base = b * 18;
+            let scale = F16_SCALES[(b + seed as usize) % F16_SCALES.len()];
+            data[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+            for i in 0..16 {
+                data[base + 2 + i] = seed.wrapping_add((b * 11 + i * 5) as u8);
+            }
+        }
+        data
+    }
+
+    /// Builds one Q8_0 row with per-block varying scales and int8 data.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn make_q8_0_row_scaled(cols: usize, seed: u8) -> Vec<u8> {
+        let blocks = cols / 32;
+        let mut data = vec![0u8; blocks * 34];
+        for b in 0..blocks {
+            let base = b * 34;
+            let scale = F16_SCALES[(b + seed as usize) % F16_SCALES.len()];
+            data[base..base + 2].copy_from_slice(&scale.to_le_bytes());
+            for i in 0..32 {
+                data[base + 2 + i] = seed.wrapping_add((b * 13 + i * 7) as u8);
+            }
+        }
+        data
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn test_activation(cols: usize) -> Vec<f32> {
+        (0..cols)
+            .map(|i| ((i as f32 * 0.017).sin() * 0.45) - ((i % 7) as f32 * 0.021))
+            .collect()
+    }
+
+    /// The SIMD Q8_K activation quantizer must match the scalar reference
+    /// exactly (same rounding mode, same group sums).
+    #[test]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn q8k_quantizer_simd_matches_scalar() {
+        for cols in [256usize, 512, 1024] {
+            let x = test_activation(cols);
+            let mut simd_buf = XqBuf::default();
+            unsafe { quantize_row_q8k(&x, &mut simd_buf) };
+            let mut scalar_buf = XqBuf::default();
+            quantize_row_q8k_scalar(&x, &mut scalar_buf);
+            assert_eq!(simd_buf.qs, scalar_buf.qs, "qs mismatch at cols={cols}");
+            assert_eq!(simd_buf.d, scalar_buf.d, "d mismatch at cols={cols}");
+            assert_eq!(
+                simd_buf.bsums, scalar_buf.bsums,
+                "bsums mismatch at cols={cols}"
+            );
+        }
+    }
+
+    // Scalar emulations of the int8-path math. Each mirrors the SIMD kernel's
+    // integer accumulation exactly (same isum/imin formula, same per-block f32
+    // combining), so SIMD kernels must agree to within accumulation-order
+    // noise — a much tighter check than the f32 dequant reference, whose gap
+    // to the int8 path is legitimate activation-quantization error.
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn emulate_q4_k_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for b in 0..cols / 256 {
+            let block = &w[b * 144..(b + 1) * 144];
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+            let q = &block[16..144];
+            let dx = buf.d[b];
+            let xq = &buf.qs[b * 256..(b + 1) * 256];
+            let bs = &buf.bsums[b * 8..(b + 1) * 8];
+            let mut isum = 0i32;
+            let mut imin = 0i32;
+            for c in 0..4usize {
+                let is = c * 2;
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let mut qa = 0i32;
+                let mut qb = 0i32;
+                for l in 0..32 {
+                    let byte = q[c * 32 + l];
+                    qa += (byte & 0xF) as i32 * xq[c * 64 + l] as i32;
+                    qb += (byte >> 4) as i32 * xq[c * 64 + 32 + l] as i32;
+                }
+                isum += sc1 as i32 * qa + sc2 as i32 * qb;
+                imin += m1 as i32 * bs[is] as i32 + m2 as i32 * bs[is + 1] as i32;
+            }
+            acc += dx * (d * isum as f32 - dmin * imin as f32);
+        }
+        acc
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn emulate_q5_k_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for b in 0..cols / 256 {
+            let block = &w[b * 176..(b + 1) * 176];
+            let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+            let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+            let qh = &block[16..48];
+            let q = &block[48..176];
+            let dx = buf.d[b];
+            let xq = &buf.qs[b * 256..(b + 1) * 256];
+            let bs = &buf.bsums[b * 8..(b + 1) * 8];
+            let mut isum = 0i32;
+            let mut imin = 0i32;
+            for c in 0..4usize {
+                let is = c * 2;
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let u1 = 1u8 << (2 * c);
+                let u2 = 2u8 << (2 * c);
+                let mut qa = 0i32;
+                let mut qb = 0i32;
+                for l in 0..32 {
+                    let byte = q[c * 32 + l];
+                    let a = (byte & 0xF) | if qh[l] & u1 != 0 { 0x10 } else { 0 };
+                    let bv = (byte >> 4) | if qh[l] & u2 != 0 { 0x10 } else { 0 };
+                    qa += a as i32 * xq[c * 64 + l] as i32;
+                    qb += bv as i32 * xq[c * 64 + 32 + l] as i32;
+                }
+                isum += sc1 as i32 * qa + sc2 as i32 * qb;
+                imin += m1 as i32 * bs[is] as i32 + m2 as i32 * bs[is + 1] as i32;
+            }
+            acc += dx * (d * isum as f32 - dmin * imin as f32);
+        }
+        acc
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn emulate_q6_k_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for b in 0..cols / 256 {
+            let block = &w[b * 210..(b + 1) * 210];
+            let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+            let dx = buf.d[b];
+            let xq = &buf.qs[b * 256..(b + 1) * 256];
+            let mut isum = 0i32;
+            for g in 0..2usize {
+                let ql = &block[g * 64..g * 64 + 64];
+                let qh = &block[128 + g * 32..128 + g * 32 + 32];
+                let scs = &block[192 + g * 8..192 + g * 8 + 8];
+                let base = g * 128;
+                for l in 0..32 {
+                    let q0 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i32 - 32;
+                    let q1 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                    let q2 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                    let q3 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+                    let sc_idx = l / 16;
+                    isum += scs[sc_idx] as i8 as i32 * q0 * xq[base + l] as i32
+                        + scs[sc_idx + 2] as i8 as i32 * q1 * xq[base + 32 + l] as i32
+                        + scs[sc_idx + 4] as i8 as i32 * q2 * xq[base + 64 + l] as i32
+                        + scs[sc_idx + 6] as i8 as i32 * q3 * xq[base + 96 + l] as i32;
+                }
+            }
+            acc += dx * d * isum as f32;
+        }
+        acc
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn emulate_q4_0_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for sb in 0..cols / 256 {
+            let dx = buf.d[sb];
+            let xq = &buf.qs[sb * 256..(sb + 1) * 256];
+            let mut inner = 0.0f32;
+            for blk in 0..8usize {
+                let block = &w[(sb * 8 + blk) * 18..(sb * 8 + blk + 1) * 18];
+                let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let mut s = 0i32;
+                for i in 0..16 {
+                    let lo = (block[2 + i] & 0xF) as i32 - 8;
+                    let hi = (block[2 + i] >> 4) as i32 - 8;
+                    s += lo * xq[blk * 32 + i] as i32;
+                    s += hi * xq[blk * 32 + 16 + i] as i32;
+                }
+                inner += d * s as f32;
+            }
+            acc += dx * inner;
+        }
+        acc
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn emulate_q8_0_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
+        let mut acc = 0.0f32;
+        for sb in 0..cols / 256 {
+            let dx = buf.d[sb];
+            let xq = &buf.qs[sb * 256..(sb + 1) * 256];
+            let mut inner = 0.0f32;
+            for blk in 0..8usize {
+                let block = &w[(sb * 8 + blk) * 34..(sb * 8 + blk + 1) * 34];
+                let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let mut s = 0i32;
+                for i in 0..32 {
+                    s += block[2 + i] as i8 as i32 * xq[blk * 32 + i] as i32;
+                }
+                inner += d * s as f32;
+            }
+            acc += dx * inner;
+        }
+        acc
+    }
+
+    /// Shared macro: SIMD int8 kernel vs its scalar emulation (near-exact),
+    /// plus a coarse sanity check against the f32 dequantized reference.
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    macro_rules! int8_parity_test {
+        ($name:ident, $gate:expr, $make:expr, $dequant:ident, $emulate:ident, $kernel:ident, $seeds:expr) => {
+            #[test]
+            fn $name() {
+                if !$gate {
+                    return;
+                }
+                let cols = 512usize;
+                for seed in $seeds {
+                    let w: Vec<u8> = $make(cols, seed);
+                    let x = test_activation(cols);
+
+                    let mut buf = XqBuf::default();
+                    let xq = build_xq(&x, &mut buf);
+                    let got = unsafe { $kernel(&w, xq, cols) };
+
+                    let emu = $emulate(&w, &buf, cols);
+                    let tol = 1e-4 * emu.abs().max(1.0);
+                    assert!(
+                        (got - emu).abs() <= tol,
+                        "seed {seed}: SIMD {got} vs scalar-int8 emulation {emu}"
+                    );
+
+                    // Coarse sanity: the int8 scheme itself should stay within
+                    // ~10% of full precision even on adversarial synthetic data.
+                    let deq = $dequant(&w, cols);
+                    let reference: f32 = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+                    let sanity = 0.10 * reference.abs() + 1.0;
+                    assert!(
+                        (got - reference).abs() < sanity,
+                        "seed {seed}: int8 {got} vs dequant reference {reference}"
+                    );
+                }
+            }
+        };
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q5k_sdot_matches_reference_dequant,
+        has_dotprod(),
+        |cols, seed| make_q5k_weights(1, cols, seed),
+        dequant_row_q5_k,
+        emulate_q5_k_q8k,
+        dot_q5_k_q8k_neon,
+        [5u8, 21, 103, 202]
+    );
+
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q4_0_sdot_matches_reference_dequant,
+        has_dotprod(),
+        make_q4_0_row_scaled,
+        dequant_row_q4_0,
+        emulate_q4_0_q8k,
+        dot_q4_0_q8k_neon,
+        [3u8, 19, 101, 200]
+    );
+
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q8_0_sdot_matches_reference_dequant,
+        has_dotprod(),
+        make_q8_0_row_scaled,
+        dequant_row_q8_0,
+        emulate_q8_0_q8k,
+        dot_q8_0_q8k_neon,
+        [7u8, 42, 133, 240]
+    );
+
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q4k_avx2_int8_matches_reference_dequant,
+        has_avx2_fma(),
+        |cols, seed| make_q4k_weights_dmin(1, cols, seed),
+        dequant_row_q4_k,
+        emulate_q4_k_q8k,
+        dot_q4_k_q8k_avx2,
+        [3u8, 19, 101, 200]
+    );
+
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q5k_avx2_int8_matches_reference_dequant,
+        has_avx2_fma(),
+        |cols, seed| make_q5k_weights(1, cols, seed),
+        dequant_row_q5_k,
+        emulate_q5_k_q8k,
+        dot_q5_k_q8k_avx2,
+        [5u8, 21, 103, 202]
+    );
+
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q6k_avx2_int8_matches_reference_dequant,
+        has_avx2_fma(),
+        |cols, seed| make_q6k_weights(1, cols, seed),
+        dequant_row_q6_k,
+        emulate_q6_k_q8k,
+        dot_q6_k_q8k_avx2,
+        [7u8, 23, 99, 211]
+    );
+
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q4_0_avx2_int8_matches_reference_dequant,
+        has_avx2_fma(),
+        make_q4_0_row_scaled,
+        dequant_row_q4_0,
+        emulate_q4_0_q8k,
+        dot_q4_0_q8k_avx2,
+        [3u8, 19, 101, 200]
+    );
+
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    int8_parity_test!(
+        q8_0_avx2_int8_matches_reference_dequant,
+        has_avx2_fma(),
+        make_q8_0_row_scaled,
+        dequant_row_q8_0,
+        emulate_q8_0_q8k,
+        dot_q8_0_q8k_avx2,
+        [7u8, 42, 133, 240]
+    );
+
+    /// End-to-end: the public Q4_0 matvec (worker pool + caller-side shared
+    /// activation quantization) must match per-row dequantized references.
+    #[test]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    ))]
+    fn q4_0_matvec_pooled_matches_reference() {
+        let cols = 512usize;
+        let rows = 256usize;
+        let row_bytes = (cols / 32) * 18;
+        let mut w = vec![0u8; rows * row_bytes];
+        for r in 0..rows {
+            let row = make_q4_0_row_scaled(cols, (r % 251) as u8);
+            w[r * row_bytes..(r + 1) * row_bytes].copy_from_slice(&row);
+        }
+        let x = test_activation(cols);
+        let mut out = Vec::new();
+        matvec_q4_0_into(&w, &x, rows, cols, &mut out);
+        for r in 0..rows {
+            let deq = dequant_row_q4_0(&w[r * row_bytes..(r + 1) * row_bytes], cols);
+            let reference: f32 = deq.iter().zip(&x).map(|(a, b)| a * b).sum();
+            let tol = 0.02 * reference.abs() + 1.0;
+            assert!(
+                (out[r] - reference).abs() < tol,
+                "row {r}: matvec {} vs reference {reference}",
+                out[r]
             );
         }
     }

@@ -5,6 +5,13 @@ pub const Q4K_MIN_METAL_ROWS: usize = 8_192;
 pub const Q4K_MIN_METAL_COLS: usize = 4_096;
 pub const Q6K_MIN_METAL_ROWS: usize = 2_048;
 pub const FUSED_KQUANT_MIN_METAL_ROWS: usize = 512;
+/// Minimum `rows * cols` for a fused K-quant projection to be worth a blocking
+/// Metal command buffer. Below this, dispatch+sync latency exceeds the GPU
+/// matvec: gemma-4-E2B QKV (~6.3M weights) loses to CPU while Ministral-3B
+/// QKV (~15.7M) wins (see BENCHMARK.md). Env-tunable via
+/// `RUSTY_LLM_METAL_FUSED_MIN_WORK`.
+pub const FUSED_KQUANT_MIN_METAL_WORK: usize = 12_000_000;
+static FUSED_KQUANT_MIN_METAL_WORK_RUNTIME: OnceLock<usize> = OnceLock::new();
 pub const ATTENTION_MIN_METAL_TOKENS: usize = 8_192;
 pub const ULTRA_ATTENTION_MIN_METAL_TOKENS: usize = 512;
 pub const ULTRA_Q4K_MIN_METAL_ROWS: usize = 512;
@@ -920,14 +927,30 @@ fn q6k_min_metal_rows() -> usize {
     }
 }
 
-/// Decides whether a fused K-quant projection is large enough to amortize Metal dispatch.
+/// Returns the minimum fused-projection work (`rows * cols`) for Metal dispatch.
+fn fused_kquant_min_metal_work() -> usize {
+    *FUSED_KQUANT_MIN_METAL_WORK_RUNTIME.get_or_init(|| {
+        std::env::var("RUSTY_LLM_METAL_FUSED_MIN_WORK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(FUSED_KQUANT_MIN_METAL_WORK)
+    })
+}
+
+/// Decides whether a fused K-quant projection is large enough to amortize Metal
+/// dispatch. Requires both a row-count floor AND enough total work
+/// (`rows * cols`) to cover the blocking command-buffer latency; a wide-cols
+/// escape keeps genuinely large matvecs on the GPU. Ultra mode keeps the old
+/// row-only gate for aggressive routing.
 fn fused_kquant_should_use_metal(total_rows: usize, cols: usize) -> bool {
-    let min_rows = if ultra_mode_enabled() {
-        ultra_q4k_min_metal_rows()
-    } else {
-        FUSED_KQUANT_MIN_METAL_ROWS
-    };
-    total_rows >= min_rows || cols >= Q4K_MIN_METAL_COLS
+    if ultra_mode_enabled() {
+        return total_rows >= ultra_q4k_min_metal_rows() || cols >= Q4K_MIN_METAL_COLS;
+    }
+    if cols >= Q4K_MIN_METAL_COLS {
+        return true;
+    }
+    total_rows >= FUSED_KQUANT_MIN_METAL_ROWS
+        && total_rows.saturating_mul(cols) >= fused_kquant_min_metal_work()
 }
 
 /// Decides whether a full attention scan is large enough for Metal dispatch.
@@ -1639,13 +1662,18 @@ mod tests {
     }
 
     #[test]
-    /// Verifies that tiny fused K-quant projections stay on CPU.
+    /// Verifies the fused K-quant heuristic gates on both a row floor and total
+    /// work, keeping dispatch-bound small projections on CPU.
     fn fused_kquant_metal_heuristic_skips_tiny_projections() {
+        // Below the row floor stays on CPU.
         assert!(!super::fused_kquant_should_use_metal(128, 3072));
-        assert!(super::fused_kquant_should_use_metal(
-            super::FUSED_KQUANT_MIN_METAL_ROWS,
-            3072
-        ));
+        // Meets the row floor but not the ~12M work floor (gemma-4-E2B QKV
+        // ~3072x2048 = 6.3M) — must stay on CPU (was the Metal-slower-than-CPU
+        // regression).
+        assert!(!super::fused_kquant_should_use_metal(3072, 2048));
+        // Clears both floors (Ministral-3B QKV ~5120x3072 = 15.7M) — Metal.
+        assert!(super::fused_kquant_should_use_metal(5120, 3072));
+        // Wide-cols escape keeps large matvecs on the GPU regardless of work.
         assert!(super::fused_kquant_should_use_metal(128, 4096));
     }
 

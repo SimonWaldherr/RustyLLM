@@ -31,6 +31,10 @@ include = [
     "Makefile",
     "rust-toolchain.toml",
     "bench_models.sh",
+    "make.ps1",
+    "make.cmd",
+    "bench_models.ps1",
+    "scripts/*.psm1",
 ]
 
 [package.metadata.docs.rs]

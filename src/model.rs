@@ -425,7 +425,7 @@ fn try_quant_matvec3_into(
             let Some(v_kind) = quant_matvec_kind(*v_dtype) else {
                 return false;
             };
-            if crate::metal::enabled()
+            if crate::metal::dispatch_enabled()
                 && (quant_kind_prefers_single_metal(q_kind)
                     || quant_kind_prefers_single_metal(k_kind)
                     || quant_kind_prefers_single_metal(v_kind))
@@ -550,7 +550,7 @@ fn try_quant_matvec2_into(
             let Some(b_kind) = quant_matvec_kind(*b_dtype) else {
                 return false;
             };
-            if crate::metal::enabled()
+            if crate::metal::dispatch_enabled()
                 && (quant_kind_prefers_single_metal(a_kind)
                     || quant_kind_prefers_single_metal(b_kind))
             {
@@ -1022,6 +1022,120 @@ mod tests {
         assert!((q[3] - 4.0).abs() < 1e-5);
         assert!((k[0] + 7.0).abs() < 1e-5);
         assert!((k[2] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn layer_norm_matches_manual_mean_variance() {
+        // x = [1,2,3,4]: mean 2.5, var 1.25; weight 2, bias 1.
+        let mut x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let w = vec![2.0f32; 4];
+        let b = vec![1.0f32; 4];
+        super::layer_norm_in_place(&mut x, &w, &b, 0.0);
+        let inv = 1.0 / 1.25f32.sqrt();
+        let expect = [
+            (1.0 - 2.5) * inv * 2.0 + 1.0,
+            (2.0 - 2.5) * inv * 2.0 + 1.0,
+            (3.0 - 2.5) * inv * 2.0 + 1.0,
+            (4.0 - 2.5) * inv * 2.0 + 1.0,
+        ];
+        for (got, want) in x.iter().zip(expect.iter()) {
+            assert!((got - want).abs() < 1e-5, "layer norm {got} vs {want}");
+        }
+    }
+
+    /// Builds a tiny synthetic nomic-bert model (dim 8, 2 heads, head_dim 4,
+    /// 1 layer, SwiGLU FFN) with deterministic F32 weights for forward tests.
+    #[cfg(test)]
+    fn tiny_nomic_model() -> (super::Config, super::NomicBertWeights) {
+        use super::{Config, NomicBertLayerWeights, NomicBertWeights, Weight};
+        let dim = 8usize;
+        let hidden = 16usize;
+        let vocab = 12usize;
+        let head_dim = 4usize;
+        let n_heads = 2usize;
+        let config = Config {
+            arch: "nomic-bert".to_string(),
+            dim,
+            hidden_dim: hidden,
+            n_layers: 1,
+            n_heads,
+            n_kv_heads: n_heads,
+            vocab_size: vocab,
+            max_seq_len: 64,
+            rope_theta: 1000.0,
+            rms_norm_eps: 1e-12,
+            head_dim,
+            kv_dim: head_dim * n_heads,
+            kv_mul: 1,
+            value_dim: head_dim,
+            sliding_window: 0,
+            expert_count: 0,
+            expert_used_count: 0,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        // Deterministic pseudo-random f32 fill in [-0.5, 0.5).
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 2654435761 + seed * 40503) % 1000) as f32 / 1000.0) - 0.5)
+                .collect()
+        };
+        let sq = dim * dim;
+        let layer = NomicBertLayerWeights {
+            wq: Weight::F32(fill(sq, 1)),
+            bq: vec![0.0; dim],
+            wk: Weight::F32(fill(sq, 2)),
+            bk: vec![0.0; dim],
+            wv: Weight::F32(fill(sq, 3)),
+            bv: vec![0.0; dim],
+            wo: Weight::F32(fill(sq, 4)),
+            bo: vec![0.0; dim],
+            attn_out_norm: vec![1.0; dim],
+            attn_out_norm_b: vec![0.0; dim],
+            ffn_gate: Some(Weight::F32(fill(hidden * dim, 5))),
+            ffn_up: Weight::F32(fill(hidden * dim, 6)),
+            ffn_up_b: vec![0.0; hidden],
+            ffn_down: Weight::F32(fill(dim * hidden, 7)),
+            ffn_down_b: vec![0.0; dim],
+            layer_out_norm: vec![1.0; dim],
+            layer_out_norm_b: vec![0.0; dim],
+        };
+        let weights = NomicBertWeights {
+            token_embd: Weight::F32(fill(vocab * dim, 8)),
+            token_type0: Vec::new(),
+            tok_norm: vec![1.0; dim],
+            tok_norm_b: vec![0.0; dim],
+            layers: vec![layer],
+            ln_eps: 1e-12,
+        };
+        (config, weights)
+    }
+
+    #[test]
+    fn nomic_bert_forward_produces_finite_hidden_states() {
+        let (config, weights) = tiny_nomic_model();
+        let tokens = [2u32, 5, 7, 3];
+        let hs = super::forward_nomic_bert_hidden(&config, &weights, &tokens);
+        assert_eq!(hs.len(), tokens.len() * config.dim);
+        assert!(hs.iter().all(|v| v.is_finite()), "non-finite hidden state");
+        // Post-norm output should not be all-zero.
+        assert!(hs.iter().any(|&v| v.abs() > 1e-6));
+    }
+
+    #[test]
+    fn nomic_bert_attention_is_bidirectional() {
+        // Changing a LATER token must affect an EARLIER token's hidden state —
+        // only possible with non-causal (bidirectional) attention.
+        let (config, weights) = tiny_nomic_model();
+        let a = super::forward_nomic_bert_hidden(&config, &weights, &[2u32, 5, 7, 3]);
+        let b = super::forward_nomic_bert_hidden(&config, &weights, &[2u32, 5, 9, 3]);
+        let dim = config.dim;
+        // Token 0 ([CLS]) hidden state differs because token 2 changed.
+        let delta: f32 = (0..dim).map(|j| (a[j] - b[j]).abs()).sum();
+        assert!(
+            delta > 1e-5,
+            "token 0 unchanged ⇒ attention is not bidirectional"
+        );
     }
 }
 
@@ -2258,6 +2372,22 @@ pub(crate) fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut Vec<f
     }
 }
 
+/// True LayerNorm (mean-subtract, unit variance, affine weight + bias) in
+/// place. Used by BERT-style encoders (nomic-bert); RMSNorm omits the mean.
+#[inline]
+pub(crate) fn layer_norm_in_place(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    let mean = x.iter().sum::<f32>() / n as f32;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
+    let inv = 1.0 / (var + eps).sqrt();
+    for i in 0..n {
+        x[i] = (x[i] - mean) * inv * weight[i] + bias[i];
+    }
+}
+
 #[inline]
 /// Applies per-head RMSNorm in place, using the same weight vector for each head.
 fn rms_norm_heads_in_place(
@@ -2552,6 +2682,159 @@ pub(crate) fn online_attention(
     }
 }
 
+/// Minimum attention work (`scanned positions × kv heads`) below which the
+/// per-token worker-pool rendezvous costs more than the serial scan saves.
+const ATTENTION_PARALLEL_MIN_WORK: usize = 4096;
+
+/// Returns the attention-parallelization work threshold, allowing an override
+/// via `RUSTY_LLM_ATTN_PARALLEL_MIN_WORK` (set very high to force the serial
+/// scan, e.g. for A/B measurement or tuning).
+#[cfg(not(target_family = "wasm"))]
+fn attention_parallel_min_work() -> usize {
+    use std::sync::OnceLock;
+    static MIN_WORK: OnceLock<usize> = OnceLock::new();
+    *MIN_WORK.get_or_init(|| {
+        std::env::var("RUSTY_LLM_ATTN_PARALLEL_MIN_WORK")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(ATTENTION_PARALLEL_MIN_WORK)
+    })
+}
+
+/// Raw context for the parallel attention-over-heads trampoline. All pointers
+/// reference buffers owned by the caller for the (blocking) duration of the
+/// `parallel_range` call; each KV head writes a disjoint `out` band.
+#[cfg(not(target_family = "wasm"))]
+struct AttnHeadsCtx {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn attn_heads_trampoline(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `ctx` is a live `&AttnHeadsCtx` for the blocking call; each kv_h
+    // reads disjoint K/V bands and writes a disjoint `out` slice.
+    unsafe {
+        let c = &*(ctx as *const AttnHeadsCtx);
+        for kv_h in start..end {
+            let q_off = kv_h * c.kv_mul * c.head_dim;
+            let out_off = kv_h * c.kv_mul * c.value_dim;
+            let q = std::slice::from_raw_parts(c.q.add(q_off), c.kv_mul * c.head_dim);
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+            let out = std::slice::from_raw_parts_mut(c.out.add(out_off), c.kv_mul * c.value_dim);
+            online_attention_grouped(
+                q,
+                keys,
+                values,
+                c.key_stride,
+                c.value_stride,
+                c.slot_count,
+                c.head_dim,
+                c.value_dim,
+                c.kv_mul,
+                c.start_t,
+                c.end_t,
+                c.scale,
+                out,
+            );
+        }
+    }
+}
+
+/// Runs grouped attention for every KV head, fanning the heads across the
+/// worker pool when the scan is large enough to amortize the rendezvous and
+/// running serially otherwise. Each head reads a disjoint K/V band and writes a
+/// disjoint slice of `out`, so the parallel and serial paths are equivalent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_over_kv_heads(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let scanned = end_t.saturating_sub(start_t) + 1;
+    let work = scanned.saturating_mul(n_kv_heads);
+    let threads = crate::simd::num_threads();
+
+    #[cfg(not(target_family = "wasm"))]
+    if n_kv_heads > 1 && threads > 1 && work >= attention_parallel_min_work() {
+        let ctx = AttnHeadsCtx {
+            q: queries.as_ptr(),
+            k: keys.as_ptr(),
+            v: values.as_ptr(),
+            out: out.as_mut_ptr(),
+            k_len: keys.len(),
+            v_len: values.len(),
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            kv_mul,
+            start_t,
+            end_t,
+            scale,
+        };
+        // SAFETY: `ctx` outlives the blocking call; each KV head writes a
+        // disjoint `out` band and reads disjoint K/V state.
+        unsafe {
+            crate::simd::parallel_range(
+                n_kv_heads,
+                attn_heads_trampoline,
+                &ctx as *const AttnHeadsCtx as *const (),
+            );
+        }
+        return;
+    }
+
+    // Serial fallback (short contexts, single-threaded, or wasm).
+    for kv_h in 0..n_kv_heads {
+        let q_off = kv_h * kv_mul * head_dim;
+        let out_off = kv_h * kv_mul * value_dim;
+        online_attention_grouped(
+            &queries[q_off..q_off + kv_mul * head_dim],
+            &keys[kv_h * head_dim..],
+            &values[kv_h * value_dim..],
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            kv_mul,
+            start_t,
+            end_t,
+            scale,
+            &mut out[out_off..out_off + kv_mul * value_dim],
+        );
+    }
+}
+
 #[inline]
 /// Runs online attention for all `kv_mul` query heads that share one KV head
 /// at once, reading each cached key/value row exactly once instead of once
@@ -2637,7 +2920,7 @@ pub(crate) fn silu(x: f32) -> f32 {
 
 #[inline(always)]
 /// Computes the tanh-approximate GELU activation used by Gemma feed-forward blocks.
-fn gelu(x: f32) -> f32 {
+pub(crate) fn gelu(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x)).tanh())
 }
@@ -3232,25 +3515,22 @@ pub fn forward_into(
             pos,
             scale,
         ) {
-            for kv_h in 0..config.n_kv_heads {
-                let q_off = kv_h * kv_mul * head_dim;
-                let out_off = kv_h * kv_mul * config.value_dim;
-                online_attention_grouped(
-                    &buf.q[q_off..q_off + kv_mul * head_dim],
-                    &cache.k[l][kv_h * config.head_dim..],
-                    &cache.v[l][kv_h * config.value_dim..],
-                    kv_k_dim,
-                    kv_v_dim,
-                    cache.storage_len,
-                    head_dim,
-                    config.value_dim,
-                    kv_mul,
-                    attn_window,
-                    pos,
-                    scale,
-                    &mut buf.attn_out[out_off..out_off + kv_mul * config.value_dim],
-                );
-            }
+            attention_over_kv_heads(
+                &buf.q,
+                &cache.k[l],
+                &cache.v[l],
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                head_dim,
+                config.value_dim,
+                config.n_kv_heads,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
         }
 
         if fused_post_attention_ffn
@@ -3563,25 +3843,22 @@ pub fn forward_gemma4_into(
             pos,
             scale,
         ) {
-            for kv_h in 0..n_kv_heads_l {
-                let q_off = kv_h * kv_mul_l * head_dim_l;
-                let out_off = kv_h * kv_mul_l * value_dim_l;
-                online_attention_grouped(
-                    &buf.q[q_off..q_off + kv_mul_l * head_dim_l],
-                    &cache.k[kv_cache_layer][kv_h * head_dim_l..],
-                    &cache.v[kv_cache_layer][kv_h * value_dim_l..],
-                    cache.per_pos_k_dim,
-                    cache.per_pos_v_dim,
-                    cache.storage_len,
-                    head_dim_l,
-                    value_dim_l,
-                    kv_mul_l,
-                    attn_window,
-                    pos,
-                    scale,
-                    &mut buf.attn_out[out_off..out_off + kv_mul_l * value_dim_l],
-                );
-            }
+            attention_over_kv_heads(
+                &buf.q[..config.n_heads * head_dim_l],
+                &cache.k[kv_cache_layer],
+                &cache.v[kv_cache_layer],
+                cache.per_pos_k_dim,
+                cache.per_pos_v_dim,
+                cache.storage_len,
+                head_dim_l,
+                value_dim_l,
+                n_kv_heads_l,
+                kv_mul_l,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[..attn_out_len],
+            );
         }
 
         // Output projection + residual
@@ -3848,7 +4125,14 @@ pub fn load_gemma4_model(
         eprintln!("Note: output tied to embeddings");
         token_embd.clone()
     };
-    let final_logit_softcap = gguf.get_f32("gemma4.final_logit_softcapping", 30.0);
+    // Only softcap when the checkpoint actually ships the key (Gemma-2 era);
+    // Gemma-3/4 checkpoints dropped final softcapping, and a phantom default
+    // costs a scalar tanh over the whole vocab every decoded token.
+    let arch = gguf.get_str("general.architecture").unwrap_or("gemma4");
+    let final_logit_softcap = gguf.get_f32(
+        &format!("{}.final_logit_softcapping", arch),
+        gguf.get_f32("gemma4.final_logit_softcapping", 0.0),
+    );
     let rope_base = gguf.get_f32("gemma4.rope.freq_base", config.rope_theta);
     let rope_base_swa = gguf.get_f32("gemma4.rope.freq_base_swa", rope_base);
     let rope_freqs_full = load_optional_f32_vec(
@@ -4546,25 +4830,22 @@ fn forward_hidden_impl<'a>(
             pos,
             scale,
         ) {
-            for kv_h in 0..config.n_kv_heads {
-                let q_off = kv_h * kv_mul * head_dim;
-                let out_off = kv_h * kv_mul * config.value_dim;
-                online_attention_grouped(
-                    &buf.q[q_off..q_off + kv_mul * head_dim],
-                    &cache.k[l][kv_h * config.head_dim..],
-                    &cache.v[l][kv_h * config.value_dim..],
-                    kv_k_dim,
-                    kv_v_dim,
-                    cache.storage_len,
-                    head_dim,
-                    config.value_dim,
-                    kv_mul,
-                    attn_window,
-                    pos,
-                    scale,
-                    &mut buf.attn_out[out_off..out_off + kv_mul * config.value_dim],
-                );
-            }
+            attention_over_kv_heads(
+                &buf.q,
+                &cache.k[l],
+                &cache.v[l],
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                head_dim,
+                config.value_dim,
+                config.n_kv_heads,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
@@ -4984,25 +5265,22 @@ fn forward_hidden_gemma4_impl<'a>(
             pos,
             scale,
         ) {
-            for kv_h in 0..n_kv_heads_l {
-                let q_off = kv_h * kv_mul_l * head_dim_l;
-                let out_off = kv_h * kv_mul_l * value_dim_l;
-                online_attention_grouped(
-                    &buf.q[q_off..q_off + kv_mul_l * head_dim_l],
-                    &cache.k[kv_cache_layer][kv_h * head_dim_l..],
-                    &cache.v[kv_cache_layer][kv_h * value_dim_l..],
-                    cache.per_pos_k_dim,
-                    cache.per_pos_v_dim,
-                    cache.storage_len,
-                    head_dim_l,
-                    value_dim_l,
-                    kv_mul_l,
-                    attn_window,
-                    pos,
-                    scale,
-                    &mut buf.attn_out[out_off..out_off + kv_mul_l * value_dim_l],
-                );
-            }
+            attention_over_kv_heads(
+                &buf.q[..config.n_heads * head_dim_l],
+                &cache.k[kv_cache_layer],
+                &cache.v[kv_cache_layer],
+                cache.per_pos_k_dim,
+                cache.per_pos_v_dim,
+                cache.storage_len,
+                head_dim_l,
+                value_dim_l,
+                n_kv_heads_l,
+                kv_mul_l,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out[..attn_out_len],
+            );
         }
 
         layer
@@ -5093,4 +5371,520 @@ pub fn forward_prefill_gemma4(
     pos: usize,
 ) {
     let _ = forward_hidden_gemma4_impl(config, weights, cache, buf, token, pos, false);
+}
+
+// ─── nomic-bert (BERT-style encoder for embeddings) ─────────────────────────
+
+/// Per-layer weights for a nomic-bert / BERT encoder block. FFN is SwiGLU when
+/// `ffn_gate` is `Some` (nomic-bert) and GELU-sequential otherwise (plain BERT
+/// or nomic-bert-moe dense layers). All norms are true LayerNorm (weight+bias).
+pub struct NomicBertLayerWeights {
+    pub wq: Weight,
+    pub bq: Vec<f32>,
+    pub wk: Weight,
+    pub bk: Vec<f32>,
+    pub wv: Weight,
+    pub bv: Vec<f32>,
+    pub wo: Weight,
+    pub bo: Vec<f32>,
+    pub attn_out_norm: Vec<f32>,
+    pub attn_out_norm_b: Vec<f32>,
+    pub ffn_gate: Option<Weight>,
+    pub ffn_up: Weight,
+    pub ffn_up_b: Vec<f32>,
+    pub ffn_down: Weight,
+    pub ffn_down_b: Vec<f32>,
+    pub layer_out_norm: Vec<f32>,
+    pub layer_out_norm_b: Vec<f32>,
+}
+
+/// Full weight set for a nomic-bert encoder. Output is the last hidden state;
+/// pooling and L2 normalization happen in the runtime's `embed`.
+pub struct NomicBertWeights {
+    pub token_embd: Weight,
+    /// `token_types.weight` row 0 (segment embedding); empty when absent.
+    pub token_type0: Vec<f32>,
+    pub tok_norm: Vec<f32>,
+    pub tok_norm_b: Vec<f32>,
+    pub layers: Vec<NomicBertLayerWeights>,
+    /// LayerNorm epsilon (nomic uses 1e-12, distinct from the RMS eps).
+    pub ln_eps: f32,
+}
+
+/// Loads a nomic-bert / BERT encoder model from mapped GGUF bytes.
+pub fn load_nomic_bert_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, NomicBertWeights) {
+    let mut config = Config::from_gguf(gguf);
+    // head_dim defaults to dim / n_heads via Config::from_gguf; ensure kv heads
+    // mirror query heads (BERT is full multi-head, no GQA).
+    if config.n_kv_heads == 0 {
+        config.n_kv_heads = config.n_heads;
+    }
+    let arch = gguf.get_str("general.architecture").unwrap_or("nomic-bert");
+    // nomic stores the LayerNorm eps under attention.layer_norm_epsilon, NOT
+    // the RMS key Config::from_gguf reads; default to the BERT-standard 1e-12.
+    let ln_eps = gguf.get_f32(&format!("{}.attention.layer_norm_epsilon", arch), 1e-12);
+
+    let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> =
+        gguf.tensors.iter().map(|t| (t.name.clone(), t)).collect();
+    let data_offset = gguf.data_offset;
+    let mut inferred_sizes: HashMap<String, usize> = HashMap::new();
+    if !gguf.tensors.is_empty() {
+        let mmap_len = mmap_data.len();
+        let mut offs: Vec<(u64, usize)> = gguf
+            .tensors
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.offset, i))
+            .collect();
+        offs.sort_unstable_by_key(|o| o.0);
+        for w in 0..offs.len() {
+            let (off, idx) = offs[w];
+            let next_off = if w + 1 < offs.len() {
+                offs[w + 1].0
+            } else {
+                (mmap_len as u64).saturating_sub(data_offset as u64)
+            };
+            let byte_size = if next_off > off {
+                (next_off - off) as usize
+            } else {
+                0
+            };
+            inferred_sizes.insert(gguf.tensors[idx].name.clone(), byte_size);
+        }
+    }
+
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let q_rows = config.n_heads * head_dim;
+    let kv_rows = config.n_kv_heads * head_dim;
+
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let token_type0 = if tensor_idx.contains_key("token_types.weight") {
+        // token_types.weight is [dim x n_types]; segment ids are always 0.
+        load_optional_f32_slice(
+            mmap_data,
+            data_offset,
+            "token_types.weight",
+            &tensor_idx,
+            &inferred_sizes,
+            0,
+            dim,
+        )
+    } else {
+        Vec::new()
+    };
+    let tok_norm = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "token_embd_norm.weight",
+        &tensor_idx,
+        &inferred_sizes,
+    );
+    let tok_norm_b = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "token_embd_norm.bias",
+        &tensor_idx,
+        &inferred_sizes,
+    );
+
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for l in 0..config.n_layers {
+        let qkv_name = format!("blk.{}.attn_qkv.weight", l);
+        let (wq, wk, wv, bq, bk, bv);
+        if tensor_idx.contains_key(&qkv_name) {
+            // Fused QKV: rows [0..q) = Q, [q..q+kv) = K, [q+kv..q+2kv) = V.
+            wq = load_weight_rows(
+                mmap_data,
+                data_offset,
+                &qkv_name,
+                &tensor_idx,
+                &inferred_sizes,
+                0,
+                q_rows,
+                dim,
+                borrow_quantized,
+            );
+            wk = load_weight_rows(
+                mmap_data,
+                data_offset,
+                &qkv_name,
+                &tensor_idx,
+                &inferred_sizes,
+                q_rows,
+                kv_rows,
+                dim,
+                borrow_quantized,
+            );
+            wv = load_weight_rows(
+                mmap_data,
+                data_offset,
+                &qkv_name,
+                &tensor_idx,
+                &inferred_sizes,
+                q_rows + kv_rows,
+                kv_rows,
+                dim,
+                borrow_quantized,
+            );
+            let qkv_bias = format!("blk.{}.attn_qkv.bias", l);
+            bq = load_optional_f32_slice(
+                mmap_data,
+                data_offset,
+                &qkv_bias,
+                &tensor_idx,
+                &inferred_sizes,
+                0,
+                q_rows,
+            );
+            bk = load_optional_f32_slice(
+                mmap_data,
+                data_offset,
+                &qkv_bias,
+                &tensor_idx,
+                &inferred_sizes,
+                q_rows,
+                kv_rows,
+            );
+            bv = load_optional_f32_slice(
+                mmap_data,
+                data_offset,
+                &qkv_bias,
+                &tensor_idx,
+                &inferred_sizes,
+                q_rows + kv_rows,
+                kv_rows,
+            );
+        } else {
+            // Separate q/k/v tensors (plain BERT layout).
+            wq = load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            wk = load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            wv = load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            bq = load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                q_rows,
+            );
+            bk = load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                kv_rows,
+            );
+            bv = load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_v.bias", l),
+                &tensor_idx,
+                &inferred_sizes,
+                kv_rows,
+            );
+        }
+
+        let wo = load_weight(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.attn_output.weight", l),
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        let bo = load_optional_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.attn_output.bias", l),
+            &tensor_idx,
+            &inferred_sizes,
+            dim,
+        );
+        let attn_out_norm = load_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.attn_output_norm.weight", l),
+            &tensor_idx,
+            &inferred_sizes,
+        );
+        let attn_out_norm_b = load_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.attn_output_norm.bias", l),
+            &tensor_idx,
+            &inferred_sizes,
+        );
+
+        let gate_name = format!("blk.{}.ffn_gate.weight", l);
+        let ffn_gate = if tensor_idx.contains_key(&gate_name) {
+            Some(load_weight(
+                mmap_data,
+                data_offset,
+                &gate_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ))
+        } else {
+            None
+        };
+        let ffn_up = load_weight(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.ffn_up.weight", l),
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        let ffn_up_b = load_optional_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.ffn_up.bias", l),
+            &tensor_idx,
+            &inferred_sizes,
+            config.hidden_dim,
+        );
+        let ffn_down = load_weight(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.ffn_down.weight", l),
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        let ffn_down_b = load_optional_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.ffn_down.bias", l),
+            &tensor_idx,
+            &inferred_sizes,
+            dim,
+        );
+        let layer_out_norm = load_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.layer_output_norm.weight", l),
+            &tensor_idx,
+            &inferred_sizes,
+        );
+        let layer_out_norm_b = load_f32_vec(
+            mmap_data,
+            data_offset,
+            &format!("blk.{}.layer_output_norm.bias", l),
+            &tensor_idx,
+            &inferred_sizes,
+        );
+
+        layers.push(NomicBertLayerWeights {
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            wo,
+            bo,
+            attn_out_norm,
+            attn_out_norm_b,
+            ffn_gate,
+            ffn_up,
+            ffn_up_b,
+            ffn_down,
+            ffn_down_b,
+            layer_out_norm,
+            layer_out_norm_b,
+        });
+    }
+
+    let weights = NomicBertWeights {
+        token_embd,
+        token_type0,
+        tok_norm,
+        tok_norm_b,
+        layers,
+        ln_eps,
+    };
+    (config, weights)
+}
+
+/// Runs the nomic-bert encoder over `tokens` and returns the last-layer hidden
+/// states as an `n_tokens * dim` row-major buffer. Attention is bidirectional
+/// (every position attends every position), there is no KV cache, and the
+/// architecture is post-norm (LayerNorm after each residual add).
+pub fn forward_nomic_bert_hidden(
+    config: &Config,
+    weights: &NomicBertWeights,
+    tokens: &[u32],
+) -> Vec<f32> {
+    let n = tokens.len();
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let n_heads = config.n_heads;
+    let eps = weights.ln_eps;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let inv_freq = build_rope_inv_freq(config.rope_theta, head_dim, 1.0);
+    let kv_row = n_heads * head_dim;
+
+    // Embedding + token-type row 0, then embedding LayerNorm.
+    let mut hs = vec![0.0f32; n * dim];
+    let mut row = vec![0.0f32; dim];
+    for (i, &tok) in tokens.iter().enumerate() {
+        weights.token_embd.row_into(tok as usize, dim, &mut row);
+        if weights.token_type0.len() == dim {
+            for j in 0..dim {
+                row[j] += weights.token_type0[j];
+            }
+        }
+        let dst = &mut hs[i * dim..(i + 1) * dim];
+        dst.copy_from_slice(&row);
+        layer_norm_in_place(dst, &weights.tok_norm, &weights.tok_norm_b, eps);
+    }
+
+    let mut q_all = vec![0.0f32; n * kv_row];
+    let mut k_all = vec![0.0f32; n * kv_row];
+    let mut v_all = vec![0.0f32; n * kv_row];
+    let mut q_buf = Vec::new();
+    let mut k_buf = Vec::new();
+    let mut v_buf = Vec::new();
+    let mut proj = Vec::new();
+    let mut gate_buf = Vec::new();
+    let mut up_buf = Vec::new();
+    let mut ffn_out = Vec::new();
+    let mut attn_out = vec![0.0f32; kv_row];
+
+    for layer in &weights.layers {
+        // Project Q/K/V for every position from the (already post-normed) hidden
+        // state, add biases, then apply NeoX RoPE per position.
+        for i in 0..n {
+            let x = &hs[i * dim..(i + 1) * dim];
+            layer.wq.matvec_into(x, &mut q_buf);
+            layer.wk.matvec_into(x, &mut k_buf);
+            layer.wv.matvec_into(x, &mut v_buf);
+            add_bias_if_present(&mut q_buf, &layer.bq);
+            add_bias_if_present(&mut k_buf, &layer.bk);
+            add_bias_if_present(&mut v_buf, &layer.bv);
+            apply_rope_qk_neox(
+                &mut q_buf,
+                &mut k_buf,
+                i,
+                head_dim,
+                n_heads,
+                config.n_kv_heads,
+                &inv_freq,
+            );
+            q_all[i * kv_row..(i + 1) * kv_row].copy_from_slice(&q_buf);
+            k_all[i * kv_row..(i + 1) * kv_row].copy_from_slice(&k_buf);
+            v_all[i * kv_row..(i + 1) * kv_row].copy_from_slice(&v_buf);
+        }
+
+        // Bidirectional attention per position, then output projection +
+        // residual + LayerNorm (post-norm).
+        for i in 0..n {
+            for value in attn_out.iter_mut() {
+                *value = 0.0;
+            }
+            for h in 0..n_heads {
+                let q_head =
+                    &q_all[i * kv_row + h * head_dim..i * kv_row + h * head_dim + head_dim];
+                let keys = &k_all[h * head_dim..];
+                let values = &v_all[h * head_dim..];
+                let out_head = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+                online_attention_grouped(
+                    q_head,
+                    keys,
+                    values,
+                    kv_row,
+                    kv_row,
+                    n,
+                    head_dim,
+                    head_dim,
+                    1,
+                    0,
+                    n - 1,
+                    scale,
+                    out_head,
+                );
+            }
+            layer.wo.matvec_into(&attn_out, &mut proj);
+            add_bias_if_present(&mut proj, &layer.bo);
+            let dst = &mut hs[i * dim..(i + 1) * dim];
+            for j in 0..dim {
+                dst[j] += proj[j];
+            }
+            layer_norm_in_place(dst, &layer.attn_out_norm, &layer.attn_out_norm_b, eps);
+        }
+
+        // Feed-forward per position, then residual + LayerNorm.
+        for i in 0..n {
+            let x = &hs[i * dim..(i + 1) * dim];
+            layer.ffn_up.matvec_into(x, &mut up_buf);
+            add_bias_if_present(&mut up_buf, &layer.ffn_up_b);
+            match &layer.ffn_gate {
+                Some(gate) => {
+                    // SwiGLU: silu(gate(x)) * up(x).
+                    gate.matvec_into(x, &mut gate_buf);
+                    for j in 0..up_buf.len() {
+                        up_buf[j] *= silu(gate_buf[j]);
+                    }
+                }
+                None => {
+                    // GELU-sequential: gelu(up(x)).
+                    for value in up_buf.iter_mut() {
+                        *value = gelu(*value);
+                    }
+                }
+            }
+            layer.ffn_down.matvec_into(&up_buf, &mut ffn_out);
+            add_bias_if_present(&mut ffn_out, &layer.ffn_down_b);
+            let dst = &mut hs[i * dim..(i + 1) * dim];
+            for j in 0..dim {
+                dst[j] += ffn_out[j];
+            }
+            layer_norm_in_place(dst, &layer.layer_out_norm, &layer.layer_out_norm_b, eps);
+        }
+    }
+
+    hs
 }
