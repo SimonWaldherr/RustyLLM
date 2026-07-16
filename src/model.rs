@@ -612,6 +612,76 @@ fn kquant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::KQuantMatvecKind> 
     }
 }
 
+/// Returns the raw layout for K-quant weights that can share one Q8_K
+/// activation quantization. The encoder batch path keeps these bytes borrowed
+/// from the GGUF mapping, just like the single-token matvec path.
+#[cfg(not(target_family = "wasm"))]
+fn kquant_weight_parts(
+    weight: &Weight,
+) -> Option<(crate::simd::KQuantMatvecKind, &[u8], usize, usize)> {
+    let Weight::Quantized {
+        data,
+        dtype,
+        rows,
+        cols,
+    } = weight
+    else {
+        return None;
+    };
+    if *cols == 0 || *cols % 256 != 0 {
+        return None;
+    }
+    let kind = kquant_matvec_kind(*dtype)?;
+    let bytes = quantized_row_bytes(*dtype, *cols)?.checked_mul(*rows)?;
+    let data = data.as_slice();
+    if data.len() < bytes {
+        return None;
+    }
+    Some((kind, data, *rows, *cols))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn try_kquant_matvec_batch_into(weight: &Weight, inputs: &[f32], out: &mut Vec<f32>) -> bool {
+    let Some(parts) = kquant_weight_parts(weight) else {
+        return false;
+    };
+    crate::simd::matvec_kquant_batch_into(parts, inputs, out)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn try_kquant_matvec2_batch_into(
+    a: &Weight,
+    b: &Weight,
+    inputs: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (Some(a), Some(b)) = (kquant_weight_parts(a), kquant_weight_parts(b)) else {
+        return false;
+    };
+    crate::simd::matvec_kquant2_batch_into(a, b, inputs, out_a, out_b)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn try_kquant_matvec3_batch_into(
+    a: &Weight,
+    b: &Weight,
+    c: &Weight,
+    inputs: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (Some(a), Some(b), Some(c)) = (
+        kquant_weight_parts(a),
+        kquant_weight_parts(b),
+        kquant_weight_parts(c),
+    ) else {
+        return false;
+    };
+    crate::simd::matvec_kquant3_batch_into(a, b, c, inputs, out_a, out_b, out_c)
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn quant_kind_prefers_single_metal(kind: crate::simd::QuantMatvecKind) -> bool {
     matches!(
@@ -1428,6 +1498,109 @@ mod tests {
         (config, weights)
     }
 
+    /// Creates compact, non-zero Q5_K rows for exercising the quantized Nomic
+    /// batch path. Q5_K intentionally has no Metal kernel, which makes the
+    /// serial/batched parity check independent of the caller's Metal setting.
+    fn tiny_q5k_weight(rows: usize, cols: usize, seed: u8) -> Weight {
+        assert_eq!(cols % 256, 0);
+        let row_bytes = (cols / 256) * 176;
+        let mut data = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..cols / 256 {
+                let base = row * row_bytes + block * 176;
+                // f16 0.0078125: small enough that the synthetic LayerNorm
+                // path stays well-conditioned while preserving non-zero dots.
+                data[base..base + 2].copy_from_slice(&0x2000u16.to_le_bytes());
+                // dmin remains zero. Pack scale=1/min=0 for all eight groups.
+                for i in 0..4 {
+                    data[base + 4 + i] = 1;
+                    data[base + 12 + i] = 1;
+                }
+                // qh is zero, so the remaining bytes encode 4-bit values.
+                for i in 0..128 {
+                    data[base + 48 + i] =
+                        seed.wrapping_add((row * 17 + block * 29 + i * 3) as u8) & 0x77;
+                }
+            }
+        }
+        Weight::Quantized {
+            data: RawTensorData::Owned(data),
+            dtype: GGMLType::Q5_K,
+            rows,
+            cols,
+        }
+    }
+
+    /// Builds one full-width Q5_K Nomic layer. Eight tokens select the
+    /// row-balanced batch scheduler, while the test can still force the
+    /// original per-token execution through `forward_nomic_bert_hidden_impl`.
+    fn quantized_nomic_model() -> (super::Config, super::NomicBertWeights) {
+        use super::{Config, NomicBertLayerWeights, NomicBertWeights};
+
+        let dim = 256usize;
+        let hidden = 256usize;
+        let vocab = 16usize;
+        let config = Config {
+            arch: "nomic-bert".to_string(),
+            dim,
+            hidden_dim: hidden,
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: vocab,
+            max_seq_len: 64,
+            rope_theta: 1000.0,
+            rms_norm_eps: 1e-12,
+            head_dim: dim,
+            kv_dim: dim,
+            kv_mul: 1,
+            value_dim: dim,
+            sliding_window: 0,
+            expert_count: 0,
+            expert_used_count: 0,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 17 + seed * 13) % 31) as f32 * 0.001 - 0.015)
+                .collect()
+        };
+        let bias = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i + seed) % 5) as f32 * 0.001 - 0.002)
+                .collect()
+        };
+        let layer = NomicBertLayerWeights {
+            wq: tiny_q5k_weight(dim, dim, 3),
+            bq: bias(dim, 1),
+            wk: tiny_q5k_weight(dim, dim, 17),
+            bk: bias(dim, 2),
+            wv: tiny_q5k_weight(dim, dim, 31),
+            bv: bias(dim, 3),
+            wo: tiny_q5k_weight(dim, dim, 47),
+            bo: bias(dim, 4),
+            attn_out_norm: vec![1.0; dim],
+            attn_out_norm_b: bias(dim, 5),
+            ffn_gate: Some(tiny_q5k_weight(hidden, dim, 61)),
+            ffn_up: tiny_q5k_weight(hidden, dim, 79),
+            ffn_up_b: bias(hidden, 6),
+            ffn_down: tiny_q5k_weight(dim, hidden, 97),
+            ffn_down_b: bias(dim, 7),
+            layer_out_norm: vec![1.0; dim],
+            layer_out_norm_b: bias(dim, 8),
+        };
+        let weights = NomicBertWeights {
+            token_embd: Weight::F32(fill(vocab * dim, 9)),
+            token_type0: Vec::new(),
+            tok_norm: vec![1.0; dim],
+            tok_norm_b: bias(dim, 10),
+            layers: vec![layer],
+            ln_eps: 1e-12,
+        };
+        (config, weights)
+    }
+
     #[test]
     fn nomic_bert_forward_produces_finite_hidden_states() {
         let (config, weights) = tiny_nomic_model();
@@ -1453,6 +1626,24 @@ mod tests {
             delta > 1e-5,
             "token 0 unchanged ⇒ attention is not bidirectional"
         );
+    }
+
+    #[test]
+    fn quantized_nomic_batched_forward_matches_per_token_path() {
+        let (config, weights) = quantized_nomic_model();
+        let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
+
+        let serial = super::forward_nomic_bert_hidden_impl(&config, &weights, &tokens, false);
+        let batched = super::forward_nomic_bert_hidden(&config, &weights, &tokens);
+        assert_eq!(batched.len(), tokens.len() * config.dim);
+        assert!(batched.iter().all(|value| value.is_finite()));
+        for (index, (batched, serial)) in batched.iter().zip(&serial).enumerate() {
+            let tolerance = serial.abs().max(1.0) * 2e-5;
+            assert!(
+                (batched - serial).abs() <= tolerance,
+                "hidden[{index}] batched={batched} serial={serial} tolerance={tolerance}",
+            );
+        }
     }
 }
 
@@ -3001,6 +3192,7 @@ pub(crate) fn online_attention(
 
 /// Minimum attention work (`scanned positions × kv heads`) below which the
 /// per-token worker-pool rendezvous costs more than the serial scan saves.
+#[cfg(not(target_family = "wasm"))]
 const ATTENTION_PARALLEL_MIN_WORK: usize = 4096;
 
 /// Returns the attention-parallelization work threshold, allowing an override
@@ -3095,8 +3287,11 @@ pub(crate) fn attention_over_kv_heads(
     scale: f32,
     out: &mut [f32],
 ) {
+    #[cfg(not(target_family = "wasm"))]
     let scanned = end_t.saturating_sub(start_t) + 1;
+    #[cfg(not(target_family = "wasm"))]
     let work = scanned.saturating_mul(n_kv_heads);
+    #[cfg(not(target_family = "wasm"))]
     let threads = crate::simd::num_threads();
 
     #[cfg(not(target_family = "wasm"))]
@@ -6082,6 +6277,95 @@ pub fn load_nomic_bert_model(
     (config, weights)
 }
 
+#[cfg(not(target_family = "wasm"))]
+/// Checks that a Nomic BERT layer can use the token-batched K-quant path
+/// without changing its mathematical layout. The checks happen before the
+/// first residual update, so a failed capability check always falls back to
+/// the existing per-token implementation cleanly.
+fn nomic_batched_layer_supported(layer: &NomicBertLayerWeights, dim: usize, kv_row: usize) -> bool {
+    let Some(gate) = layer.ffn_gate.as_ref() else {
+        return false;
+    };
+    let (Some(q), Some(k), Some(v), Some(wo), Some(gate), Some(up), Some(down)) = (
+        kquant_weight_parts(&layer.wq),
+        kquant_weight_parts(&layer.wk),
+        kquant_weight_parts(&layer.wv),
+        kquant_weight_parts(&layer.wo),
+        kquant_weight_parts(gate),
+        kquant_weight_parts(&layer.ffn_up),
+        kquant_weight_parts(&layer.ffn_down),
+    ) else {
+        return false;
+    };
+
+    q.2 == kv_row
+        && k.2 == kv_row
+        && v.2 == kv_row
+        && q.3 == dim
+        && k.3 == dim
+        && v.3 == dim
+        && wo.2 == dim
+        && wo.3 == kv_row
+        && gate.3 == dim
+        && up.3 == dim
+        && gate.2 == up.2
+        && down.2 == dim
+        && down.3 == gate.2
+}
+
+/// Raw context for independent bidirectional-attention rows. `parallel_range`
+/// blocks until every worker returns, and each callback writes a disjoint row
+/// of `out`, so the borrowed vectors remain valid and data-race free.
+#[cfg(not(target_family = "wasm"))]
+struct NomicAttentionBatch {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    n: usize,
+    n_heads: usize,
+    head_dim: usize,
+    kv_row: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn nomic_attention_batch_range(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `parallel_range` blocks for the lifetime of the stack context;
+    // q/k/v are immutable and each worker receives a disjoint output range.
+    let ctx = unsafe { &*(ctx as *const NomicAttentionBatch) };
+    let q_all = unsafe { std::slice::from_raw_parts(ctx.q, ctx.n * ctx.kv_row) };
+    let k_all = unsafe { std::slice::from_raw_parts(ctx.k, ctx.n * ctx.kv_row) };
+    let v_all = unsafe { std::slice::from_raw_parts(ctx.v, ctx.n * ctx.kv_row) };
+    for i in start..end {
+        let attn_out =
+            unsafe { std::slice::from_raw_parts_mut(ctx.out.add(i * ctx.kv_row), ctx.kv_row) };
+        attn_out.fill(0.0);
+        for h in 0..ctx.n_heads {
+            let q_head =
+                &q_all[i * ctx.kv_row + h * ctx.head_dim..i * ctx.kv_row + (h + 1) * ctx.head_dim];
+            let keys = &k_all[h * ctx.head_dim..];
+            let values = &v_all[h * ctx.head_dim..];
+            let out_head = &mut attn_out[h * ctx.head_dim..(h + 1) * ctx.head_dim];
+            online_attention_grouped(
+                q_head,
+                keys,
+                values,
+                ctx.kv_row,
+                ctx.kv_row,
+                ctx.n,
+                ctx.head_dim,
+                ctx.head_dim,
+                1,
+                0,
+                ctx.n - 1,
+                ctx.scale,
+                out_head,
+            );
+        }
+    }
+}
+
 /// Runs the nomic-bert encoder over `tokens` and returns the last-layer hidden
 /// states as an `n_tokens * dim` row-major buffer. Attention is bidirectional
 /// (every position attends every position), there is no KV cache, and the
@@ -6090,6 +6374,18 @@ pub fn forward_nomic_bert_hidden(
     config: &Config,
     weights: &NomicBertWeights,
     tokens: &[u32],
+) -> Vec<f32> {
+    forward_nomic_bert_hidden_impl(config, weights, tokens, true)
+}
+
+/// Internal Nomic BERT forward implementation. The test-only serial switch
+/// lets the quantized batched path be checked against the established
+/// per-token execution without changing production behavior.
+fn forward_nomic_bert_hidden_impl(
+    config: &Config,
+    weights: &NomicBertWeights,
+    tokens: &[u32],
+    _allow_batched: bool,
 ) -> Vec<f32> {
     let n = tokens.len();
     let dim = config.dim;
@@ -6126,8 +6422,110 @@ pub fn forward_nomic_bert_hidden(
     let mut up_buf = Vec::new();
     let mut ffn_out = Vec::new();
     let mut attn_out = vec![0.0f32; kv_row];
+    // Batched encoder phases reuse these buffers per layer. Very short inputs
+    // retain the lower-latency per-token path below.
+    #[cfg(not(target_family = "wasm"))]
+    let mut attn_all = vec![0.0f32; n * kv_row];
+    #[cfg(not(target_family = "wasm"))]
+    let mut proj_all: Vec<f32> = Vec::new();
+    #[cfg(not(target_family = "wasm"))]
+    let mut gate_all: Vec<f32> = Vec::new();
+    #[cfg(not(target_family = "wasm"))]
+    let mut up_all: Vec<f32> = Vec::new();
+    #[cfg(not(target_family = "wasm"))]
+    let mut ffn_all: Vec<f32> = Vec::new();
 
     for layer in &weights.layers {
+        #[cfg(not(target_family = "wasm"))]
+        if _allow_batched && n >= 8 && nomic_batched_layer_supported(layer, dim, kv_row) {
+            // Four batched projection phases plus one batched attention phase
+            // replace the old per-token QKV/Wo/gate+up/down jobs. Each
+            // projection quantizes a token activation once on its owning
+            // worker and consumes all output rows before the next token.
+            assert!(try_kquant_matvec3_batch_into(
+                &layer.wq, &layer.wk, &layer.wv, &hs, &mut q_all, &mut k_all, &mut v_all,
+            ));
+            for i in 0..n {
+                let q = &mut q_all[i * kv_row..(i + 1) * kv_row];
+                let k = &mut k_all[i * kv_row..(i + 1) * kv_row];
+                let v = &mut v_all[i * kv_row..(i + 1) * kv_row];
+                add_bias_if_present(q, &layer.bq);
+                add_bias_if_present(k, &layer.bk);
+                add_bias_if_present(v, &layer.bv);
+                apply_rope_qk_neox(q, k, i, head_dim, n_heads, config.n_kv_heads, &inv_freq);
+            }
+
+            let attention = NomicAttentionBatch {
+                q: q_all.as_ptr(),
+                k: k_all.as_ptr(),
+                v: v_all.as_ptr(),
+                out: attn_all.as_mut_ptr(),
+                n,
+                n_heads,
+                head_dim,
+                kv_row,
+                scale,
+            };
+            unsafe {
+                simd::parallel_range(
+                    n,
+                    nomic_attention_batch_range,
+                    &attention as *const NomicAttentionBatch as *const (),
+                );
+            }
+
+            assert!(try_kquant_matvec_batch_into(
+                &layer.wo,
+                &attn_all,
+                &mut proj_all,
+            ));
+            for i in 0..n {
+                let projection = &mut proj_all[i * dim..(i + 1) * dim];
+                add_bias_if_present(projection, &layer.bo);
+                let dst = &mut hs[i * dim..(i + 1) * dim];
+                for j in 0..dim {
+                    dst[j] += projection[j];
+                }
+                layer_norm_in_place(dst, &layer.attn_out_norm, &layer.attn_out_norm_b, eps);
+            }
+
+            let gate = layer
+                .ffn_gate
+                .as_ref()
+                .expect("batched Nomic path requires a SwiGLU gate");
+            assert!(try_kquant_matvec2_batch_into(
+                gate,
+                &layer.ffn_up,
+                &hs,
+                &mut gate_all,
+                &mut up_all,
+            ));
+            let ffn_dim = up_all.len() / n;
+            for i in 0..n {
+                let gate = &gate_all[i * ffn_dim..(i + 1) * ffn_dim];
+                let up = &mut up_all[i * ffn_dim..(i + 1) * ffn_dim];
+                add_bias_if_present(up, &layer.ffn_up_b);
+                for j in 0..ffn_dim {
+                    up[j] *= silu(gate[j]);
+                }
+            }
+            assert!(try_kquant_matvec_batch_into(
+                &layer.ffn_down,
+                &up_all,
+                &mut ffn_all,
+            ));
+            for i in 0..n {
+                let ffn = &mut ffn_all[i * dim..(i + 1) * dim];
+                add_bias_if_present(ffn, &layer.ffn_down_b);
+                let dst = &mut hs[i * dim..(i + 1) * dim];
+                for j in 0..dim {
+                    dst[j] += ffn[j];
+                }
+                layer_norm_in_place(dst, &layer.layer_out_norm, &layer.layer_out_norm_b, eps);
+            }
+            continue;
+        }
+
         // Project Q/K/V for every position from the (already post-normed) hidden
         // state, add biases, then apply NeoX RoPE per position.
         for i in 0..n {

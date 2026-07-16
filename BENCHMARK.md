@@ -1,6 +1,6 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-07-03 18:19 CEST**
+Updated: **2026-07-16 22:27 CEST**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
 
@@ -35,21 +35,25 @@ This report compares the CPU path with the optional Apple Metal GPU path. Metal 
 ## Embedding Supplement — 2026-07-16
 
 Warm end-to-end `/v1/embeddings` measurements for
-`nomic-embed-text-v1.5.Q4_K_M.gguf` (80.2 MiB, 768 dimensions) on the build
-`af6af2f`. Each backend used 12 workers; the short input uses 20 measured runs
-after two warm-ups, while the long input uses five measured runs after two
-warm-ups. Latency includes local loopback HTTP, tokenization, encoder forward,
-pooling, and response serialization.
+`nomic-embed-text-v1.5.Q4_K_M.gguf` (80.2 MiB, 768 dimensions). The optimized
+release build used `-C target-cpu=native`, 12 workers, two warm-ups, and ten
+measured requests per cell. Latency includes local loopback HTTP, tokenization,
+encoder forward, pooling, and response serialization. The before values are the
+previous `af6af2f` measurement; current values use the token/row-batched
+K-quant encoder scheduler. Each current value is the median; throughput uses
+the unrounded latency. Because the earlier baseline used a different sample
+count, the reported speedups are directional rather than a strict A/B result.
 
-| Input tokens | CPU latency | CPU throughput | Metal latency | Metal throughput | Metal/CPU |
-|---:|---:|---:|---:|---:|---:|
-| 16 | 64.3 ms | 248.7 tok/s | 62.3 ms | 256.8 tok/s | 1.03x |
-| 222 | 997.8 ms | 222.5 tok/s | 974.9 ms | 227.7 tok/s | 1.02x |
+| Input tokens | CPU before | CPU current | Metal-enabled profile (CPU encoder) | CPU speedup |
+|---:|---:|---:|---:|---:|
+| 16 | 64.3 ms / 248.7 tok/s | **20.1 ms / 795 tok/s** | **19.9 ms / 803 tok/s** | 3.19x |
+| 222 | 997.8 ms / 222.5 tok/s | **222.4 ms / 998 tok/s** | **223.8 ms / 992 tok/s** | 4.49x |
 
-Metal is active for Q4_K matvec and Q6_K output kernels. The optimized CPU
-encoder is therefore nearly at parity for this small embedding model; GPU gains
-are currently 2–3% rather than the larger gains observed for some decoder
-models below.
+`RUSTY_LLM_METAL=1` was enabled for the last column, but these encoder requests
+deliberately submit no Metal work once the batch path is selected: Q5_K QKV has
+no suitable Metal batch kernel, and synchronous per-token GPU dispatches were
+slower. This is therefore a Metal-enabled runtime-profile measurement, not a
+GPU-throughput claim; both profiles are within about 1% end-to-end.
 
 ## Summary
 
