@@ -1628,7 +1628,14 @@ pub fn dot_q6_k_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 /// Computes an MXFP4 row dot product against an f32 vector.
 pub fn dot_mxfp4_f32(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     debug_assert!(n % 32 == 0);
-    dot_mxfp4_f32_scalar(qdata, x, n)
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_mxfp4_f32_neon(qdata, x, n) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_mxfp4_f32_scalar(qdata, x, n)
+    }
 }
 
 // ─── Simple matvec implementations ──────────────────────────────────────────
@@ -4206,6 +4213,7 @@ fn mxfp4_scale_lookup() -> &'static [f32; 256] {
 }
 
 /// Portable scalar implementation of MXFP4 dot product.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
     let block_size = 17;
@@ -4222,6 +4230,98 @@ fn dot_mxfp4_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     }
 
     sum
+}
+
+/// NEON MXFP4 dot product. Each 17-byte block stores 16 packed nibbles plus a
+/// shared exponent, with consecutive low/high nibbles mapping to consecutive
+/// activation values. A table lookup turns the nonlinear E2M1 nibbles into
+/// signed integer mantissas before the vector FMA path consumes them.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_mxfp4_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
+    use std::arch::aarch64::*;
+
+    const MANTISSAS: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+    let n_blocks = n / 32;
+    let mantissas = vld1q_s8(MANTISSAS.as_ptr());
+    let nibble_mask = vdupq_n_u8(0x0f);
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut block_idx = 0usize;
+
+    while block_idx + 1 < n_blocks {
+        let block = qdata.as_ptr().add(block_idx * 17);
+        let next_block = block.add(17);
+        let x_ptr = x.as_ptr().add(block_idx * 32);
+        // The lookup table stores E2M1 mantissas in half-units so they fit in
+        // signed bytes; fold the 0.5 conversion into the shared exponent.
+        let scale = mxfp4_scale_to_f32(*block.add(16)) * 0.5;
+        let next_scale = mxfp4_scale_to_f32(*next_block.add(16)) * 0.5;
+        acc0 = vmlaq_f32(
+            acc0,
+            dot_mxfp4_block_f32_neon(block, x_ptr, mantissas, nibble_mask),
+            vdupq_n_f32(scale),
+        );
+        acc1 = vmlaq_f32(
+            acc1,
+            dot_mxfp4_block_f32_neon(next_block, x_ptr.add(32), mantissas, nibble_mask),
+            vdupq_n_f32(next_scale),
+        );
+        block_idx += 2;
+    }
+
+    if block_idx < n_blocks {
+        let block = qdata.as_ptr().add(block_idx * 17);
+        let scale = mxfp4_scale_to_f32(*block.add(16)) * 0.5;
+        acc0 = vmlaq_f32(
+            acc0,
+            dot_mxfp4_block_f32_neon(
+                block,
+                x.as_ptr().add(block_idx * 32),
+                mantissas,
+                nibble_mask,
+            ),
+            vdupq_n_f32(scale),
+        );
+    }
+
+    vaddvq_f32(vaddq_f32(acc0, acc1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_mxfp4_block_f32_neon(
+    block: *const u8,
+    x: *const f32,
+    mantissas: std::arch::aarch64::int8x16_t,
+    nibble_mask: std::arch::aarch64::uint8x16_t,
+) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+
+    let packed = vld1q_u8(block);
+    let lo = vqtbl1q_s8(mantissas, vandq_u8(packed, nibble_mask));
+    let hi = vqtbl1q_s8(mantissas, vshrq_n_u8(packed, 4));
+    let x0 = vld2q_f32(x);
+    let x1 = vld2q_f32(x.add(8));
+    let x2 = vld2q_f32(x.add(16));
+    let x3 = vld2q_f32(x.add(24));
+    let mut acc = vdupq_n_f32(0.0);
+
+    macro_rules! accumulate_nibbles {
+        ($values:expr, $x0:expr, $x1:expr, $x2:expr, $x3:expr) => {{
+            let first = vmovl_s8(vget_low_s8($values));
+            let second = vmovl_s8(vget_high_s8($values));
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(first))), $x0);
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(first))), $x1);
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_low_s16(second))), $x2);
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(vmovl_s16(vget_high_s16(second))), $x3);
+        }};
+    }
+
+    accumulate_nibbles!(lo, x0.0, x1.0, x2.0, x3.0);
+    accumulate_nibbles!(hi, x0.1, x1.1, x2.1, x3.1);
+    acc
 }
 
 // ─── ARM NEON implementations (aarch64) ─────────────────────────────────────
@@ -5283,6 +5383,90 @@ mod tests {
     }
 
     #[test]
+    /// Verifies the MXFP4 NEON path against the scalar reference across
+    /// several packed blocks and distinct shared exponents.
+    fn mxfp4_dot_matches_scalar_reference() {
+        let blocks = 10usize;
+        let n = blocks * 32;
+        let mut row = vec![0u8; blocks * 17];
+        for block in 0..blocks {
+            let base = block * 17;
+            for i in 0..16 {
+                let lo = ((block * 7 + i * 3 + 1) & 0x0f) as u8;
+                let hi = ((block * 11 + i * 5 + 9) & 0x0f) as u8;
+                row[base + i] = lo | (hi << 4);
+            }
+            row[base + 16] = 123 + (block as u8 % 9);
+        }
+        let x: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.071).sin() * 0.9 + (i % 13) as f32 * 0.02)
+            .collect();
+
+        let expected = dot_mxfp4_f32_scalar(&row, &x, n);
+        let actual = dot_mxfp4_f32(&row, &x, n);
+        let tolerance = expected.abs().max(1.0) * 2e-5;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "MXFP4 SIMD {actual} vs scalar {expected}, tolerance {tolerance}"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib mxfp4_neon_speedup -- --ignored --nocapture"]
+    /// Compares the dispatched MXFP4 kernel against the scalar reference on a
+    /// representative GPT-OSS expert-row width. This stays ignored because
+    /// wall-clock timing is intentionally not part of the regular test suite.
+    fn mxfp4_neon_speedup() {
+        const COLS: usize = 2880;
+        const ROWS: usize = 192;
+        const RUNS: usize = 100;
+        const ROW_BYTES: usize = (COLS / 32) * 17;
+
+        let mut weights = vec![0u8; ROWS * ROW_BYTES];
+        for row in 0..ROWS {
+            for block in 0..(COLS / 32) {
+                let base = row * ROW_BYTES + block * 17;
+                for i in 0..16 {
+                    let lo = ((row * 3 + block * 5 + i * 7 + 1) & 0x0f) as u8;
+                    let hi = ((row * 11 + block * 13 + i * 2 + 9) & 0x0f) as u8;
+                    weights[base + i] = lo | (hi << 4);
+                }
+                weights[base + 16] = 123 + ((row + block) as u8 % 9);
+            }
+        }
+        let x: Vec<f32> = (0..COLS)
+            .map(|i| (i as f32 * 0.013).sin() * 0.8 + (i % 17) as f32 * 0.01)
+            .collect();
+
+        let measure = |kernel: fn(&[u8], &[f32], usize) -> f32| {
+            let mut checksum = 0.0f32;
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for row in 0..ROWS {
+                    let offset = row * ROW_BYTES;
+                    checksum += kernel(&weights[offset..offset + ROW_BYTES], &x, COLS);
+                }
+            }
+            (start.elapsed(), std::hint::black_box(checksum))
+        };
+
+        let (scalar_time, scalar_sum) = measure(dot_mxfp4_f32_scalar);
+        let (simd_time, simd_sum) = measure(dot_mxfp4_f32);
+        let tolerance = scalar_sum.abs().max(1.0) * 2e-5;
+        assert!(
+            (simd_sum - scalar_sum).abs() <= tolerance,
+            "MXFP4 checksum {simd_sum} vs scalar {scalar_sum}"
+        );
+        let speedup = scalar_time.as_secs_f64() / simd_time.as_secs_f64();
+        eprintln!(
+            "MXFP4 dot: scalar={:.3} ms, SIMD={:.3} ms, speedup={:.2}x",
+            scalar_time.as_secs_f64() * 1000.0,
+            simd_time.as_secs_f64() * 1000.0,
+            speedup,
+        );
+    }
+
+    #[test]
     /// Verifies that fused Q4_K two-projection output matches separate projections.
     fn q4k_matvec2_matches_separate_matvecs() {
         set_num_threads(3);
@@ -5792,6 +5976,7 @@ mod tests {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         not(target_family = "wasm")
     ))]
+    #[allow(dead_code)]
     fn emulate_q4_k_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
         let mut acc = 0.0f32;
         for b in 0..cols / 256 {
@@ -5869,6 +6054,7 @@ mod tests {
         any(target_arch = "aarch64", target_arch = "x86_64"),
         not(target_family = "wasm")
     ))]
+    #[allow(dead_code)]
     fn emulate_q6_k_q8k(w: &[u8], buf: &XqBuf, cols: usize) -> f32 {
         let mut acc = 0.0f32;
         for b in 0..cols / 256 {

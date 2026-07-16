@@ -432,6 +432,21 @@ fn try_quant_matvec3_into(
             {
                 return false;
             }
+            if let (Some(q_kind), Some(k_kind), Some(v_kind)) = (
+                kquant_matvec_kind(*q_dtype),
+                kquant_matvec_kind(*k_dtype),
+                kquant_matvec_kind(*v_dtype),
+            ) {
+                return crate::simd::matvec_kquant3_into(
+                    (q_kind, q_data.as_slice(), *q_rows, *q_cols),
+                    (k_kind, k_data.as_slice(), *k_rows, *k_cols),
+                    (v_kind, v_data.as_slice(), *v_rows, *v_cols),
+                    x,
+                    q,
+                    k,
+                    v,
+                );
+            }
             crate::simd::matvec_quant3_into(
                 (q_kind, q_data.as_slice(), *q_rows, *q_cols),
                 (k_kind, k_data.as_slice(), *k_rows, *k_cols),
@@ -581,6 +596,18 @@ fn quant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::QuantMatvecKind> {
         GGMLType::Q5_K => Some(crate::simd::QuantMatvecKind::Q5K),
         GGMLType::Q6_K => Some(crate::simd::QuantMatvecKind::Q6K),
         GGMLType::MXFP4 => Some(crate::simd::QuantMatvecKind::Mxfp4),
+        _ => None,
+    }
+}
+
+/// Maps the K-quants that can share one activation quantization in a fused
+/// projection. Q/K/V commonly mix Q4_K and Q6_K in embedding GGUFs.
+#[cfg(not(target_family = "wasm"))]
+fn kquant_matvec_kind(dtype: GGMLType) -> Option<crate::simd::KQuantMatvecKind> {
+    match dtype {
+        GGMLType::Q4_K => Some(crate::simd::KQuantMatvecKind::Q4K),
+        GGMLType::Q5_K => Some(crate::simd::KQuantMatvecKind::Q5K),
+        GGMLType::Q6_K => Some(crate::simd::KQuantMatvecKind::Q6K),
         _ => None,
     }
 }
@@ -813,6 +840,68 @@ impl ExpertWeight {
             _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
         }
     }
+
+    /// Attempts to run two expert matrices against the same activation in one
+    /// worker-pool job. GPT-OSS evaluates gate and up projections together for
+    /// every selected expert, so combining them avoids a second rendezvous with
+    /// the matrix-vector workers without changing the per-row calculation.
+    /// Returns `false` when the two tensors cannot safely share this path.
+    pub fn try_matvec_expert_pair_into(
+        &self,
+        other: &Self,
+        expert: usize,
+        x: &[f32],
+        out_self: &mut Vec<f32>,
+        out_other: &mut Vec<f32>,
+    ) -> bool {
+        if self.dtype != GGMLType::MXFP4
+            || other.dtype != GGMLType::MXFP4
+            || expert >= self.experts
+            || expert >= other.experts
+            || self.experts != other.experts
+            || self.rows != other.rows
+            || self.cols != other.cols
+            || self.cols == 0
+            || self.cols % 32 != 0
+            || self.cols != x.len()
+        {
+            return false;
+        }
+
+        let row_bytes = (self.cols / 32) * 17;
+        let Some(expert_bytes) = self.rows.checked_mul(row_bytes) else {
+            return false;
+        };
+        let Some(start) = expert.checked_mul(expert_bytes) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(expert_bytes) else {
+            return false;
+        };
+        let self_data = self.data.as_slice();
+        let other_data = other.data.as_slice();
+        if end > self_data.len() || end > other_data.len() {
+            return false;
+        }
+
+        simd::matvec_quant2_into(
+            (
+                simd::QuantMatvecKind::Mxfp4,
+                &self_data[start..end],
+                self.rows,
+                self.cols,
+            ),
+            (
+                simd::QuantMatvecKind::Mxfp4,
+                &other_data[start..end],
+                other.rows,
+                other.cols,
+            ),
+            x,
+            out_self,
+            out_other,
+        )
+    }
 }
 
 pub struct GptOssLayerWeights {
@@ -958,8 +1047,8 @@ fn attention_uses_linear_slots(start_t: usize, end_t: usize, slot_count: usize) 
 #[cfg(test)]
 mod tests {
     use super::{
-        KVCache, apply_rope_qk_neox, attention_start_pos, attention_uses_linear_slots,
-        build_rope_inv_freq_with_factors,
+        ExpertWeight, GGMLType, KVCache, RawTensorData, Weight, apply_rope_qk_neox,
+        attention_start_pos, attention_uses_linear_slots, build_rope_inv_freq_with_factors,
     };
 
     #[test]
@@ -1041,6 +1130,234 @@ mod tests {
         for (got, want) in x.iter().zip(expect.iter()) {
             assert!((got - want).abs() < 1e-5, "layer norm {got} vs {want}");
         }
+    }
+
+    #[test]
+    fn paired_mxfp4_expert_matvec_matches_separate_matvecs() {
+        const EXPERTS: usize = 2;
+        const ROWS: usize = 3;
+        const COLS: usize = 32;
+        const ROW_BYTES: usize = 17;
+
+        let make_weight = |seed: u8| {
+            let mut data = vec![0u8; EXPERTS * ROWS * ROW_BYTES];
+            for expert in 0..EXPERTS {
+                for row in 0..ROWS {
+                    let base = (expert * ROWS + row) * ROW_BYTES;
+                    for i in 0..16 {
+                        let lo = seed.wrapping_add((expert * 7 + row * 5 + i) as u8) & 0x0f;
+                        let hi = seed.wrapping_add((expert * 3 + row * 11 + i * 2) as u8) & 0x0f;
+                        data[base + i] = lo | (hi << 4);
+                    }
+                    // MXFP4 exponent byte: 127 encodes a scale of 1.0.
+                    data[base + 16] = 127;
+                }
+            }
+            ExpertWeight {
+                data: RawTensorData::Owned(data),
+                dtype: GGMLType::MXFP4,
+                experts: EXPERTS,
+                rows: ROWS,
+                cols: COLS,
+            }
+        };
+
+        let gate = make_weight(1);
+        let up = make_weight(9);
+        let x: Vec<f32> = (0..COLS).map(|i| i as f32 * 0.125 - 1.75).collect();
+        let expert = 1;
+
+        let mut separate_gate = Vec::new();
+        let mut separate_up = Vec::new();
+        gate.matvec_expert_into(expert, &x, &mut separate_gate);
+        up.matvec_expert_into(expert, &x, &mut separate_up);
+
+        let mut paired_gate = Vec::new();
+        let mut paired_up = Vec::new();
+        assert!(gate.try_matvec_expert_pair_into(
+            &up,
+            expert,
+            &x,
+            &mut paired_gate,
+            &mut paired_up,
+        ));
+        assert_eq!(paired_gate.len(), ROWS);
+        assert_eq!(paired_up.len(), ROWS);
+        for (got, expected) in paired_gate.iter().zip(&separate_gate) {
+            assert!((got - expected).abs() < 1e-6, "gate {got} vs {expected}");
+        }
+        for (got, expected) in paired_up.iter().zip(&separate_up) {
+            assert!((got - expected).abs() < 1e-6, "up {got} vs {expected}");
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    /// Mixed Q4_K/Q4_K/Q6_K Q/K/V weights share the activation quantization
+    /// and worker-pool rendezvous without changing the three projections.
+    fn mixed_kquant_qkv_fusion_matches_individual_matvecs() {
+        const COLS: usize = 256;
+        const ROWS: usize = 3;
+        const Q4_ROW_BYTES: usize = 144;
+        const Q6_ROW_BYTES: usize = 210;
+
+        let q4_weight = |salt: u8| {
+            let mut data = vec![0u8; ROWS * Q4_ROW_BYTES];
+            for (row, bytes) in data.chunks_exact_mut(Q4_ROW_BYTES).enumerate() {
+                // GGML block_q4_K: d=1, dmin=0, followed by 12 scale bytes
+                // and 128 packed quants. Values are deterministic but nonzero.
+                bytes[0] = 0;
+                bytes[1] = 0x3c;
+                for (i, value) in bytes[4..16].iter_mut().enumerate() {
+                    *value = salt.wrapping_add((row * 13 + i * 7) as u8);
+                }
+                for (i, value) in bytes[16..].iter_mut().enumerate() {
+                    *value = salt.wrapping_add((row * 17 + i * 11) as u8);
+                }
+            }
+            Weight::Quantized {
+                data: RawTensorData::Owned(data),
+                dtype: GGMLType::Q4_K,
+                rows: ROWS,
+                cols: COLS,
+            }
+        };
+        let q6_weight = |salt: u8| {
+            let mut data = vec![0u8; ROWS * Q6_ROW_BYTES];
+            for (row, bytes) in data.chunks_exact_mut(Q6_ROW_BYTES).enumerate() {
+                // GGML block_q6_K: 128 low bits, 64 high bits, 16 scales, d.
+                for (i, value) in bytes[..192].iter_mut().enumerate() {
+                    *value = salt.wrapping_add((row * 19 + i * 5) as u8);
+                }
+                for (i, value) in bytes[192..208].iter_mut().enumerate() {
+                    *value = (i as i8 - 8) as u8;
+                }
+                bytes[208] = 0;
+                bytes[209] = 0x3c;
+            }
+            Weight::Quantized {
+                data: RawTensorData::Owned(data),
+                dtype: GGMLType::Q6_K,
+                rows: ROWS,
+                cols: COLS,
+            }
+        };
+
+        let q = q4_weight(3);
+        let k = q4_weight(29);
+        let v = q6_weight(71);
+        let x: Vec<f32> = (0..COLS)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.0625)
+            .collect();
+
+        let mut expected_q = Vec::new();
+        let mut expected_k = Vec::new();
+        let mut expected_v = Vec::new();
+        q.matvec_into(&x, &mut expected_q);
+        k.matvec_into(&x, &mut expected_k);
+        v.matvec_into(&x, &mut expected_v);
+        assert!(
+            expected_q
+                .iter()
+                .chain(&expected_k)
+                .chain(&expected_v)
+                .all(|v| v.is_finite())
+        );
+
+        let mut fused_q = Vec::new();
+        let mut fused_k = Vec::new();
+        let mut fused_v = Vec::new();
+        assert!(super::try_quant_matvec3_into(
+            &q,
+            &k,
+            &v,
+            &x,
+            &mut fused_q,
+            &mut fused_k,
+            &mut fused_v,
+        ));
+
+        for (got, expected) in fused_q.iter().zip(&expected_q) {
+            assert!((got - expected).abs() <= expected.abs().max(1.0) * 1e-5);
+        }
+        for (got, expected) in fused_k.iter().zip(&expected_k) {
+            assert!((got - expected).abs() <= expected.abs().max(1.0) * 1e-5);
+        }
+        for (got, expected) in fused_v.iter().zip(&expected_v) {
+            assert!((got - expected).abs() <= expected.abs().max(1.0) * 1e-5);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib mxfp4_expert_pair_speedup -- --ignored --nocapture"]
+    /// Measures the worker-pool rendezvous saved by GPT-OSS gate/up fusion on
+    /// the actual 2,880 x 2,880 expert projection shape.
+    fn mxfp4_expert_pair_speedup() {
+        const ROWS: usize = 2880;
+        const COLS: usize = 2880;
+        const ROW_BYTES: usize = (COLS / 32) * 17;
+        const RUNS: usize = 100;
+
+        let make_weight = |seed: u8| {
+            let mut data = vec![0u8; ROWS * ROW_BYTES];
+            for row in 0..ROWS {
+                for block in 0..(COLS / 32) {
+                    let base = row * ROW_BYTES + block * 17;
+                    for i in 0..16 {
+                        let lo = ((row * 3 + block * 5 + i * 7 + seed as usize) & 0x0f) as u8;
+                        let hi = ((row * 11 + block * 13 + i * 2 + seed as usize) & 0x0f) as u8;
+                        data[base + i] = lo | (hi << 4);
+                    }
+                    data[base + 16] = 123 + ((row + block) as u8 % 9);
+                }
+            }
+            ExpertWeight {
+                data: RawTensorData::Owned(data),
+                dtype: GGMLType::MXFP4,
+                experts: 1,
+                rows: ROWS,
+                cols: COLS,
+            }
+        };
+
+        let gate = make_weight(1);
+        let up = make_weight(9);
+        let x: Vec<f32> = (0..COLS)
+            .map(|i| (i as f32 * 0.017).cos() * 0.75 + (i % 19) as f32 * 0.01)
+            .collect();
+        let mut gate_out = Vec::new();
+        let mut up_out = Vec::new();
+
+        // Start the persistent worker pool before timing either implementation.
+        gate.matvec_expert_into(0, &x, &mut gate_out);
+        up.matvec_expert_into(0, &x, &mut up_out);
+        assert!(gate.try_matvec_expert_pair_into(&up, 0, &x, &mut gate_out, &mut up_out));
+
+        let separate_start = std::time::Instant::now();
+        let mut separate_checksum = 0.0f32;
+        for _ in 0..RUNS {
+            gate.matvec_expert_into(0, &x, &mut gate_out);
+            up.matvec_expert_into(0, &x, &mut up_out);
+            separate_checksum += gate_out[0] + up_out[0];
+        }
+        let separate_time = separate_start.elapsed();
+
+        let fused_start = std::time::Instant::now();
+        let mut fused_checksum = 0.0f32;
+        for _ in 0..RUNS {
+            assert!(gate.try_matvec_expert_pair_into(&up, 0, &x, &mut gate_out, &mut up_out));
+            fused_checksum += gate_out[0] + up_out[0];
+        }
+        let fused_time = fused_start.elapsed();
+
+        assert!((fused_checksum - separate_checksum).abs() < 1e-4);
+        let speedup = separate_time.as_secs_f64() / fused_time.as_secs_f64();
+        eprintln!(
+            "GPT-OSS expert gate/up: separate={:.3} ms, fused={:.3} ms, speedup={:.2}x",
+            separate_time.as_secs_f64() * 1000.0,
+            fused_time.as_secs_f64() * 1000.0,
+            speedup,
+        );
     }
 
     /// Builds a tiny synthetic nomic-bert model (dim 8, 2 heads, head_dim 4,
@@ -3171,12 +3488,20 @@ pub fn forward_gpt_oss_into(
             let up_bias = layer.up_exps_bias.row_f32(expert_idx, config.hidden_dim);
             let down_bias = layer.down_exps_bias.row_f32(expert_idx, config.dim);
 
-            layer
-                .gate_exps
-                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
-            layer
-                .up_exps
-                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
+            if !layer.gate_exps.try_matvec_expert_pair_into(
+                &layer.up_exps,
+                expert_idx,
+                &buf.xn2,
+                &mut buf.gate,
+                &mut buf.up,
+            ) {
+                layer
+                    .gate_exps
+                    .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
+                layer
+                    .up_exps
+                    .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
+            }
             for i in 0..config.hidden_dim {
                 buf.gate[i] = swiglu_gpt_oss(buf.gate[i] + gate_bias[i], buf.up[i] + up_bias[i]);
             }
@@ -5067,12 +5392,20 @@ fn forward_hidden_gpt_oss_impl<'a>(
             let up_bias = layer.up_exps_bias.row_f32(expert_idx, config.hidden_dim);
             let down_bias = layer.down_exps_bias.row_f32(expert_idx, config.dim);
 
-            layer
-                .gate_exps
-                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
-            layer
-                .up_exps
-                .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
+            if !layer.gate_exps.try_matvec_expert_pair_into(
+                &layer.up_exps,
+                expert_idx,
+                &buf.xn2,
+                &mut buf.gate,
+                &mut buf.up,
+            ) {
+                layer
+                    .gate_exps
+                    .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.gate);
+                layer
+                    .up_exps
+                    .matvec_expert_into(expert_idx, &buf.xn2, &mut buf.up);
+            }
             for i in 0..config.hidden_dim {
                 buf.gate[i] = swiglu_gpt_oss(buf.gate[i] + gate_bias[i], buf.up[i] + up_bias[i]);
             }
@@ -5799,9 +6132,13 @@ pub fn forward_nomic_bert_hidden(
         // state, add biases, then apply NeoX RoPE per position.
         for i in 0..n {
             let x = &hs[i * dim..(i + 1) * dim];
-            layer.wq.matvec_into(x, &mut q_buf);
-            layer.wk.matvec_into(x, &mut k_buf);
-            layer.wv.matvec_into(x, &mut v_buf);
+            if !try_quant_matvec3_into(
+                &layer.wq, &layer.wk, &layer.wv, x, &mut q_buf, &mut k_buf, &mut v_buf,
+            ) {
+                layer.wq.matvec_into(x, &mut q_buf);
+                layer.wk.matvec_into(x, &mut k_buf);
+                layer.wv.matvec_into(x, &mut v_buf);
+            }
             add_bias_if_present(&mut q_buf, &layer.bq);
             add_bias_if_present(&mut k_buf, &layer.bk);
             add_bias_if_present(&mut v_buf, &layer.bv);
@@ -5859,18 +6196,22 @@ pub fn forward_nomic_bert_hidden(
         // Feed-forward per position, then residual + LayerNorm.
         for i in 0..n {
             let x = &hs[i * dim..(i + 1) * dim];
-            layer.ffn_up.matvec_into(x, &mut up_buf);
-            add_bias_if_present(&mut up_buf, &layer.ffn_up_b);
             match &layer.ffn_gate {
                 Some(gate) => {
                     // SwiGLU: silu(gate(x)) * up(x).
-                    gate.matvec_into(x, &mut gate_buf);
+                    if !try_quant_matvec2_into(gate, &layer.ffn_up, x, &mut gate_buf, &mut up_buf) {
+                        gate.matvec_into(x, &mut gate_buf);
+                        layer.ffn_up.matvec_into(x, &mut up_buf);
+                    }
+                    add_bias_if_present(&mut up_buf, &layer.ffn_up_b);
                     for j in 0..up_buf.len() {
                         up_buf[j] *= silu(gate_buf[j]);
                     }
                 }
                 None => {
                     // GELU-sequential: gelu(up(x)).
+                    layer.ffn_up.matvec_into(x, &mut up_buf);
+                    add_bias_if_present(&mut up_buf, &layer.ffn_up_b);
                     for value in up_buf.iter_mut() {
                         *value = gelu(*value);
                     }

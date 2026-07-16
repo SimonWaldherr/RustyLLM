@@ -1968,6 +1968,17 @@ impl Runner {
             &mut out,
         );
         rows.push(expert_up.clone());
+        let expert_gate_up_fused = measure_expert_matvec_pair(
+            "expert0_gate_up.fused",
+            &layer_weights.gate_exps,
+            &layer_weights.up_exps,
+            expert_idx,
+            &dim_input,
+            runs,
+        );
+        if let Some(row) = &expert_gate_up_fused {
+            rows.push(row.clone());
+        }
         let expert_down = measure_expert_matvec(
             "expert0_down",
             &layer_weights.down_exps,
@@ -2047,7 +2058,11 @@ impl Runner {
             .as_ref()
             .map(|row| row.avg_ms)
             .unwrap_or(attn_q.avg_ms + attn_k.avg_ms + attn_v.avg_ms);
-        let expert_triplet_ms = expert_gate.avg_ms + expert_up.avg_ms + expert_down.avg_ms;
+        let expert_gate_up_ms = expert_gate_up_fused
+            .as_ref()
+            .map(|row| row.avg_ms)
+            .unwrap_or(expert_gate.avg_ms + expert_up.avg_ms);
+        let expert_triplet_ms = expert_gate_up_ms + expert_down.avg_ms;
         rows.push(estimated_kernel_row(
             "expert0_triplet.estimated",
             self.config.dim,
@@ -3492,6 +3507,35 @@ fn measure_expert_matvec(
             std::hint::black_box(out.len());
         },
     )
+}
+
+/// Measures the fused gate/up projection used for one routed GPT-OSS expert.
+fn measure_expert_matvec_pair(
+    name: &str,
+    gate: &ExpertWeight,
+    up: &ExpertWeight,
+    expert: usize,
+    x: &[f32],
+    runs: usize,
+) -> Option<KernelBenchRow> {
+    let expert = expert.min(gate.experts.saturating_sub(1));
+    let mut gate_out = Vec::new();
+    let mut up_out = Vec::new();
+    if !gate.try_matvec_expert_pair_into(up, expert, x, &mut gate_out, &mut up_out) {
+        return None;
+    }
+    Some(measure_kernel_raw(
+        name,
+        format!("{:?}+{:?}", gate.dtype, up.dtype),
+        gate.rows + up.rows,
+        gate.cols,
+        runs,
+        || {
+            let ran = gate.try_matvec_expert_pair_into(up, expert, x, &mut gate_out, &mut up_out);
+            std::hint::black_box(ran);
+            std::hint::black_box(gate_out.len() + up_out.len());
+        },
+    ))
 }
 
 #[cfg(not(target_family = "wasm"))]
