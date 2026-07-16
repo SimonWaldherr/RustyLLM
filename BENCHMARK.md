@@ -32,6 +32,25 @@ This report compares the CPU path with the optional Apple Metal GPU path. Metal 
 | CPU | `RUSTY_LLM_METAL=0` | Metal: disabled by RUSTY_LLM_METAL | `.bench_raw/cpu/` |
 | Metal GPU | `RUSTY_LLM_METAL=1` | Metal: Q4_K matvec enabled, Q6_K output matvec enabled | `.bench_raw/metal/` |
 
+## Embedding Supplement — 2026-07-16
+
+Warm end-to-end `/v1/embeddings` measurements for
+`nomic-embed-text-v1.5.Q4_K_M.gguf` (80.2 MiB, 768 dimensions) on the build
+`af6af2f`. Each backend used 12 workers; the short input uses 20 measured runs
+after two warm-ups, while the long input uses five measured runs after two
+warm-ups. Latency includes local loopback HTTP, tokenization, encoder forward,
+pooling, and response serialization.
+
+| Input tokens | CPU latency | CPU throughput | Metal latency | Metal throughput | Metal/CPU |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 64.3 ms | 248.7 tok/s | 62.3 ms | 256.8 tok/s | 1.03x |
+| 222 | 997.8 ms | 222.5 tok/s | 974.9 ms | 227.7 tok/s | 1.02x |
+
+Metal is active for Q4_K matvec and Q6_K output kernels. The optimized CPU
+encoder is therefore nearly at parity for this small embedding model; GPU gains
+are currently 2–3% rather than the larger gains observed for some decoder
+models below.
+
 ## Summary
 
 | Profile | Ok | Failed | Skipped/partial | Best decode | Median decode |
