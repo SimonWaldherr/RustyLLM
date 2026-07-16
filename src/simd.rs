@@ -123,9 +123,9 @@ fn physical_cores() -> Option<usize> {
     let mut pairs = std::collections::HashSet::new();
     let mut phys: Option<u32> = None;
     let mut core: Option<u32> = None;
-    let mut flush = |phys: &mut Option<u32>,
-                     core: &mut Option<u32>,
-                     pairs: &mut std::collections::HashSet<(u32, u32)>| {
+    let flush = |phys: &mut Option<u32>,
+                 core: &mut Option<u32>,
+                 pairs: &mut std::collections::HashSet<(u32, u32)>| {
         if let (Some(p), Some(c)) = (phys.take(), core.take()) {
             pairs.insert((p, c));
         }
