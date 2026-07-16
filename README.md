@@ -88,6 +88,8 @@ Additional documentation:
   `models` tools.
 - Text embeddings via `Runner::embed`, mean-pooled over the last transformer
   layer and L2-normalized for cosine similarity.
+- Batched `nomic-bert` embedding encoder with shared Q8_K activations,
+  cache-friendly weight-row reuse, and dynamic worker scheduling.
 - Minimal browser chat UI served from `/chat`, an expert UI from
   `/chat?expert`, and a GGUF explorer from `/explorer`.
 - Library API for embedding RustyLLM in other Rust applications.
@@ -709,6 +711,24 @@ Response shape:
   "usage": {"prompt_tokens": 9, "total_tokens": 9}
 }
 ```
+
+#### Nomic embedding performance
+
+On an Apple M2 Max with the target-native release build and 12 workers,
+`nomic-embed-text-v1.5.Q4_K_M.gguf` reaches the following warm end-to-end
+`/v1/embeddings` medians (tokenization, encoder, pooling, and local HTTP are
+included):
+
+| Input tokens | CPU | Metal-enabled profile |
+|---:|---:|---:|
+| 16 | 878 tok/s | 937 tok/s |
+| 222 | **1,169 tok/s** | **1,172 tok/s** |
+
+The encoder's batched Q5_K/Q4_K/Q6_K path deliberately stays on CPU even when
+`RUSTY_LLM_METAL=1`: current per-token GPU dispatch overhead is slower for
+these 768-wide projections. The Metal-enabled column is therefore a runtime
+profile measurement, not a claim of GPU embedding throughput. See
+[BENCHMARK.md](BENCHMARK.md) for the reproducible methodology and raw latency.
 
 Ollama-style embeddings:
 
