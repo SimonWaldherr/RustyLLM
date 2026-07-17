@@ -1802,7 +1802,10 @@ const EXPF_P5: f32 = 0.5;
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn exp_ps_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
-    let x = _mm256_min_ps(_mm256_set1_ps(EXPF_HI), _mm256_max_ps(_mm256_set1_ps(EXPF_LO), x));
+    let x = _mm256_min_ps(
+        _mm256_set1_ps(EXPF_HI),
+        _mm256_max_ps(_mm256_set1_ps(EXPF_LO), x),
+    );
     // n = round-toward-neg-inf(x * log2(e) + 0.5)
     let fx = _mm256_fmadd_ps(x, _mm256_set1_ps(EXPF_LOG2E), _mm256_set1_ps(0.5));
     let fx = _mm256_floor_ps(fx);

@@ -1717,7 +1717,13 @@ mod tests {
             // comparison never routes through the GPU-resident path on
             // Metal-capable machines.
             let _ = super::forward_hidden_impl(
-                &config, &weights, &mut cache_seq, &mut buf, token, pos, false,
+                &config,
+                &weights,
+                &mut cache_seq,
+                &mut buf,
+                token,
+                pos,
+                false,
             );
         }
 
@@ -1739,11 +1745,19 @@ mod tests {
         ));
 
         for l in 0..config.n_layers {
-            for (i, (a, b)) in cache_seq.k[l].iter().zip(cache_batch.k[l].iter()).enumerate() {
+            for (i, (a, b)) in cache_seq.k[l]
+                .iter()
+                .zip(cache_batch.k[l].iter())
+                .enumerate()
+            {
                 let tol = 1e-3f32.max(a.abs() * 1e-3);
                 assert!((a - b).abs() <= tol, "k[{l}][{i}] seq {a} batch {b}");
             }
-            for (i, (a, b)) in cache_seq.v[l].iter().zip(cache_batch.v[l].iter()).enumerate() {
+            for (i, (a, b)) in cache_seq.v[l]
+                .iter()
+                .zip(cache_batch.v[l].iter())
+                .enumerate()
+            {
                 let tol = 1e-3f32.max(a.abs() * 1e-3);
                 assert!((a - b).abs() <= tol, "v[{l}][{i}] seq {a} batch {b}");
             }
@@ -5802,8 +5816,7 @@ pub fn forward_prefill_batch(
             );
         }
 
-        if !try_kquant_matvec_batch_into(&layer.wo, &buf.attn_out[..b * attn_dim], &mut buf.proj)
-        {
+        if !try_kquant_matvec_batch_into(&layer.wo, &buf.attn_out[..b * attn_dim], &mut buf.proj) {
             debug_assert!(false, "batchable wo rejected by batch kernel");
             return false;
         }
@@ -5836,7 +5849,11 @@ pub fn forward_prefill_batch(
             return false;
         }
         let hidden_len = b * config.hidden_dim;
-        simd::silu_mul_into(&buf.gate[..hidden_len], &buf.up[..hidden_len], &mut buf.hidden);
+        simd::silu_mul_into(
+            &buf.gate[..hidden_len],
+            &buf.up[..hidden_len],
+            &mut buf.hidden,
+        );
         if !try_kquant_matvec_batch_into(&layer.w2, &buf.hidden[..hidden_len], &mut buf.proj) {
             debug_assert!(false, "batchable w2 rejected by batch kernel");
             return false;
