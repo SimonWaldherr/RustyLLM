@@ -29,6 +29,29 @@ fn find_macos_sdk() -> Option<PathBuf> {
     macos_sdk_candidates().find(|path| Path::new(path).exists())
 }
 
+/// Finds Clang inside Xcode or the Command Line Tools. `/usr/bin/clang` is an
+/// xcrun wrapper on macOS; invoking the real compiler avoids an unnecessary
+/// xcrun SDK/cache lookup during every Cargo build.
+fn find_macos_clang() -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(developer_dir) = env::var_os("DEVELOPER_DIR").filter(|value| !value.is_empty()) {
+        let developer_dir = PathBuf::from(developer_dir);
+        candidates.push(developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"));
+        candidates.push(developer_dir.join("usr/bin/clang"));
+    }
+    candidates.push(PathBuf::from(
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+    ));
+    candidates.push(PathBuf::from(
+        "/Library/Developer/CommandLineTools/usr/bin/clang",
+    ));
+
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("clang"))
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rusty_metal)");
 
@@ -45,7 +68,7 @@ fn main() {
     let tmp_dir = out_dir.join("xcrun-tmp");
     let _ = fs::create_dir_all(&tmp_dir);
 
-    let mut clang = Command::new("clang");
+    let mut clang = Command::new(find_macos_clang());
     clang
         .env("TMPDIR", &tmp_dir)
         .env("TMP", &tmp_dir)
