@@ -357,6 +357,7 @@ Generation options:
 - `--temp <F>` or `-t <F>` sets temperature; `0` uses greedy decoding.
 - `--top-p <F>` sets nucleus sampling in the range `(0, 1]`.
 - `--top-k <N>` sets top-k filtering.
+- `--min-p <F>` sets a min-p cutoff in the range `[0, 1)`: tokens whose probability is below `min_p` times the top token's probability are discarded. `0` (the default) disables it.
 - `--repeat-penalty <F>` applies a repetition penalty to recent tokens.
 - `--seed <N>` sets the RNG seed. `0` uses the default time-based behavior.
 - `--system-prompt <text>` overrides the default chat system prompt.
@@ -534,6 +535,7 @@ curl -X POST http://127.0.0.1:8080/generate \
     "temp": 0.7,
     "top_p": 0.9,
     "top_k": 40,
+    "min_p": 0.0,
     "repeat_penalty": 1.1,
     "stop": ["</s>", "\n\n"]
   }'
@@ -759,6 +761,7 @@ curl -X POST http://127.0.0.1:8080/api/generate \
       "temperature": 0.7,
       "top_p": 0.9,
       "top_k": 40,
+      "min_p": 0.0,
       "repeat_penalty": 1.1
     }
   }'
