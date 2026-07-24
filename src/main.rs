@@ -75,6 +75,7 @@ fn print_usage(name: &str) {
     eprintln!("  --temp <F>                Temperature (default: 0.7, 0=greedy)");
     eprintln!("  --top-p <F>               Nucleus sampling threshold (default: 0.9)");
     eprintln!("  --top-k <N>               Top-K filtering (default: 40)");
+    eprintln!("  --min-p <F>               Min-P cutoff, relative to top token; 0 disables (default: 0)");
     eprintln!("  --repeat-penalty <F>      Repetition penalty (default: 1.1)");
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
@@ -433,6 +434,9 @@ fn run() -> Result<(), String> {
             }
             "--top-k" => {
                 options.sampler.top_k = parse_arg::<usize>(&args, &mut i, "--top-k")?;
+            }
+            "--min-p" => {
+                options.sampler.min_p = parse_arg::<f32>(&args, &mut i, "--min-p")?;
             }
             "--repeat-penalty" => {
                 options.sampler.repeat_penalty =
@@ -1575,6 +1579,7 @@ fn run_benchmark_json(
             "temperature": options.sampler.temperature,
             "top_p": options.sampler.top_p,
             "top_k": options.sampler.top_k,
+            "min_p": options.sampler.min_p,
             "repeat_penalty": options.sampler.repeat_penalty,
             "seed": options.seed,
             "stop_sequences": options.stop_sequences,

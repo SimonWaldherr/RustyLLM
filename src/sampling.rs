@@ -31,6 +31,10 @@ pub struct SamplerConfig {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: usize,
+    /// Minimum-probability cutoff, relative to the most likely token. Tokens whose
+    /// probability is below `min_p * p_max` are discarded before sampling. `0.0`
+    /// disables the filter. Applied together with (and independently of) top-k/top-p.
+    pub min_p: f32,
     pub repeat_penalty: f32,
 }
 
@@ -41,6 +45,7 @@ impl Default for SamplerConfig {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
+            min_p: 0.0,
             repeat_penalty: 1.1,
         }
     }
@@ -110,6 +115,7 @@ pub fn sample_with_scratch(
             logits,
             config.top_k,
             config.top_p,
+            config.min_p,
             inv_temp,
             rng,
             candidates,
@@ -143,8 +149,9 @@ pub fn sample_with_scratch(
             .unwrap_or(0);
     }
 
-    // Top-P (nucleus sampling)
-    if config.top_p < 1.0 {
+    // Top-P (nucleus) and/or min-P truncation. Both operate on the sorted head, so
+    // we only pay for the sort when at least one of them is active.
+    if config.top_p < 1.0 || config.min_p > 0.0 {
         candidates.clear();
         if candidates.capacity() < n {
             candidates.reserve(n - candidates.capacity());
@@ -152,19 +159,35 @@ pub fn sample_with_scratch(
         candidates.extend(logits.iter().copied().enumerate());
         candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
-        let mut cumsum = 0.0f32;
-        let mut cutoff_idx = candidates.len();
-        let threshold = config.top_p * sum;
-        for (i, &(_, weight)) in candidates.iter().enumerate() {
-            cumsum += weight;
-            if cumsum > threshold {
-                cutoff_idx = i + 1;
-                break;
+        // min-P: drop tokens below `min_p * p_max`. Weights are exp(logit - max_logit),
+        // so the top candidate's weight is 1.0 and min_p maps onto the weight scale.
+        let mut limit = candidates.len();
+        if config.min_p > 0.0 && !candidates.is_empty() {
+            let threshold = config.min_p * candidates[0].1;
+            limit = candidates
+                .iter()
+                .position(|&(_, w)| w < threshold)
+                .unwrap_or(candidates.len())
+                .max(1);
+        }
+
+        // Top-P (nucleus) truncation within the min-P-filtered head.
+        let mut cutoff_idx = limit;
+        if config.top_p < 1.0 {
+            let mut cumsum = 0.0f32;
+            let threshold = config.top_p * sum;
+            for (i, &(_, weight)) in candidates[..limit].iter().enumerate() {
+                cumsum += weight;
+                if cumsum > threshold {
+                    cutoff_idx = i + 1;
+                    break;
+                }
             }
         }
 
-        if cumsum.is_finite() && cumsum > 0.0 {
-            let r = rng.next_f32() * cumsum;
+        let kept_sum: f32 = candidates[..cutoff_idx].iter().map(|&(_, w)| w).sum();
+        if kept_sum.is_finite() && kept_sum > 0.0 {
+            let r = rng.next_f32() * kept_sum;
             let mut seen = 0.0f32;
             for &(idx, p) in &candidates[..cutoff_idx] {
                 seen += p;
@@ -195,6 +218,7 @@ fn sample_top_k(
     logits: &[f32],
     top_k: usize,
     top_p: f32,
+    min_p: f32,
     inv_temp: f32,
     rng: &mut Rng,
     candidates: &mut Vec<(usize, f32)>,
@@ -240,12 +264,24 @@ fn sample_top_k(
         return candidates[0].0 as u32;
     }
 
-    let mut cutoff = candidates.len();
-    let mut kept_sum = sum;
+    // Candidates are held in descending-logit order, so descending-weight order too;
+    // candidates[0].1 is therefore the max weight for the min-P cutoff.
+    let mut limit = candidates.len();
+    if min_p > 0.0 {
+        let threshold = min_p * candidates[0].1;
+        limit = candidates
+            .iter()
+            .position(|&(_, w)| w < threshold)
+            .unwrap_or(candidates.len())
+            .max(1);
+    }
+
+    let mut cutoff = limit;
+    let mut kept_sum: f32 = candidates[..limit].iter().map(|&(_, w)| w).sum();
     if top_p < 1.0 {
         let mut cumsum = 0.0f32;
         let threshold = top_p * sum;
-        for (i, &(_, weight)) in candidates.iter().enumerate() {
+        for (i, &(_, weight)) in candidates[..limit].iter().enumerate() {
             cumsum += weight;
             if cumsum > threshold {
                 cutoff = i + 1;
@@ -309,6 +345,7 @@ mod tests {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 1,
+            min_p: 0.0,
             repeat_penalty: 1.0,
         };
         let mut rng = Rng::new(42);
@@ -336,6 +373,7 @@ mod tests {
             temperature: 1.0,
             top_p: 1.0,
             top_k: 2,
+            min_p: 0.0,
             repeat_penalty: 1.0,
         };
         let mut rng = Rng::new(42);
@@ -357,6 +395,7 @@ mod tests {
             temperature: 1.0,
             top_p: 0.6,
             top_k: 2,
+            min_p: 0.0,
             repeat_penalty: 1.0,
         };
         let mut rng = Rng::new(42);
@@ -374,6 +413,7 @@ mod tests {
             temperature: 1.0,
             top_p: 0.6,
             top_k: 0,
+            min_p: 0.0,
             repeat_penalty: 1.0,
         };
         let mut rng = Rng::new(42);
@@ -382,5 +422,61 @@ mod tests {
             let token = sample(&mut logits, &config, &mut rng, &[]);
             assert_eq!(token, 0);
         }
+    }
+
+    #[test]
+    /// Verifies min-P discards low-probability tokens on the full-vocab path. With a
+    /// dominant logit, a moderate min_p leaves only the top token in the running.
+    fn min_p_prunes_full_vocab_tail() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.3,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(42);
+        for _ in 0..128 {
+            // Only tokens 0 and 1 are within a factor of ~e of the max; token 2/3 are far below.
+            let mut logits = vec![10.0, 9.5, 3.0, 1.0];
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert!(token <= 1, "min-P let through a pruned tail token: {}", token);
+        }
+    }
+
+    #[test]
+    /// Verifies min-P also constrains the top-k path and never yields an empty set.
+    fn min_p_prunes_top_k_path() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 4,
+            min_p: 0.5,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(7);
+        for _ in 0..128 {
+            let mut logits = vec![10.0, 2.0, 1.0, 0.0];
+            // Only token 0 survives min_p = 0.5 (others are far below half of p_max).
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert_eq!(token, 0);
+        }
+    }
+
+    #[test]
+    /// Verifies an aggressive min_p never leaves the candidate set empty: the single
+    /// most likely token is always retained.
+    fn min_p_keeps_at_least_one_token() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.999_999,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(1);
+        let mut logits = vec![1.0, 2.0, 3.0, 4.0];
+        let token = sample(&mut logits, &config, &mut rng, &[]);
+        assert_eq!(token, 3);
     }
 }
