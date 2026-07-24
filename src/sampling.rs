@@ -122,9 +122,34 @@ pub fn sample_with_scratch(
             .unwrap_or(0);
     }
 
-    // Top-P (nucleus) and/or min-P truncation. Both operate on the sorted head, so
-    // we only pay for the sort when at least one of them is active.
-    if config.top_p < 1.0 || config.min_p > 0.0 {
+    // Fast path: min-P without top-P needs no sort. After the max-subtracted softmax
+    // the most likely token's weight is exactly 1.0, so `min_p * p_max` reduces to the
+    // constant `min_p` and the filter is a single linear pass over the vocabulary
+    // (O(n) instead of the O(n log n) sort below). Since min_p < 1.0 is enforced, the
+    // top token always survives, so the kept set is never empty.
+    if config.min_p > 0.0 && config.top_p >= 1.0 {
+        let threshold = config.min_p;
+        let kept_sum: f32 = logits.iter().filter(|&&w| w >= threshold).sum();
+        if kept_sum.is_finite() && kept_sum > 0.0 {
+            let r = rng.next_f32() * kept_sum;
+            let mut seen = 0.0f32;
+            let mut last = 0usize;
+            for (i, &w) in logits.iter().enumerate() {
+                if w >= threshold {
+                    last = i;
+                    seen += w;
+                    if seen > r {
+                        return i as u32;
+                    }
+                }
+            }
+            return last as u32;
+        }
+    }
+
+    // Top-P (nucleus), optionally combined with min-P. Both operate on the sorted head,
+    // so we only pay for the sort when top-P is active.
+    if config.top_p < 1.0 {
         candidates.clear();
         if candidates.capacity() < n {
             candidates.reserve(n - candidates.capacity());
@@ -495,6 +520,26 @@ mod tests {
         for _ in 0..128 {
             let mut logits = vec![10.0, 2.0, 1.0, 0.0];
             // Only token 0 survives min_p = 0.5 (others are far below half of p_max).
+            let token = sample(&mut logits, &config, &mut rng, &[]);
+            assert_eq!(token, 0);
+        }
+    }
+
+    #[test]
+    /// Verifies min-P combined with top-P (the sorted path) still bounds the result to
+    /// the min-P-surviving head.
+    fn min_p_and_top_p_combined() {
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 0,
+            min_p: 0.5,
+            repeat_penalty: 1.0,
+        };
+        let mut rng = Rng::new(3);
+        for _ in 0..128 {
+            let mut logits = vec![10.0, 2.0, 1.0, 0.0];
+            // min_p = 0.5 leaves only token 0 (others fall far below half of p_max).
             let token = sample(&mut logits, &config, &mut rng, &[]);
             assert_eq!(token, 0);
         }
