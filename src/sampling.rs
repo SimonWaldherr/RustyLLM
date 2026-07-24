@@ -76,38 +76,11 @@ pub fn sample_with_scratch(
     }
 
     if config.temperature < 1e-6 {
-        if config.repeat_penalty != 1.0 {
-            for &tok in recent_tokens {
-                if (tok as usize) < n {
-                    let v = logits[tok as usize];
-                    logits[tok as usize] = if !v.is_finite() {
-                        f32::NEG_INFINITY
-                    } else if v > 0.0 {
-                        v / config.repeat_penalty
-                    } else {
-                        v * config.repeat_penalty
-                    };
-                }
-            }
-        }
+        apply_repeat_penalty(logits, recent_tokens, config.repeat_penalty);
         return argmax_finite_token(logits);
     }
 
-    // Repetition penalty
-    if config.repeat_penalty != 1.0 {
-        for &tok in recent_tokens {
-            if (tok as usize) < n {
-                let v = logits[tok as usize];
-                logits[tok as usize] = if !v.is_finite() {
-                    f32::NEG_INFINITY
-                } else if v > 0.0 {
-                    v / config.repeat_penalty
-                } else {
-                    v * config.repeat_penalty
-                };
-            }
-        }
-    }
+    apply_repeat_penalty(logits, recent_tokens, config.repeat_penalty);
 
     let inv_temp = 1.0 / config.temperature;
     if config.top_k > 0 && config.top_k < n {
@@ -316,6 +289,29 @@ fn bubble_up_last(candidates: &mut [(usize, f32)]) {
     }
 }
 
+/// Applies the CTRL-style repetition penalty in place: positive logits of recently
+/// seen tokens are divided by `penalty` and negative logits multiplied, pushing them
+/// toward zero. A `penalty` of 1.0 is a no-op. Non-finite logits are clamped to
+/// negative infinity so they can never be selected.
+fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    let n = logits.len();
+    for &tok in recent_tokens {
+        if (tok as usize) < n {
+            let v = logits[tok as usize];
+            logits[tok as usize] = if !v.is_finite() {
+                f32::NEG_INFINITY
+            } else if v > 0.0 {
+                v / penalty
+            } else {
+                v * penalty
+            };
+        }
+    }
+}
+
 /// Returns the index of the highest finite logit.
 fn argmax_finite_token(logits: &[f32]) -> u32 {
     let mut best = 0usize;
@@ -336,7 +332,48 @@ fn argmax_finite_token(logits: &[f32]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rng, SamplerConfig, sample};
+    use super::{Rng, SamplerConfig, apply_repeat_penalty, sample};
+
+    #[test]
+    /// Verifies the repeat penalty divides positive logits and multiplies negative ones,
+    /// leaving unseen tokens and a penalty of 1.0 untouched.
+    fn repeat_penalty_pushes_seen_logits_toward_zero() {
+        let mut logits = vec![4.0, -4.0, 2.0];
+        apply_repeat_penalty(&mut logits, &[0, 1], 2.0);
+        assert_eq!(logits[0], 2.0, "positive logit should be divided");
+        assert_eq!(logits[1], -8.0, "negative logit should be multiplied");
+        assert_eq!(logits[2], 2.0, "unseen token must be unchanged");
+
+        let mut noop = vec![1.0, 2.0];
+        apply_repeat_penalty(&mut noop, &[0, 1], 1.0);
+        assert_eq!(noop, vec![1.0, 2.0], "penalty of 1.0 is a no-op");
+    }
+
+    #[test]
+    /// Verifies out-of-range recent tokens are ignored rather than panicking.
+    fn repeat_penalty_ignores_out_of_range_tokens() {
+        let mut logits = vec![1.0, 2.0];
+        apply_repeat_penalty(&mut logits, &[5, 99], 2.0);
+        assert_eq!(logits, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    /// Verifies a greedy (temperature 0) decode still applies the repeat penalty, so a
+    /// heavily penalized front-runner can lose to the runner-up.
+    fn repeat_penalty_flips_greedy_winner() {
+        let config = SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repeat_penalty: 4.0,
+        };
+        let mut rng = Rng::new(1);
+        // Token 0 leads (8.0 vs 3.0) but is in the recent set; /4 drops it to 2.0.
+        let mut logits = vec![8.0, 3.0];
+        let token = sample(&mut logits, &config, &mut rng, &[0]);
+        assert_eq!(token, 1, "penalized front-runner should lose to runner-up");
+    }
 
     #[test]
     /// Verifies that `top_k = 1` always returns the highest-logit token.
