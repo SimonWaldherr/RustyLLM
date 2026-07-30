@@ -21,7 +21,7 @@ use rusty_llm::metal;
 use rusty_llm::model::Config;
 use rusty_llm::runtime::{
     BackendPolicy, ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
-    compatibility_report,
+    architecture_preparation_note, compatibility_report,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, McpServeOptions, ServeOptions};
@@ -1130,6 +1130,7 @@ fn inspect_model_file(path: &PathBuf) -> Result<(), String> {
             "name": gguf.get_str("general.name"),
             "architecture": arch,
             "supported_architecture": supported_architecture,
+            "preparation_note": architecture_preparation_note(arch),
         },
         "config": {
             "dim": config.dim,

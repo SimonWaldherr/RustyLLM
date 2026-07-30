@@ -666,6 +666,21 @@ pub fn architecture_supported(arch: &str) -> bool {
     )
 }
 
+/// Returns implementation guidance for known GGUF architectures that are not
+/// executable by this runtime yet.
+///
+/// Keeping this separate from [`architecture_supported`] makes `--inspect`
+/// useful for new model families without letting a generic transformer loader
+/// attempt to execute an incompatible tensor layout.
+pub fn architecture_preparation_note(arch: &str) -> Option<&'static str> {
+    match arch {
+        "nemotron_h_moe" => Some(
+            "The Nemotron-H MoE family (including Soofi S Isar) is a hybrid Mamba-2/attention model with routed experts. RustyLLM still needs Mamba-2 state-space recurrence, per-layer recurrent state, and sparse routed-MoE execution before it can load this architecture.",
+        ),
+        _ => None,
+    }
+}
+
 /// Reports whether an architecture uses the Gemma-family dense decoder path.
 /// Reports whether batched prompt prefill is enabled (default on; set
 /// `RUSTY_LLM_BATCH_PREFILL=0` to force the per-token path, e.g. for A/B
@@ -735,6 +750,9 @@ impl CompatibilityReport {
 
     fn first_error(&self, arch: &str) -> String {
         if !self.supported_architecture {
+            if let Some(note) = architecture_preparation_note(arch) {
+                return format!("Unsupported architecture: {}. {}", arch, note);
+            }
             return format!(
                 "Unsupported architecture: {}. Please ensure you are using a supported GGUF architecture.",
                 arch
@@ -2874,6 +2892,8 @@ impl Runner {
             token == self.tok.eos_id
                 || self.tok.special_id("<end_of_turn>") == Some(token)
                 || self.tok.special_id("<turn|>") == Some(token)
+        } else if matches!(self.chat_template_kind(), Some("chatml")) {
+            token == self.tok.eos_id || self.tok.special_id("<|im_end|>") == Some(token)
         } else {
             token == self.tok.eos_id
         }
@@ -2898,6 +2918,11 @@ impl Runner {
         }
         if matches!(self.chat_template_kind(), Some("header-chat")) {
             if let Some(tokens) = self.render_header_chat_messages(messages, system_prompt) {
+                return tokens;
+            }
+        }
+        if matches!(self.chat_template_kind(), Some("chatml")) {
+            if let Some(tokens) = self.render_chatml_messages(messages, system_prompt) {
                 return tokens;
             }
         }
@@ -3196,6 +3221,51 @@ impl Runner {
         Some(tokens)
     }
 
+    /// Renders ChatML turns, as used by Soofi S Isar and related GGUFs.
+    fn render_chatml_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+    ) -> Option<Vec<u32>> {
+        let im_start = self.tok.special_id("<|im_start|>")?;
+        let im_end = self.tok.special_id("<|im_end|>")?;
+        let mut tokens = Vec::new();
+        if self.tok.adds_bos_token() {
+            tokens.push(self.tok.bos_id);
+        }
+
+        let push_turn = |role: &str, content: &str, out: &mut Vec<u32>| {
+            out.push(im_start);
+            out.extend(self.tok.encode_without_bos(role));
+            out.extend(self.tok.encode_without_bos("\n"));
+            out.extend(self.tok.encode_without_bos(content));
+            out.push(im_end);
+            out.extend(self.tok.encode_without_bos("\n"));
+        };
+
+        if !system_prompt.trim().is_empty()
+            && !messages.iter().any(|m| matches!(m.role, ChatRole::System))
+        {
+            push_turn("system", system_prompt.trim(), &mut tokens);
+        }
+
+        for message in messages {
+            let role = match message.role {
+                ChatRole::System => "system",
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+            };
+            push_turn(role, message.content.trim(), &mut tokens);
+        }
+
+        // Leave the assistant turn open so generation continues after its
+        // role header, as `add_generation_prompt` does in ChatML templates.
+        tokens.push(im_start);
+        tokens.extend(self.tok.encode_without_bos("assistant"));
+        tokens.extend(self.tok.encode_without_bos("\n"));
+        Some(tokens)
+    }
+
     /// Classifies the loaded tokenizer chat template.
     fn chat_template_kind(&self) -> Option<&'static str> {
         let template = self
@@ -3219,6 +3289,8 @@ impl Runner {
             && template.contains("[/INST]")
         {
             Some("mistral3-inst")
+        } else if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
+            Some("chatml")
         } else {
             None
         }
@@ -4065,7 +4137,8 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendPolicy, RECENT_TOKEN_LIMIT, RuntimeProfile, clean_thinking_prompt,
+        BackendPolicy, CompatibilityReport, RECENT_TOKEN_LIMIT, RuntimeProfile,
+        architecture_preparation_note, architecture_supported, clean_thinking_prompt,
         cosine_similarity, l2_normalize_in_place, mean_pool_in_place, push_recent_token,
         recent_token_tail, trailing_char_boundary_start,
     };
@@ -4237,6 +4310,37 @@ mod tests {
             ),
             Some("header-chat")
         );
+    }
+
+    #[test]
+    /// Verifies that ChatML templates select the renderer prepared for Soofi.
+    fn chat_template_kind_detects_chatml() {
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(
+                "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+            ),
+            Some("chatml")
+        );
+    }
+
+    #[test]
+    /// Verifies that hybrid Nemotron-H/MoE GGUFs return actionable readiness guidance.
+    fn nemotron_h_moe_reports_preparation_requirements() {
+        let report = CompatibilityReport {
+            supported_architecture: false,
+            unsupported_tensor_types: Vec::new(),
+            missing_tensors: Vec::new(),
+            unsupported_layouts: Vec::new(),
+        };
+        assert!(
+            architecture_preparation_note("nemotron_h_moe")
+                .expect("Soofi architecture has guidance")
+                .contains("Mamba-2")
+        );
+        assert!(!architecture_supported("nemotron_h_moe"));
+        let error = report.first_error("nemotron_h_moe");
+        assert!(error.contains("Soofi S Isar"));
+        assert!(error.contains("routed-MoE"));
     }
 
     #[test]

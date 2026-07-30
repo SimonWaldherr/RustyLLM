@@ -125,6 +125,22 @@ the tokenizer template exposes those markers. The startup optimization summary
 prints the selected renderer, for example `chat-template=mistral3-inst`, so you
 can quickly spot whether a model uses a native template or the plain fallback.
 
+### Soofi S Isar readiness
+
+The preview GGUF for [Soofi S Isar](https://huggingface.co/Soofi-Project/Soofi-S-Isar-Preview-GGUF)
+identifies itself as `nemotron_h_moe`. Its 23 hybrid Mamba-2/MoE layers and six
+attention layers need recurrent state-space execution plus sparse routing across
+its experts. RustyLLM recognizes that architecture in `--inspect`, reports the
+required work in `model.preparation_note`, and uses its native ChatML formatter
+(`&lt;|im_start|&gt;...&lt;|im_end|&gt;`) once the architecture becomes executable.
+
+It is intentionally **not loadable yet**: treating it as the ordinary
+`nemotron` transformer loader would produce incorrect results. Native support
+requires Mamba-2 SSM kernels and cache, top-k routed-MoE dispatch including the
+shared expert, mixed Mamba/attention layer scheduling, then CPU/Metal benchmark
+coverage against a Soofi GGUF fixture. The smallest published preview quant is
+about 21 GB (Q4_K_M); Q5_K_M is about 25 GB, before runtime memory overhead.
+
 ## Requirements
 
 - Rust 1.95 or newer. The repository pins `1.95.0` in
