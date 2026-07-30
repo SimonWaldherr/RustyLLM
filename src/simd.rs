@@ -1666,6 +1666,33 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Computes four dot products against the same right-hand vector. GQA
+/// attention uses this for its common four-query-head groups, letting the SIMD
+/// loop load each cached key vector once rather than once per query head.
+#[inline]
+pub fn dot_f32x4(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    debug_assert_eq!(a0.len(), b.len());
+    debug_assert_eq!(a1.len(), b.len());
+    debug_assert_eq!(a2.len(), b.len());
+    debug_assert_eq!(a3.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_f32x4_neon(a0, a1, a2, a3, b) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { dot_f32x4_avx2(a0, a1, a2, a3, b) }
+        } else {
+            dot_f32x4_scalar(a0, a1, a2, a3, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        dot_f32x4_scalar(a0, a1, a2, a3, b)
+    }
+}
+
 /// Computes `out[i] += alpha * x[i]`.
 #[inline]
 /// Adds a scaled vector into another vector in place.
@@ -3608,6 +3635,19 @@ fn dot_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
 }
 
 #[allow(dead_code)]
+fn dot_f32x4_scalar(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    let mut out = [0.0; 4];
+    for i in 0..b.len() {
+        let key = b[i];
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+    }
+    out
+}
+
+#[allow(dead_code)]
 /// Portable scalar implementation of Q8_0 dot product.
 fn dot_q8_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
@@ -4984,6 +5024,38 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+unsafe fn dot_f32x4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let n = b.len();
+    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        let key = vld1q_f32(b.as_ptr().add(i));
+        sums[0] = vmlaq_f32(sums[0], vld1q_f32(a0.as_ptr().add(i)), key);
+        sums[1] = vmlaq_f32(sums[1], vld1q_f32(a1.as_ptr().add(i)), key);
+        sums[2] = vmlaq_f32(sums[2], vld1q_f32(a2.as_ptr().add(i)), key);
+        sums[3] = vmlaq_f32(sums[3], vld1q_f32(a3.as_ptr().add(i)), key);
+        i += 4;
+    }
+    let mut out = [
+        vaddvq_f32(sums[0]),
+        vaddvq_f32(sums[1]),
+        vaddvq_f32(sums[2]),
+        vaddvq_f32(sums[3]),
+    ];
+    while i < n {
+        let key = b[i];
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
 unsafe fn dot_q8_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
@@ -5257,6 +5329,37 @@ unsafe fn dot_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
         sum += a[i] * b[i];
     }
     sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_f32x4_avx2(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let key = _mm256_loadu_ps(b.as_ptr().add(i));
+        sums[0] = _mm256_fmadd_ps(_mm256_loadu_ps(a0.as_ptr().add(i)), key, sums[0]);
+        sums[1] = _mm256_fmadd_ps(_mm256_loadu_ps(a1.as_ptr().add(i)), key, sums[1]);
+        sums[2] = _mm256_fmadd_ps(_mm256_loadu_ps(a2.as_ptr().add(i)), key, sums[2]);
+        sums[3] = _mm256_fmadd_ps(_mm256_loadu_ps(a3.as_ptr().add(i)), key, sums[3]);
+        i += 8;
+    }
+    let mut out = [
+        hsum_avx(sums[0]),
+        hsum_avx(sums[1]),
+        hsum_avx(sums[2]),
+        hsum_avx(sums[3]),
+    ];
+    while i < b.len() {
+        let key = b[i];
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+        i += 1;
+    }
+    out
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -5709,6 +5812,27 @@ mod tests {
             (fused - reference).abs() < 1e-3,
             "fused {fused} vs reference {reference}"
         );
+    }
+
+    #[test]
+    fn four_way_f32_dot_matches_individual_dots() {
+        let key: Vec<f32> = (0..67).map(|i| i as f32 * 0.03125 - 1.0).collect();
+        let queries: Vec<Vec<f32>> = (0..4)
+            .map(|head| {
+                (0..67)
+                    .map(|i| (i as f32 * (head + 1) as f32 * 0.017) - 0.5)
+                    .collect()
+            })
+            .collect();
+        let got = dot_f32x4(&queries[0], &queries[1], &queries[2], &queries[3], &key);
+        for head in 0..4 {
+            let expected = dot_f32(&queries[head], &key);
+            assert!(
+                (got[head] - expected).abs() < 1e-4,
+                "head {head}: {} vs {expected}",
+                got[head]
+            );
+        }
     }
 
     #[test]

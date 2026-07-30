@@ -1144,6 +1144,62 @@ mod tests {
     }
 
     #[test]
+    fn grouped_four_head_attention_matches_individual_heads() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const TOKENS: usize = 11;
+        let queries: Vec<f32> = (0..4 * HEAD_DIM).map(|i| i as f32 * 0.013 - 0.2).collect();
+        let keys: Vec<f32> = (0..TOKENS * HEAD_DIM)
+            .map(|i| i as f32 * 0.021 - 0.3)
+            .collect();
+        let values: Vec<f32> = (0..TOKENS * VALUE_DIM)
+            .map(|i| i as f32 * 0.009 - 0.4)
+            .collect();
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut grouped = vec![0.0; 4 * VALUE_DIM];
+        super::online_attention_grouped(
+            &queries,
+            &keys,
+            &values,
+            HEAD_DIM,
+            VALUE_DIM,
+            TOKENS,
+            HEAD_DIM,
+            VALUE_DIM,
+            4,
+            0,
+            TOKENS - 1,
+            scale,
+            &mut grouped,
+        );
+        for head in 0..4 {
+            let mut expected = vec![0.0; VALUE_DIM];
+            super::online_attention(
+                &queries[head * HEAD_DIM..(head + 1) * HEAD_DIM],
+                &keys,
+                &values,
+                HEAD_DIM,
+                VALUE_DIM,
+                TOKENS,
+                HEAD_DIM,
+                VALUE_DIM,
+                0,
+                TOKENS - 1,
+                scale,
+                &mut expected,
+            );
+            for i in 0..VALUE_DIM {
+                assert!(
+                    (grouped[head * VALUE_DIM + i] - expected[i]).abs() < 1e-5,
+                    "head {head}, value {i}: {} vs {}",
+                    grouped[head * VALUE_DIM + i],
+                    expected[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sliding_kv_cache_uses_ring_storage_without_lowering_context_limit() {
         let mut cache = KVCache::with_sliding_window(2, 4, 6, 128, Some(8));
         assert_eq!(cache.max_len, 128);
@@ -3549,10 +3605,25 @@ pub(crate) fn online_attention_grouped(
         let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
+        let scores = if kv_mul == 4 {
+            let q0 = unsafe { queries.get_unchecked(0..key_head_dim) };
+            let q1 = unsafe { queries.get_unchecked(key_head_dim..2 * key_head_dim) };
+            let q2 = unsafe { queries.get_unchecked(2 * key_head_dim..3 * key_head_dim) };
+            let q3 = unsafe { queries.get_unchecked(3 * key_head_dim..4 * key_head_dim) };
+            simd::dot_f32x4(q0, q1, q2, q3, keys_sub)
+        } else {
+            [0.0; 4]
+        };
+
         for g in 0..kv_mul {
-            let q_sub =
-                unsafe { queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim) };
-            let score = simd::dot_f32(q_sub, keys_sub) * scale;
+            let score = if kv_mul == 4 {
+                scores[g] * scale
+            } else {
+                let q_sub = unsafe {
+                    queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
+                };
+                simd::dot_f32(q_sub, keys_sub) * scale
+            };
             let out_sub = unsafe {
                 out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
             };

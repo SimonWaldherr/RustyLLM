@@ -8,7 +8,7 @@ use crate::tokenizer::Tokenizer;
 use std::cmp::Ordering;
 #[cfg(not(target_family = "wasm"))]
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Embedding result returned by [`Runner::embed`].
@@ -618,6 +618,11 @@ pub struct Runner {
     #[allow(dead_code)]
     #[cfg(not(target_family = "wasm"))]
     mapped_model: Option<crate::mmap::MmapFile>,
+    /// Chat-template classification is invariant for the life of the runner
+    /// but is consulted on every generated token (`is_stop_token`), so it is
+    /// computed once and cached rather than re-parsing the template string
+    /// per token.
+    chat_template_kind_cache: OnceLock<Option<&'static str>>,
 }
 
 /// Reports whether the architecture string maps to a supported loader.
@@ -1105,6 +1110,7 @@ impl Runner {
             generation_lock: Mutex::new(()),
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
+            chat_template_kind_cache: OnceLock::new(),
         })
     }
 
@@ -1184,6 +1190,7 @@ impl Runner {
             speculative_assistant: None,
             generation_lock: Mutex::new(()),
             mapped_model: Some(mmap),
+            chat_template_kind_cache: OnceLock::new(),
         };
         let runner_time = t_runner.elapsed();
         let load_time = t0.elapsed();
@@ -3272,12 +3279,14 @@ impl Runner {
 
     /// Classifies the loaded tokenizer chat template.
     fn chat_template_kind(&self) -> Option<&'static str> {
-        let template = self
-            .gguf
-            .metadata
-            .get("tokenizer.chat_template")?
-            .as_str()?;
-        Self::chat_template_kind_from_template(template)
+        *self.chat_template_kind_cache.get_or_init(|| {
+            let template = self
+                .gguf
+                .metadata
+                .get("tokenizer.chat_template")?
+                .as_str()?;
+            Self::chat_template_kind_from_template(template)
+        })
     }
 
     fn chat_template_kind_from_template(template: &str) -> Option<&'static str> {
