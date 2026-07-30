@@ -320,7 +320,8 @@ impl GenerationOptions {
         if !self.sampler.repeat_penalty.is_finite() || self.sampler.repeat_penalty <= 0.0 {
             return Err(String::from("repeat_penalty must be a finite number > 0."));
         }
-        if !self.sampler.min_p.is_finite() || self.sampler.min_p < 0.0 || self.sampler.min_p >= 1.0 {
+        if !self.sampler.min_p.is_finite() || self.sampler.min_p < 0.0 || self.sampler.min_p >= 1.0
+        {
             return Err(String::from("min_p must be in the range [0, 1)."));
         }
         if self.speculative.max_draft_tokens == 0 && self.speculative.assistant_path.is_some() {

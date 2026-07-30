@@ -502,7 +502,11 @@ mod tests {
             // Only tokens 0 and 1 are within a factor of ~e of the max; token 2/3 are far below.
             let mut logits = vec![10.0, 9.5, 3.0, 1.0];
             let token = sample(&mut logits, &config, &mut rng, &[]);
-            assert!(token <= 1, "min-P let through a pruned tail token: {}", token);
+            assert!(
+                token <= 1,
+                "min-P let through a pruned tail token: {}",
+                token
+            );
         }
     }
 

@@ -75,7 +75,9 @@ fn print_usage(name: &str) {
     eprintln!("  --temp <F>                Temperature (default: 0.7, 0=greedy)");
     eprintln!("  --top-p <F>               Nucleus sampling threshold (default: 0.9)");
     eprintln!("  --top-k <N>               Top-K filtering (default: 40)");
-    eprintln!("  --min-p <F>               Min-P cutoff, relative to top token; 0 disables (default: 0)");
+    eprintln!(
+        "  --min-p <F>               Min-P cutoff, relative to top token; 0 disables (default: 0)"
+    );
     eprintln!("  --repeat-penalty <F>      Repetition penalty (default: 1.1)");
     eprintln!("  --seed <N>                RNG seed (default: time-based)");
     eprintln!("  --threads <N>             Override thread count");
