@@ -3605,25 +3605,42 @@ pub(crate) fn online_attention_grouped(
         let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
-        let scores = if kv_mul == 4 {
+        if kv_mul == 4 {
             let q0 = unsafe { queries.get_unchecked(0..key_head_dim) };
             let q1 = unsafe { queries.get_unchecked(key_head_dim..2 * key_head_dim) };
             let q2 = unsafe { queries.get_unchecked(2 * key_head_dim..3 * key_head_dim) };
             let q3 = unsafe { queries.get_unchecked(3 * key_head_dim..4 * key_head_dim) };
-            simd::dot_f32x4(q0, q1, q2, q3, keys_sub)
-        } else {
-            [0.0; 4]
-        };
+            let scores = simd::dot_f32x4(q0, q1, q2, q3, keys_sub);
+            let mut multiplier = [1.0; 4];
+            let mut alpha = [0.0; 4];
+            for g in 0..4 {
+                let score = scores[g] * scale;
+                if score > max_score[g] {
+                    let old_scale = if max_score[g].is_finite() {
+                        exp_attn(max_score[g] - score)
+                    } else {
+                        0.0
+                    };
+                    multiplier[g] = old_scale;
+                    alpha[g] = 1.0;
+                    denom[g] = denom[g] * old_scale + 1.0;
+                    max_score[g] = score;
+                } else {
+                    alpha[g] = exp_attn(score - max_score[g]);
+                    denom[g] += alpha[g];
+                }
+            }
+            let (out0, rest) = out.split_at_mut(value_head_dim);
+            let (out1, rest) = rest.split_at_mut(value_head_dim);
+            let (out2, out3) = rest.split_at_mut(value_head_dim);
+            simd::affine_add_f32x4(out0, out1, out2, out3, multiplier, alpha, value_row);
+            continue;
+        }
 
         for g in 0..kv_mul {
-            let score = if kv_mul == 4 {
-                scores[g] * scale
-            } else {
-                let q_sub = unsafe {
-                    queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
-                };
-                simd::dot_f32(q_sub, keys_sub) * scale
-            };
+            let q_sub =
+                unsafe { queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim) };
+            let score = simd::dot_f32(q_sub, keys_sub) * scale;
             let out_sub = unsafe {
                 out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
             };

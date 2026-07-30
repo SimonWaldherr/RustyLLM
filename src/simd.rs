@@ -1767,6 +1767,39 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     }
 }
 
+/// Applies four independent `out = out * multiplier + alpha * x` updates
+/// while streaming the shared source vector only once. This is the value-cache
+/// half of four-head grouped-query attention.
+#[inline]
+pub fn affine_add_f32x4(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+) {
+    debug_assert_eq!(out0.len(), x.len());
+    debug_assert_eq!(out1.len(), x.len());
+    debug_assert_eq!(out2.len(), x.len());
+    debug_assert_eq!(out3.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        affine_add_f32x4_neon(out0, out1, out2, out3, multiplier, alpha, x)
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_fma() {
+        unsafe { affine_add_f32x4_avx2(out0, out1, out2, out3, multiplier, alpha, x) }
+    } else {
+        affine_add_f32x4_scalar(out0, out1, out2, out3, multiplier, alpha, x)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        affine_add_f32x4_scalar(out0, out1, out2, out3, multiplier, alpha, x)
+    }
+}
+
 /// Computes `out[i] = silu(gate[i]) * up[i]` — the SwiGLU elementwise combine
 /// between the fused gate/up projections and the down projection. The scalar
 /// `expf` loop this replaces costs ~0.8 ms per layer at Ministral's
@@ -3648,6 +3681,24 @@ fn dot_f32x4_scalar(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f32]) -
 }
 
 #[allow(dead_code)]
+fn affine_add_f32x4_scalar(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+) {
+    for i in 0..x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+    }
+}
+
+#[allow(dead_code)]
 /// Portable scalar implementation of Q8_0 dot product.
 fn dot_q8_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
@@ -5056,6 +5107,76 @@ unsafe fn dot_f32x4_neon(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f3
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+unsafe fn affine_add_f32x4_neon(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+) {
+    use std::arch::aarch64::*;
+    let mul = [
+        vdupq_n_f32(multiplier[0]),
+        vdupq_n_f32(multiplier[1]),
+        vdupq_n_f32(multiplier[2]),
+        vdupq_n_f32(multiplier[3]),
+    ];
+    let add = [
+        vdupq_n_f32(alpha[0]),
+        vdupq_n_f32(alpha[1]),
+        vdupq_n_f32(alpha[2]),
+        vdupq_n_f32(alpha[3]),
+    ];
+    let mut i = 0;
+    while i + 4 <= x.len() {
+        let value = vld1q_f32(x.as_ptr().add(i));
+        vst1q_f32(
+            out0.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out0.as_ptr().add(i)), mul[0]),
+                value,
+                add[0],
+            ),
+        );
+        vst1q_f32(
+            out1.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out1.as_ptr().add(i)), mul[1]),
+                value,
+                add[1],
+            ),
+        );
+        vst1q_f32(
+            out2.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out2.as_ptr().add(i)), mul[2]),
+                value,
+                add[2],
+            ),
+        );
+        vst1q_f32(
+            out3.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out3.as_ptr().add(i)), mul[3]),
+                value,
+                add[3],
+            ),
+        );
+        i += 4;
+    }
+    while i < x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
 unsafe fn dot_q8_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
@@ -5360,6 +5481,55 @@ unsafe fn dot_f32x4_avx2(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[f3
         i += 1;
     }
     out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn affine_add_f32x4_avx2(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+) {
+    use std::arch::x86_64::*;
+    let mul = [
+        _mm256_set1_ps(multiplier[0]),
+        _mm256_set1_ps(multiplier[1]),
+        _mm256_set1_ps(multiplier[2]),
+        _mm256_set1_ps(multiplier[3]),
+    ];
+    let add = [
+        _mm256_set1_ps(alpha[0]),
+        _mm256_set1_ps(alpha[1]),
+        _mm256_set1_ps(alpha[2]),
+        _mm256_set1_ps(alpha[3]),
+    ];
+    let mut i = 0;
+    while i + 8 <= x.len() {
+        let value = _mm256_loadu_ps(x.as_ptr().add(i));
+        let update = |out: &mut [f32], m, a| {
+            let old = _mm256_loadu_ps(out.as_ptr().add(i));
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(i),
+                _mm256_fmadd_ps(value, a, _mm256_mul_ps(old, m)),
+            );
+        };
+        update(out0, mul[0], add[0]);
+        update(out1, mul[1], add[1]);
+        update(out2, mul[2], add[2]);
+        update(out3, mul[3], add[3]);
+        i += 8;
+    }
+    while i < x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+        i += 1;
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
