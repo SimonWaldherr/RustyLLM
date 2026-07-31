@@ -1,0 +1,20 @@
+# Use the real Apple Clang binary instead of /usr/bin/clang, which is an
+# xcrun shim. The shim writes an xcrun lookup database before every compiler
+# invocation; that is noisy and can fail in sandboxed or read-only temporary
+# directories. The linker and C compiler overrides are target-specific, so
+# Linux and Windows toolchains remain unchanged; callers can override CC or
+# SDKROOT explicitly when needed.
+
+[target.aarch64-apple-darwin]
+linker = "scripts/macos-clang"
+
+[target.x86_64-apple-darwin]
+linker = "scripts/macos-clang"
+
+[env]
+CC_aarch64_apple_darwin = { value = "scripts/macos-clang", relative = true }
+CC_x86_64_apple_darwin = { value = "scripts/macos-clang", relative = true }
+# Rust invokes xcrun while linking on macOS when SDKROOT is unset. An existing
+# SDKROOT from a custom Xcode installation still takes precedence; this path
+# is the standard full-Xcode SDK used by the Metal backend on macOS.
+SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"

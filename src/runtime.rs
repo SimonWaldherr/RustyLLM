@@ -604,6 +604,128 @@ enum DecodeFlow {
     Fallback,
 }
 
+/// A bounded, process-local prompt snapshot. This is deliberately separate
+/// from a conversation [`Session`]: identical stateless requests from
+/// different clients can reuse the same prompt KV state without sharing
+/// mutable decode state or generated tokens.
+struct PrefixSnapshot {
+    tokens: Vec<u32>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    logits: Vec<f32>,
+}
+
+/// Small LRU cache for completed prompt evaluations. It mirrors the
+/// prefix-cache idea used by high-throughput inference servers while keeping
+/// RustyLLM's existing per-session cache semantics untouched. Snapshots are
+/// bounded both by token count and by an approximate byte budget because KV
+/// state is intentionally stored in the model's native f32 representation.
+struct SharedPrefixCache {
+    entries: Vec<PrefixSnapshot>,
+    max_entries: usize,
+    max_tokens: usize,
+    max_bytes: usize,
+}
+
+impl SharedPrefixCache {
+    fn from_env() -> Self {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(default)
+        }
+
+        Self {
+            entries: Vec::new(),
+            max_entries: env_usize("RUSTY_LLM_PREFIX_CACHE_ENTRIES", 1).max(1),
+            max_tokens: env_usize("RUSTY_LLM_PREFIX_CACHE_TOKENS", 512).max(1),
+            max_bytes: env_usize("RUSTY_LLM_PREFIX_CACHE_BYTES", 128 * 1024 * 1024).max(1),
+        }
+    }
+
+    /// Restores an exact prompt snapshot into a freshly allocated KV cache.
+    /// The copied slices contain only active prompt rows; the remaining cache
+    /// capacity is already zeroed by `KVCache::with_sliding_window`.
+    fn restore(&mut self, tokens: &[u32], cache: &mut KVCache) -> Option<Vec<f32>> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.tokens == tokens)?;
+        let entry = self.entries.remove(index);
+        if entry.k.len() != cache.k.len()
+            || entry.v.len() != cache.v.len()
+            || entry
+                .k
+                .iter()
+                .zip(&cache.k)
+                .any(|(src, dst)| src.len() > dst.len())
+            || entry
+                .v
+                .iter()
+                .zip(&cache.v)
+                .any(|(src, dst)| src.len() > dst.len())
+        {
+            self.entries.insert(0, entry);
+            return None;
+        }
+        for (dst, src) in cache.k.iter_mut().zip(&entry.k) {
+            dst[..src.len()].copy_from_slice(src);
+        }
+        for (dst, src) in cache.v.iter_mut().zip(&entry.v) {
+            dst[..src.len()].copy_from_slice(src);
+        }
+        let logits = entry.logits.clone();
+        self.entries.insert(0, entry);
+        Some(logits)
+    }
+
+    /// Inserts a completed prompt. Existing identical entries are promoted to
+    /// MRU instead of duplicating their KV state.
+    fn insert(&mut self, tokens: &[u32], cache: &KVCache, logits: &[f32]) {
+        if tokens.is_empty()
+            || tokens.len() > self.max_tokens
+            || cache.sliding_window.is_some()
+            || cache.storage_len < tokens.len()
+            || cache.k.len() != cache.v.len()
+        {
+            return;
+        }
+        let k_len = tokens.len().saturating_mul(cache.per_pos_k_dim);
+        let v_len = tokens.len().saturating_mul(cache.per_pos_v_dim);
+        let bytes = cache
+            .k
+            .len()
+            .saturating_mul(k_len)
+            .saturating_add(cache.v.len().saturating_mul(v_len))
+            .saturating_add(logits.len().saturating_mul(std::mem::size_of::<f32>()));
+        if bytes > self.max_bytes {
+            return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.tokens == tokens) {
+            self.entries.remove(index);
+        }
+        self.entries.insert(
+            0,
+            PrefixSnapshot {
+                tokens: tokens.to_vec(),
+                k: cache
+                    .k
+                    .iter()
+                    .map(|layer| layer[..k_len].to_vec())
+                    .collect(),
+                v: cache
+                    .v
+                    .iter()
+                    .map(|layer| layer[..v_len].to_vec())
+                    .collect(),
+                logits: logits.to_vec(),
+            },
+        );
+        self.entries.truncate(self.max_entries);
+    }
+}
+
 pub struct Runner {
     gguf: GGUFFile,
     arch: String,
@@ -615,6 +737,9 @@ pub struct Runner {
     /// The worker pool's job slot is single-entry; two simultaneous
     /// forward passes would race on it and produce corrupted output.
     generation_lock: Mutex<()>,
+    /// Shared completed-prompt KV snapshots for stateless requests. This is
+    /// bounded and never shares mutable state with a live generation.
+    prefix_cache: Mutex<SharedPrefixCache>,
     #[allow(dead_code)]
     #[cfg(not(target_family = "wasm"))]
     mapped_model: Option<crate::mmap::MmapFile>,
@@ -1108,6 +1233,7 @@ impl Runner {
             weights,
             speculative_assistant: None,
             generation_lock: Mutex::new(()),
+            prefix_cache: Mutex::new(SharedPrefixCache::from_env()),
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
             chat_template_kind_cache: OnceLock::new(),
@@ -1189,6 +1315,7 @@ impl Runner {
             weights,
             speculative_assistant: None,
             generation_lock: Mutex::new(()),
+            prefix_cache: Mutex::new(SharedPrefixCache::from_env()),
             mapped_model: Some(mmap),
             chat_template_kind_cache: OnceLock::new(),
         };
@@ -2330,7 +2457,30 @@ impl Runner {
         // cache; incremental decoding starts from the last prompt logits.
         let t_prefill = Instant::now();
         let mut logits = Vec::with_capacity(self.config.vocab_size);
-        self.prefill_prompt_tokens(&mut cache, &mut buf, &tokens, 0, &mut logits, options);
+        let shared_prefix_allowed = sliding_window.is_none()
+            && (!crate::metal::resident_enabled() || !crate::metal::dispatch_enabled());
+        let shared_prefix_hit = if shared_prefix_allowed {
+            self.prefix_cache
+                .lock()
+                .ok()
+                .and_then(|mut prefix_cache| prefix_cache.restore(&tokens, &mut cache))
+        } else {
+            None
+        };
+        let cached_prompt_tokens = shared_prefix_hit
+            .as_ref()
+            .map(|_| tokens.len())
+            .unwrap_or(0);
+        if let Some(cached_logits) = shared_prefix_hit {
+            logits = cached_logits;
+        } else {
+            self.prefill_prompt_tokens(&mut cache, &mut buf, &tokens, 0, &mut logits, options);
+            if shared_prefix_allowed {
+                if let Ok(mut prefix_cache) = self.prefix_cache.lock() {
+                    prefix_cache.insert(&tokens, &cache, &logits);
+                }
+            }
+        }
         let prefill_time = t_prefill.elapsed();
 
         let mut speculative = self.prepare_speculative_state(options, &tokens, cache_len);
@@ -2434,7 +2584,7 @@ impl Runner {
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
-                cached_tokens: 0,
+                cached_tokens: cached_prompt_tokens,
                 speculative: speculative_stats,
             },
         })
@@ -4150,11 +4300,46 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendPolicy, CompatibilityReport, RECENT_TOKEN_LIMIT, RuntimeProfile,
+        BackendPolicy, CompatibilityReport, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
         architecture_preparation_note, architecture_supported, clean_thinking_prompt,
         cosine_similarity, l2_normalize_in_place, mean_pool_in_place, push_recent_token,
         recent_token_tail, trailing_char_boundary_start,
     };
+
+    #[test]
+    /// Verifies shared prompt snapshots restore only active KV rows and logits.
+    fn shared_prefix_cache_round_trips_prompt_state() {
+        let mut source = crate::model::KVCache::new(2, 4, 6, 8);
+        let tokens = [11u32, 12, 13];
+        for (layer, (k, v)) in source.k.iter_mut().zip(&mut source.v).enumerate() {
+            for (i, value) in k[..tokens.len() * source.per_pos_k_dim]
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (layer * 100 + i) as f32;
+            }
+            for (i, value) in v[..tokens.len() * source.per_pos_v_dim]
+                .iter_mut()
+                .enumerate()
+            {
+                *value = (layer * 200 + i) as f32;
+            }
+        }
+        let logits = vec![0.25f32, -1.5, 3.0];
+        let mut shared = SharedPrefixCache {
+            entries: Vec::new(),
+            max_entries: 1,
+            max_tokens: 16,
+            max_bytes: 1024 * 1024,
+        };
+        shared.insert(&tokens, &source, &logits);
+
+        let mut restored = crate::model::KVCache::new(2, 4, 6, 8);
+        let got_logits = shared.restore(&tokens, &mut restored).expect("cache hit");
+        assert_eq!(got_logits, logits);
+        assert_eq!(restored.k, source.k);
+        assert_eq!(restored.v, source.v);
+    }
 
     #[test]
     /// Verifies that mean pooling divides accumulated token vectors by sample count.

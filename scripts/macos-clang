@@ -1,0 +1,80 @@
+#!/bin/sh
+# Resolve a real Apple Clang executable without invoking /usr/bin/clang or
+# /usr/bin/cc, both of which are xcrun shims on macOS.
+set -eu
+
+find_clang() {
+    if [ -n "${DEVELOPER_DIR:-}" ]; then
+        for candidate in \
+            "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang" \
+            "$DEVELOPER_DIR/usr/bin/clang"; do
+            if [ -x "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
+    fi
+
+    for candidate in \
+        /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang \
+        /Library/Developer/CommandLineTools/usr/bin/clang; do
+        if [ -x "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    candidate="$(command -v clang 2>/dev/null || true)"
+    case "$candidate" in
+        /usr/bin/clang|/usr/bin/cc|"")
+            printf '%s\n' "macOS Apple Clang was not found; install Xcode or the Command Line Tools" >&2
+            return 127
+            ;;
+        *)
+            printf '%s\n' "$candidate"
+            return 0
+            ;;
+    esac
+}
+
+find_sdk() {
+    if [ -n "${SDKROOT:-}" ] && [ -d "$SDKROOT" ]; then
+        printf '%s\n' "$SDKROOT"
+        return 0
+    fi
+
+    if [ -n "${DEVELOPER_DIR:-}" ]; then
+        candidate="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        if [ -d "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    for candidate in \
+        /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk \
+        /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk; do
+        if [ -d "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# /usr/bin/clang normally receives SDKROOT from xcrun. Because this wrapper
+# deliberately bypasses xcrun, provide the same sysroot explicitly so Apple
+# headers such as TargetConditionals.h remain available to C dependencies.
+has_sysroot=0
+for arg in "$@"; do
+    if [ "$arg" = "-isysroot" ]; then
+        has_sysroot=1
+        break
+    fi
+done
+if [ "$has_sysroot" -eq 0 ] && sdk="$(find_sdk)"; then
+    set -- -isysroot "$sdk" "$@"
+fi
+
+exec "$(find_clang)" "$@"

@@ -155,6 +155,8 @@ about 21 GB (Q4_K_M); Q5_K_M is about 25 GB, before runtime memory overhead.
   `wasm32-unknown-unknown` target.
 - Optional for macOS Metal experiments: Xcode command line tools with `xcrun`,
   `clang`, and `ar`.
+  Cargo uses the real Apple Clang binary to avoid xcrun cache writes; set
+  `SDKROOT` when Xcode is installed outside `/Applications/Xcode.app`.
 
 ## Build
 
@@ -1070,6 +1072,12 @@ No generated WASM binaries are written back to the repository branch.
   (`scanned positions × KV heads`, default 4096) before the decode attention
   scan fans out across the worker pool. Set very high to force the serial
   scan.
+- `RUSTY_LLM_PREFIX_CACHE_ENTRIES`, `RUSTY_LLM_PREFIX_CACHE_TOKENS`, and
+  `RUSTY_LLM_PREFIX_CACHE_BYTES`: bounded shared prompt-KV snapshots for
+  repeated stateless requests (defaults: `1`, `512`, and `128 MiB`). The cache
+  is disabled for sliding-window and GPU-resident decode paths; set entries to
+  a larger value for multi-client workloads or to `1` for the lowest memory
+  footprint.
 
 ## Development
 

@@ -1200,6 +1200,99 @@ mod tests {
     }
 
     #[test]
+    fn grouped_attention_ring_slots_match_linearized_window() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const SLOT_COUNT: usize = 5;
+        const START: usize = 7;
+        const END: usize = 11;
+        let queries: Vec<f32> = (0..4 * HEAD_DIM).map(|i| i as f32 * 0.017 - 0.15).collect();
+        let ring_keys: Vec<f32> = (0..SLOT_COUNT * HEAD_DIM)
+            .map(|i| i as f32 * 0.023 - 0.31)
+            .collect();
+        let ring_values: Vec<f32> = (0..SLOT_COUNT * VALUE_DIM)
+            .map(|i| i as f32 * 0.011 - 0.27)
+            .collect();
+        let order = [2usize, 3, 4, 0, 1];
+        let mut linear_keys = Vec::with_capacity(ring_keys.len());
+        let mut linear_values = Vec::with_capacity(ring_values.len());
+        for slot in order {
+            linear_keys.extend_from_slice(&ring_keys[slot * HEAD_DIM..(slot + 1) * HEAD_DIM]);
+            linear_values.extend_from_slice(&ring_values[slot * VALUE_DIM..(slot + 1) * VALUE_DIM]);
+        }
+
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut wrapped = vec![0.0; 4 * VALUE_DIM];
+        super::online_attention_grouped(
+            &queries,
+            &ring_keys,
+            &ring_values,
+            HEAD_DIM,
+            VALUE_DIM,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            4,
+            START,
+            END,
+            scale,
+            &mut wrapped,
+        );
+        let mut linear = vec![0.0; 4 * VALUE_DIM];
+        super::online_attention_grouped(
+            &queries,
+            &linear_keys,
+            &linear_values,
+            HEAD_DIM,
+            VALUE_DIM,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            4,
+            0,
+            SLOT_COUNT - 1,
+            scale,
+            &mut linear,
+        );
+        for (wrapped, linear) in wrapped.iter().zip(linear) {
+            assert!((wrapped - linear).abs() < 1e-5, "{wrapped} vs {linear}");
+        }
+
+        let mut grouped_mha = vec![0.0; VALUE_DIM];
+        let mut single_head = vec![0.0; VALUE_DIM];
+        super::online_attention_grouped(
+            &queries[..HEAD_DIM],
+            &ring_keys,
+            &ring_values,
+            HEAD_DIM,
+            VALUE_DIM,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            1,
+            START,
+            END,
+            scale,
+            &mut grouped_mha,
+        );
+        super::online_attention(
+            &queries[..HEAD_DIM],
+            &ring_keys,
+            &ring_values,
+            HEAD_DIM,
+            VALUE_DIM,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            START,
+            END,
+            scale,
+            &mut single_head,
+        );
+        assert_eq!(grouped_mha, single_head);
+    }
+
+    #[test]
     fn sliding_kv_cache_uses_ring_storage_without_lowering_context_limit() {
         let mut cache = KVCache::with_sliding_window(2, 4, 6, 128, Some(8));
         assert_eq!(cache.max_len, 128);
@@ -3324,12 +3417,22 @@ pub(crate) fn online_attention_with_sink(
     sink_score: f32,
     out: &mut [f32],
 ) {
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
     let mut max_score = sink_score;
     let mut denom = 1.0f32;
     let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
+    // Advance the ring slot incrementally. Decode normally follows the
+    // linear path, where this removes a per-token modulo and multiplication;
+    // wrapped sliding-window ranges still get one predictable wrap check.
+    let mut slot = if linear_slots {
+        start_t
+    } else {
+        start_t % slot_count
+    };
 
-    for t in start_t..=end_t {
-        let slot = if linear_slots { t } else { t % slot_count };
+    for _ in start_t..=end_t {
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
@@ -3350,6 +3453,11 @@ pub(crate) fn online_attention_with_sink(
             let weight = exp_attn(score - max_score);
             simd::axpy_f32(out_sub, weight, value_row);
             denom += weight;
+        }
+
+        slot += 1;
+        if slot == slot_count {
+            slot = 0;
         }
     }
 
@@ -3376,12 +3484,21 @@ pub(crate) fn online_attention(
     scale: f32,
     out: &mut [f32],
 ) {
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
     let mut max_score = f32::NEG_INFINITY;
     let mut denom = 0.0f32;
     let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
+    // Keep slot traversal sequential for the common non-wrapping decode
+    // range and use a single conditional reset for ring-buffer attention.
+    let mut slot = if linear_slots {
+        start_t
+    } else {
+        start_t % slot_count
+    };
 
-    for t in start_t..=end_t {
-        let slot = if linear_slots { t } else { t % slot_count };
+    for _ in start_t..=end_t {
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let score = simd::dot_f32(query, keys_sub) * scale;
@@ -3402,6 +3519,11 @@ pub(crate) fn online_attention(
             let weight = exp_attn(score - max_score);
             simd::axpy_f32(out_sub, weight, value_row);
             denom += weight;
+        }
+
+        slot += 1;
+        if slot == slot_count {
+            slot = 0;
         }
     }
 
@@ -3592,14 +3714,40 @@ pub(crate) fn online_attention_grouped(
 ) {
     debug_assert_eq!(queries.len(), kv_mul * key_head_dim);
     debug_assert_eq!(out.len(), kv_mul * value_head_dim);
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
+
+    // MHA (one query head per KV head) does not need the grouped scratch
+    // arrays or per-token group loop. Reuse the lean scalar-head path.
+    if kv_mul == 1 {
+        return online_attention(
+            queries,
+            keys,
+            values,
+            key_stride,
+            value_stride,
+            slot_count,
+            key_head_dim,
+            value_head_dim,
+            start_t,
+            end_t,
+            scale,
+            out,
+        );
+    }
 
     let mut max_score = [f32::NEG_INFINITY; MAX_KV_MUL];
     let mut denom = [0.0f32; MAX_KV_MUL];
     let kv_mul = kv_mul.min(MAX_KV_MUL);
     let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
+    let mut slot = if linear_slots {
+        start_t
+    } else {
+        start_t % slot_count
+    };
 
-    for t in start_t..=end_t {
-        let slot = if linear_slots { t } else { t % slot_count };
+    for _ in start_t..=end_t {
         let k_off = slot * key_stride;
         let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
         let v_off = slot * value_stride;
@@ -3634,6 +3782,10 @@ pub(crate) fn online_attention_grouped(
             let (out1, rest) = rest.split_at_mut(value_head_dim);
             let (out2, out3) = rest.split_at_mut(value_head_dim);
             simd::affine_add_f32x4(out0, out1, out2, out3, multiplier, alpha, value_row);
+            slot += 1;
+            if slot == slot_count {
+                slot = 0;
+            }
             continue;
         }
 
@@ -3658,6 +3810,11 @@ pub(crate) fn online_attention_grouped(
                 simd::axpy_f32(out_sub, weight, value_row);
                 denom[g] += weight;
             }
+        }
+
+        slot += 1;
+        if slot == slot_count {
+            slot = 0;
         }
     }
 
