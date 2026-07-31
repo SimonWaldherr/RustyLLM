@@ -14,10 +14,12 @@
 // On x86_64, we runtime-detect AVX2 and fall back to scalar.
 
 #[cfg(not(target_family = "wasm"))]
+use std::cell::UnsafeCell;
+#[cfg(not(target_family = "wasm"))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(target_family = "wasm"))]
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(not(target_family = "wasm"))]
 use std::thread;
 
@@ -724,7 +726,14 @@ pub unsafe fn parallel_range(len: usize, func: unsafe fn(*const (), usize, usize
     }
     #[cfg(not(target_family = "wasm"))]
     {
-        let workers = num_threads().min(len);
+        // A static even split finishes when its largest shard does, so workers
+        // past the point where `ceil(len / workers)` stops shrinking add no
+        // speed and only cost power and thermal headroom. Attention over 8 KV
+        // heads on 6 threads runs two rounds either way, so it takes 4 workers
+        // and leaves the other cores their clock budget.
+        let threads = num_threads().min(len);
+        let per_worker = len.div_ceil(threads.max(1));
+        let workers = len.div_ceil(per_worker.max(1)).max(1);
         worker_pool().run_range(ctx, func, len, workers);
     }
 }
@@ -932,6 +941,11 @@ impl MatvecJob {
     }
 
     unsafe fn run_rows(self, start: usize, end: usize, xq: XQuant) {
+        // Deliberately no software prefetch here: the rows are fully sequential,
+        // so the hardware stream prefetcher already covers them, and an explicit
+        // `_mm_prefetch` ahead of the row measured 8-10% *slower* on the large
+        // DRAM-bound projections (the LM head and ffn_down) because the extra
+        // requests compete with demand loads for fill buffers.
         for row in start..end {
             *self.out.add(row) = dot_row(
                 self.kind,
@@ -1380,44 +1394,76 @@ impl WorkerJob {
     }
 }
 
+/// Per-helper synchronization slot. `wake` is written only by the dispatching
+/// thread and `done` only by the helper itself, each on its own cache line, so
+/// publishing a job never bounces one line between several helpers and the
+/// dispatcher's completion polling cannot slow the helpers down.
 #[cfg(not(target_family = "wasm"))]
-struct WorkerState {
-    job: Option<WorkerJob>,
-    job_id: u64,
+struct WorkerSlot {
+    wake: CachePadded<AtomicU64>,
+    done: CachePadded<AtomicU64>,
+    thread: OnceLock<thread::Thread>,
 }
 
 #[cfg(not(target_family = "wasm"))]
 struct WorkerPool {
-    state: Mutex<WorkerState>,
-    work_available: Condvar,
-    completed: CachePadded<AtomicUsize>,
+    /// Serializes dispatchers, since the HTTP server can decode on several
+    /// threads. Uncontended in the common single-stream case, where it costs
+    /// one atomic swap rather than the per-dispatch handshake it replaces.
+    dispatch: Mutex<()>,
+    /// The published job. Written by the dispatcher while it holds `dispatch`
+    /// and only after every helper of the previous generation reported `done`,
+    /// so no helper can still be reading it.
+    job: UnsafeCell<Option<WorkerJob>>,
+    /// Helper slots; `slots[i]` drives shard `i + 1`. Shard 0 is the caller.
+    slots: Vec<WorkerSlot>,
+    generation: AtomicU64,
     current_chunk: CachePadded<AtomicUsize>,
-    published_job_id: CachePadded<AtomicU64>,
     max_workers: usize,
 }
 
+// Safety: `job` is only ever written by a dispatcher holding `dispatch`, and
+// only while no helper is running, which `run_job` enforces by waiting for
+// every helper's `done` before returning.
+#[cfg(not(target_family = "wasm"))]
+unsafe impl Sync for WorkerPool {}
+
 #[cfg(not(target_family = "wasm"))]
 impl WorkerPool {
-    /// Spawns a fixed set of worker threads for shared matrix-vector jobs.
+    /// Spawns `max_workers - 1` helper threads. The dispatching thread runs the
+    /// remaining shard itself, so an `N`-thread job occupies exactly `N` cores
+    /// instead of `N` helpers plus a spinning dispatcher.
     fn new(max_workers: usize) -> Arc<Self> {
+        let helpers = max_workers.saturating_sub(1);
         let pool = Arc::new(Self {
-            state: Mutex::new(WorkerState {
-                job: None,
-                job_id: 0,
-            }),
-            work_available: Condvar::new(),
-            completed: CachePadded(AtomicUsize::new(0)),
+            dispatch: Mutex::new(()),
+            job: UnsafeCell::new(None),
+            slots: (0..helpers)
+                .map(|_| WorkerSlot {
+                    wake: CachePadded(AtomicU64::new(0)),
+                    done: CachePadded(AtomicU64::new(0)),
+                    thread: OnceLock::new(),
+                })
+                .collect(),
+            generation: AtomicU64::new(0),
             current_chunk: CachePadded(AtomicUsize::new(0)),
-            published_job_id: CachePadded(AtomicU64::new(0)),
             max_workers,
         });
 
-        for worker_idx in 0..max_workers {
+        for helper_idx in 0..helpers {
             let pool = Arc::clone(&pool);
             thread::Builder::new()
-                .name(format!("rusty-llm-matvec-{}", worker_idx))
-                .spawn(move || worker_loop(pool, worker_idx))
+                .name(format!("rusty-llm-matvec-{}", helper_idx + 1))
+                .spawn(move || worker_loop(pool, helper_idx))
                 .expect("failed to start matvec worker");
+        }
+
+        // `run_job` wakes helpers through their thread handle, so every slot has
+        // to carry one before the first dispatch or a wake-up could be lost.
+        for slot in &pool.slots {
+            while slot.thread.get().is_none() {
+                std::hint::spin_loop();
+            }
         }
 
         pool
@@ -1522,80 +1568,101 @@ impl WorkerPool {
         );
     }
 
-    /// Publishes a worker job and waits for all selected workers to finish it.
+    /// Publishes a worker job, runs shard 0 on the calling thread, and blocks
+    /// until every helper shard reports completion.
+    ///
+    /// `workers` must equal the job's own worker count, since each shard derives
+    /// its slice from that field. The calling thread executes kernel code while
+    /// holding `dispatch`, so a job function must never dispatch again: nesting
+    /// would deadlock on the non-reentrant mutex.
     fn run_job(&self, job: WorkerJob, workers: usize) {
-        // Fast spin-wait if previous job is finishing (usually very quick)
-        loop {
-            let mut state = self.state.lock().expect("worker pool mutex poisoned");
-            if state.job.is_none() {
-                state.job_id = state.job_id.wrapping_add(1);
-                self.completed.0.store(0, Ordering::Release);
-                self.current_chunk.0.store(workers, Ordering::Release);
-                state.job = Some(job);
-                self.published_job_id
-                    .0
-                    .store(state.job_id, Ordering::Release);
-                self.work_available.notify_all();
-                break;
-            }
-            drop(state);
-            std::hint::spin_loop();
+        let _dispatch = self.dispatch.lock().expect("worker pool mutex poisoned");
+        let generation = self.generation.load(Ordering::Relaxed).wrapping_add(1);
+        let helpers = workers.saturating_sub(1).min(self.slots.len());
+
+        // Safety: every helper of the previous generation reported `done` before
+        // that dispatch returned, and `dispatch` keeps other dispatchers out, so
+        // nothing else can be reading or writing the job slot right now.
+        unsafe {
+            *self.job.get() = Some(job);
         }
+        self.current_chunk.0.store(workers, Ordering::Release);
 
-        // Wait for workers to finish current job using spin-loop
-        // This is a micro-job, so sleeping via Condvar is too slow for LLM latencies.
-        let mut spins = 0;
-        loop {
-            if self.completed.0.load(Ordering::Acquire) == workers {
-                break;
-            }
-
-            if spins < 10000 {
-                std::hint::spin_loop();
-                spins += 1;
-            } else {
-                thread::yield_now();
+        // Release the job to exactly the helpers this job needs; the rest stay
+        // parked instead of waking up only to discover they have no shard.
+        for slot in &self.slots[..helpers] {
+            slot.wake.0.store(generation, Ordering::Release);
+        }
+        for slot in &self.slots[..helpers] {
+            if let Some(handle) = slot.thread.get() {
+                handle.unpark();
             }
         }
 
-        // Final cleanup
-        let mut state = self.state.lock().expect("worker pool mutex poisoned");
-        state.job = None;
+        // The dispatcher is a full participant rather than a spinning observer.
+        // On the dynamic-chunk path it also joins the work stealing, so a slow
+        // helper no longer leaves this core idle.
+        unsafe {
+            job.run_worker(0, &self.current_chunk.0);
+        }
+
+        for slot in &self.slots[..helpers] {
+            let mut spins = 0usize;
+            while slot.done.0.load(Ordering::Acquire) != generation {
+                if spins < 20_000 {
+                    std::hint::spin_loop();
+                    spins += 1;
+                } else {
+                    thread::yield_now();
+                }
+            }
+        }
+
+        self.generation.store(generation, Ordering::Relaxed);
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-/// Processes worker-pool jobs on one background thread.
-fn worker_loop(pool: Arc<WorkerPool>, worker_idx: usize) {
-    let _ = pin_current_thread(worker_idx);
-    let mut last_job_id = 0u64;
+/// Runs helper shard `helper_idx + 1` for every job published to this pool.
+fn worker_loop(pool: Arc<WorkerPool>, helper_idx: usize) {
+    let shard = helper_idx + 1;
+    let _ = pin_current_thread(shard);
+    let slot = &pool.slots[helper_idx];
+    let _ = slot.thread.set(thread::current());
+    let mut last_seen = slot.wake.0.load(Ordering::Acquire);
+
     loop {
-        let poll_spins = worker_poll_spins();
-        for _ in 0..poll_spins {
-            if pool.published_job_id.0.load(Ordering::Acquire) != last_job_id {
-                break;
+        // Spin briefly on this helper's own cache line so back-to-back layers
+        // hand off without a syscall, then park so that an idle helper costs
+        // nothing at all instead of burning a core polling a shared flag.
+        let mut generation = slot.wake.0.load(Ordering::Acquire);
+        if generation == last_seen {
+            for _ in 0..worker_poll_spins() {
+                std::hint::spin_loop();
+                generation = slot.wake.0.load(Ordering::Acquire);
+                if generation != last_seen {
+                    break;
+                }
             }
-            std::hint::spin_loop();
+        }
+        // `park` may return spuriously, and an `unpark` that lands before the
+        // park makes it return immediately; re-checking `wake` covers both.
+        while generation == last_seen {
+            thread::park();
+            generation = slot.wake.0.load(Ordering::Acquire);
         }
 
-        let job = {
-            let mut state = pool.state.lock().expect("worker pool mutex poisoned");
-            while state.job_id == last_job_id || state.job.is_none() {
-                state = pool
-                    .work_available
-                    .wait(state)
-                    .expect("worker pool mutex poisoned");
-            }
-            last_job_id = state.job_id;
-            state.job.expect("job should be available")
-        };
-
-        if worker_idx < job.workers() {
+        // Safety: the dispatcher wrote the job before the release store to
+        // `wake` that we just acquired, and it will not touch the slot again
+        // until this helper publishes `done` below.
+        let job = unsafe { (*pool.job.get()).expect("job should be available") };
+        if shard < job.workers() {
             unsafe {
-                job.run_worker(worker_idx, &pool.current_chunk.0);
+                job.run_worker(shard, &pool.current_chunk.0);
             }
-            pool.completed.0.fetch_add(1, Ordering::Release);
         }
+        last_seen = generation;
+        slot.done.0.store(generation, Ordering::Release);
     }
 }
 
