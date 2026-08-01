@@ -6020,70 +6020,85 @@ unsafe fn dot_q6_k_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     acc
 }
 
-/// Q4_0 · Q8_K integer dot product on AVX2: `-8` folds into signed weights and
-/// the signed×signed product runs through the `abs`/`sign` `maddubs` form.
+/// Q4_0 · Q8_K integer dot product on AVX2. Weights stay unsigned so `maddubs`
+/// takes them directly, the `-8` bias folds into one term built from the
+/// per-32 activation sums, and the per-block scale accumulates into an f32 lane
+/// vector that is reduced once per row. Reached only behind `has_avx2_fma()`.
 #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q4_0_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     use std::arch::x86_64::*;
     let n_super = n / 256;
     let lowmask = _mm_set1_epi8(0x0F);
-    let eight = _mm256_set1_epi8(8);
     let ones = _mm256_set1_epi16(1);
-    let mut acc = 0.0f32;
+    // One f32 lane accumulator for the whole row, reduced once at the end. The
+    // previous version ran a full `hsum_i32_avx2` plus a scalar f32 multiply-add
+    // for every 32-weight block, i.e. eight vector-to-scalar round trips per
+    // super-block, and those latencies dominated a kernel that only reads 18
+    // bytes per block.
+    let mut acc = _mm256_setzero_ps();
+    // The `-8` weight bias folds out of the inner loop: with `q` left unsigned,
+    // sum((q-8)*x) == sum(q*x) - 8*sum(x), and sum(x) per 32-element group is
+    // already tabulated in `xq.bsums` (Q4_0's block size is exactly that group
+    // size). That removes the `abs`/`sign` pair the `maddubs` form needed.
+    let mut bias = 0.0f32;
 
     for sb in 0..n_super {
         let dx = *xq.d.add(sb);
         let xqb = xq.qs.add(sb * 256);
+        let bsums = xq.bsums.add(sb * 8);
         let base = qdata.as_ptr().add(sb * 8 * 18);
-        let mut inner = 0.0f32;
         for blk in 0..8usize {
             let block = base.add(blk * 18);
-            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let scale = dx * f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
 
             // lo nibble of byte i → weight[i], hi nibble → weight[i+16].
             let nib = _mm_loadu_si128(block.add(2) as *const __m128i);
             let lo = _mm_and_si128(nib, lowmask);
             let hi = _mm_and_si128(_mm_srli_epi16(nib, 4), lowmask);
-            let q = _mm256_sub_epi8(_mm256_set_m128i(hi, lo), eight);
+            // Unsigned 0..15 feeds `maddubs` directly; 15*128*2 stays inside i16.
+            let q = _mm256_set_m128i(hi, lo);
 
             let xv = _mm256_loadu_si256(xqb.add(blk * 32) as *const __m256i);
-            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(q), _mm256_sign_epi8(xv, q));
-            let s = _mm256_madd_epi16(p, ones);
-            inner += d * hsum_i32_avx2(s) as f32;
+            let p = _mm256_madd_epi16(_mm256_maddubs_epi16(q, xv), ones);
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(p), acc);
+            bias += scale * *bsums.add(blk) as f32;
         }
-        acc += dx * inner;
     }
-    acc
+    hsum_avx(acc) - 8.0 * bias
 }
 
-/// Q8_0 · Q8_K integer dot product on AVX2 via the `abs`/`sign` `maddubs` form.
+/// Q8_0 · Q8_K integer dot product on AVX2 via the `abs`/`sign` `maddubs` form,
+/// accumulating scaled block sums in an f32 lane vector. Reached only behind
+/// `has_avx2_fma()`.
 #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q8_0_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     use std::arch::x86_64::*;
     let n_super = n / 256;
     let ones = _mm256_set1_epi16(1);
-    let mut acc = 0.0f32;
+    // As in the Q4_0 kernel: keep the per-block scale in an f32 lane
+    // accumulator instead of horizontally reducing to a scalar eight times per
+    // super-block. Q8_0 weights are already signed with no offset, so the
+    // `abs`/`sign` pair stays.
+    let mut acc = _mm256_setzero_ps();
 
     for sb in 0..n_super {
         let dx = *xq.d.add(sb);
         let xqb = xq.qs.add(sb * 256);
         let base = qdata.as_ptr().add(sb * 8 * 34);
-        let mut inner = 0.0f32;
         for blk in 0..8usize {
             let block = base.add(blk * 34);
-            let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+            let scale = dx * f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
 
             let w = _mm256_loadu_si256(block.add(2) as *const __m256i);
             let xv = _mm256_loadu_si256(xqb.add(blk * 32) as *const __m256i);
             let p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(xv, w));
             let s = _mm256_madd_epi16(p, ones);
-            inner += d * hsum_i32_avx2(s) as f32;
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(scale), _mm256_cvtepi32_ps(s), acc);
         }
-        acc += dx * inner;
     }
-    acc
+    hsum_avx(acc)
 }
 
 #[cfg(target_arch = "x86_64")]
