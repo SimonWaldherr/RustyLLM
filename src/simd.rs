@@ -365,7 +365,11 @@ fn pin_current_thread_impl(_worker_idx: usize) -> bool {
 /// This is a scheduler hint, not a pin: macOS may still migrate the thread. It
 /// biases placement, which is the most Apple offers here. Returns whether the
 /// request itself was accepted.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
 fn apply_compute_thread_qos() -> bool {
     /// `QOS_CLASS_USER_INITIATED` from `<sys/qos.h>`'s `qos_class_t`
     /// (`USER_INTERACTIVE` is `0x21`, `DEFAULT` is `0x15`).
@@ -376,7 +380,11 @@ fn apply_compute_thread_qos() -> bool {
     unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0 }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
 thread_local! {
     static COMPUTE_QOS_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -392,7 +400,11 @@ thread_local! {
 /// of that thread's life. `--cpu-affinity` is an explicit request to place this
 /// engine's compute threads, so that is within what the caller asked for, but it
 /// is why the behaviour is not on by default.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    not(target_family = "wasm")
+))]
 #[inline]
 fn ensure_compute_thread_qos() {
     if !cpu_affinity_enabled() {
@@ -7583,7 +7595,10 @@ mod tests {
         let decode = super::default_worker_threads();
         let prefill = super::physical_threads();
         assert!(decode >= 1, "decode default must be positive, got {decode}");
-        assert!(prefill >= 1, "prefill ceiling must be positive, got {prefill}");
+        assert!(
+            prefill >= 1,
+            "prefill ceiling must be positive, got {prefill}"
+        );
         assert!(
             prefill >= decode,
             "prefill ceiling {prefill} is below the decode default {decode}"

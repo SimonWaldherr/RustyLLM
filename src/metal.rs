@@ -556,13 +556,8 @@ pub fn resident_decode_into(
 /// device-to-host copy on every prefilled position.
 pub fn resident_prefill(x_embed: &[f32], pos: usize) -> bool {
     unsafe {
-        ffi::rusty_metal_resident_decode(
-            x_embed.as_ptr(),
-            pos as u32,
-            0,
-            0,
-            std::ptr::null_mut(),
-        ) != 0
+        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, 0, std::ptr::null_mut())
+            != 0
     }
 }
 
