@@ -4340,11 +4340,38 @@ fn resident_forward_attempt(
     if pos >= cache.storage_len || !resident_ready(config, weights, cache, buf) {
         return false;
     }
-    static RESIDENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = RESIDENT_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = resident_lock();
     crate::metal::resident_decode_into(&buf.x, pos, config.vocab_size, logits)
+}
+
+/// Runs one prompt token on the resident decoder for its KV-cache writes only.
+///
+/// Prefill discards every position's logits except the last, so this skips the
+/// vocabulary projection entirely instead of computing it into a throwaway
+/// buffer. On a tied-embedding model like Ministral that projection is the
+/// largest single weight read in the graph, so this removes it — plus a
+/// full-vocabulary GPU-to-CPU copy — from every prefilled position.
+fn resident_prefill_attempt(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+) -> bool {
+    if pos >= cache.storage_len || !resident_ready(config, weights, cache, buf) {
+        return false;
+    }
+    let _guard = resident_lock();
+    crate::metal::resident_prefill(&buf.x, pos)
+}
+
+/// Serializes resident-decoder calls. It keeps its working buffers and KV cache
+/// in static GPU memory, so two forward passes must never run concurrently.
+fn resident_lock() -> std::sync::MutexGuard<'static, ()> {
+    static RESIDENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    RESIDENT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Single forward pass for one token at position `pos`
@@ -5856,8 +5883,7 @@ pub fn forward_prefill(
         weights
             .token_embd
             .row_into(token as usize, config.dim, &mut buf.x);
-        let mut discard = Vec::new();
-        if resident_forward_attempt(config, weights, cache, buf, pos, &mut discard) {
+        if resident_prefill_attempt(config, weights, cache, buf, pos) {
             return;
         }
     }

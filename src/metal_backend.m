@@ -2156,9 +2156,18 @@ int rusty_metal_resident_set_output(const float *output_norm, const uint8_t *out
     return 1;
 }
 
+// `want_logits` == 0 runs the layer stack for its KV-cache side effects only and
+// skips the final norm plus the vocabulary projection. Prompt tokens need the
+// cache filled but throw their logits away, and that projection is the single
+// largest weight read in the model (330 MiB for a 131072-entry Q6_K vocabulary),
+// so skipping it removes both the read and the device->host copy from every
+// prefill token. It is safe to skip because each call re-seeds gR_x from the
+// caller's embedding, so nothing carries over from the tail of the graph; only
+// the in-layer RoPE/attention KV writes have to happen.
 int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t start_t,
-                                float *logits_out) {
-    if (!gResidentReady || !x_embed || !logits_out || pos >= gR_storage) return 0;
+                                int want_logits, float *logits_out) {
+    if (!gResidentReady || !x_embed || pos >= gR_storage) return 0;
+    if (want_logits && !logits_out) return 0;
     @autoreleasepool {
         memcpy([gR_x contents], x_embed, (NSUInteger)gR_dim * sizeof(float));
         uint32_t slot = pos;
@@ -2185,15 +2194,19 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
             resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
             resident_matvec(enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj, L->rows[6], L->cols[6]);
         }
-        resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
-        resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
+        if (want_logits) {
+            resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
+            resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
+        }
         [enc endEncoding];
         double encode_end = rusty_metal_now_seconds();
         [cb commit];
         [cb waitUntilCompleted];
         rusty_metal_profile_command_buffer(cb, encode_start, encode_end);
         if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
-        memcpy(logits_out, [gR_logits contents], (NSUInteger)gR_vocab * sizeof(float));
+        if (want_logits) {
+            memcpy(logits_out, [gR_logits contents], (NSUInteger)gR_vocab * sizeof(float));
+        }
         return 1;
     }
 }

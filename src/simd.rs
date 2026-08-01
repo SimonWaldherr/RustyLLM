@@ -154,22 +154,23 @@ fn physical_cores() -> Option<usize> {
     }
 }
 
-/// Counts physical cores on macOS via `sysctl hw.physicalcpu` (equal to the
-/// logical count on Apple Silicon, lower on hyper-threaded Intel Macs).
 #[cfg(all(target_os = "macos", not(target_family = "wasm")))]
-fn physical_cores() -> Option<usize> {
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const std::ffi::c_char,
-            oldp: *mut std::ffi::c_void,
-            oldlenp: *mut usize,
-            newp: *const std::ffi::c_void,
-            newlen: usize,
-        ) -> i32;
-    }
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *const std::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
+}
+
+/// Reads a single `i32` sysctl by name, returning `None` when the key is absent
+/// (older macOS) or non-positive.
+#[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+fn sysctl_i32(name: &std::ffi::CStr) -> Option<usize> {
     let mut value: i32 = 0;
     let mut len = std::mem::size_of::<i32>();
-    let name = c"hw.physicalcpu";
     let rc = unsafe {
         sysctlbyname(
             name.as_ptr(),
@@ -186,6 +187,41 @@ fn physical_cores() -> Option<usize> {
     }
 }
 
+/// Counts every physical core, including Apple Silicon efficiency cores. This
+/// is the ceiling for prefill thread widening: batched prefill is compute-bound
+/// and dynamically chunked (see [`KQuantBatchSchedule::Rows`]), so a slower
+/// E-core steals fewer chunks rather than stalling a barrier, and its
+/// throughput still adds.
+#[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+fn physical_cores() -> Option<usize> {
+    sysctl_i32(c"hw.physicalcpu")
+}
+
+/// Counts the cores worth scheduling *decode* matvec shards on.
+///
+/// On Apple Silicon `hw.physicalcpu` counts performance **and** efficiency
+/// cores (12 on an M2 Max: 8 Avalanche + 4 Blizzard), but an E-core has half
+/// the NEON issue width at a lower clock, so a shard placed on one takes
+/// roughly 3x as long. Decode dispatches are small and every one waits for its
+/// slowest shard, so including E-cores sets the barrier to E-core speed and
+/// makes the projection slower than using the P-cores alone. macOS 12+ exposes
+/// the split through `hw.perflevel0.physicalcpu` (performance level 0 is the
+/// fastest tier), which is the same key llama.cpp selects its default thread
+/// count from. On a homogeneous CPU there is a single performance level, so this
+/// key reports the full physical count and the result is unchanged from
+/// `hw.physicalcpu`; the fallback covers macOS releases predating the key.
+#[cfg(all(target_os = "macos", not(target_family = "wasm")))]
+fn performance_cores() -> Option<usize> {
+    sysctl_i32(c"hw.perflevel0.physicalcpu").or_else(physical_cores)
+}
+
+/// Outside Apple Silicon every core is equivalent for these kernels, so the
+/// decode default and the prefill ceiling share one physical-core count.
+#[cfg(all(not(target_os = "macos"), not(target_family = "wasm")))]
+fn performance_cores() -> Option<usize> {
+    physical_cores()
+}
+
 #[cfg(all(
     not(windows),
     not(target_os = "linux"),
@@ -196,21 +232,45 @@ fn physical_cores() -> Option<usize> {
     None
 }
 
-/// Default matvec worker count: one per physical core. The quantized dot
+/// Default matvec worker count: one per performance core. The quantized dot
 /// kernels saturate the vector units, so SMT siblings contend rather than
 /// help (measured: Ministral-3B decode 3.64 t/s at 6 threads vs 3.18 at 12 on
-/// a 6C/12T i7-10850H). `--threads` still overrides.
+/// a 6C/12T i7-10850H), and on Apple Silicon an efficiency-core shard would set
+/// the barrier for every dispatch. `--threads` still overrides.
 #[cfg(not(target_family = "wasm"))]
 fn default_worker_threads() -> usize {
-    physical_cores().unwrap_or_else(available_threads).max(1)
+    // Cached: `performance_cores()` is a `sysctl` syscall on macOS.
+    static DEFAULT: OnceLock<usize> = OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        // Clamped to the parallelism the OS will actually give us. The core
+        // counts come from hardware topology (sysctl, /proc/cpuinfo), which
+        // ignores cpuset/affinity restrictions, so inside a two-CPU container on
+        // a many-core host the raw count would oversubscribe the pool badly.
+        performance_cores()
+            .unwrap_or_else(available_threads)
+            .min(available_threads())
+            .max(1)
+    })
 }
 
-/// Public view of the physical-core worker count, used to cap prefill
-/// batch-thread widening at the same SMT-aware limit as the decode default.
+/// Ceiling for prefill batch-thread widening: one thread per physical core.
+///
+/// This counts *all* physical cores, unlike the decode default, which on Apple
+/// Silicon uses performance cores only. Prefill runs far more work per dispatch
+/// and steals chunks dynamically, so an efficiency core contributes throughput
+/// there instead of setting a barrier. On an M2 Max that means decode defaults
+/// to 8 threads while a long prompt widens to 12 — the first time the widening
+/// path does anything on Apple Silicon, since it previously compared 12 to 12.
 pub fn physical_threads() -> usize {
     #[cfg(not(target_family = "wasm"))]
     {
-        default_worker_threads()
+        static PHYSICAL: OnceLock<usize> = OnceLock::new();
+        *PHYSICAL.get_or_init(|| {
+            physical_cores()
+                .unwrap_or_else(available_threads)
+                .min(available_threads())
+                .max(1)
+        })
     }
     #[cfg(target_family = "wasm")]
     {
@@ -252,7 +312,26 @@ pub fn pin_current_thread(worker_idx: usize) -> bool {
     pin_current_thread_impl(worker_idx)
 }
 
-#[cfg(target_os = "macos")]
+/// Apple Silicon has no thread-pinning API: `THREAD_AFFINITY_POLICY` is gated
+/// on `ml_get_max_affinity_sets() != 0` in XNU, which is 0 on arm64, so
+/// `thread_policy_set` returns `KERN_NOT_SUPPORTED` there. Quality of Service is
+/// the supported way to bias placement on that hardware, so `--cpu-affinity`
+/// maps onto QoS on arm64 Macs.
+///
+/// It stays behind the flag rather than becoming the default because llama.cpp
+/// gets its Apple Silicon placement purely from sizing the pool to the
+/// performance cores and sets no QoS class at all, and this build has no Apple
+/// hardware to measure the difference on.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn pin_current_thread_impl(_worker_idx: usize) -> bool {
+    apply_compute_thread_qos()
+}
+
+/// Intel Macs do support affinity sets, so keep the original behaviour there.
+/// The tag is an L2-sharing hint rather than a pin: distinct tags ask the
+/// scheduler to spread these threads across separate cache groups, which suits
+/// workers that stream disjoint weight ranges.
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 fn pin_current_thread_impl(worker_idx: usize) -> bool {
     const THREAD_AFFINITY_POLICY: i32 = 4;
     let tag = (worker_idx as i32).saturating_add(1);
@@ -262,16 +341,77 @@ fn pin_current_thread_impl(worker_idx: usize) -> bool {
     }
 }
 
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+unsafe extern "C" {
+    fn mach_thread_self() -> u32;
+    fn thread_policy_set(thread: u32, flavor: i32, policy_info: *const i32, count: u32) -> i32;
+}
+
 #[cfg(not(target_os = "macos"))]
 fn pin_current_thread_impl(_worker_idx: usize) -> bool {
     false
 }
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn mach_thread_self() -> u32;
-    fn thread_policy_set(thread: u32, flavor: i32, policy_info: *const i32, count: u32) -> i32;
+/// Requests performance-core placement for the calling compute thread.
+///
+/// On Apple Silicon the scheduler picks between performance and efficiency
+/// cores partly from a thread's QoS class: `QOS_CLASS_BACKGROUND` is confined to
+/// the efficiency cores, while the higher classes are eligible for the
+/// performance cores. Because every pool dispatch waits for its slowest shard,
+/// one shard on an E-core slows the entire projection, so a pool thread asks for
+/// `QOS_CLASS_USER_INITIATED` — high enough to be preferred on the performance
+/// cores, without claiming the UI-critical `QOS_CLASS_USER_INTERACTIVE` band.
+///
+/// This is a scheduler hint, not a pin: macOS may still migrate the thread. It
+/// biases placement, which is the most Apple offers here. Returns whether the
+/// request itself was accepted.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+fn apply_compute_thread_qos() -> bool {
+    /// `QOS_CLASS_USER_INITIATED` from `<sys/qos.h>`'s `qos_class_t`
+    /// (`USER_INTERACTIVE` is `0x21`, `DEFAULT` is `0x15`).
+    const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+    }
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) == 0 }
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+thread_local! {
+    static COMPUTE_QOS_APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Applies the compute QoS request once per dispatching thread.
+///
+/// The pool's shard 0 runs on whichever thread dispatched the job, so under
+/// `--cpu-affinity` that thread needs performance-core placement just as much as
+/// the helpers do. Doing it lazily here covers the CLI's decode thread and each
+/// of the server's per-connection threads without new public API.
+///
+/// Note that this raises the QoS of a thread the pool does not own, for the rest
+/// of that thread's life. `--cpu-affinity` is an explicit request to place this
+/// engine's compute threads, so that is within what the caller asked for, but it
+/// is why the behaviour is not on by default.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(target_family = "wasm")))]
+#[inline]
+fn ensure_compute_thread_qos() {
+    if !cpu_affinity_enabled() {
+        return;
+    }
+    COMPUTE_QOS_APPLIED.with(|applied| {
+        if !applied.get() {
+            applied.set(true);
+            let _ = apply_compute_thread_qos();
+        }
+    });
+}
+
+#[cfg(all(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    not(target_family = "wasm")
+))]
+#[inline(always)]
+fn ensure_compute_thread_qos() {}
 
 #[inline]
 /// Returns the configured matrix-vector worker count.
@@ -1238,6 +1378,15 @@ impl KQuantBatch3Job {
         let (b_start, b_end) = clipped_range(start, end, self.rows_a, self.rows_b);
         let (c_start, c_end) = clipped_range(start, end, self.rows_a + self.rows_b, self.rows_c);
 
+        // Token-outer/row-inner deliberately. Swapping to row-outer to keep one
+        // weight row in L1 measured SLOWER here: a Q4_K row at cols=3072 is
+        // 1728 B, but one token's quantized activation is 3072 B, so the
+        // activations are the larger operand. Row-outer would stream all
+        // `tokens` activations (192 KiB at a 64-token microbatch) per row
+        // instead of one row chunk (55 KiB) per token, moving the thrashing to
+        // the worse side. Fixing this properly needs register blocking over both
+        // dimensions (unpack a weight block once, apply it to ~4 tokens), not a
+        // loop interchange.
         for token in 0..self.tokens {
             let x = self.inputs.add(token * self.cols);
             // Row ownership reuses weight rows across tokens. Activations are
@@ -1525,12 +1674,24 @@ impl WorkerPool {
     /// weights and the batch-wide quantized activations saves substantially
     /// more memory traffic than token ownership.
     fn run_kquant_batch3(&self, mut job: KQuantBatch3Job) {
-        job.workers = job.workers.min(self.max_workers).min(job.tokens).max(1);
+        // Pick the schedule first, then bound the worker count by whatever that
+        // schedule actually shards. Clamping to `tokens` up front (as this used
+        // to) also throttled the row schedule, so a short microbatch — the tail
+        // chunk of a prompt, or a small `--ubatch` — ran a projection over
+        // thousands of rows on `tokens` workers and left the rest of the cores
+        // idle.
+        let available = job.workers.min(self.max_workers).max(1);
         let projection_rows = job.rows_a + job.rows_b + job.rows_c;
-        job.schedule = if projection_rows >= job.workers {
+        job.schedule = if projection_rows >= available {
             KQuantBatchSchedule::Rows
         } else {
             KQuantBatchSchedule::Tokens
+        };
+        job.workers = match job.schedule {
+            // Reached only when projection_rows >= available, so every worker
+            // already receives rows.
+            KQuantBatchSchedule::Rows => available,
+            KQuantBatchSchedule::Tokens => available.min(job.tokens).max(1),
         };
         if job.workers <= 1 {
             unsafe {
@@ -1576,6 +1737,7 @@ impl WorkerPool {
     /// holding `dispatch`, so a job function must never dispatch again: nesting
     /// would deadlock on the non-reentrant mutex.
     fn run_job(&self, job: WorkerJob, workers: usize) {
+        ensure_compute_thread_qos();
         let _dispatch = self.dispatch.lock().expect("worker pool mutex poisoned");
         let generation = self.generation.load(Ordering::Relaxed).wrapping_add(1);
         let helpers = workers.saturating_sub(1).min(self.slots.len());
@@ -2953,7 +3115,11 @@ pub fn matvec_kquant3_batch_into(
 
     #[cfg(not(target_family = "wasm"))]
     {
-        let workers = num_threads().min(tokens);
+        // Pass the full thread count: `run_kquant_batch3` picks the schedule and
+        // then bounds the workers by whatever that schedule shards. Clamping to
+        // `tokens` here would throttle the row schedule, which shards thousands
+        // of projection rows and does not care how many tokens the batch holds.
+        let workers = num_threads();
         let batch_xq = prepare_batch_xq(inputs, cols_a);
         let (batch_qs, batch_d, batch_bsums) = batch_xq.as_ref().map_or(
             (std::ptr::null(), std::ptr::null(), std::ptr::null()),
@@ -7389,5 +7555,41 @@ mod tests {
                 out[r]
             );
         }
+    }
+
+    /// The prefill widening ceiling must never sit below the decode default,
+    /// otherwise `effective_prefill_threads` would ask to *narrow* the pool for
+    /// long prompts. On Apple Silicon the two intentionally differ (performance
+    /// cores for decode, every physical core for prefill); everywhere else they
+    /// resolve to the same physical-core count.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn prefill_thread_ceiling_never_below_decode_default() {
+        let decode = super::default_worker_threads();
+        let prefill = super::physical_threads();
+        assert!(decode >= 1, "decode default must be positive, got {decode}");
+        assert!(prefill >= 1, "prefill ceiling must be positive, got {prefill}");
+        assert!(
+            prefill >= decode,
+            "prefill ceiling {prefill} is below the decode default {decode}"
+        );
+    }
+
+    /// Both core counts must stay within the machine's logical parallelism, so a
+    /// bogus `sysctl` reading can never oversubscribe the pool.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn core_counts_do_not_exceed_logical_parallelism() {
+        let logical = super::available_threads();
+        assert!(
+            super::default_worker_threads() <= logical,
+            "decode default {} exceeds {logical} logical threads",
+            super::default_worker_threads()
+        );
+        assert!(
+            super::physical_threads() <= logical,
+            "prefill ceiling {} exceeds {logical} logical threads",
+            super::physical_threads()
+        );
     }
 }

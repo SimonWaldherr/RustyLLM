@@ -85,7 +85,12 @@ fn print_usage(name: &str) {
     eprintln!("  --ubatch <N>              Logical prefill microbatch/chunk size");
     eprintln!("  --no-auto-batch-threads   Disable automatic prefill thread widening");
     eprintln!("  --poll <N>                Worker spin-poll iterations before sleeping");
-    eprintln!("  --cpu-affinity            Best-effort pinning for SIMD worker threads");
+    eprintln!(
+        "  --cpu-affinity            Best-effort pinning for SIMD worker threads (on Apple"
+    );
+    eprintln!(
+        "                            Silicon: request performance-core placement via QoS)"
+    );
     eprintln!("  --mlock                   Best-effort lock mapped model pages in RAM");
     eprintln!("  --backend <name>          Backend policy: auto, cpu, metal, metal-ultra");
     eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");

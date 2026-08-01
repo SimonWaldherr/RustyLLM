@@ -1839,7 +1839,10 @@ impl Runner {
         // core: SMT siblings contend in the vector units and measurably slow
         // the bandwidth-bound matvec kernels (prefill at 12 logical threads
         // benchmarked BELOW the 6-physical-core decode default on a 6C/12T
-        // i7). On chips without SMT (Apple Silicon) this is a no-op.
+        // i7). On Apple Silicon this widens decode's performance-core default
+        // out to every physical core, because batched prefill has enough work
+        // per dispatch and steals chunks dynamically, so the efficiency cores
+        // add throughput instead of setting the barrier (M2 Max: 8 -> 12).
         let target = crate::simd::available_threads().min(crate::simd::physical_threads());
         let current = crate::simd::num_threads();
         (target > current).then_some(target)

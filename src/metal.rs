@@ -325,11 +325,15 @@ mod ffi {
             inv_freq: *const f32,
             inv_freq_len: u32,
         ) -> i32;
-        /// Runs one full token forward pass entirely on the GPU (one command buffer).
+        /// Runs one full token forward pass entirely on the GPU (one command
+        /// buffer). `want_logits` == 0 stops after the layer stack, leaving the
+        /// KV cache updated but producing no logits; `logits_out` may then be
+        /// null.
         pub fn rusty_metal_resident_decode(
             x_embed: *const f32,
             pos: u32,
             start_t: u32,
+            want_logits: i32,
             logits_out: *mut f32,
         ) -> i32;
     }
@@ -530,7 +534,8 @@ pub fn resident_decode_into(
 ) -> bool {
     logits.resize(vocab, 0.0);
     unsafe {
-        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, logits.as_mut_ptr()) != 0
+        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, 1, logits.as_mut_ptr())
+            != 0
     }
 }
 
@@ -541,6 +546,28 @@ pub fn resident_decode_into(
     _vocab: usize,
     _logits: &mut Vec<f32>,
 ) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Runs one prompt token through the GPU-resident decoder for its KV-cache
+/// writes alone, skipping the vocabulary projection whose result prefill throws
+/// away. Saves the largest weight read in the model plus a full-vocabulary
+/// device-to-host copy on every prefilled position.
+pub fn resident_prefill(x_embed: &[f32], pos: usize) -> bool {
+    unsafe {
+        ffi::rusty_metal_resident_decode(
+            x_embed.as_ptr(),
+            pos as u32,
+            0,
+            0,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub fn resident_prefill(_x_embed: &[f32], _pos: usize) -> bool {
     false
 }
 
