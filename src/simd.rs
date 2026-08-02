@@ -4743,6 +4743,10 @@ unsafe fn dot_q4_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     use std::arch::aarch64::*;
     let nb = n / 256;
     let mask = vdupq_n_u8(0x0F);
+    // Keep the four partial dot lanes live within each K block. Reducing every
+    // 32-value sub-block with `vaddvq_s32` serializes the dot-product pipe;
+    // one reduction per 256-value block leaves the independent sub-blocks in
+    // flight without changing the scalar block accumulation semantics.
     let mut acc = 0.0f32;
 
     for b in 0..nb {
@@ -4757,7 +4761,7 @@ unsafe fn dot_q4_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
         let xqb = xq.qs.add(b * 256);
         let bsb = xq.bsums.add(b * 8);
 
-        let mut isum = 0i32;
+        let mut isum = vdupq_n_s32(0);
         let mut imin = 0i32;
         for c in 0..4usize {
             let is = c * 2;
@@ -4777,13 +4781,20 @@ unsafe fn dot_q4_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             let xb0 = vld1q_s8(xqb.add(c * 64 + 32));
             let xb1 = vld1q_s8(xqb.add(c * 64 + 48));
 
-            let qa = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), a0, xa0), a1, xa1));
-            let qb = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), b0, xb0), b1, xb1));
+            let qa = sdot(sdot(vdupq_n_s32(0), a0, xa0), a1, xa1);
+            let qb = sdot(sdot(vdupq_n_s32(0), b0, xb0), b1, xb1);
 
-            isum += sc1 as i32 * qa + sc2 as i32 * qb;
+            isum = vaddq_s32(
+                isum,
+                vaddq_s32(
+                    vmulq_s32(qa, vdupq_n_s32(sc1 as i32)),
+                    vmulq_s32(qb, vdupq_n_s32(sc2 as i32)),
+                ),
+            );
             imin += m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
         }
-        acc += dx * (d * isum as f32 - dmin * imin as f32);
+        let isum = vaddvq_s32(isum) as f32;
+        acc += dx * (d * isum - dmin * imin as f32);
     }
     acc
 }
@@ -4810,7 +4821,7 @@ unsafe fn dot_q6_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
         let mut qh_ptr = block.add(128);
         let mut sc_ptr = block.add(192);
         let mut grp_x_base = 0usize;
-        let mut isum = 0i32;
+        let mut isum = vdupq_n_s32(0);
 
         for _grp in 0..2 {
             for half in 0..2usize {
@@ -4837,22 +4848,29 @@ unsafe fn dot_q6_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
                 let q4 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(hi2, vshlq_n_u8(h4, 4)), sub32));
 
                 let x_off = grp_x_base + l;
-                let p1 = vaddvq_s32(sdot(vdupq_n_s32(0), q1, vld1q_s8(xqb.add(x_off))));
-                let p2 = vaddvq_s32(sdot(vdupq_n_s32(0), q2, vld1q_s8(xqb.add(x_off + 32))));
-                let p3 = vaddvq_s32(sdot(vdupq_n_s32(0), q3, vld1q_s8(xqb.add(x_off + 64))));
-                let p4 = vaddvq_s32(sdot(vdupq_n_s32(0), q4, vld1q_s8(xqb.add(x_off + 96))));
+                let p1 = sdot(vdupq_n_s32(0), q1, vld1q_s8(xqb.add(x_off)));
+                let p2 = sdot(vdupq_n_s32(0), q2, vld1q_s8(xqb.add(x_off + 32)));
+                let p3 = sdot(vdupq_n_s32(0), q3, vld1q_s8(xqb.add(x_off + 64)));
+                let p4 = sdot(vdupq_n_s32(0), q4, vld1q_s8(xqb.add(x_off + 96)));
 
-                isum += (*sc_ptr.add(is) as i8) as i32 * p1
-                    + (*sc_ptr.add(is + 2) as i8) as i32 * p2
-                    + (*sc_ptr.add(is + 4) as i8) as i32 * p3
-                    + (*sc_ptr.add(is + 6) as i8) as i32 * p4;
+                let s1 = vdupq_n_s32((*sc_ptr.add(is) as i8) as i32);
+                let s2 = vdupq_n_s32((*sc_ptr.add(is + 2) as i8) as i32);
+                let s3 = vdupq_n_s32((*sc_ptr.add(is + 4) as i8) as i32);
+                let s4 = vdupq_n_s32((*sc_ptr.add(is + 6) as i8) as i32);
+                isum = vaddq_s32(
+                    isum,
+                    vaddq_s32(
+                        vaddq_s32(vmulq_s32(p1, s1), vmulq_s32(p2, s2)),
+                        vaddq_s32(vmulq_s32(p3, s3), vmulq_s32(p4, s4)),
+                    ),
+                );
             }
             ql_ptr = ql_ptr.add(64);
             qh_ptr = qh_ptr.add(32);
             sc_ptr = sc_ptr.add(8);
             grp_x_base += 128;
         }
-        acc += d * dx * isum as f32;
+        acc += d * dx * vaddvq_s32(isum) as f32;
     }
     acc
 }
@@ -4883,7 +4901,7 @@ unsafe fn dot_q5_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
         let xqb = xq.qs.add(b * 256);
         let bsb = xq.bsums.add(b * 8);
 
-        let mut isum = 0i32;
+        let mut isum = vdupq_n_s32(0);
         let mut imin = 0i32;
         for c in 0..4usize {
             let is = c * 2;
@@ -4907,21 +4925,27 @@ unsafe fn dot_q5_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             let xb0 = vld1q_s8(xqb.add(c * 64 + 32));
             let xb1 = vld1q_s8(xqb.add(c * 64 + 48));
 
-            let qa = vaddvq_s32(sdot(
+            let qa = sdot(
                 sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(a0), xa0),
                 vreinterpretq_s8_u8(a1),
                 xa1,
-            ));
-            let qb = vaddvq_s32(sdot(
+            );
+            let qb = sdot(
                 sdot(vdupq_n_s32(0), vreinterpretq_s8_u8(b0), xb0),
                 vreinterpretq_s8_u8(b1),
                 xb1,
-            ));
+            );
 
-            isum += sc1 as i32 * qa + sc2 as i32 * qb;
+            isum = vaddq_s32(
+                isum,
+                vaddq_s32(
+                    vmulq_s32(qa, vdupq_n_s32(sc1 as i32)),
+                    vmulq_s32(qb, vdupq_n_s32(sc2 as i32)),
+                ),
+            );
             imin += m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
         }
-        acc += dx * (d * isum as f32 - dmin * imin as f32);
+        acc += dx * (d * vaddvq_s32(isum) as f32 - dmin * imin as f32);
     }
     acc
 }
@@ -4936,14 +4960,13 @@ unsafe fn dot_q4_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     let n_super = n / 256;
     let mask = vdupq_n_u8(0x0F);
     let eight = vdupq_n_u8(8);
-    let mut acc = 0.0f32;
+    let mut acc = vdupq_n_f32(0.0);
 
     for sb in 0..n_super {
         let dx = *xq.d.add(sb);
         let xqb = xq.qs.add(sb * 256);
         let base = qdata.as_ptr().add(sb * 8 * 18);
-        let mut inner0 = 0.0f32;
-        let mut inner1 = 0.0f32;
+        let mut inner = vdupq_n_f32(0.0);
         for pair in 0..4usize {
             let blk = pair * 2;
             let block0 = base.add(blk * 18);
@@ -4965,14 +4988,14 @@ unsafe fn dot_q4_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             let x2 = vld1q_s8(xqb.add(blk * 32 + 32));
             let x3 = vld1q_s8(xqb.add(blk * 32 + 48));
 
-            let s0 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), a0, x0), b0, x1));
-            let s1 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), a1, x2), b1, x3));
-            inner0 += d0 * s0 as f32;
-            inner1 += d1 * s1 as f32;
+            let s0 = sdot(sdot(vdupq_n_s32(0), a0, x0), b0, x1);
+            let s1 = sdot(sdot(vdupq_n_s32(0), a1, x2), b1, x3);
+            inner = vmlaq_f32(inner, vcvtq_f32_s32(s0), vdupq_n_f32(d0));
+            inner = vmlaq_f32(inner, vcvtq_f32_s32(s1), vdupq_n_f32(d1));
         }
-        acc += dx * (inner0 + inner1);
+        acc = vmlaq_f32(acc, inner, vdupq_n_f32(dx));
     }
-    acc
+    vaddvq_f32(acc)
 }
 
 /// Q8_0 · Q8_K integer dot product: two `sdot` instructions per 32-weight
@@ -4982,14 +5005,13 @@ unsafe fn dot_q4_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
 unsafe fn dot_q8_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     use std::arch::aarch64::*;
     let n_super = n / 256;
-    let mut acc = 0.0f32;
+    let mut acc = vdupq_n_f32(0.0);
 
     for sb in 0..n_super {
         let dx = *xq.d.add(sb);
         let xqb = xq.qs.add(sb * 256);
         let base = qdata.as_ptr().add(sb * 8 * 34);
-        let mut inner0 = 0.0f32;
-        let mut inner1 = 0.0f32;
+        let mut inner = vdupq_n_f32(0.0);
         for pair in 0..4usize {
             let blk = pair * 2;
             let block0 = base.add(blk * 34);
@@ -5007,14 +5029,14 @@ unsafe fn dot_q8_0_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             let x2 = vld1q_s8(xqb.add(blk * 32 + 32));
             let x3 = vld1q_s8(xqb.add(blk * 32 + 48));
 
-            let s0 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), w0, x0), w1, x1));
-            let s1 = vaddvq_s32(sdot(sdot(vdupq_n_s32(0), w2, x2), w3, x3));
-            inner0 += d0 * s0 as f32;
-            inner1 += d1 * s1 as f32;
+            let s0 = sdot(sdot(vdupq_n_s32(0), w0, x0), w1, x1);
+            let s1 = sdot(sdot(vdupq_n_s32(0), w2, x2), w3, x3);
+            inner = vmlaq_f32(inner, vcvtq_f32_s32(s0), vdupq_n_f32(d0));
+            inner = vmlaq_f32(inner, vcvtq_f32_s32(s1), vdupq_n_f32(d1));
         }
-        acc += dx * (inner0 + inner1);
+        acc = vmlaq_f32(acc, inner, vdupq_n_f32(dx));
     }
-    acc
+    vaddvq_f32(acc)
 }
 
 #[cfg(target_arch = "aarch64")]
