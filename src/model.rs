@@ -852,6 +852,11 @@ pub struct LayerWeights {
     pub bk: Vec<f32>,
     pub wv: Weight,
     pub bv: Vec<f32>,
+    /// Optional per-head RMSNorm weights applied to queries and keys before
+    /// RoPE. Qwen3 GGUFs expose these as `attn_q_norm` / `attn_k_norm`.
+    /// Keeping them optional preserves the regular LLaMA/Qwen2 path.
+    pub attn_q_norm: Vec<f32>,
+    pub attn_k_norm: Vec<f32>,
     pub wo: Weight,
     pub ffn_norm: Vec<f32>,
     pub w1: Weight, // gate
@@ -1330,6 +1335,57 @@ mod tests {
         assert!((q[3] - 4.0).abs() < 1e-5);
         assert!((k[0] + 7.0).abs() < 1e-5);
         assert!((k[2] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qwen_rope_uses_rotate_half_layout() {
+        let config = super::Config {
+            arch: "qwen3".to_string(),
+            dim: 4,
+            hidden_dim: 8,
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: 8,
+            max_seq_len: 8,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            head_dim: 4,
+            kv_dim: 4,
+            kv_mul: 1,
+            value_dim: 4,
+            sliding_window: 0,
+            expert_count: 0,
+            expert_used_count: 0,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        let mut q = vec![1.0, 2.0, 3.0, 4.0];
+        let mut k = vec![5.0, 6.0, 7.0, 8.0];
+        let inv = vec![std::f32::consts::FRAC_PI_2, 0.0];
+
+        super::apply_model_rope(&config, &mut q, &mut k, 1, &inv);
+
+        assert!((q[0] + 3.0).abs() < 1e-5);
+        assert!((q[1] - 2.0).abs() < 1e-5);
+        assert!((q[2] - 1.0).abs() < 1e-5);
+        assert!((q[3] - 4.0).abs() < 1e-5);
+        assert!((k[0] + 7.0).abs() < 1e-5);
+        assert!((k[2] - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qk_norm_normalizes_each_head_before_rope() {
+        let mut q = vec![3.0, 4.0, 0.0, 5.0];
+        let mut k = vec![6.0, 8.0];
+        super::apply_qk_norm_if_present(&mut q, &mut k, 2, 2, 1, &[2.0, 1.0], &[1.0, 3.0], 0.0);
+
+        assert!((q[0] - 1.697_056_3).abs() < 1e-5);
+        assert!((q[1] - 1.131_370_9).abs() < 1e-5);
+        assert!((q[2] - 0.0).abs() < 1e-5);
+        assert!((q[3] - std::f32::consts::SQRT_2).abs() < 1e-5);
+        assert!((k[0] - 0.848_528_15).abs() < 1e-5);
+        assert!((k[1] - 3.394_112_6).abs() < 1e-5);
     }
 
     #[test]
@@ -1827,6 +1883,8 @@ mod tests {
                     bk: Vec::new(),
                     wv: tiny_q4k_weight(config.n_kv_heads * head_dim, dim, s.wrapping_add(37)),
                     bv: Vec::new(),
+                    attn_q_norm: Vec::new(),
+                    attn_k_norm: Vec::new(),
                     wo: tiny_q4k_weight(dim, config.n_heads * head_dim, s.wrapping_add(41)),
                     ffn_norm: vec![1.0; dim],
                     w1: tiny_q4k_weight(hidden, dim, s.wrapping_add(53)),
@@ -2892,6 +2950,22 @@ pub fn load_model(
             bk,
             wv,
             bv,
+            attn_q_norm: load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_q_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                config.head_dim,
+            ),
+            attn_k_norm: load_optional_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_k_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                config.head_dim,
+            ),
             wo: load_weight(
                 mmap_data,
                 data_offset,
@@ -3242,6 +3316,66 @@ fn rms_norm_heads_in_place(
                 *value *= scale;
             }
         }
+    }
+}
+
+/// Applies optional Q/K per-head RMSNorm used by Qwen3 and related models.
+/// The GGUF tensors are one head wide and are shared by all query/key heads.
+#[inline]
+fn apply_qk_norm_if_present(
+    q: &mut [f32],
+    k: &mut [f32],
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    q_weight: &[f32],
+    k_weight: &[f32],
+    eps: f32,
+) {
+    if !q_weight.is_empty() {
+        assert_eq!(
+            q_weight.len(),
+            head_dim,
+            "attn_q_norm width must match attention key length"
+        );
+        rms_norm_heads_in_place(q, head_dim, n_heads, Some(q_weight), eps);
+    }
+    if !k_weight.is_empty() {
+        assert_eq!(
+            k_weight.len(),
+            head_dim,
+            "attn_k_norm width must match attention key length"
+        );
+        rms_norm_heads_in_place(k, head_dim, n_kv_heads, Some(k_weight), eps);
+    }
+}
+
+/// Applies the RoPE layout expected by the model architecture. Qwen2 and
+/// Qwen3 use Hugging Face's `rotate_half` convention: each element in the
+/// first half of a head rotates with its counterpart in the second half.
+/// LLaMA-family GGUFs use adjacent pairs instead.
+#[inline]
+fn apply_model_rope(config: &Config, q: &mut [f32], k: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    if matches!(config.arch.as_str(), "qwen2" | "qwen3") {
+        apply_rope_qk_neox(
+            q,
+            k,
+            pos,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            inv_freq,
+        );
+    } else {
+        apply_rope_qk(
+            q,
+            k,
+            pos,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            inv_freq,
+        );
     }
 }
 
@@ -4232,6 +4366,12 @@ fn resident_configure_once(
     }
 
     for (l, layer) in weights.layers.iter().enumerate() {
+        // The resident Metal kernel implements the unnormalised LLaMA Q/K
+        // path. Qwen3 needs the CPU/regular Metal operators below so Q/K
+        // normalization is applied before RoPE.
+        if !layer.attn_q_norm.is_empty() || !layer.attn_k_norm.is_empty() {
+            return false;
+        }
         let ws = [
             &layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w1, &layer.w3, &layer.w2,
         ];
@@ -4431,15 +4571,18 @@ pub fn forward_into(
         add_bias_if_present(&mut buf.k, &layer.bk);
         add_bias_if_present(&mut buf.v, &layer.bv);
 
-        apply_rope_qk(
+        apply_qk_norm_if_present(
             &mut buf.q,
             &mut buf.k,
-            pos,
             head_dim,
             config.n_heads,
             config.n_kv_heads,
-            &buf.rope_inv_freq,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            config.rms_norm_eps,
         );
+
+        apply_model_rope(config, &mut buf.q, &mut buf.k, pos, &buf.rope_inv_freq);
 
         // Store KV (keys and values may have different per-head dims)
         let kv_k_dim = cache.per_pos_k_dim;
@@ -5752,15 +5895,18 @@ fn forward_hidden_impl<'a>(
         add_bias_if_present(&mut buf.k, &layer.bk);
         add_bias_if_present(&mut buf.v, &layer.bv);
 
-        apply_rope_qk(
+        apply_qk_norm_if_present(
             &mut buf.q,
             &mut buf.k,
-            pos,
             head_dim,
             config.n_heads,
             config.n_kv_heads,
-            &buf.rope_inv_freq,
+            &layer.attn_q_norm,
+            &layer.attn_k_norm,
+            config.rms_norm_eps,
         );
+
+        apply_model_rope(config, &mut buf.q, &mut buf.k, pos, &buf.rope_inv_freq);
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
@@ -5937,7 +6083,12 @@ impl PrefillBatchBuffer {
 #[cfg(not(target_family = "wasm"))]
 pub fn standard_prefill_batchable(weights: &ModelWeights) -> bool {
     weights.layers.iter().all(|layer| {
-        kquant_weight_parts(&layer.wq).is_some()
+        // The batched prefill kernel does not yet apply Q/K per-head RMSNorm.
+        // Fall back to the sequential path for Qwen3-style layers rather than
+        // filling the cache with unnormalised keys.
+        layer.attn_q_norm.is_empty()
+            && layer.attn_k_norm.is_empty()
+            && kquant_weight_parts(&layer.wq).is_some()
             && kquant_weight_parts(&layer.wk).is_some()
             && kquant_weight_parts(&layer.wv).is_some()
             && kquant_weight_parts(&layer.wo).is_some()
@@ -6053,15 +6204,7 @@ pub fn forward_prefill_batch(
             add_bias_if_present(k_row, &layer.bk);
             add_bias_if_present(v_row, &layer.bv);
 
-            apply_rope_qk(
-                q_row,
-                k_row,
-                pos,
-                head_dim,
-                config.n_heads,
-                config.n_kv_heads,
-                &buf.rope_inv_freq,
-            );
+            apply_model_rope(config, q_row, k_row, pos, &buf.rope_inv_freq);
 
             let kv_k_start = cache.k_offset(pos);
             let kv_v_start = cache.v_offset(pos);
