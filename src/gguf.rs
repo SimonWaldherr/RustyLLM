@@ -182,6 +182,29 @@ impl MetaValue {
             _ => None,
         }
     }
+
+    /// Reads an integer array as unsigned values. Negative entries are
+    /// discarded rather than silently wrapping to very large dimensions.
+    pub fn as_u32_array(&self) -> Option<Vec<u32>> {
+        match self {
+            Self::Array(arr) => Some(
+                arr.iter()
+                    .filter_map(|value| match value {
+                        Self::U8(v) => Some(*v as u32),
+                        Self::U16(v) => Some(*v as u32),
+                        Self::U32(v) => Some(*v),
+                        Self::U64(v) => u32::try_from(*v).ok(),
+                        Self::I8(v) => (*v >= 0).then_some(*v as u32),
+                        Self::I16(v) => (*v >= 0).then_some(*v as u32),
+                        Self::I32(v) => (*v >= 0).then_some(*v as u32),
+                        Self::I64(v) => u32::try_from(*v).ok(),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

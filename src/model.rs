@@ -45,7 +45,13 @@ impl Config {
         let p = arch.to_string();
 
         let dim = gguf.get_u32(&format!("{}.embedding_length", p), 0) as usize;
-        let n_heads = gguf.get_u32(&format!("{}.attention.head_count", p), 0) as usize;
+        let n_heads = gguf.get_u32(&format!("{}.attention.head_count", p), 0).max(
+            gguf.metadata
+                .get(&format!("{}.attention.head_count", p))
+                .and_then(crate::gguf::MetaValue::as_u32_array)
+                .and_then(|heads| heads.into_iter().max())
+                .unwrap_or(0),
+        ) as usize;
         let n_kv_heads =
             gguf.get_u32(&format!("{}.attention.head_count_kv", p), n_heads as u32) as usize;
         let rope_dim = gguf.get_u32(&format!("{}.rope.dimension_count", p), 0) as usize;
@@ -883,35 +889,25 @@ impl ExpertWeight {
     /// Runs one expert matrix from a mixture-of-experts tensor and returns its output.
     pub fn matvec_expert(&self, expert: usize, x: &[f32]) -> Vec<f32> {
         assert!(expert < self.experts, "expert index out of bounds");
-        let data = self.data.as_slice();
-        match self.dtype {
-            GGMLType::MXFP4 => {
-                let row_bytes = (self.cols / 32) * 17;
-                let expert_bytes = self.rows * row_bytes;
-                let start = expert * expert_bytes;
-                simd::matvec_mxfp4(&data[start..start + expert_bytes], x, self.rows, self.cols)
-            }
-            _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
-        }
+        let mut out = Vec::new();
+        self.matvec_expert_into(expert, x, &mut out);
+        out
     }
 
     /// Runs one expert matrix from a mixture-of-experts tensor into a reusable buffer.
     pub fn matvec_expert_into(&self, expert: usize, x: &[f32], out: &mut Vec<f32>) {
         assert!(expert < self.experts, "expert index out of bounds");
         let data = self.data.as_slice();
+        let row_bytes = quantized_row_bytes(self.dtype, self.cols)
+            .unwrap_or_else(|| panic!("Unsupported expert weight dtype: {:?}", self.dtype));
+        let expert_bytes = self.rows * row_bytes;
+        let start = expert * expert_bytes;
+        let weights = &data[start..start + expert_bytes];
         match self.dtype {
-            GGMLType::MXFP4 => {
-                let row_bytes = (self.cols / 32) * 17;
-                let expert_bytes = self.rows * row_bytes;
-                let start = expert * expert_bytes;
-                simd::matvec_mxfp4_into(
-                    &data[start..start + expert_bytes],
-                    x,
-                    self.rows,
-                    self.cols,
-                    out,
-                );
-            }
+            GGMLType::Q4_K => simd::matvec_q4_k_into(weights, x, self.rows, self.cols, out),
+            GGMLType::Q5_K => simd::matvec_q5_k_into(weights, x, self.rows, self.cols, out),
+            GGMLType::Q6_K => simd::matvec_q6_k_into(weights, x, self.rows, self.cols, out),
+            GGMLType::MXFP4 => simd::matvec_mxfp4_into(weights, x, self.rows, self.cols, out),
             _ => panic!("Unsupported expert weight dtype: {:?}", self.dtype),
         }
     }
@@ -1006,6 +1002,55 @@ pub struct GptOssWeights {
     pub output_norm: Vec<f32>,
     pub output: Weight,
     pub layers: Vec<GptOssLayerWeights>,
+}
+
+/// Dense and sparse feed-forward layouts used by Poolside's Laguna models.
+pub struct LagunaSparseMlpWeights {
+    pub router: Weight,
+    pub router_bias: Vec<f32>,
+    pub gate_experts: ExpertWeight,
+    pub up_experts: ExpertWeight,
+    pub down_experts: ExpertWeight,
+    pub shared_gate: Weight,
+    pub shared_up: Weight,
+    pub shared_down: Weight,
+}
+
+pub enum LagunaMlpWeights {
+    Dense {
+        gate: Weight,
+        up: Weight,
+        down: Weight,
+    },
+    Sparse(Box<LagunaSparseMlpWeights>),
+}
+
+/// One Laguna decoder block. Attention dimensions vary by layer (48 or 64
+/// heads in Laguna-XS), while keys and values keep eight heads throughout.
+pub struct LagunaLayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub wq: Weight,
+    pub wk: Weight,
+    pub wv: Weight,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub attn_gate: Weight,
+    pub wo: Weight,
+    pub ffn_norm: Vec<f32>,
+    pub mlp: LagunaMlpWeights,
+    pub n_heads: usize,
+    pub rotary_dim: usize,
+    pub rope_inv_freq: Vec<f32>,
+    pub sliding_window: bool,
+}
+
+pub struct LagunaWeights {
+    pub token_embd: Weight,
+    pub output_norm: Vec<f32>,
+    pub output: Weight,
+    pub layers: Vec<LagunaLayerWeights>,
+    pub router_normalize_weights: bool,
+    pub routed_scaling_factor: f32,
 }
 
 // ─── KV Cache ────────────────────────────────────────────────────────────────
@@ -3009,6 +3054,296 @@ pub fn load_model(
     (config, weights)
 }
 
+/// Loads Poolside Laguna's alternating dense/sparse-MoE decoder layout.
+pub fn load_laguna_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, LagunaWeights) {
+    let config = Config::from_gguf(gguf);
+    eprintln!(
+        "Config: dim={}, layers={}, max-heads={}/{}, hidden={}, experts={}/{}, vocab={}, ctx={}",
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.hidden_dim,
+        config.expert_used_count,
+        config.expert_count,
+        config.vocab_size,
+        config.max_seq_len
+    );
+    let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> = gguf
+        .tensors
+        .iter()
+        .map(|tensor| (tensor.name.clone(), tensor))
+        .collect();
+    let inferred_sizes = HashMap::new();
+    let data_offset = gguf.data_offset;
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output_norm = load_f32_vec(
+        mmap_data,
+        data_offset,
+        "output_norm.weight",
+        &tensor_idx,
+        &inferred_sizes,
+    );
+    let output = load_weight(
+        mmap_data,
+        data_offset,
+        "output.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let rope_dim = gguf.get_u32("laguna.rope.dimension_count", config.head_dim as u32) as usize;
+    let swa_rope_dim =
+        gguf.get_u32("laguna.rope.dimension_count_swa", config.head_dim as u32) as usize;
+    let rope_theta = gguf.get_f32("laguna.rope.freq_base", config.rope_theta);
+    let swa_rope_theta = gguf.get_f32("laguna.rope.freq_base_swa", rope_theta);
+    // Laguna's base head count is used by full-attention layers. The larger
+    // per-layer count identifies SWA layers (and therefore selects Laguna's
+    // separate 128-dim, theta=10_000 RoPE configuration).
+    let full_attention_heads = gguf
+        .metadata
+        .get("laguna.attention.head_count")
+        .and_then(crate::gguf::MetaValue::as_u32_array)
+        .and_then(|counts| counts.into_iter().min())
+        .map(|count| count as usize)
+        .unwrap_or(config.n_heads);
+    let router_normalize_weights = match gguf.metadata.get("laguna.expert_weights_norm") {
+        Some(crate::gguf::MetaValue::Bool(value)) => *value,
+        Some(value) => value.as_u32().map(|value| value != 0).unwrap_or(true),
+        None => true,
+    };
+    let routed_scaling_factor = gguf.get_f32("laguna.expert_weights_scale", 1.0);
+
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for l in 0..config.n_layers {
+        let q_name = format!("blk.{l}.attn_q.weight");
+        let q_info = tensor_idx
+            .get(&q_name)
+            .unwrap_or_else(|| panic!("Missing tensor: {q_name}"));
+        let n_heads = q_info.dims[1] as usize / config.head_dim;
+        let sliding_window = n_heads > full_attention_heads;
+        let rotary_dim = if sliding_window {
+            swa_rope_dim
+        } else {
+            rope_dim
+        };
+        let layer_rope_theta = if sliding_window {
+            swa_rope_theta
+        } else {
+            rope_theta
+        };
+
+        let mlp = if tensor_idx.contains_key(&format!("blk.{l}.ffn_gate.weight")) {
+            LagunaMlpWeights::Dense {
+                gate: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_gate.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                up: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_up.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                down: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_down.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+            }
+        } else {
+            LagunaMlpWeights::Sparse(Box::new(LagunaSparseMlpWeights {
+                router: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_gate_inp.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                router_bias: load_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.exp_probs_b.bias"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                ),
+                gate_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_gate_exps.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                up_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_up_exps.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                down_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_down_exps.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                shared_gate: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_gate_shexp.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                shared_up: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_up_shexp.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                shared_down: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{l}.ffn_down_shexp.weight"),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+            }))
+        };
+        layers.push(LagunaLayerWeights {
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_norm.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            wq: load_weight(
+                mmap_data,
+                data_offset,
+                &q_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            wk: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_k.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            wv: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_v.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            q_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_q_norm.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            k_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_k_norm.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            attn_gate: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_gate.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            wo: load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.attn_output.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            ),
+            ffn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{l}.ffn_norm.weight"),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            mlp,
+            n_heads,
+            rotary_dim,
+            rope_inv_freq: build_rope_inv_freq(layer_rope_theta, rotary_dim, 1.0),
+            sliding_window,
+        });
+        if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {
+            eprintln!("  Loaded layer {}/{}", l + 1, config.n_layers);
+        }
+    }
+    (
+        config,
+        LagunaWeights {
+            token_embd,
+            output_norm,
+            output,
+            layers,
+            router_normalize_weights,
+            routed_scaling_factor,
+        },
+    )
+}
+
 /// Loads GPT-OSS-specific weights from a parsed GGUF file.
 pub fn load_gpt_oss_model(
     mmap_data: &[u8],
@@ -3475,6 +3810,39 @@ pub(crate) fn apply_rope_qk_neox(
             let v1 = k[idx1];
             k[idx0] = v0 * cos_a - v1 * sin_a;
             k[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+/// Applies Qwen/GLM-style `rotate_half` RoPE to a prefix of each head. Laguna
+/// uses 64 rotary dimensions for full-attention layers and 128 for its SWA
+/// layers, while every head remains 128 elements wide.
+fn apply_rope_qk_neox_partial(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    inv_freq: &[f32],
+) {
+    let rotary_dim = rotary_dim.min(head_dim) & !1;
+    let half = rotary_dim / 2;
+    debug_assert!(inv_freq.len() >= half);
+    for i in 0..half {
+        let (sin, cos) = (pos as f32 * inv_freq[i]).sin_cos();
+        for (values, heads) in [(&mut *q, n_heads), (&mut *k, n_kv_heads)] {
+            for head in 0..heads {
+                let start = head * head_dim;
+                if start + rotary_dim > values.len() {
+                    break;
+                }
+                let a = values[start + i];
+                let b = values[start + half + i];
+                values[start + i] = a * cos - b * sin;
+                values[start + half + i] = b * cos + a * sin;
+            }
         }
     }
 }
@@ -4685,6 +5053,252 @@ pub fn forward_into(
         &mut buf.xn,
     );
     weights.output.matvec_into(&buf.xn, logits);
+}
+
+/// Runs one Laguna decoder step. Laguna combines variable-width GQA attention,
+/// a positive per-head attention gate, and sparse routed SwiGLU experts.
+fn forward_laguna_impl(
+    config: &Config,
+    weights: &LagunaWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: Option<&mut Vec<f32>>,
+) {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    for (layer_index, layer) in weights.layers.iter().enumerate() {
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        if !try_quant_matvec3_into(
+            &layer.wq, &layer.wk, &layer.wv, &buf.xn, &mut buf.q, &mut buf.k, &mut buf.v,
+        ) {
+            layer.wq.matvec_into(&buf.xn, &mut buf.q);
+            layer.wk.matvec_into(&buf.xn, &mut buf.k);
+            layer.wv.matvec_into(&buf.xn, &mut buf.v);
+        }
+        rms_norm_heads_in_place(
+            &mut buf.q,
+            config.head_dim,
+            layer.n_heads,
+            Some(&layer.q_norm),
+            config.rms_norm_eps,
+        );
+        rms_norm_heads_in_place(
+            &mut buf.k,
+            config.head_dim,
+            config.n_kv_heads,
+            Some(&layer.k_norm),
+            config.rms_norm_eps,
+        );
+        apply_rope_qk_neox_partial(
+            &mut buf.q,
+            &mut buf.k,
+            pos,
+            config.head_dim,
+            layer.rotary_dim,
+            layer.n_heads,
+            config.n_kv_heads,
+            &layer.rope_inv_freq,
+        );
+
+        let k_start = cache.k_offset(pos);
+        let v_start = cache.v_offset(pos);
+        cache.k[layer_index][k_start..k_start + buf.k.len()].copy_from_slice(&buf.k);
+        cache.v[layer_index][v_start..v_start + buf.v.len()].copy_from_slice(&buf.v);
+        let attn_dim = layer.n_heads * config.value_dim;
+        let attn_start = if layer.sliding_window {
+            attention_start_pos(pos, config.sliding_window)
+        } else {
+            0
+        };
+        attention_over_kv_heads(
+            &buf.q,
+            &cache.k[layer_index],
+            &cache.v[layer_index],
+            cache.per_pos_k_dim,
+            cache.per_pos_v_dim,
+            cache.storage_len,
+            config.head_dim,
+            config.value_dim,
+            config.n_kv_heads,
+            layer.n_heads / config.n_kv_heads,
+            attn_start,
+            pos,
+            1.0 / (config.head_dim as f32).sqrt(),
+            &mut buf.attn_out[..attn_dim],
+        );
+        layer.attn_gate.matvec_into(&buf.xn, &mut buf.gate);
+        for head in 0..layer.n_heads {
+            let gate = softplus(buf.gate[head]);
+            let start = head * config.value_dim;
+            for value in &mut buf.attn_out[start..start + config.value_dim] {
+                *value *= gate;
+            }
+        }
+        layer
+            .wo
+            .matvec_into(&buf.attn_out[..attn_dim], &mut buf.proj);
+        for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
+            *residual += projection;
+        }
+
+        rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
+        match &layer.mlp {
+            LagunaMlpWeights::Dense { gate, up, down } => {
+                if !try_quant_matvec2_into(gate, up, &buf.xn2, &mut buf.gate, &mut buf.up) {
+                    gate.matvec_into(&buf.xn2, &mut buf.gate);
+                    up.matvec_into(&buf.xn2, &mut buf.up);
+                }
+                crate::simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+                down.matvec_into(&buf.hidden, &mut buf.proj);
+            }
+            LagunaMlpWeights::Sparse(sparse) => {
+                let LagunaSparseMlpWeights {
+                    router,
+                    router_bias,
+                    gate_experts,
+                    up_experts,
+                    down_experts,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                } = sparse.as_ref();
+                if !try_quant_matvec2_into(
+                    shared_gate,
+                    shared_up,
+                    &buf.xn2,
+                    &mut buf.gate,
+                    &mut buf.up,
+                ) {
+                    shared_gate.matvec_into(&buf.xn2, &mut buf.gate);
+                    shared_up.matvec_into(&buf.xn2, &mut buf.up);
+                }
+                crate::simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+                shared_down.matvec_into(&buf.hidden, &mut buf.moe);
+
+                router.matvec_into(&buf.xn2, &mut buf.router_logits);
+                select_laguna_experts(
+                    &mut buf.router_logits,
+                    router_bias,
+                    config.expert_used_count,
+                    weights.router_normalize_weights,
+                    &mut buf.top_experts,
+                    &mut buf.expert_probs,
+                );
+                for (slot, &(expert, _)) in buf.top_experts.iter().enumerate() {
+                    gate_experts.matvec_expert_into(expert, &buf.xn2, &mut buf.gate);
+                    up_experts.matvec_expert_into(expert, &buf.xn2, &mut buf.up);
+                    crate::simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+                    down_experts.matvec_expert_into(expert, &buf.hidden, &mut buf.proj);
+                    let scale = buf.expert_probs[slot] * weights.routed_scaling_factor;
+                    for (sum, value) in buf.moe.iter_mut().zip(&buf.proj) {
+                        *sum += value * scale;
+                    }
+                }
+                buf.proj.clone_from(&buf.moe);
+            }
+        }
+        for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
+            *residual += projection;
+        }
+    }
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    if let Some(logits) = logits {
+        weights.output.matvec_into(&buf.xn, logits);
+    }
+}
+
+pub fn forward_laguna_into(
+    config: &Config,
+    weights: &LagunaWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
+    forward_laguna_impl(config, weights, cache, buf, token, pos, Some(logits));
+}
+
+/// Returns Laguna's final normalized residual stream. This shares the decode
+/// implementation so embedding callers remain compatible with the decoder.
+pub fn forward_hidden_laguna<'a>(
+    config: &Config,
+    weights: &LagunaWeights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_laguna_impl(config, weights, cache, buf, token, pos, None);
+    &buf.xn
+}
+
+/// Advances a Laguna cache entry without calculating logits that cannot be
+/// sampled until the final prompt token.
+pub fn forward_prefill_laguna(
+    config: &Config,
+    weights: &LagunaWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    forward_laguna_impl(config, weights, cache, buf, token, pos, None);
+}
+
+#[inline]
+fn softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
+fn select_laguna_experts(
+    logits: &mut [f32],
+    correction_bias: &[f32],
+    top_k: usize,
+    normalize: bool,
+    selected: &mut Vec<(usize, f32)>,
+    probabilities: &mut Vec<f32>,
+) {
+    selected.clear();
+    for (expert, logit) in logits.iter_mut().enumerate() {
+        *logit = 1.0 / (1.0 + (-*logit).exp());
+        let corrected = *logit + correction_bias.get(expert).copied().unwrap_or(0.0);
+        if selected.len() < top_k {
+            selected.push((expert, corrected));
+            selected.sort_by(|a, b| b.1.total_cmp(&a.1));
+        } else if corrected
+            > selected
+                .last()
+                .map(|entry| entry.1)
+                .unwrap_or(f32::INFINITY)
+        {
+            selected.pop();
+            selected.push((expert, corrected));
+            selected.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+    }
+    probabilities.clear();
+    probabilities.extend(selected.iter().map(|(expert, _)| logits[*expert]));
+    if normalize {
+        let total: f32 = probabilities.iter().sum();
+        if total > 0.0 {
+            for probability in probabilities {
+                *probability /= total;
+            }
+        }
+    }
 }
 
 /// Forward pass for Gemma-4 models (initial implementation mirroring the

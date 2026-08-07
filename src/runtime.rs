@@ -580,6 +580,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Result<f32, String> {
 enum LoadedWeights {
     Standard(ModelWeights),
     GptOss(GptOssWeights),
+    Laguna(crate::model::LagunaWeights),
     Gemma4(crate::model::Gemma4Weights),
     /// BERT-style encoder (nomic-bert) — embedding-only, no decode path.
     NomicBert(crate::model::NomicBertWeights),
@@ -766,6 +767,7 @@ pub fn architecture_supported(arch: &str) -> bool {
             | "ministral"
             | "qwen2"
             | "qwen3"
+            | "laguna"
             | "gpt-oss"
             | "granite"
             | "granite3"
@@ -950,6 +952,10 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
 
     match arch {
         "gpt-oss" => return,
+        "laguna" => {
+            validate_laguna_layout(gguf, &config, report);
+            return;
+        }
         _ if is_gemma_arch(arch) => {
             validate_gemma_layout(gguf, &config, report);
             return;
@@ -1021,6 +1027,47 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
             } else {
                 validate_row_count(gguf, &up, config.hidden_dim * 2, report);
             }
+        }
+    }
+}
+
+fn validate_laguna_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+    if config.dim == 0 || config.n_layers == 0 || config.n_heads == 0 || config.n_kv_heads == 0 {
+        report
+            .unsupported_layouts
+            .push(String::from("missing required Laguna metadata"));
+        return;
+    }
+    for name in ["token_embd.weight", "output_norm.weight", "output.weight"] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+    for layer in 0..config.n_layers {
+        let prefix = format!("blk.{layer}.");
+        for suffix in [
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
+            "attn_gate.weight",
+            "attn_output.weight",
+            "attn_norm.weight",
+            "ffn_norm.weight",
+        ] {
+            let name = format!("{prefix}{suffix}");
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+        let dense = has(&format!("{prefix}ffn_gate.weight"));
+        let sparse = has(&format!("{prefix}ffn_gate_inp.weight"));
+        if !dense && !sparse {
+            report
+                .missing_tensors
+                .push(format!("{prefix}dense or sparse MLP tensors"));
         }
     }
 }
@@ -1210,6 +1257,10 @@ impl Runner {
                 let (config, weights) = model::load_gpt_oss_model(data, &gguf, false);
                 (config, LoadedWeights::GptOss(weights))
             }
+            "laguna" => {
+                let (config, weights) = model::load_laguna_model(data, &gguf, false);
+                (config, LoadedWeights::Laguna(weights))
+            }
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
                 (config, LoadedWeights::Gemma4(weights))
@@ -1289,6 +1340,10 @@ impl Runner {
             "gpt-oss" => {
                 let (config, weights) = model::load_gpt_oss_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::GptOss(weights))
+            }
+            "laguna" => {
+                let (config, weights) = model::load_laguna_model(mmap.as_slice(), &gguf, true);
+                (config, LoadedWeights::Laguna(weights))
             }
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(mmap.as_slice(), &gguf, true);
@@ -1473,6 +1528,7 @@ impl Runner {
         match &self.weights {
             LoadedWeights::Standard(weights) => &weights.token_embd,
             LoadedWeights::GptOss(weights) => &weights.token_embd,
+            LoadedWeights::Laguna(weights) => &weights.token_embd,
             LoadedWeights::Gemma4(weights) => &weights.token_embd,
             LoadedWeights::NomicBert(weights) => &weights.token_embd,
         }
@@ -1801,10 +1857,17 @@ impl Runner {
     }
 
     fn effective_sliding_window(&self, options: &GenerationOptions) -> Option<usize> {
-        options
-            .runtime
-            .sliding_window_size
-            .or_else(|| (self.config.sliding_window > 0).then_some(self.config.sliding_window))
+        if self.arch == "laguna" {
+            // Laguna mixes full-attention and SWA layers. Its full layers need
+            // the complete cache, while the forward pass applies the SWA
+            // window only to the marked layers.
+            options.runtime.sliding_window_size
+        } else {
+            options
+                .runtime
+                .sliding_window_size
+                .or_else(|| (self.config.sliding_window > 0).then_some(self.config.sliding_window))
+        }
     }
 
     fn effective_prefill_ubatch(&self, options: &GenerationOptions, prompt_tokens: usize) -> usize {
@@ -1875,6 +1938,9 @@ impl Runner {
             LoadedWeights::GptOss(weights) => {
                 self.gpt_oss_kernel_benchmark(weights, runs, requested_layer)
             }
+            LoadedWeights::Laguna(_) => Err(String::from(
+                "--kernel-bench does not yet provide a Laguna sparse-expert profile.",
+            )),
             LoadedWeights::Gemma4(_) => Err(String::from(
                 "--kernel-bench currently supports standard transformer and gpt-oss MoE weights only.",
             )),
@@ -2912,6 +2978,9 @@ impl Runner {
             LoadedWeights::GptOss(weights) => {
                 model::forward_gpt_oss_into(&self.config, weights, cache, buf, token, pos, logits)
             }
+            LoadedWeights::Laguna(weights) => {
+                model::forward_laguna_into(&self.config, weights, cache, buf, token, pos, logits)
+            }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_gemma4_into(&self.config, weights, cache, buf, token, pos, logits)
             }
@@ -2937,6 +3006,9 @@ impl Runner {
             LoadedWeights::GptOss(weights) => {
                 model::forward_hidden_gpt_oss(&self.config, weights, cache, buf, token, pos)
             }
+            LoadedWeights::Laguna(weights) => {
+                model::forward_hidden_laguna(&self.config, weights, cache, buf, token, pos)
+            }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_hidden_gemma4(&self.config, weights, cache, buf, token, pos)
             }
@@ -2961,6 +3033,9 @@ impl Runner {
         match &self.weights {
             LoadedWeights::GptOss(weights) => {
                 model::forward_prefill_gpt_oss(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::Laguna(weights) => {
+                model::forward_prefill_laguna(&self.config, weights, cache, buf, token, pos)
             }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_prefill_gemma4(&self.config, weights, cache, buf, token, pos)
@@ -3052,6 +3127,8 @@ impl Runner {
     fn is_stop_token(&self, token: u32) -> bool {
         if self.arch == "gpt-oss" {
             token == self.tok.eos_id || token == 200002 || token == 200007
+        } else if self.arch == "laguna" {
+            token == self.tok.eos_id || self.tok.special_id("</assistant>") == Some(token)
         } else if is_gemma_arch(&self.arch) {
             token == self.tok.eos_id
                 || self.tok.special_id("<end_of_turn>") == Some(token)
@@ -3087,6 +3164,11 @@ impl Runner {
         }
         if matches!(self.chat_template_kind(), Some("chatml")) {
             if let Some(tokens) = self.render_chatml_messages(messages, system_prompt) {
+                return tokens;
+            }
+        }
+        if matches!(self.chat_template_kind(), Some("laguna")) {
+            if let Some(tokens) = self.render_laguna_messages(messages, system_prompt) {
                 return tokens;
             }
         }
@@ -3430,6 +3512,64 @@ impl Runner {
         Some(tokens)
     }
 
+    /// Renders Poolside Laguna's `<system>` / `<user>` / `<assistant>` format.
+    /// The assistant and thinking delimiters are special tokens; all other
+    /// tags are regular tokenizer text in the published GGUF.
+    fn render_laguna_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+    ) -> Option<Vec<u32>> {
+        let assistant = self.tok.special_id("<assistant>")?;
+        let end_assistant = self.tok.special_id("</assistant>")?;
+        let end_thinking = self.tok.special_id("</think>")?;
+        let mut tokens = vec![self.tok.eos_id];
+        let mut first_system = None;
+        if system_prompt.trim().is_empty() {
+            first_system = messages
+                .first()
+                .filter(|message| matches!(message.role, ChatRole::System));
+        }
+        let system = if system_prompt.trim().is_empty() {
+            first_system.map(|message| message.content.trim())
+        } else {
+            Some(system_prompt.trim())
+        };
+        if let Some(system) = system.filter(|content| !content.is_empty()) {
+            tokens.extend(self.tok.encode_without_bos("<system>"));
+            tokens.extend(self.tok.encode_without_bos(system));
+            tokens.extend(self.tok.encode_without_bos("</system>\n"));
+        }
+
+        for (index, message) in messages.iter().enumerate() {
+            if first_system.is_some() && index == 0 {
+                continue;
+            }
+            match message.role {
+                ChatRole::System => {
+                    tokens.extend(self.tok.encode_without_bos("<system>"));
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.extend(self.tok.encode_without_bos("</system>\n"));
+                }
+                ChatRole::User => {
+                    tokens.extend(self.tok.encode_without_bos("<user>"));
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.extend(self.tok.encode_without_bos("</user>\n"));
+                }
+                ChatRole::Assistant => {
+                    tokens.push(assistant);
+                    tokens.push(end_thinking);
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.push(end_assistant);
+                    tokens.extend(self.tok.encode_without_bos("\n"));
+                }
+            }
+        }
+        tokens.push(assistant);
+        tokens.push(end_thinking);
+        Some(tokens)
+    }
+
     /// Classifies the loaded tokenizer chat template.
     fn chat_template_kind(&self) -> Option<&'static str> {
         *self.chat_template_kind_cache.get_or_init(|| {
@@ -3457,6 +3597,12 @@ impl Runner {
             Some("mistral3-inst")
         } else if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
             Some("chatml")
+        } else if template.contains("<system>")
+            && template.contains("<user>")
+            && template.contains("<assistant>")
+            && template.contains("</think>")
+        {
+            Some("laguna")
         } else {
             None
         }
@@ -3516,7 +3662,10 @@ impl Runner {
     pub fn new_session(&self, max_cached_tokens: usize) -> crate::session::Session {
         let cap = max_cached_tokens.min(self.config.max_seq_len).max(1);
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
-        let sliding_window = (self.config.sliding_window > 0).then_some(self.config.sliding_window);
+        // Laguna interleaves full-attention and sliding-window layers. A
+        // global ring cache would discard keys still required by full layers.
+        let sliding_window = (self.arch != "laguna" && self.config.sliding_window > 0)
+            .then_some(self.config.sliding_window);
         let kv_cache = KVCache::with_sliding_window(
             self.config.n_layers,
             kv_k_dim,
@@ -4521,6 +4670,17 @@ mod tests {
                 "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
             ),
             Some("chatml")
+        );
+    }
+
+    #[test]
+    /// Verifies that the Poolside Laguna assistant/thinking template uses its native renderer.
+    fn chat_template_kind_detects_laguna() {
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(
+                "{{ '<system>' }}{{ '<user>' }}{{ '<assistant>' }}{{ '</think>' }}"
+            ),
+            Some("laguna")
         );
     }
 
