@@ -61,6 +61,26 @@ pub fn f16_to_f32(h: u16) -> f32 {
     }
 }
 
+// ─── bf16 ↔ f32 conversion ────────────────────────────────────────────────────
+
+#[inline(always)]
+/// Widens a bf16 bit pattern to `f32` (bf16 is just the top 16 bits of f32).
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+#[inline(always)]
+/// Narrows `f32` to bf16 with round-to-nearest-even, preserving NaN payloads.
+pub fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if x.is_nan() {
+        // Force the quiet bit so a narrowed NaN never turns into +/-Inf.
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
 /// Sets the process-wide matrix-vector worker count.
 pub fn set_num_threads(n: usize) {
     NUM_THREADS.store(n.max(1), Ordering::Relaxed);
@@ -2008,6 +2028,147 @@ pub fn scale_add_f32(out: &mut [f32], scale: f32, add: &[f32]) {
     }
 }
 
+// ─── bf16 KV-cache kernels: f32 query/accumulator, bf16-stored K/V ───────────
+// Used only by the bf16 KV-cache path (`KVCache::enable_bf16`): the query and
+// the softmax accumulator stay f32 (unchanged numerics), only the cached
+// key/value row read from RAM is bf16 and gets widened inline per element —
+// no full-row dequant scratch buffer, so the DRAM traffic saved by storing
+// half-width KV is not immediately spent again on an equally large fp32 copy.
+
+/// Dot product of an f32 vector against a bf16-stored vector (same length).
+#[inline]
+pub fn dot_bf16_f32(a: &[f32], b: &[u16]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_bf16_f32_neon(a, b) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { dot_bf16_f32_avx2(a, b) }
+        } else {
+            dot_bf16_f32_scalar(a, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        dot_bf16_f32_scalar(a, b)
+    }
+}
+
+/// Computes `out[i] += alpha * bf16_to_f32(x[i])`.
+#[inline]
+pub fn axpy_bf16_f32(out: &mut [f32], alpha: f32, x: &[u16]) {
+    debug_assert_eq!(out.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { axpy_bf16_f32_neon(out, alpha, x) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { axpy_bf16_f32_avx2(out, alpha, x) }
+        } else {
+            axpy_bf16_f32_scalar(out, alpha, x)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        axpy_bf16_f32_scalar(out, alpha, x)
+    }
+}
+
+/// Computes `out[i] = out[i] * scale + bf16_to_f32(add[i])`.
+#[inline]
+pub fn scale_add_bf16_f32(out: &mut [f32], scale: f32, add: &[u16]) {
+    debug_assert_eq!(out.len(), add.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { scale_add_bf16_f32_neon(out, scale, add) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { scale_add_bf16_f32_avx2(out, scale, add) }
+        } else {
+            scale_add_bf16_f32_scalar(out, scale, add)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scale_add_bf16_f32_scalar(out, scale, add)
+    }
+}
+
+/// bf16-KV counterpart of `dot_f32x4`: widens each bf16 key element once and
+/// reuses it across all four query-head dot products. Without this, GQA's
+/// generic per-head loop would re-widen the same key row `kv_mul` times.
+#[inline]
+pub fn dot_bf16x4_f32(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[u16]) -> [f32; 4] {
+    debug_assert_eq!(a0.len(), b.len());
+    debug_assert_eq!(a1.len(), b.len());
+    debug_assert_eq!(a2.len(), b.len());
+    debug_assert_eq!(a3.len(), b.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_bf16x4_f32_neon(a0, a1, a2, a3, b) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { dot_bf16x4_f32_avx2(a0, a1, a2, a3, b) }
+        } else {
+            dot_bf16x4_f32_scalar(a0, a1, a2, a3, b)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        dot_bf16x4_f32_scalar(a0, a1, a2, a3, b)
+    }
+}
+
+/// bf16-KV counterpart of `affine_add_f32x4`: widens each bf16 value element
+/// once and reuses it across all four heads' accumulator updates.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn affine_add_bf16x4_f32(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[u16],
+) {
+    debug_assert_eq!(out0.len(), x.len());
+    debug_assert_eq!(out1.len(), x.len());
+    debug_assert_eq!(out2.len(), x.len());
+    debug_assert_eq!(out3.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { affine_add_bf16x4_f32_neon(out0, out1, out2, out3, multiplier, alpha, x) }
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { affine_add_bf16x4_f32_avx2(out0, out1, out2, out3, multiplier, alpha, x) }
+        } else {
+            affine_add_bf16x4_f32_scalar(out0, out1, out2, out3, multiplier, alpha, x)
+        }
+        return;
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        affine_add_bf16x4_f32_scalar(out0, out1, out2, out3, multiplier, alpha, x)
+    }
+}
+
 /// Applies four independent `out = out * multiplier + alpha * x` updates
 /// while streaming the shared source vector only once. This is the value-cache
 /// half of four-head grouped-query attention.
@@ -2214,6 +2375,47 @@ fn scale_f32_scalar(out: &mut [f32], scale: f32) {
 fn scale_add_f32_scalar(out: &mut [f32], scale: f32, add: &[f32]) {
     for (o, a) in out.iter_mut().zip(add.iter()) {
         *o = *o * scale + *a;
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+/// Scalar fallback for the bf16-KV dot product.
+fn dot_bf16_f32_scalar(a: &[f32], b: &[u16]) -> f32 {
+    let n = a.len();
+    let chunks = n / 4;
+    let mut s0 = 0.0f32;
+    let mut s1 = 0.0f32;
+    let mut s2 = 0.0f32;
+    let mut s3 = 0.0f32;
+    for i in 0..chunks {
+        let base = i * 4;
+        s0 += a[base] * bf16_to_f32(b[base]);
+        s1 += a[base + 1] * bf16_to_f32(b[base + 1]);
+        s2 += a[base + 2] * bf16_to_f32(b[base + 2]);
+        s3 += a[base + 3] * bf16_to_f32(b[base + 3]);
+    }
+    for i in (chunks * 4)..n {
+        s0 += a[i] * bf16_to_f32(b[i]);
+    }
+    (s0 + s1) + (s2 + s3)
+}
+
+#[inline]
+#[allow(dead_code)]
+/// Scalar fallback for bf16-KV AXPY.
+fn axpy_bf16_f32_scalar(out: &mut [f32], alpha: f32, x: &[u16]) {
+    for (o, &xi) in out.iter_mut().zip(x.iter()) {
+        *o += alpha * bf16_to_f32(xi);
+    }
+}
+
+#[inline]
+#[allow(dead_code)]
+/// Scalar fallback for bf16-KV fused scale-and-add.
+fn scale_add_bf16_f32_scalar(out: &mut [f32], scale: f32, add: &[u16]) {
+    for (o, &a) in out.iter_mut().zip(add.iter()) {
+        *o = *o * scale + bf16_to_f32(a);
     }
 }
 
@@ -3944,6 +4146,38 @@ fn affine_add_f32x4_scalar(
 }
 
 #[allow(dead_code)]
+fn dot_bf16x4_f32_scalar(a0: &[f32], a1: &[f32], a2: &[f32], a3: &[f32], b: &[u16]) -> [f32; 4] {
+    let mut out = [0.0; 4];
+    for i in 0..b.len() {
+        let key = bf16_to_f32(b[i]);
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn affine_add_bf16x4_f32_scalar(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[u16],
+) {
+    for i in 0..x.len() {
+        let value = bf16_to_f32(x[i]);
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * value;
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * value;
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * value;
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * value;
+    }
+}
+
+#[allow(dead_code)]
 /// Portable scalar implementation of Q8_0 dot product.
 fn dot_q8_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     let n_blocks = n / 32;
@@ -5660,6 +5894,190 @@ unsafe fn scale_add_f32_neon(out: &mut [f32], scale: f32, add: &[f32]) {
     }
 }
 
+// ─── bf16 KV-cache kernels: NEON ──────────────────────────────────────────────
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn load_bf16_widen_neon(ptr: *const u16) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    let half = vld1_u16(ptr);
+    let widened = vmovl_u16(half);
+    vreinterpretq_f32_u32(vshlq_n_u32(widened, 16))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_bf16_f32_neon(a: &[f32], b: &[u16]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let main = n / 4;
+    let mut acc = vdupq_n_f32(0.0);
+    let mut ap = a.as_ptr();
+    let mut bp = b.as_ptr();
+    for _ in 0..main {
+        let bv = load_bf16_widen_neon(bp);
+        acc = vmlaq_f32(acc, vld1q_f32(ap), bv);
+        ap = ap.add(4);
+        bp = bp.add(4);
+    }
+    let mut sum = vaddvq_f32(acc);
+    for i in (main * 4)..n {
+        sum += a[i] * bf16_to_f32(b[i]);
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn axpy_bf16_f32_neon(out: &mut [f32], alpha: f32, x: &[u16]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 4;
+    let av = vdupq_n_f32(alpha);
+    let mut op = out.as_mut_ptr();
+    let mut xp = x.as_ptr();
+    for _ in 0..main {
+        let o = vld1q_f32(op);
+        let xv = load_bf16_widen_neon(xp);
+        vst1q_f32(op, vmlaq_f32(o, xv, av));
+        op = op.add(4);
+        xp = xp.add(4);
+    }
+    for i in (main * 4)..n {
+        out[i] += alpha * bf16_to_f32(x[i]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn scale_add_bf16_f32_neon(out: &mut [f32], scale: f32, add: &[u16]) {
+    use std::arch::aarch64::*;
+    let n = out.len();
+    let main = n / 4;
+    let sv = vdupq_n_f32(scale);
+    let mut op = out.as_mut_ptr();
+    let mut ap = add.as_ptr();
+    for _ in 0..main {
+        let o = vld1q_f32(op);
+        let av = load_bf16_widen_neon(ap);
+        vst1q_f32(op, vmlaq_f32(av, o, sv));
+        op = op.add(4);
+        ap = ap.add(4);
+    }
+    for i in (main * 4)..n {
+        out[i] = out[i] * scale + bf16_to_f32(add[i]);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_bf16x4_f32_neon(
+    a0: &[f32],
+    a1: &[f32],
+    a2: &[f32],
+    a3: &[f32],
+    b: &[u16],
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let n = b.len();
+    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        let key = load_bf16_widen_neon(b.as_ptr().add(i));
+        sums[0] = vmlaq_f32(sums[0], vld1q_f32(a0.as_ptr().add(i)), key);
+        sums[1] = vmlaq_f32(sums[1], vld1q_f32(a1.as_ptr().add(i)), key);
+        sums[2] = vmlaq_f32(sums[2], vld1q_f32(a2.as_ptr().add(i)), key);
+        sums[3] = vmlaq_f32(sums[3], vld1q_f32(a3.as_ptr().add(i)), key);
+        i += 4;
+    }
+    let mut out = [
+        vaddvq_f32(sums[0]),
+        vaddvq_f32(sums[1]),
+        vaddvq_f32(sums[2]),
+        vaddvq_f32(sums[3]),
+    ];
+    while i < n {
+        let key = bf16_to_f32(b[i]);
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn affine_add_bf16x4_f32_neon(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[u16],
+) {
+    use std::arch::aarch64::*;
+    let mul = [
+        vdupq_n_f32(multiplier[0]),
+        vdupq_n_f32(multiplier[1]),
+        vdupq_n_f32(multiplier[2]),
+        vdupq_n_f32(multiplier[3]),
+    ];
+    let add = [
+        vdupq_n_f32(alpha[0]),
+        vdupq_n_f32(alpha[1]),
+        vdupq_n_f32(alpha[2]),
+        vdupq_n_f32(alpha[3]),
+    ];
+    let mut i = 0;
+    while i + 4 <= x.len() {
+        let value = load_bf16_widen_neon(x.as_ptr().add(i));
+        vst1q_f32(
+            out0.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out0.as_ptr().add(i)), mul[0]),
+                value,
+                add[0],
+            ),
+        );
+        vst1q_f32(
+            out1.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out1.as_ptr().add(i)), mul[1]),
+                value,
+                add[1],
+            ),
+        );
+        vst1q_f32(
+            out2.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out2.as_ptr().add(i)), mul[2]),
+                value,
+                add[2],
+            ),
+        );
+        vst1q_f32(
+            out3.as_mut_ptr().add(i),
+            vmlaq_f32(
+                vmulq_f32(vld1q_f32(out3.as_ptr().add(i)), mul[3]),
+                value,
+                add[3],
+            ),
+        );
+        i += 4;
+    }
+    while i < x.len() {
+        let value = bf16_to_f32(x[i]);
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * value;
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * value;
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * value;
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * value;
+        i += 1;
+    }
+}
+
 // ─── AVX2 + FMA implementations (x86_64) ────────────────────────────────────
 
 /// Horizontal sum of 8 f32 in a __m256 register
@@ -6194,6 +6612,175 @@ unsafe fn scale_add_f32_avx2(out: &mut [f32], scale: f32, add: &[f32]) {
     }
     for i in (main * 8)..n {
         out[i] = out[i] * scale + add[i];
+    }
+}
+
+// ─── bf16 KV-cache kernels: AVX2 ──────────────────────────────────────────────
+
+/// Loads 8 packed bf16 values and widens them to an `__m256` of f32 by
+/// zero-extending to u32 and shifting into the high 16 bits — bf16's only
+/// difference from f32 is a truncated mantissa, so this is exact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn load_bf16_widen_avx2(ptr: *const u16) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    let half = _mm_loadu_si128(ptr as *const __m128i);
+    let widened = _mm256_cvtepu16_epi32(half);
+    let shifted = _mm256_slli_epi32(widened, 16);
+    _mm256_castsi256_ps(shifted)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16_f32_avx2(a: &[f32], b: &[u16]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = a.len();
+    let main = n / 8;
+    let mut acc = _mm256_setzero_ps();
+    let mut ap = a.as_ptr();
+    let mut bp = b.as_ptr();
+    for _ in 0..main {
+        let bv = load_bf16_widen_avx2(bp);
+        acc = _mm256_fmadd_ps(_mm256_loadu_ps(ap), bv, acc);
+        ap = ap.add(8);
+        bp = bp.add(8);
+    }
+    let mut sum = hsum_avx(acc);
+    for i in (main * 8)..n {
+        sum += a[i] * bf16_to_f32(b[i]);
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn axpy_bf16_f32_avx2(out: &mut [f32], alpha: f32, x: &[u16]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8;
+    let av = _mm256_set1_ps(alpha);
+    let mut op = out.as_mut_ptr();
+    let mut xp = x.as_ptr();
+    for _ in 0..main {
+        let o = _mm256_loadu_ps(op);
+        let xv = load_bf16_widen_avx2(xp);
+        let y = _mm256_fmadd_ps(av, xv, o);
+        _mm256_storeu_ps(op, y);
+        op = op.add(8);
+        xp = xp.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] += alpha * bf16_to_f32(x[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scale_add_bf16_f32_avx2(out: &mut [f32], scale: f32, add: &[u16]) {
+    use std::arch::x86_64::*;
+    let n = out.len();
+    let main = n / 8;
+    let sv = _mm256_set1_ps(scale);
+    let mut op = out.as_mut_ptr();
+    let mut ap = add.as_ptr();
+    for _ in 0..main {
+        let o = _mm256_loadu_ps(op);
+        let a = load_bf16_widen_avx2(ap);
+        let y = _mm256_fmadd_ps(o, sv, a);
+        _mm256_storeu_ps(op, y);
+        op = op.add(8);
+        ap = ap.add(8);
+    }
+    for i in (main * 8)..n {
+        out[i] = out[i] * scale + bf16_to_f32(add[i]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_bf16x4_f32_avx2(
+    a0: &[f32],
+    a1: &[f32],
+    a2: &[f32],
+    a3: &[f32],
+    b: &[u16],
+) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let key = load_bf16_widen_avx2(b.as_ptr().add(i));
+        sums[0] = _mm256_fmadd_ps(_mm256_loadu_ps(a0.as_ptr().add(i)), key, sums[0]);
+        sums[1] = _mm256_fmadd_ps(_mm256_loadu_ps(a1.as_ptr().add(i)), key, sums[1]);
+        sums[2] = _mm256_fmadd_ps(_mm256_loadu_ps(a2.as_ptr().add(i)), key, sums[2]);
+        sums[3] = _mm256_fmadd_ps(_mm256_loadu_ps(a3.as_ptr().add(i)), key, sums[3]);
+        i += 8;
+    }
+    let mut out = [
+        hsum_avx(sums[0]),
+        hsum_avx(sums[1]),
+        hsum_avx(sums[2]),
+        hsum_avx(sums[3]),
+    ];
+    while i < b.len() {
+        let key = bf16_to_f32(b[i]);
+        out[0] += a0[i] * key;
+        out[1] += a1[i] * key;
+        out[2] += a2[i] * key;
+        out[3] += a3[i] * key;
+        i += 1;
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn affine_add_bf16x4_f32_avx2(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[u16],
+) {
+    use std::arch::x86_64::*;
+    let mul = [
+        _mm256_set1_ps(multiplier[0]),
+        _mm256_set1_ps(multiplier[1]),
+        _mm256_set1_ps(multiplier[2]),
+        _mm256_set1_ps(multiplier[3]),
+    ];
+    let add = [
+        _mm256_set1_ps(alpha[0]),
+        _mm256_set1_ps(alpha[1]),
+        _mm256_set1_ps(alpha[2]),
+        _mm256_set1_ps(alpha[3]),
+    ];
+    let mut i = 0;
+    while i + 8 <= x.len() {
+        let value = load_bf16_widen_avx2(x.as_ptr().add(i));
+        let update = |out: &mut [f32], m, a| {
+            let old = _mm256_loadu_ps(out.as_ptr().add(i));
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(i),
+                _mm256_fmadd_ps(value, a, _mm256_mul_ps(old, m)),
+            );
+        };
+        update(out0, mul[0], add[0]);
+        update(out1, mul[1], add[1]);
+        update(out2, mul[2], add[2]);
+        update(out3, mul[3], add[3]);
+        i += 8;
+    }
+    while i < x.len() {
+        let value = bf16_to_f32(x[i]);
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * value;
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * value;
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * value;
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * value;
+        i += 1;
     }
 }
 
@@ -7643,5 +8230,139 @@ mod tests {
             "prefill ceiling {} exceeds {logical} logical threads",
             super::physical_threads()
         );
+    }
+
+    #[test]
+    fn bf16_roundtrip_is_exact_for_bf16_representable_values() {
+        // Values whose low 16 mantissa bits are already zero survive
+        // f32 -> bf16 -> f32 exactly.
+        for bits in [0x3f80_0000u32, 0xbf00_0000, 0x4120_0000, 0x0000_0000] {
+            let x = f32::from_bits(bits);
+            assert_eq!(bf16_to_f32(f32_to_bf16(x)), x);
+        }
+    }
+
+    #[test]
+    fn bf16_roundtrip_rounds_to_nearest_even() {
+        // 1.0 + 2^-8 rounds up (tie broken toward even mantissa); relative
+        // error must stay within bf16's ~2^-8 precision.
+        let x = 1.0f32 + 1.0 / 256.0;
+        let y = bf16_to_f32(f32_to_bf16(x));
+        assert!((y - x).abs() <= x * (1.0 / 128.0));
+    }
+
+    #[test]
+    fn bf16_conversion_preserves_nan() {
+        let n = f32::NAN;
+        assert!(bf16_to_f32(f32_to_bf16(n)).is_nan());
+    }
+
+    fn bf16_row(values: &[f32]) -> Vec<u16> {
+        values.iter().map(|&v| f32_to_bf16(v)).collect()
+    }
+
+    #[test]
+    fn dot_bf16_matches_f32_reference_within_bf16_precision() {
+        let n = 37; // deliberately not a multiple of 8/4 to exercise tails
+        let a: Vec<f32> = (0..n).map(|i| (i as f32) * 0.037 - 0.6).collect();
+        let b: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32) * 0.11 - 0.4).collect();
+        let b_bf16 = bf16_row(&b);
+        let b_widened: Vec<f32> = b_bf16.iter().map(|&h| bf16_to_f32(h)).collect();
+
+        let got = dot_bf16_f32(&a, &b_bf16);
+        let want = dot_f32(&a, &b_widened);
+        assert!(
+            (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+            "got {got}, want {want}"
+        );
+    }
+
+    #[test]
+    fn axpy_bf16_matches_f32_reference() {
+        let n = 29;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.21 - 1.3).collect();
+        let x_bf16 = bf16_row(&x);
+        let x_widened: Vec<f32> = x_bf16.iter().map(|&h| bf16_to_f32(h)).collect();
+
+        let mut out_bf16 = vec![0.5f32; n];
+        let mut out_f32 = vec![0.5f32; n];
+        axpy_bf16_f32(&mut out_bf16, 1.7, &x_bf16);
+        axpy_f32(&mut out_f32, 1.7, &x_widened);
+        for (got, want) in out_bf16.iter().zip(out_f32.iter()) {
+            assert!((got - want).abs() <= 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn scale_add_bf16_matches_f32_reference() {
+        let n = 41;
+        let add: Vec<f32> = (0..n).map(|i| (i as f32) * -0.09 + 2.0).collect();
+        let add_bf16 = bf16_row(&add);
+        let add_widened: Vec<f32> = add_bf16.iter().map(|&h| bf16_to_f32(h)).collect();
+
+        let mut out_bf16 = vec![0.3f32; n];
+        let mut out_f32 = vec![0.3f32; n];
+        scale_add_bf16_f32(&mut out_bf16, 0.42, &add_bf16);
+        scale_add_f32(&mut out_f32, 0.42, &add_widened);
+        for (got, want) in out_bf16.iter().zip(out_f32.iter()) {
+            assert!((got - want).abs() <= 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn dot_bf16x4_matches_four_individual_bf16_dots() {
+        let n = 23;
+        let a0: Vec<f32> = (0..n).map(|i| (i as f32) * 0.05 - 0.4).collect();
+        let a1: Vec<f32> = (0..n).map(|i| (i as f32) * -0.03 + 0.2).collect();
+        let a2: Vec<f32> = (0..n).map(|i| (i as f32) * 0.09).collect();
+        let a3: Vec<f32> = (0..n).map(|i| 1.0 - (i as f32) * 0.02).collect();
+        let b: Vec<f32> = (0..n).map(|i| ((i * 5 % 11) as f32) * 0.13 - 0.5).collect();
+        let b_bf16 = bf16_row(&b);
+
+        let got = dot_bf16x4_f32(&a0, &a1, &a2, &a3, &b_bf16);
+        let want = [
+            dot_bf16_f32(&a0, &b_bf16),
+            dot_bf16_f32(&a1, &b_bf16),
+            dot_bf16_f32(&a2, &b_bf16),
+            dot_bf16_f32(&a3, &b_bf16),
+        ];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!((g - w).abs() <= 1e-4, "got {g}, want {w}");
+        }
+    }
+
+    #[test]
+    fn affine_add_bf16x4_matches_scalar_reference_formula() {
+        let n = 19;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.07 - 0.6).collect();
+        let x_bf16 = bf16_row(&x);
+        let multiplier = [0.0f32, 1.0, 0.5, 2.0];
+        let alpha = [1.0f32, 0.3, 0.7, 1.5];
+        let bases = [
+            vec![0.2f32; n],
+            vec![0.4f32; n],
+            vec![-0.1f32; n],
+            vec![0.9f32; n],
+        ];
+
+        let mut out0 = bases[0].clone();
+        let mut out1 = bases[1].clone();
+        let mut out2 = bases[2].clone();
+        let mut out3 = bases[3].clone();
+        affine_add_bf16x4_f32(
+            &mut out0, &mut out1, &mut out2, &mut out3, multiplier, alpha, &x_bf16,
+        );
+        let got = [out0, out1, out2, out3];
+
+        for g in 0..4 {
+            for i in 0..n {
+                let want = bases[g][i] * multiplier[g] + alpha[g] * bf16_to_f32(x_bf16[i]);
+                assert!(
+                    (got[g][i] - want).abs() <= 1e-5,
+                    "head {g}, i {i}: {} vs {want}",
+                    got[g][i]
+                );
+            }
+        }
     }
 }

@@ -1058,6 +1058,15 @@ pub struct LagunaWeights {
 pub struct KVCache {
     pub k: Vec<Vec<f32>>, // [layer][slot * per_pos_k_dim ..]
     pub v: Vec<Vec<f32>>,
+    /// Populated instead of `k`/`v` once `enable_bf16` is called. Halves the
+    /// bytes read from RAM per scanned KV position during attention, which is
+    /// the dominant remaining lever once decode is DRAM-bandwidth-bound (see
+    /// BENCHMARK.md / perf notes) — weights already saturate the bus, so at
+    /// long context the KV read itself becomes a comparable or larger share
+    /// of per-token traffic.
+    pub k_bf16: Vec<Vec<u16>>,
+    pub v_bf16: Vec<Vec<u16>>,
+    pub bf16: bool,
     pub per_pos_k_dim: usize,
     pub per_pos_v_dim: usize,
     pub max_len: usize,
@@ -1089,12 +1098,34 @@ impl KVCache {
         Self {
             k: vec![vec![0.0; storage_len * per_pos_k_dim]; n_layers],
             v: vec![vec![0.0; storage_len * per_pos_v_dim]; n_layers],
+            k_bf16: Vec::new(),
+            v_bf16: Vec::new(),
+            bf16: false,
             per_pos_k_dim,
             per_pos_v_dim,
             max_len,
             storage_len,
             sliding_window,
         }
+    }
+
+    /// Switches this (freshly constructed, not-yet-written) cache to store
+    /// keys/values as bf16 instead of f32. Only the `Standard` (LLaMA-style)
+    /// forward path (`forward_into`/`forward_hidden_impl`/
+    /// `forward_prefill_batch`) knows how to read/write the bf16 storage;
+    /// callers must not enable this for other architectures.
+    pub fn enable_bf16(&mut self) {
+        if self.bf16 {
+            return;
+        }
+        self.k_bf16 = self.k.iter().map(|layer| vec![0u16; layer.len()]).collect();
+        self.v_bf16 = self.v.iter().map(|layer| vec![0u16; layer.len()]).collect();
+        // Drop the f32 backing storage rather than leaving it allocated and
+        // unused; keep the outer Vec length so `cache.k.len() == n_layers`
+        // still holds for any caller that uses it that way.
+        self.k = vec![Vec::new(); self.k.len()];
+        self.v = vec![Vec::new(); self.v.len()];
+        self.bf16 = true;
     }
 
     /// Updates the active sliding window and resizes storage if the ring size changed.
@@ -1104,11 +1135,20 @@ impl KVCache {
         self.sliding_window = sliding_window;
         if storage_len != self.storage_len {
             self.storage_len = storage_len;
-            for layer in &mut self.k {
-                layer.resize(storage_len * self.per_pos_k_dim, 0.0);
-            }
-            for layer in &mut self.v {
-                layer.resize(storage_len * self.per_pos_v_dim, 0.0);
+            if self.bf16 {
+                for layer in &mut self.k_bf16 {
+                    layer.resize(storage_len * self.per_pos_k_dim, 0);
+                }
+                for layer in &mut self.v_bf16 {
+                    layer.resize(storage_len * self.per_pos_v_dim, 0);
+                }
+            } else {
+                for layer in &mut self.k {
+                    layer.resize(storage_len * self.per_pos_k_dim, 0.0);
+                }
+                for layer in &mut self.v {
+                    layer.resize(storage_len * self.per_pos_v_dim, 0.0);
+                }
             }
         }
         changed
@@ -1139,6 +1179,34 @@ impl KVCache {
     #[inline]
     pub fn v_offset(&self, pos: usize) -> usize {
         self.slot_for_pos(pos) * self.per_pos_v_dim
+    }
+
+    /// Writes one position's key row, narrowing to bf16 if that mode is active.
+    #[inline]
+    pub fn write_k(&mut self, layer: usize, pos: usize, values: &[f32]) {
+        let off = self.k_offset(pos);
+        if self.bf16 {
+            let dst = &mut self.k_bf16[layer][off..off + values.len()];
+            for (d, &v) in dst.iter_mut().zip(values.iter()) {
+                *d = crate::simd::f32_to_bf16(v);
+            }
+        } else {
+            self.k[layer][off..off + values.len()].copy_from_slice(values);
+        }
+    }
+
+    /// Writes one position's value row, narrowing to bf16 if that mode is active.
+    #[inline]
+    pub fn write_v(&mut self, layer: usize, pos: usize, values: &[f32]) {
+        let off = self.v_offset(pos);
+        if self.bf16 {
+            let dst = &mut self.v_bf16[layer][off..off + values.len()];
+            for (d, &v) in dst.iter_mut().zip(values.iter()) {
+                *d = crate::simd::f32_to_bf16(v);
+            }
+        } else {
+            self.v[layer][off..off + values.len()].copy_from_slice(values);
+        }
     }
 }
 
@@ -1357,6 +1425,220 @@ mod tests {
         assert_eq!(cache.storage_len, 128);
         assert_eq!(cache.k_offset(9), 36);
         assert_eq!(cache.v_offset(9), 54);
+    }
+
+    #[test]
+    fn enable_bf16_moves_storage_and_write_k_v_narrows_losslessly_within_precision() {
+        let mut cache = KVCache::with_sliding_window(2, 4, 6, 16, None);
+        cache.enable_bf16();
+        assert!(cache.bf16);
+        // f32 backing storage is dropped, but the outer per-layer Vec length
+        // (n_layers) is preserved.
+        assert_eq!(cache.k.len(), 2);
+        assert_eq!(cache.k[0].len(), 0);
+        assert_eq!(cache.k_bf16[0].len(), 4 * 16);
+        assert_eq!(cache.v_bf16[0].len(), 6 * 16);
+
+        let k_row = [0.5f32, -1.25, 3.0, 0.125];
+        let v_row = [1.0f32, -2.0, 0.0, 4.5, -0.75, 2.25];
+        cache.write_k(0, 3, &k_row);
+        cache.write_v(0, 3, &v_row);
+        let off_k = cache.k_offset(3);
+        let off_v = cache.v_offset(3);
+        for (i, &expected) in k_row.iter().enumerate() {
+            assert_eq!(
+                crate::simd::bf16_to_f32(cache.k_bf16[0][off_k + i]),
+                expected,
+                "bf16 exactly represents these round values"
+            );
+        }
+        for (i, &expected) in v_row.iter().enumerate() {
+            assert_eq!(
+                crate::simd::bf16_to_f32(cache.v_bf16[0][off_v + i]),
+                expected
+            );
+        }
+
+        // set_sliding_window must resize the bf16 storage, not the (empty) f32 one.
+        assert!(cache.set_sliding_window(Some(4)));
+        assert_eq!(cache.k_bf16[0].len(), 4 * 4);
+        assert_eq!(cache.k[0].len(), 0);
+    }
+
+    #[test]
+    fn grouped_attention_bf16_matches_f32_within_bf16_precision() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const TOKENS: usize = 5;
+        const KV_MUL: usize = 4;
+        let queries: Vec<f32> = (0..KV_MUL * HEAD_DIM)
+            .map(|i| i as f32 * 0.017 - 0.15)
+            .collect();
+        let keys: Vec<f32> = (0..TOKENS * HEAD_DIM)
+            .map(|i| i as f32 * 0.023 - 0.31)
+            .collect();
+        let values: Vec<f32> = (0..TOKENS * VALUE_DIM)
+            .map(|i| i as f32 * 0.011 - 0.27)
+            .collect();
+        let keys_bf16: Vec<u16> = keys.iter().map(|&v| crate::simd::f32_to_bf16(v)).collect();
+        let values_bf16: Vec<u16> = values
+            .iter()
+            .map(|&v| crate::simd::f32_to_bf16(v))
+            .collect();
+
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut f32_out = vec![0.0; KV_MUL * VALUE_DIM];
+        super::online_attention_grouped(
+            &queries,
+            &keys,
+            &values,
+            HEAD_DIM,
+            VALUE_DIM,
+            TOKENS,
+            HEAD_DIM,
+            VALUE_DIM,
+            KV_MUL,
+            0,
+            TOKENS - 1,
+            scale,
+            &mut f32_out,
+        );
+        let mut bf16_out = vec![0.0; KV_MUL * VALUE_DIM];
+        super::online_attention_grouped_bf16(
+            &queries,
+            &keys_bf16,
+            &values_bf16,
+            HEAD_DIM,
+            VALUE_DIM,
+            TOKENS,
+            HEAD_DIM,
+            VALUE_DIM,
+            KV_MUL,
+            0,
+            TOKENS - 1,
+            scale,
+            &mut bf16_out,
+        );
+        for (got, want) in bf16_out.iter().zip(f32_out.iter()) {
+            assert!(
+                (got - want).abs() <= 0.01 * want.abs().max(1.0),
+                "got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib attention_bf16_speedup_at_long_context -- --ignored --nocapture"]
+    fn attention_bf16_speedup_at_long_context() {
+        // Isolates the exact kernel changed by KVCache::enable_bf16 — no
+        // model load, no weight matvecs, no tokenizer — so it measures the
+        // bytes-moved argument directly instead of being swamped by the
+        // DRAM-bandwidth-bound weight reads that dominate a real decode step.
+        // Dims match Ministral-3B (head_dim=128, value_dim=128, n_kv_heads=8,
+        // kv_mul=4, 26 layers); CTX matches the "long context" regime where
+        // the plan (perf-work-status memory) expects the win to show up.
+        //
+        // Each (layer, kv_head) gets its OWN buffer rather than reusing one:
+        // a single kv_head's K+V at ctx=8192 is only ~8 MiB, well inside this
+        // CPU's L3 — repeatedly scanning the same 8 MiB would benchmark cache
+        // bandwidth, not the DRAM bandwidth the whole optimization targets.
+        // The full N_LAYERS x N_KV_HEADS working set (~1.6 GiB f32 / 0.8 GiB
+        // bf16) cannot be cache-resident, matching a real decode step where
+        // every layer's KV is read fresh and evicted by the next layer's.
+        const HEAD_DIM: usize = 128;
+        const VALUE_DIM: usize = 128;
+        const N_KV_HEADS: usize = 8;
+        const KV_MUL: usize = 4;
+        const N_LAYERS: usize = 26;
+        const CTX: usize = 8192;
+        const RUNS: usize = 2;
+        const N_BUFFERS: usize = N_LAYERS * N_KV_HEADS;
+
+        let queries: Vec<f32> = (0..KV_MUL * HEAD_DIM)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+        let keys: Vec<f32> = (0..N_BUFFERS * CTX * HEAD_DIM)
+            .map(|i| (i as f32 * 0.0000007).cos() * 0.5)
+            .collect();
+        let values: Vec<f32> = (0..N_BUFFERS * CTX * VALUE_DIM)
+            .map(|i| (i as f32 * 0.0000011).sin() * 0.5)
+            .collect();
+        let keys_bf16: Vec<u16> = keys.iter().map(|&v| crate::simd::f32_to_bf16(v)).collect();
+        let values_bf16: Vec<u16> = values
+            .iter()
+            .map(|&v| crate::simd::f32_to_bf16(v))
+            .collect();
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let mut f32_out = vec![0.0f32; KV_MUL * VALUE_DIM];
+        let f32_time = {
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for buf in 0..N_BUFFERS {
+                    let k = &keys[buf * CTX * HEAD_DIM..(buf + 1) * CTX * HEAD_DIM];
+                    let v = &values[buf * CTX * VALUE_DIM..(buf + 1) * CTX * VALUE_DIM];
+                    super::online_attention_grouped(
+                        &queries,
+                        k,
+                        v,
+                        HEAD_DIM,
+                        VALUE_DIM,
+                        CTX,
+                        HEAD_DIM,
+                        VALUE_DIM,
+                        KV_MUL,
+                        0,
+                        CTX - 1,
+                        scale,
+                        &mut f32_out,
+                    );
+                }
+            }
+            start.elapsed()
+        };
+
+        let mut bf16_out = vec![0.0f32; KV_MUL * VALUE_DIM];
+        let bf16_time = {
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for buf in 0..N_BUFFERS {
+                    let k = &keys_bf16[buf * CTX * HEAD_DIM..(buf + 1) * CTX * HEAD_DIM];
+                    let v = &values_bf16[buf * CTX * VALUE_DIM..(buf + 1) * CTX * VALUE_DIM];
+                    super::online_attention_grouped_bf16(
+                        &queries,
+                        k,
+                        v,
+                        HEAD_DIM,
+                        VALUE_DIM,
+                        CTX,
+                        HEAD_DIM,
+                        VALUE_DIM,
+                        KV_MUL,
+                        0,
+                        CTX - 1,
+                        scale,
+                        &mut bf16_out,
+                    );
+                }
+            }
+            start.elapsed()
+        };
+
+        for (got, want) in bf16_out.iter().zip(f32_out.iter()) {
+            assert!(
+                (got - want).abs() <= 0.02 * want.abs().max(1.0),
+                "got {got}, want {want}"
+            );
+        }
+        let speedup = f32_time.as_secs_f64() / bf16_time.as_secs_f64();
+        let total_f32_mib = (N_BUFFERS * CTX * (HEAD_DIM + VALUE_DIM) * 4) / (1024 * 1024);
+        let total_bf16_mib = (N_BUFFERS * CTX * (HEAD_DIM + VALUE_DIM) * 2) / (1024 * 1024);
+        eprintln!(
+            "Full-model-shaped attention scan at ctx={CTX}, {N_LAYERS} layers x {N_KV_HEADS} kv-heads: f32={:.1} ms ({total_f32_mib} MiB), bf16={:.1} ms ({total_bf16_mib} MiB), speedup={:.2}x",
+            f32_time.as_secs_f64() * 1000.0 / RUNS as f64,
+            bf16_time.as_secs_f64() * 1000.0 / RUNS as f64,
+            speedup,
+        );
     }
 
     #[test]
@@ -4336,6 +4618,352 @@ pub(crate) fn online_attention_grouped(
 /// `online_attention_grouped` so it stays allocation-free.
 const MAX_KV_MUL: usize = 16;
 
+// ─── bf16 KV-cache attention (Standard architecture only) ────────────────────
+// Mirrors online_attention / online_attention_grouped / attention_over_kv_heads
+// exactly, but reads bf16-stored keys/values instead of f32. The query and the
+// running softmax accumulator (out/max_score/denom) stay f32 — only the
+// per-position K/V row read from the cache is bf16, widened inline by the
+// simd::dot_bf16_f32/axpy_bf16_f32/scale_add_bf16_f32 kernels (and, for the
+// common GQA kv_mul == 4 case, simd::dot_bf16x4_f32/affine_add_bf16x4_f32,
+// which widen each bf16 element once and reuse it across all four query
+// heads). That fused path is not optional: an earlier version of this
+// function used only the generic per-head loop, which re-widened the same
+// key/value row 4 times per position and measured as a real end-to-end
+// decode *regression* versus f32 (paired A/B on Ministral, ~10-25% slower)
+// instead of the expected bandwidth win — the redundant widening cost more
+// than the halved KV bytes saved. Used only when `KVCache::bf16` is set.
+
+#[inline]
+pub(crate) fn online_attention_bf16(
+    query: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
+    let mut max_score = f32::NEG_INFINITY;
+    let mut denom = 0.0f32;
+    let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
+    let mut slot = if linear_slots {
+        start_t
+    } else {
+        start_t % slot_count
+    };
+
+    for _ in start_t..=end_t {
+        let k_off = slot * key_stride;
+        let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
+        let score = simd::dot_bf16_f32(query, keys_sub) * scale;
+        let v_off = slot * value_stride;
+        let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
+
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
+        if score > max_score {
+            let old_scale = if max_score.is_finite() {
+                exp_attn(max_score - score)
+            } else {
+                0.0
+            };
+            simd::scale_add_bf16_f32(out_sub, old_scale, value_row);
+            denom = denom * old_scale + 1.0;
+            max_score = score;
+        } else {
+            let weight = exp_attn(score - max_score);
+            simd::axpy_bf16_f32(out_sub, weight, value_row);
+            denom += weight;
+        }
+
+        slot += 1;
+        if slot == slot_count {
+            slot = 0;
+        }
+    }
+
+    if denom > 0.0 {
+        let inv = 1.0 / denom;
+        let out_sub = unsafe { out.get_unchecked_mut(..value_head_dim) };
+        simd::scale_f32(out_sub, inv);
+    }
+}
+
+#[inline]
+pub(crate) fn online_attention_grouped_bf16(
+    queries: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(queries.len(), kv_mul * key_head_dim);
+    debug_assert_eq!(out.len(), kv_mul * value_head_dim);
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
+
+    if kv_mul == 1 {
+        return online_attention_bf16(
+            queries,
+            keys,
+            values,
+            key_stride,
+            value_stride,
+            slot_count,
+            key_head_dim,
+            value_head_dim,
+            start_t,
+            end_t,
+            scale,
+            out,
+        );
+    }
+
+    let mut max_score = [f32::NEG_INFINITY; MAX_KV_MUL];
+    let mut denom = [0.0f32; MAX_KV_MUL];
+    let kv_mul = kv_mul.min(MAX_KV_MUL);
+    let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
+    let mut slot = if linear_slots {
+        start_t
+    } else {
+        start_t % slot_count
+    };
+
+    for _ in start_t..=end_t {
+        let k_off = slot * key_stride;
+        let keys_sub = unsafe { keys.get_unchecked(k_off..k_off + key_head_dim) };
+        let v_off = slot * value_stride;
+        let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
+
+        // Mirrors the f32 kv_mul == 4 fast path: without this, the generic
+        // per-g loop below would re-widen the same bf16 key/value row four
+        // times (once per query head) instead of once, which measured as a
+        // real decode regression versus f32 rather than the expected win.
+        if kv_mul == 4 {
+            let q0 = unsafe { queries.get_unchecked(0..key_head_dim) };
+            let q1 = unsafe { queries.get_unchecked(key_head_dim..2 * key_head_dim) };
+            let q2 = unsafe { queries.get_unchecked(2 * key_head_dim..3 * key_head_dim) };
+            let q3 = unsafe { queries.get_unchecked(3 * key_head_dim..4 * key_head_dim) };
+            let scores = simd::dot_bf16x4_f32(q0, q1, q2, q3, keys_sub);
+            let mut multiplier = [1.0; 4];
+            let mut alpha = [0.0; 4];
+            for g in 0..4 {
+                let score = scores[g] * scale;
+                if score > max_score[g] {
+                    let old_scale = if max_score[g].is_finite() {
+                        exp_attn(max_score[g] - score)
+                    } else {
+                        0.0
+                    };
+                    multiplier[g] = old_scale;
+                    alpha[g] = 1.0;
+                    denom[g] = denom[g] * old_scale + 1.0;
+                    max_score[g] = score;
+                } else {
+                    alpha[g] = exp_attn(score - max_score[g]);
+                    denom[g] += alpha[g];
+                }
+            }
+            let (out0, rest) = out.split_at_mut(value_head_dim);
+            let (out1, rest) = rest.split_at_mut(value_head_dim);
+            let (out2, out3) = rest.split_at_mut(value_head_dim);
+            simd::affine_add_bf16x4_f32(out0, out1, out2, out3, multiplier, alpha, value_row);
+            slot += 1;
+            if slot == slot_count {
+                slot = 0;
+            }
+            continue;
+        }
+
+        for g in 0..kv_mul {
+            let q_sub =
+                unsafe { queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim) };
+            let score = simd::dot_bf16_f32(q_sub, keys_sub) * scale;
+            let out_sub = unsafe {
+                out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
+            };
+            if score > max_score[g] {
+                let old_scale = if max_score[g].is_finite() {
+                    exp_attn(max_score[g] - score)
+                } else {
+                    0.0
+                };
+                simd::scale_add_bf16_f32(out_sub, old_scale, value_row);
+                denom[g] = denom[g] * old_scale + 1.0;
+                max_score[g] = score;
+            } else {
+                let weight = exp_attn(score - max_score[g]);
+                simd::axpy_bf16_f32(out_sub, weight, value_row);
+                denom[g] += weight;
+            }
+        }
+
+        slot += 1;
+        if slot == slot_count {
+            slot = 0;
+        }
+    }
+
+    for g in 0..kv_mul {
+        if denom[g] > 0.0 {
+            let inv = 1.0 / denom[g];
+            let out_sub = unsafe {
+                out.get_unchecked_mut(g * value_head_dim..g * value_head_dim + value_head_dim)
+            };
+            simd::scale_f32(out_sub, inv);
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct AttnHeadsCtxBf16 {
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    out: *mut f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn attn_heads_trampoline_bf16(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: mirrors attn_heads_trampoline — `ctx` is a live &AttnHeadsCtxBf16
+    // for the blocking call; each kv_h reads disjoint K/V bands and writes a
+    // disjoint `out` slice.
+    unsafe {
+        let c = &*(ctx as *const AttnHeadsCtxBf16);
+        for kv_h in start..end {
+            let q_off = kv_h * c.kv_mul * c.head_dim;
+            let out_off = kv_h * c.kv_mul * c.value_dim;
+            let q = std::slice::from_raw_parts(c.q.add(q_off), c.kv_mul * c.head_dim);
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+            let out = std::slice::from_raw_parts_mut(c.out.add(out_off), c.kv_mul * c.value_dim);
+            online_attention_grouped_bf16(
+                q,
+                keys,
+                values,
+                c.key_stride,
+                c.value_stride,
+                c.slot_count,
+                c.head_dim,
+                c.value_dim,
+                c.kv_mul,
+                c.start_t,
+                c.end_t,
+                c.scale,
+                out,
+            );
+        }
+    }
+}
+
+/// bf16-KV-cache counterpart of `attention_over_kv_heads`; same fan-out/serial
+/// split, same head-parallelism threshold.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_over_kv_heads_bf16(
+    queries: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    #[cfg(not(target_family = "wasm"))]
+    let scanned = end_t.saturating_sub(start_t) + 1;
+    #[cfg(not(target_family = "wasm"))]
+    let work = scanned.saturating_mul(n_kv_heads);
+    #[cfg(not(target_family = "wasm"))]
+    let threads = crate::simd::num_threads();
+
+    #[cfg(not(target_family = "wasm"))]
+    if n_kv_heads > 1 && threads > 1 && work >= attention_parallel_min_work() {
+        let ctx = AttnHeadsCtxBf16 {
+            q: queries.as_ptr(),
+            k: keys.as_ptr(),
+            v: values.as_ptr(),
+            out: out.as_mut_ptr(),
+            k_len: keys.len(),
+            v_len: values.len(),
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            kv_mul,
+            start_t,
+            end_t,
+            scale,
+        };
+        // SAFETY: `ctx` outlives the blocking call; each KV head writes a
+        // disjoint `out` band and reads disjoint K/V state.
+        unsafe {
+            crate::simd::parallel_range(
+                n_kv_heads,
+                attn_heads_trampoline_bf16,
+                &ctx as *const AttnHeadsCtxBf16 as *const (),
+            );
+        }
+        return;
+    }
+
+    // Serial fallback (short contexts, single-threaded, or wasm).
+    for kv_h in 0..n_kv_heads {
+        let q_off = kv_h * kv_mul * head_dim;
+        let out_off = kv_h * kv_mul * value_dim;
+        online_attention_grouped_bf16(
+            &queries[q_off..q_off + kv_mul * head_dim],
+            &keys[kv_h * head_dim..],
+            &values[kv_h * value_dim..],
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            kv_mul,
+            start_t,
+            end_t,
+            scale,
+            &mut out[out_off..out_off + kv_mul * value_dim],
+        );
+    }
+}
+
 /// SiLU activation
 #[inline(always)]
 /// Computes the SiLU activation.
@@ -4955,11 +5583,8 @@ pub fn forward_into(
         // Store KV (keys and values may have different per-head dims)
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = cache.k_offset(pos);
-        let kv_v_start = cache.v_offset(pos);
-        // debug log removed
-        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
-        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
+        cache.write_k(l, pos, &buf.k);
+        cache.write_v(l, pos, &buf.v);
 
         // Multi-head attention with GQA
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -4968,7 +5593,24 @@ pub fn forward_into(
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = attention_start_pos(pos, sliding_window);
 
-        if !crate::metal::attention_into(
+        if cache.bf16 {
+            attention_over_kv_heads_bf16(
+                &buf.q,
+                &cache.k_bf16[l],
+                &cache.v_bf16[l],
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                head_dim,
+                config.value_dim,
+                config.n_kv_heads,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
+        } else if !crate::metal::attention_into(
             &buf.q,
             &cache.k[l],
             &cache.v[l],
@@ -6524,16 +7166,31 @@ fn forward_hidden_impl<'a>(
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
-        let kv_k_start = cache.k_offset(pos);
-        let kv_v_start = cache.v_offset(pos);
-        cache.k[l][kv_k_start..kv_k_start + buf.k.len()].copy_from_slice(&buf.k);
-        cache.v[l][kv_v_start..kv_v_start + buf.v.len()].copy_from_slice(&buf.v);
+        cache.write_k(l, pos, &buf.k);
+        cache.write_v(l, pos, &buf.v);
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let sliding_window = active_sliding_window(config, cache);
         let attn_window = attention_start_pos(pos, sliding_window);
 
-        if !crate::metal::attention_into(
+        if cache.bf16 {
+            attention_over_kv_heads_bf16(
+                &buf.q,
+                &cache.k_bf16[l],
+                &cache.v_bf16[l],
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                head_dim,
+                config.value_dim,
+                config.n_kv_heads,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
+        } else if !crate::metal::attention_into(
             &buf.q,
             &cache.k[l],
             &cache.v[l],
@@ -6820,28 +7477,46 @@ pub fn forward_prefill_batch(
 
             apply_model_rope(config, q_row, k_row, pos, &buf.rope_inv_freq);
 
-            let kv_k_start = cache.k_offset(pos);
-            let kv_v_start = cache.v_offset(pos);
-            cache.k[l][kv_k_start..kv_k_start + k_rows].copy_from_slice(k_row);
-            cache.v[l][kv_v_start..kv_v_start + v_rows].copy_from_slice(v_row);
+            cache.write_k(l, pos, k_row);
+            cache.write_v(l, pos, v_row);
 
             let attn_window = attention_start_pos(pos, sliding_window);
-            attention_over_kv_heads(
-                &buf.q[t * q_rows..(t + 1) * q_rows],
-                &cache.k[l],
-                &cache.v[l],
-                cache.per_pos_k_dim,
-                cache.per_pos_v_dim,
-                cache.storage_len,
-                head_dim,
-                config.value_dim,
-                config.n_kv_heads,
-                kv_mul,
-                attn_window,
-                pos,
-                scale,
-                &mut buf.attn_out[t * attn_dim..(t + 1) * attn_dim],
-            );
+            let out_row = &mut buf.attn_out[t * attn_dim..(t + 1) * attn_dim];
+            if cache.bf16 {
+                attention_over_kv_heads_bf16(
+                    &buf.q[t * q_rows..(t + 1) * q_rows],
+                    &cache.k_bf16[l],
+                    &cache.v_bf16[l],
+                    cache.per_pos_k_dim,
+                    cache.per_pos_v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    config.value_dim,
+                    config.n_kv_heads,
+                    kv_mul,
+                    attn_window,
+                    pos,
+                    scale,
+                    out_row,
+                );
+            } else {
+                attention_over_kv_heads(
+                    &buf.q[t * q_rows..(t + 1) * q_rows],
+                    &cache.k[l],
+                    &cache.v[l],
+                    cache.per_pos_k_dim,
+                    cache.per_pos_v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    config.value_dim,
+                    config.n_kv_heads,
+                    kv_mul,
+                    attn_window,
+                    pos,
+                    scale,
+                    out_row,
+                );
+            }
         }
 
         if !try_kquant_matvec_batch_into(&layer.wo, &buf.attn_out[..b * attn_dim], &mut buf.proj) {

@@ -654,7 +654,8 @@ impl SharedPrefixCache {
             .iter()
             .position(|entry| entry.tokens == tokens)?;
         let entry = self.entries.remove(index);
-        if entry.k.len() != cache.k.len()
+        if cache.bf16
+            || entry.k.len() != cache.k.len()
             || entry.v.len() != cache.v.len()
             || entry
                 .k
@@ -689,7 +690,11 @@ impl SharedPrefixCache {
             || cache.sliding_window.is_some()
             || cache.storage_len < tokens.len()
             || cache.k.len() != cache.v.len()
+            || cache.bf16
         {
+            // The prefix-cache snapshot format is f32-only; a bf16-mode cache
+            // has empty `k`/`v` (storage lives in `k_bf16`/`v_bf16` instead),
+            // so slicing `layer[..k_len]` below would panic.
             return;
         }
         let k_len = tokens.len().saturating_mul(cache.per_pos_k_dim);
@@ -1591,9 +1596,16 @@ impl Runner {
             self.chat_template_kind().unwrap_or("plain")
         };
         items.push(format!("chat-template={}", chat_template));
+        let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
+            && !crate::metal::enabled()
+            && matches!(self.weights, LoadedWeights::Standard(_));
         items.push(match options.runtime.kv_cache_dtype {
             KvCacheDType::Auto => String::from("kv-cache=f32(auto)"),
             KvCacheDType::F32 => String::from("kv-cache=f32"),
+            KvCacheDType::Bf16 if bf16_kv_will_activate => String::from("kv-cache=bf16"),
+            KvCacheDType::Bf16 => {
+                String::from("kv-cache=f32(requested bf16, unsupported for this model/backend)")
+            }
             requested => format!(
                 "kv-cache=f32(requested {} pending-bench)",
                 requested.as_str()
@@ -1725,12 +1737,16 @@ impl Runner {
                 "MTP assistant is loaded, but MTP is greedy-only and will stay disabled unless --temp 0 is used.",
             ));
         }
-        if matches!(
-            options.runtime.kv_cache_dtype,
-            KvCacheDType::Bf16 | KvCacheDType::Q8
-        ) {
+        let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
+            && !crate::metal::enabled()
+            && matches!(self.weights, LoadedWeights::Standard(_));
+        if options.runtime.kv_cache_dtype == KvCacheDType::Q8 {
             warnings.push(String::from(
-                "Requested compressed KV cache is not activated yet; f32 KV is kept until BF16/Q8 improves measured throughput.",
+                "Requested Q8 KV cache is not activated yet; f32 KV is kept until it is implemented.",
+            ));
+        } else if options.runtime.kv_cache_dtype == KvCacheDType::Bf16 && !bf16_kv_will_activate {
+            warnings.push(String::from(
+                "Requested bf16 KV cache only has a kernel for the Standard (non-Metal) forward path; f32 KV is kept for this model/backend.",
             ));
         } else if options.runtime.kv_cache_dtype == KvCacheDType::Auto
             && self.effective_max_context(options) > 16_384
@@ -2511,6 +2527,16 @@ impl Runner {
             cache_len,
             sliding_window,
         );
+        // bf16 KV halves per-token cache traffic; only the Standard forward
+        // path (forward_into/forward_hidden_impl/forward_prefill_batch) has a
+        // bf16-aware attention kernel, and Metal keeps its own resident GPU
+        // KV cache instead of `cache.k`/`cache.v` so it would never see this.
+        if options.runtime.kv_cache_dtype == KvCacheDType::Bf16
+            && !crate::metal::enabled()
+            && matches!(self.weights, LoadedWeights::Standard(_))
+        {
+            cache.enable_bf16();
+        }
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         let mut rng = if options.seed == 0 {
             let t = std::time::SystemTime::now()
