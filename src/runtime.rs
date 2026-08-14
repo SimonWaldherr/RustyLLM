@@ -581,6 +581,8 @@ enum LoadedWeights {
     Standard(ModelWeights),
     GptOss(GptOssWeights),
     Laguna(crate::model::LagunaWeights),
+    /// Hybrid Mamba-2 / attention / MoE decoder (Nemotron-H, Soofi S Isar).
+    NemotronH(crate::model::NemotronHWeights),
     Gemma4(crate::model::Gemma4Weights),
     /// BERT-style encoder (nomic-bert) — embedding-only, no decode path.
     NomicBert(crate::model::NomicBertWeights),
@@ -654,7 +656,11 @@ impl SharedPrefixCache {
             .iter()
             .position(|entry| entry.tokens == tokens)?;
         let entry = self.entries.remove(index);
+        // A recurrent model's Mamba-2 state is not captured by these snapshots,
+        // so restoring keys and values alone would resume from a state that
+        // never saw the prefix.
         if cache.bf16
+            || cache.ssm.is_some()
             || entry.k.len() != cache.k.len()
             || entry.v.len() != cache.v.len()
             || entry
@@ -691,10 +697,12 @@ impl SharedPrefixCache {
             || cache.storage_len < tokens.len()
             || cache.k.len() != cache.v.len()
             || cache.bf16
+            || cache.ssm.is_some()
         {
             // The prefix-cache snapshot format is f32-only; a bf16-mode cache
             // has empty `k`/`v` (storage lives in `k_bf16`/`v_bf16` instead),
-            // so slicing `layer[..k_len]` below would panic.
+            // so slicing `layer[..k_len]` below would panic. Recurrent caches
+            // are skipped because the snapshot cannot represent SSM state.
             return;
         }
         let k_len = tokens.len().saturating_mul(cache.per_pos_k_dim);
@@ -758,7 +766,7 @@ pub struct Runner {
 
 /// Reports whether the architecture string maps to a supported loader.
 pub fn architecture_supported(arch: &str) -> bool {
-    if is_gemma_arch(arch) {
+    if is_gemma_arch(arch) || is_nemotron_hybrid_arch(arch) {
         return true;
     }
     matches!(
@@ -815,8 +823,11 @@ pub fn architecture_supported(arch: &str) -> bool {
 /// attempt to execute an incompatible tensor layout.
 pub fn architecture_preparation_note(arch: &str) -> Option<&'static str> {
     match arch {
-        "nemotron_h_moe" => Some(
-            "The Nemotron-H MoE family (including Soofi S Isar) is a hybrid Mamba-2/attention model with routed experts. RustyLLM still needs Mamba-2 state-space recurrence, per-layer recurrent state, and sparse routed-MoE execution before it can load this architecture.",
+        // Kept as an explicit rejection rather than a silent misload: the
+        // multi-token-prediction draft head of Nemotron-3 uses `nextn.*`
+        // tensors this runtime does not execute.
+        "nemotron_h_nextn" => Some(
+            "Nemotron-H multi-token-prediction draft heads are not executed. Load the base model instead; its trailing MTP block is skipped automatically.",
         ),
         _ => None,
     }
@@ -836,6 +847,14 @@ fn batch_prefill_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off")
         )
     })
+}
+
+/// Reports whether an architecture uses the hybrid Mamba-2 decoder path.
+///
+/// `nemotron_h` is the dense variant and `nemotron_h_moe` adds routed experts;
+/// both share one loader and one forward pass, which branches per block.
+pub(crate) fn is_nemotron_hybrid_arch(arch: &str) -> bool {
+    matches!(arch, "nemotron_h" | "nemotron_h_moe")
 }
 
 pub(crate) fn is_gemma_arch(arch: &str) -> bool {
@@ -965,6 +984,10 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
             validate_gemma_layout(gguf, &config, report);
             return;
         }
+        _ if is_nemotron_hybrid_arch(arch) => {
+            validate_nemotron_h_layout(gguf, &config, report);
+            return;
+        }
         _ if is_nomic_bert_arch(arch) => {
             validate_nomic_bert_layout(gguf, &config, report);
             return;
@@ -999,16 +1022,19 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
 
     for layer in 0..config.n_layers {
         let prefix = format!("blk.{}.", layer);
-        for suffix in [
-            "attn_norm.weight",
-            "attn_output.weight",
-            "ffn_norm.weight",
-            "ffn_down.weight",
-        ] {
+        // A router marks a Mixtral-style routed layer, whose experts replace
+        // the dense gate/up/down projections entirely.
+        let routed = has(&format!("{}ffn_gate_inp.weight", prefix));
+        for suffix in ["attn_norm.weight", "attn_output.weight", "ffn_norm.weight"] {
             let name = format!("{}{}", prefix, suffix);
             if !has(&name) {
                 report.missing_tensors.push(name);
             }
+        }
+        if !routed && !has(&format!("{}ffn_down.weight", prefix)) {
+            report
+                .missing_tensors
+                .push(format!("{}ffn_down.weight", prefix));
         }
 
         let q = format!("{}attn_q.weight", prefix);
@@ -1024,6 +1050,20 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
             validate_row_count(gguf, &qkv, q_rows + k_rows + v_rows, report);
         }
 
+        if routed {
+            for suffix in [
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ] {
+                let name = format!("{}{}", prefix, suffix);
+                if !has(&name) {
+                    report.missing_tensors.push(name);
+                }
+            }
+            continue;
+        }
+
         let gate = format!("{}ffn_gate.weight", prefix);
         let up = format!("{}ffn_up.weight", prefix);
         if !has(&gate) {
@@ -1033,6 +1073,110 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
                 validate_row_count(gguf, &up, config.hidden_dim * 2, report);
             }
         }
+    }
+}
+
+/// Validates a hybrid Nemotron-H layout.
+///
+/// Each block is a Mamba-2, attention, or feed-forward mixer, so the required
+/// tensors depend on the block's kind. The kind is taken from the same
+/// per-layer metadata the loader uses, and any block whose tensors disagree
+/// with that classification is reported rather than silently mis-loaded.
+fn validate_nemotron_h_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+    let p = &config.arch;
+
+    for key in [
+        "conv_kernel",
+        "inner_size",
+        "state_size",
+        "time_step_rank",
+        "group_count",
+    ] {
+        let full = format!("{}.ssm.{}", p, key);
+        if gguf.get_u32(&full, 0) == 0 {
+            report
+                .unsupported_layouts
+                .push(format!("missing required metadata {}", full));
+        }
+    }
+    if !report.unsupported_layouts.is_empty() {
+        return;
+    }
+
+    let nextn = gguf.get_u32(&format!("{}.nextn_predict_layers", p), 0) as usize;
+    let trunk = config.n_layers.saturating_sub(nextn);
+    let kv_counts = crate::model::per_layer_metadata_for_validation(
+        gguf,
+        &format!("{}.attention.head_count_kv", p),
+        trunk,
+    );
+    let ff_lengths = crate::model::per_layer_metadata_for_validation(
+        gguf,
+        &format!("{}.feed_forward_length", p),
+        trunk,
+    );
+
+    for name in ["token_embd.weight", "output_norm.weight"] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+
+    let mut recurrent = 0usize;
+    for layer in 0..trunk {
+        let prefix = format!("blk.{}.", layer);
+        if !has(&format!("{}attn_norm.weight", prefix)) {
+            report
+                .missing_tensors
+                .push(format!("{}attn_norm.weight", prefix));
+        }
+        let kv = kv_counts.get(layer).copied().unwrap_or(0);
+        let ff = ff_lengths.get(layer).copied().unwrap_or(0);
+        let required: &[&str] = if kv == 0 && ff == 0 {
+            recurrent += 1;
+            &[
+                "ssm_in.weight",
+                "ssm_conv1d.weight",
+                "ssm_dt.bias",
+                "ssm_a",
+                "ssm_d",
+                "ssm_out.weight",
+            ]
+        } else if ff == 0 {
+            &[
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+            ]
+        } else if config.expert_count > 0 {
+            &[
+                "ffn_gate_inp.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            ]
+        } else {
+            &["ffn_up.weight", "ffn_down.weight"]
+        };
+        for suffix in required {
+            let name = format!("{}{}", prefix, suffix);
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+    }
+
+    // Per-layer arrays that are absent or all-nonzero collapse every block to
+    // the same kind, which would mean no recurrent blocks at all — a sure sign
+    // the hybrid metadata is missing rather than the model being dense.
+    if recurrent == 0 {
+        report.unsupported_layouts.push(format!(
+            "{} declares no Mamba-2 blocks; per-layer attention.head_count_kv / feed_forward_length metadata is missing or malformed",
+            p
+        ));
     }
 }
 
@@ -1265,6 +1409,10 @@ impl Runner {
             "laguna" => {
                 let (config, weights) = model::load_laguna_model(data, &gguf, false);
                 (config, LoadedWeights::Laguna(weights))
+            }
+            arch if is_nemotron_hybrid_arch(arch) => {
+                let (config, weights) = model::load_nemotron_h_model(data, &gguf, false);
+                (config, LoadedWeights::NemotronH(weights))
             }
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
@@ -1534,6 +1682,7 @@ impl Runner {
             LoadedWeights::Standard(weights) => &weights.token_embd,
             LoadedWeights::GptOss(weights) => &weights.token_embd,
             LoadedWeights::Laguna(weights) => &weights.token_embd,
+            LoadedWeights::NemotronH(weights) => &weights.token_embd,
             LoadedWeights::Gemma4(weights) => &weights.token_embd,
             LoadedWeights::NomicBert(weights) => &weights.token_embd,
         }
@@ -1956,6 +2105,9 @@ impl Runner {
             }
             LoadedWeights::Laguna(_) => Err(String::from(
                 "--kernel-bench does not yet provide a Laguna sparse-expert profile.",
+            )),
+            LoadedWeights::NemotronH(_) => Err(String::from(
+                "--kernel-bench does not yet provide a Nemotron-H hybrid Mamba-2 profile.",
             )),
             LoadedWeights::Gemma4(_) => Err(String::from(
                 "--kernel-bench currently supports standard transformer and gpt-oss MoE weights only.",
@@ -2521,12 +2673,13 @@ impl Runner {
 
         let sliding_window = self.effective_sliding_window(options);
         let mut cache = KVCache::with_sliding_window(
-            self.config.n_layers,
+            self.kv_layer_count(),
             kv_k_dim,
             kv_v_dim,
             cache_len,
             sliding_window,
         );
+        self.attach_recurrent_state(&mut cache);
         // bf16 KV halves per-token cache traffic; only the Standard forward
         // path (forward_into/forward_hidden_impl/forward_prefill_batch) has a
         // bf16-aware attention kernel, and Metal keeps its own resident GPU
@@ -3007,6 +3160,15 @@ impl Runner {
             LoadedWeights::Laguna(weights) => {
                 model::forward_laguna_into(&self.config, weights, cache, buf, token, pos, logits)
             }
+            LoadedWeights::NemotronH(weights) => model::forward_nemotron_h_into(
+                &self.config,
+                weights,
+                cache,
+                buf,
+                token,
+                pos,
+                logits,
+            ),
             LoadedWeights::Gemma4(weights) => {
                 model::forward_gemma4_into(&self.config, weights, cache, buf, token, pos, logits)
             }
@@ -3035,6 +3197,9 @@ impl Runner {
             LoadedWeights::Laguna(weights) => {
                 model::forward_hidden_laguna(&self.config, weights, cache, buf, token, pos)
             }
+            LoadedWeights::NemotronH(weights) => {
+                model::forward_hidden_nemotron_h(&self.config, weights, cache, buf, token, pos)
+            }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_hidden_gemma4(&self.config, weights, cache, buf, token, pos)
             }
@@ -3062,6 +3227,9 @@ impl Runner {
             }
             LoadedWeights::Laguna(weights) => {
                 model::forward_prefill_laguna(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::NemotronH(weights) => {
+                model::forward_prefill_nemotron_h(&self.config, weights, cache, buf, token, pos)
             }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_prefill_gemma4(&self.config, weights, cache, buf, token, pos)
@@ -3124,7 +3292,8 @@ impl Runner {
 
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
 
-        let mut cache = KVCache::new(self.config.n_layers, kv_k_dim, kv_v_dim, cache_len);
+        let mut cache = KVCache::new(self.kv_layer_count(), kv_k_dim, kv_v_dim, cache_len);
+        self.attach_recurrent_state(&mut cache);
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
 
         let dim = self.config.dim;
@@ -3161,6 +3330,15 @@ impl Runner {
                 || self.tok.special_id("<turn|>") == Some(token)
         } else if matches!(self.chat_template_kind(), Some("chatml")) {
             token == self.tok.eos_id || self.tok.special_id("<|im_end|>") == Some(token)
+        } else if matches!(
+            self.chat_template_kind(),
+            Some("mistral-inst") | Some("mistral3-inst")
+        ) {
+            // A Mistral model that starts a fresh instruction block has ended
+            // its answer, so `[INST]` terminates generation as surely as EOS.
+            // `[/INST]` is deliberately not a stop token: it closes a prompt
+            // block rather than an answer, and models echo it harmlessly.
+            token == self.tok.eos_id || self.tok.special_id("[INST]") == Some(token)
         } else {
             token == self.tok.eos_id
         }
@@ -3180,6 +3358,11 @@ impl Runner {
         }
         if matches!(self.chat_template_kind(), Some("mistral3-inst")) {
             if let Some(tokens) = self.render_mistral3_inst_messages(messages, system_prompt) {
+                return tokens;
+            }
+        }
+        if matches!(self.chat_template_kind(), Some("mistral-inst")) {
+            if let Some(tokens) = self.render_mistral_inst_messages(messages, system_prompt) {
                 return tokens;
             }
         }
@@ -3396,7 +3579,8 @@ impl Runner {
         }
 
         let mut last_role: Option<ChatRole> = None;
-        for message in messages {
+        let last_index = messages.len().saturating_sub(1);
+        for (index, message) in messages.iter().enumerate() {
             match message.role {
                 ChatRole::System => {}
                 ChatRole::User => {
@@ -3410,10 +3594,91 @@ impl Runner {
                 }
                 ChatRole::Assistant => {
                     tokens.extend(self.tok.encode_without_bos(message.content.trim()));
-                    tokens.push(self.tok.eos_id);
+                    // A trailing assistant turn is a prefill the model should
+                    // continue, so it stays open rather than being closed here.
+                    if index != last_index {
+                        tokens.push(self.tok.eos_id);
+                    }
                     last_role = Some(ChatRole::Assistant);
                 }
             }
+        }
+
+        Some(tokens)
+    }
+
+    /// Emits an instruction marker, preferring a control-token ID.
+    ///
+    /// Mistral v0.3 and Tekken vocabularies carry `[INST]` / `[/INST]` as
+    /// control tokens, but the original 32000-entry v0.1/v0.2 SentencePiece
+    /// vocabulary does not — there the marker is ordinary text. Falling back to
+    /// text encoding keeps both generations on their trained format.
+    fn push_mistral_marker(&self, marker: &str, out: &mut Vec<u32>) {
+        match self.tok.special_id(marker) {
+            Some(id) => out.push(id),
+            None => out.extend(self.tok.encode_without_bos(marker)),
+        }
+    }
+
+    /// Renders classic Mistral v1 / v3 instruction templates.
+    ///
+    /// These predate the `[SYSTEM_PROMPT]` block of the v7 format handled by
+    /// [`Self::render_mistral3_inst_messages`]. Following llama.cpp's reference
+    /// renderer, the system prompt is folded into the first `[INST]` block
+    /// separated by a blank line, assistant turns are closed with EOS, and a
+    /// trailing assistant message is left open so its text can be continued.
+    fn render_mistral_inst_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+    ) -> Option<Vec<u32>> {
+        let mut system_parts = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            system_parts.push(system_prompt.trim().to_string());
+        }
+        for message in messages {
+            if matches!(message.role, ChatRole::System) && !message.content.trim().is_empty() {
+                system_parts.push(message.content.trim().to_string());
+            }
+        }
+        let mut pending_system = system_parts.join("\n\n");
+
+        let mut tokens = vec![self.tok.bos_id];
+        let last_index = messages.len().saturating_sub(1);
+        for (index, message) in messages.iter().enumerate() {
+            match message.role {
+                ChatRole::System => {}
+                ChatRole::User => {
+                    self.push_mistral_marker("[INST]", &mut tokens);
+                    // The system prompt rides inside the first instruction
+                    // block; later turns carry the user text alone.
+                    let content = if pending_system.is_empty() {
+                        message.content.trim().to_string()
+                    } else {
+                        let merged = format!("{}\n\n{}", pending_system, message.content.trim());
+                        pending_system.clear();
+                        merged
+                    };
+                    tokens.extend(self.tok.encode_without_bos(&content));
+                    self.push_mistral_marker("[/INST]", &mut tokens);
+                }
+                ChatRole::Assistant => {
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    // A trailing assistant turn is a prefill the model should
+                    // continue, so it stays open; earlier turns are closed.
+                    if index != last_index {
+                        tokens.push(self.tok.eos_id);
+                    }
+                }
+            }
+        }
+
+        // A system prompt with no user turn to attach to still has to reach the
+        // model, so emit it as a standalone instruction block.
+        if !pending_system.is_empty() {
+            self.push_mistral_marker("[INST]", &mut tokens);
+            tokens.extend(self.tok.encode_without_bos(&pending_system));
+            self.push_mistral_marker("[/INST]", &mut tokens);
         }
 
         Some(tokens)
@@ -3621,6 +3886,13 @@ impl Runner {
             && template.contains("[/INST]")
         {
             Some("mistral3-inst")
+        } else if template.contains("[INST]") && template.contains("[/INST]") {
+            // Classic Mistral v1/v3 instruction templates (Mistral 7B Instruct
+            // v0.1-v0.3, Mixtral Instruct, Mistral Small/Nemo). They have no
+            // `[SYSTEM_PROMPT]` block, so the v7 arm above rejects them; without
+            // this arm they fell through to the generic `User:`/`Assistant:`
+            // renderer, which is off-distribution for every one of these models.
+            Some("mistral-inst")
         } else if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
             Some("chatml")
         } else if template.contains("<system>")
@@ -3644,6 +3916,29 @@ impl Runner {
 
     /// Compute the dimension parameters needed to allocate a KV cache and
     /// decode buffer for this model.
+    /// Number of layers the key/value cache must cover.
+    ///
+    /// Hybrid Mamba-2 models need one slot per *attention* block, not per
+    /// decoder block, because their recurrent blocks store no keys or values.
+    fn kv_layer_count(&self) -> usize {
+        match &self.weights {
+            LoadedWeights::NemotronH(weights) => weights.attn_layer_count.max(1),
+            _ => self.config.n_layers,
+        }
+    }
+
+    /// Attaches zeroed Mamba-2 recurrent state when the model has any.
+    fn attach_recurrent_state(&self, cache: &mut KVCache) {
+        if let LoadedWeights::NemotronH(weights) = &self.weights {
+            let recurrent = weights
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer.mixer, crate::model::NemotronMixer::Mamba2(_)))
+                .count();
+            cache.ssm = Some(crate::model::SsmState::new(recurrent, weights.ssm));
+        }
+    }
+
     fn kv_dims(&self) -> (usize, usize, usize, usize, usize) {
         match &self.weights {
             LoadedWeights::Gemma4(w) => {
@@ -3692,13 +3987,14 @@ impl Runner {
         // global ring cache would discard keys still required by full layers.
         let sliding_window = (self.arch != "laguna" && self.config.sliding_window > 0)
             .then_some(self.config.sliding_window);
-        let kv_cache = KVCache::with_sliding_window(
-            self.config.n_layers,
+        let mut kv_cache = KVCache::with_sliding_window(
+            self.kv_layer_count(),
             kv_k_dim,
             kv_v_dim,
             cap,
             sliding_window,
         );
+        self.attach_recurrent_state(&mut kv_cache);
         let decode_buf =
             DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         crate::session::Session::new(kv_cache, decode_buf)
@@ -3796,7 +4092,17 @@ impl Runner {
             session.reset();
         }
 
-        let prefix_len = Self::longest_common_prefix(&tokens, &session.cached_tokens);
+        // Mamba-2 state is overwritten in place each token, so it cannot be
+        // rewound to a shorter prefix the way a KV cache can. Reusing a partial
+        // prefix would run the model from a state that saw the *old* suffix, so
+        // hybrid models replay the whole prompt unless it matches exactly.
+        let prefix_len = match Self::longest_common_prefix(&tokens, &session.cached_tokens) {
+            len if session.kv_cache.ssm.is_some() && len != session.cached_tokens.len() => {
+                session.reset();
+                0
+            }
+            len => len,
+        };
         let reused = prefix_len;
         let new_prompt_tokens = tokens.len() - prefix_len;
         session.cached_tokens_served += reused;
@@ -4478,10 +4784,10 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendPolicy, CompatibilityReport, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
+        BackendPolicy, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
         architecture_preparation_note, architecture_supported, clean_thinking_prompt,
-        cosine_similarity, l2_normalize_in_place, mean_pool_in_place, push_recent_token,
-        recent_token_tail, trailing_char_boundary_start,
+        cosine_similarity, is_nemotron_hybrid_arch, l2_normalize_in_place, mean_pool_in_place,
+        push_recent_token, recent_token_tail, trailing_char_boundary_start,
     };
 
     #[test]
@@ -4660,6 +4966,44 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that classic Mistral v1/v3 templates select the instruction renderer
+    /// instead of falling through to the generic role-prefixed format.
+    fn chat_template_kind_detects_mistral_v1_inst() {
+        // Mistral-7B-Instruct-v0.2: no system role, no `[SYSTEM_PROMPT]` block.
+        let v1 = "{{ bos_token }}{% for message in messages %}\
+            {% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}\
+            {% else %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}";
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(v1),
+            Some("mistral-inst")
+        );
+
+        // Mistral-7B-Instruct-v0.3 folds the system prompt into an `[INST]`
+        // block, so it must classify the same way rather than as v7.
+        let v3 = "{{ bos_token }}{%- for message in messages %}\
+            {%- if message['role'] == 'user' %}{%- if loop.last and system_message is defined %}\
+            {{- '[INST] ' + system_message + '\\n\\n' + message['content'] + '[/INST]' }}\
+            {%- else %}{{- '[INST] ' + message['content'] + '[/INST]' }}{%- endif %}\
+            {%- endif %}{%- endfor %}";
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(v3),
+            Some("mistral-inst")
+        );
+    }
+
+    #[test]
+    /// Verifies that a v7 template still wins over the v1/v3 arm, since both
+    /// contain `[INST]` and only ordering keeps them apart.
+    fn chat_template_kind_prefers_mistral3_over_v1() {
+        let v7 = "{{ '[SYSTEM_PROMPT]' + system_message + '[/SYSTEM_PROMPT]' }}\
+            {{ '[INST]' + message['content'] + '[/INST]' }}";
+        assert_eq!(
+            super::Runner::chat_template_kind_from_template(v7),
+            Some("mistral3-inst")
+        );
+    }
+
+    #[test]
     /// Verifies that Mistral 3 / Ministral 3 instruction templates use the native renderer.
     fn chat_template_kind_detects_mistral3_inst() {
         let template = "{%- if messages[0]['role'] == 'system' -%}\
@@ -4711,23 +5055,21 @@ mod tests {
     }
 
     #[test]
-    /// Verifies that hybrid Nemotron-H/MoE GGUFs return actionable readiness guidance.
-    fn nemotron_h_moe_reports_preparation_requirements() {
-        let report = CompatibilityReport {
-            supported_architecture: false,
-            unsupported_tensor_types: Vec::new(),
-            missing_tensors: Vec::new(),
-            unsupported_layouts: Vec::new(),
-        };
-        assert!(
-            architecture_preparation_note("nemotron_h_moe")
-                .expect("Soofi architecture has guidance")
-                .contains("Mamba-2")
-        );
-        assert!(!architecture_supported("nemotron_h_moe"));
-        let error = report.first_error("nemotron_h_moe");
-        assert!(error.contains("Soofi S Isar"));
-        assert!(error.contains("routed-MoE"));
+    /// Verifies that hybrid Nemotron-H GGUFs (Soofi S Isar) now reach a loader
+    /// instead of being rejected with readiness guidance.
+    fn nemotron_hybrid_architectures_are_supported() {
+        for arch in ["nemotron_h", "nemotron_h_moe"] {
+            assert!(is_nemotron_hybrid_arch(arch), "{} not recognised", arch);
+            assert!(architecture_supported(arch), "{} not supported", arch);
+            assert!(
+                architecture_preparation_note(arch).is_none(),
+                "{} should no longer carry a preparation note",
+                arch
+            );
+        }
+        // The dense `nemotron` architecture is a different, non-hybrid model
+        // and must keep running through the standard loader.
+        assert!(!is_nemotron_hybrid_arch("nemotron"));
     }
 
     #[test]

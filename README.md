@@ -103,7 +103,8 @@ the supported architecture identifiers:
 `llama`, `llama2`, `llama3`, `mistral`, `mistral3`, `mixtral`, `ministral`,
 `qwen2`, `qwen3`, `gpt-oss`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `gemma4n`, `gemma4-assistant`, `granite`, `granite3`, `granite4`,
-`deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`, `hermes`, `phi`, `phi2`,
+`deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`, `nemotron_h`,
+`nemotron_h_moe`, `hermes`, `phi`, `phi2`,
 `phi3`, `phi4`, `falcon`, `falcon3`, `stablelm`, `starcoder2`, `command-r`,
 `cohere`, `internlm2`, `olmo`, `olmo2`, `exaone`, `solar`, `yi`, `arctic`,
 `nomic-bert`, `nomic-embed`, and
@@ -119,27 +120,69 @@ Q4_0 QAT GGUFs such as `google/gemma-4-12B-it-qat-q4_0-gguf` are supported by
 the same path and use fused CPU Q/K/V and Gate/Up projection jobs when Metal is
 not selected for those projections.
 
-Mistral 3 / Ministral 3 instruction GGUFs use their native
-`[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]` and `[INST]...[/INST]` chat formatting when
-the tokenizer template exposes those markers. The startup optimization summary
-prints the selected renderer, for example `chat-template=mistral3-inst`, so you
-can quickly spot whether a model uses a native template or the plain fallback.
+### Mistral chat templates
 
-### Soofi S Isar readiness
+Mistral instruction GGUFs use native `[INST]...[/INST]` formatting rather than
+the generic `User:`/`Assistant:` fallback. Two renderers cover the family:
 
-The preview GGUF for [Soofi S Isar](https://huggingface.co/Soofi-Project/Soofi-S-Isar-Preview-GGUF)
-identifies itself as `nemotron_h_moe`. Its 23 hybrid Mamba-2/MoE layers and six
-attention layers need recurrent state-space execution plus sparse routing across
-its experts. RustyLLM recognizes that architecture in `--inspect`, reports the
-required work in `model.preparation_note`, and uses its native ChatML formatter
-(`&lt;|im_start|&gt;...&lt;|im_end|&gt;`) once the architecture becomes executable.
+- `mistral3-inst` — the v7 format, with a leading
+  `[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]` block (Mistral 3 / Ministral 3, Mistral
+  Small 3.x).
+- `mistral-inst` — the classic v1/v3 format used by Mistral 7B Instruct
+  v0.1–v0.3, Mixtral Instruct, and Mistral Nemo, where the system prompt is
+  folded into the first `[INST]` block. `[INST]` markers are emitted as control
+  tokens when the vocabulary has them and as plain text otherwise, so the
+  32000-entry v0.1/v0.2 SentencePiece vocabularies render correctly too.
 
-It is intentionally **not loadable yet**: treating it as the ordinary
-`nemotron` transformer loader would produce incorrect results. Native support
-requires Mamba-2 SSM kernels and cache, top-k routed-MoE dispatch including the
-shared expert, mixed Mamba/attention layer scheduling, then CPU/Metal benchmark
-coverage against a Soofi GGUF fixture. The smallest published preview quant is
-about 21 GB (Q4_K_M); Q5_K_M is about 25 GB, before runtime memory overhead.
+In both cases a trailing assistant message is left open so its text can be
+continued rather than closed with EOS. The startup optimization summary prints
+the selected renderer, for example `chat-template=mistral-inst`, so you can
+quickly spot whether a model uses a native template or the plain fallback.
+
+### Mixtral and Mistral MoE
+
+GGUFs carrying `blk.N.ffn_gate_inp.weight` plus `ffn_{gate,up,down}_exps.weight`
+run as routed mixture-of-experts layers: a softmax router selects the top
+`expert_used_count` experts per token and blends their renormalised SwiGLU
+outputs. Routed layers stay on the CPU/regular Metal path — the GPU-resident
+decoder, the fused FFN kernels, and batched prefill all assume dense weights and
+are disabled per layer when experts are present.
+
+### Soofi S Isar / Nemotron-H
+
+[Soofi S Isar](https://huggingface.co/Soofi-Project/Soofi-S-Isar-Preview-GGUF)
+identifies itself as `nemotron_h_moe`: 23 hybrid Mamba-2/MoE layers and six
+attention layers, 128 routed experts plus one shared expert with six active per
+token. RustyLLM executes this architecture, along with the dense `nemotron_h`
+variant. Each block applies exactly one mixer:
+
+- **Mamba-2** — a fused gate/x/B/C/dt projection, a depthwise causal
+  convolution over x, B and C together, a selective scan with a per-head scalar
+  decay, then `silu(z)` gating followed by a per-group RMSNorm.
+- **Attention** — grouped-query attention with **no** positional encoding
+  (Nemotron-H is NoPE).
+- **MoE** — sigmoid-scored routing with a selection-only bias, squared-ReLU
+  experts that have no gate projection, plus an always-on shared expert.
+
+Block kinds come from the per-layer `attention.head_count_kv` and
+`feed_forward_length` metadata arrays, matching llama.cpp. A trailing
+multi-token-prediction head, if present, is skipped rather than executed.
+
+Recurrent state lives on the KV cache alongside keys and values. Because
+Mamba-2 state is overwritten in place and cannot be rewound, hybrid models skip
+the shared prefix cache and replay a prompt in full unless it matches a session's
+cached tokens exactly.
+
+The chat template is ChatML (`<|im_start|>...<|im_end|>`) with `<think>`
+reasoning blocks, which the existing ChatML renderer already handles.
+
+**Validation status:** the Mamba-2 recurrence, routing math, and tensor layout
+were implemented against llama.cpp's reference sources and are covered by
+synthetic unit tests (causal-convolution shift register, state-reset
+reproducibility, routed-MoE equivalence to a full-softmax reference). They have
+**not** been run against a real Soofi GGUF — the smallest published preview quant
+is about 21 GB (Q4_K_M), and `unsloth/Nemotron-3-Nano-30B-A3B-GGUF` offers
+smaller quants of the same architecture for a first end-to-end check.
 
 ## Requirements
 

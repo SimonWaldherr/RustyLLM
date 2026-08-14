@@ -868,6 +868,24 @@ pub struct LayerWeights {
     pub w1: Weight, // gate
     pub w2: Weight, // down
     pub w3: Weight, // up
+    /// Routed sparse experts, when the GGUF carries a Mixtral-style MoE block
+    /// instead of a dense feed-forward network. `w1`/`w2`/`w3` are unused
+    /// placeholders in that case; keeping this an `Option` rather than swapping
+    /// the three fields for an enum leaves every dense call site untouched.
+    pub moe: Option<Box<RoutedMoeWeights>>,
+}
+
+/// Routed feed-forward experts, as used by Mixtral and other Mistral MoE GGUFs.
+///
+/// Mistral's MoE blocks are SwiGLU experts selected by a softmax router, which
+/// is the same shape as the dense path repeated per expert — unlike the Laguna
+/// layout, there is no shared expert and no router bias.
+pub struct RoutedMoeWeights {
+    /// Router projection: `expert_count` rows of `dim` columns.
+    pub router: Weight,
+    pub gate_experts: ExpertWeight,
+    pub up_experts: ExpertWeight,
+    pub down_experts: ExpertWeight,
 }
 
 pub struct ModelWeights {
@@ -1044,6 +1062,159 @@ pub struct LagunaLayerWeights {
     pub sliding_window: bool,
 }
 
+/// Fixed dimensions of a Mamba-2 state-space mixer, derived from the
+/// `{arch}.ssm.*` GGUF metadata.
+#[derive(Clone, Copy, Debug)]
+pub struct SsmDims {
+    /// Depthwise convolution width (`ssm.conv_kernel`).
+    pub d_conv: usize,
+    /// Total SSM channel count (`ssm.inner_size`).
+    pub d_inner: usize,
+    /// Recurrent state width per channel (`ssm.state_size`).
+    pub d_state: usize,
+    /// Number of SSM heads. Mamba-2 reuses the Mamba-1 `ssm.time_step_rank`
+    /// key for this, which is why the name does not match the meaning.
+    pub n_head: usize,
+    /// Number of B/C groups shared across heads (`ssm.group_count`).
+    pub n_group: usize,
+}
+
+impl SsmDims {
+    /// Channels carried through the depthwise convolution: the SSM input plus
+    /// the B and C projections, which Mamba-2 convolves together.
+    pub fn conv_dim(&self) -> usize {
+        self.d_inner + 2 * self.n_group * self.d_state
+    }
+
+    /// Width of the fused input projection: gate, convolved channels, and one
+    /// timestep scalar per head.
+    pub fn d_in_proj(&self) -> usize {
+        self.d_inner + self.conv_dim() + self.n_head
+    }
+
+    /// Channels handled by one SSM head.
+    pub fn head_dim(&self) -> usize {
+        self.d_inner / self.n_head
+    }
+}
+
+/// One Mamba-2 mixer block.
+pub struct Mamba2LayerWeights {
+    /// Fused gate/x/B/C/dt projection: `d_in_proj` rows of `dim` columns.
+    pub in_proj: Weight,
+    /// Depthwise filters, channel-major: `conv_dim * d_conv`.
+    pub conv_w: Vec<f32>,
+    /// Optional convolution bias of `conv_dim` entries.
+    pub conv_b: Vec<f32>,
+    /// Per-head timestep bias.
+    pub dt_bias: Vec<f32>,
+    /// Per-head state decay. The GGUF already stores `-exp(A_log)`, so these
+    /// are negative and must not be negated again.
+    pub a: Vec<f32>,
+    /// Per-head skip-connection scale, broadcast across the head's channels.
+    pub d: Vec<f32>,
+    /// Grouped RMSNorm weights over `d_inner`, laid out as `n_group` rows.
+    pub norm: Vec<f32>,
+    /// Output projection back to the residual stream.
+    pub out_proj: Weight,
+}
+
+/// One position-free (NoPE) attention block of a Nemotron-H model.
+pub struct NemotronAttnWeights {
+    pub wq: Weight,
+    pub wk: Weight,
+    pub wv: Weight,
+    pub wo: Weight,
+    pub bo: Vec<f32>,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    /// Index of this layer's slice in the compacted KV cache, which holds one
+    /// entry per attention layer rather than one per block.
+    pub kv_slot: usize,
+}
+
+/// Routed experts of a Nemotron-H MoE block. Unlike Mixtral these have no gate
+/// projection and use a squared-ReLU activation.
+pub struct NemotronMoeWeights {
+    pub router: Weight,
+    pub router_bias: Vec<f32>,
+    pub up_experts: ExpertWeight,
+    pub down_experts: ExpertWeight,
+    pub shared_up: Weight,
+    pub shared_down: Weight,
+}
+
+/// A dense squared-ReLU feed-forward block, used by non-MoE Nemotron-H files.
+pub struct NemotronDenseFfnWeights {
+    pub up: Weight,
+    pub up_bias: Vec<f32>,
+    pub down: Weight,
+    pub down_bias: Vec<f32>,
+}
+
+/// The single mixer a Nemotron-H block applies to its normalised residual.
+/// Unlike a LLaMA block, each block has exactly one of these, not attention
+/// *and* a feed-forward network.
+pub enum NemotronMixer {
+    Mamba2(Box<Mamba2LayerWeights>),
+    Attention(Box<NemotronAttnWeights>),
+    Moe(Box<NemotronMoeWeights>),
+    DenseFfn(Box<NemotronDenseFfnWeights>),
+}
+
+pub struct NemotronHLayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub mixer: NemotronMixer,
+}
+
+/// Hybrid Mamba-2 / attention / MoE decoder, as used by NVIDIA's Nemotron-H
+/// family and by Soofi S Isar.
+pub struct NemotronHWeights {
+    pub token_embd: Weight,
+    pub output_norm: Vec<f32>,
+    pub output: Weight,
+    pub layers: Vec<NemotronHLayerWeights>,
+    pub ssm: SsmDims,
+    /// Number of attention blocks, i.e. the KV cache's layer count.
+    pub attn_layer_count: usize,
+    pub router_normalize_weights: bool,
+    pub routed_scaling_factor: f32,
+}
+
+/// Per-layer recurrent state for Mamba-2 blocks — the state-space equivalent of
+/// a KV cache. Unlike keys and values this does not grow with position: each
+/// token overwrites it in place, so a rewind requires a replay from the start.
+pub struct SsmState {
+    /// Per recurrent layer, a `conv_dim * (d_conv - 1)` shift register holding
+    /// the previous convolution inputs, oldest first within each channel.
+    pub conv: Vec<Vec<f32>>,
+    /// Per recurrent layer, a `d_inner * d_state` state matrix indexed as
+    /// `state_index + channel * d_state`.
+    pub ssm: Vec<Vec<f32>>,
+    pub dims: SsmDims,
+}
+
+impl SsmState {
+    /// Allocates zeroed recurrent state for `layers` Mamba-2 blocks.
+    pub fn new(layers: usize, dims: SsmDims) -> Self {
+        Self {
+            conv: vec![vec![0.0; dims.conv_dim() * dims.d_conv.saturating_sub(1)]; layers],
+            ssm: vec![vec![0.0; dims.d_inner * dims.d_state]; layers],
+            dims,
+        }
+    }
+
+    /// Clears every recurrent slot, returning the model to its pre-prompt state.
+    pub fn reset(&mut self) {
+        for layer in &mut self.conv {
+            layer.fill(0.0);
+        }
+        for layer in &mut self.ssm {
+            layer.fill(0.0);
+        }
+    }
+}
+
 pub struct LagunaWeights {
     pub token_embd: Weight,
     pub output_norm: Vec<f32>,
@@ -1072,6 +1243,10 @@ pub struct KVCache {
     pub max_len: usize,
     pub storage_len: usize,
     pub sliding_window: Option<usize>,
+    /// Recurrent state for hybrid Mamba-2 architectures. `None` for every
+    /// attention-only model. It lives here rather than on `Session` so that the
+    /// stateless one-shot generate path carries it too.
+    pub ssm: Option<SsmState>,
 }
 
 impl KVCache {
@@ -1106,7 +1281,26 @@ impl KVCache {
             max_len,
             storage_len,
             sliding_window,
+            ssm: None,
         }
+    }
+
+    /// Attaches zeroed Mamba-2 recurrent state for a hybrid model.
+    ///
+    /// `attn_layers` sizes the key/value storage, which only covers attention
+    /// blocks, while `recurrent_layers` sizes the state-space storage — the two
+    /// counts differ because a hybrid block is one or the other, never both.
+    pub fn with_recurrent_state(
+        attn_layers: usize,
+        per_pos_k_dim: usize,
+        per_pos_v_dim: usize,
+        max_len: usize,
+        recurrent_layers: usize,
+        dims: SsmDims,
+    ) -> Self {
+        let mut cache = Self::new(attn_layers, per_pos_k_dim, per_pos_v_dim, max_len);
+        cache.ssm = Some(SsmState::new(recurrent_layers, dims));
+        cache
     }
 
     /// Switches this (freshly constructed, not-yet-written) cache to store
@@ -2170,6 +2364,266 @@ mod tests {
         }
     }
 
+    /// Builds a Mamba-2 mixer small enough to reason about exactly.
+    ///
+    /// `in_proj` is the identity, so the caller drives the gate/x/B/C/dt splits
+    /// directly from the hidden vector, and `out_proj` copies the first
+    /// `d_inner` channels straight out. That makes the block's internals
+    /// observable without exposing any implementation detail.
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_mamba2_layer(dims: super::SsmDims) -> super::Mamba2LayerWeights {
+        let d_in_proj = dims.d_in_proj();
+        let conv_dim = dims.conv_dim();
+        let mut identity = vec![0.0f32; d_in_proj * d_in_proj];
+        for i in 0..d_in_proj {
+            identity[i * d_in_proj + i] = 1.0;
+        }
+        let mut out = vec![0.0f32; d_in_proj * dims.d_inner];
+        for i in 0..dims.d_inner {
+            out[i * dims.d_inner + i] = 1.0;
+        }
+        super::Mamba2LayerWeights {
+            in_proj: super::Weight::F32(identity),
+            // One-hot on the OLDEST tap turns the convolution into a pure
+            // (d_conv - 1)-step delay line, which is checkable by hand.
+            conv_w: (0..conv_dim)
+                .flat_map(|_| {
+                    let mut taps = vec![0.0f32; dims.d_conv];
+                    taps[0] = 1.0;
+                    taps
+                })
+                .collect(),
+            conv_b: Vec::new(),
+            dt_bias: vec![0.0; dims.n_head],
+            a: vec![-0.5; dims.n_head],
+            d: vec![0.0; dims.n_head],
+            norm: Vec::new(),
+            out_proj: super::Weight::F32(out),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn mamba2_test_dims() -> super::SsmDims {
+        super::SsmDims {
+            d_conv: 4,
+            d_inner: 4,
+            d_state: 2,
+            n_head: 1,
+            n_group: 1,
+        }
+    }
+
+    /// The depthwise convolution must behave as a causal shift register: after
+    /// N tokens its state holds the last `d_conv - 1` inputs, oldest first.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn mamba2_conv_state_is_a_causal_shift_register() {
+        let dims = mamba2_test_dims();
+        let layer = tiny_mamba2_layer(dims);
+        let window = dims.d_conv - 1;
+        let mut conv = vec![0.0f32; dims.conv_dim() * window];
+        let mut ssm = vec![0.0f32; dims.d_inner * dims.d_state];
+        let mut scratch = super::Mamba2Scratch::default();
+        let mut out = Vec::new();
+
+        // Token t writes value `t + 1` into every convolved channel.
+        for step in 1..=5u32 {
+            let mut hidden = vec![0.0f32; dims.d_in_proj()];
+            for channel in 0..dims.conv_dim() {
+                hidden[dims.d_inner + channel] = step as f32;
+            }
+            super::nemotron_mamba2_step(
+                &layer,
+                &dims,
+                &mut conv,
+                &mut ssm,
+                &hidden,
+                1e-5,
+                &mut scratch,
+                &mut out,
+            );
+        }
+
+        // After five tokens the register holds inputs 3, 4 and 5.
+        for channel in 0..dims.conv_dim() {
+            let slot = &conv[channel * window..channel * window + window];
+            assert_eq!(
+                slot,
+                &[3.0, 4.0, 5.0],
+                "conv shift register wrong for channel {}",
+                channel
+            );
+        }
+    }
+
+    /// Re-running the same tokens from a cleared state must reproduce the same
+    /// outputs — i.e. every mutable thing the mixer touches lives in the state
+    /// buffers and nothing leaks between sequences.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn mamba2_reset_reproduces_identical_outputs() {
+        let dims = mamba2_test_dims();
+        let layer = tiny_mamba2_layer(dims);
+        let mut state = super::SsmState::new(1, dims);
+        let mut scratch = super::Mamba2Scratch::default();
+
+        let inputs: Vec<Vec<f32>> = (1..=4)
+            .map(|step| {
+                (0..dims.d_in_proj())
+                    .map(|i| ((i + step) % 5) as f32 * 0.25 - 0.5)
+                    .collect()
+            })
+            .collect();
+
+        let run = |state: &mut super::SsmState, scratch: &mut super::Mamba2Scratch| {
+            let mut collected = Vec::new();
+            let mut out = Vec::new();
+            for hidden in &inputs {
+                super::nemotron_mamba2_step(
+                    &layer,
+                    &dims,
+                    &mut state.conv[0],
+                    &mut state.ssm[0],
+                    hidden,
+                    1e-5,
+                    scratch,
+                    &mut out,
+                );
+                collected.push(out.clone());
+            }
+            collected
+        };
+
+        let first = run(&mut state, &mut scratch);
+        state.reset();
+        let second = run(&mut state, &mut scratch);
+        assert_eq!(first, second, "reset did not restore the initial state");
+
+        // The recurrence must actually carry information forward: identical
+        // inputs at different positions should not produce identical outputs.
+        assert!(
+            first.windows(2).any(|pair| pair[0] != pair[1]),
+            "outputs are position-independent, so the state is not being used"
+        );
+        assert!(
+            first.iter().flatten().all(|v| v.is_finite()),
+            "non-finite Mamba-2 output"
+        );
+    }
+
+    /// Builds a synthetic Q4_K expert stack laid out exactly as GGUF stores
+    /// `ffn_*_exps` tensors: expert-major, each expert a full `rows x cols`
+    /// matrix. Every expert gets distinct nibbles so routing differences are
+    /// observable in the output.
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_q4k_expert_weight(
+        experts: usize,
+        rows: usize,
+        cols: usize,
+        seed: u8,
+    ) -> super::ExpertWeight {
+        assert_eq!(cols % 256, 0);
+        let blocks_per_row = cols / 256;
+        let mut data = vec![0u8; experts * rows * blocks_per_row * 144];
+        for (block_idx, block) in data.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+            block[2..4].copy_from_slice(&0x3400u16.to_le_bytes()); // dmin = 0.25
+            for i in 0..12 {
+                block[4 + i] = seed.wrapping_add((block_idx * 7 + i * 5) as u8) & 0x3F;
+            }
+            for i in 0..128 {
+                block[16 + i] = seed.wrapping_add((block_idx * 13 + i * 3) as u8);
+            }
+        }
+        super::ExpertWeight {
+            data: super::RawTensorData::Owned(data),
+            dtype: crate::gguf::GGMLType::Q4_K,
+            experts,
+            rows,
+            cols,
+        }
+    }
+
+    /// Verifies the routed feed-forward block against an independently written
+    /// reference: softmax over *every* expert logit, top-k, then renormalise.
+    ///
+    /// `routed_moe_ffn_into` instead takes the top-k raw logits and softmaxes
+    /// only those. The two are equivalent, and this test is what holds that
+    /// claim honest — a regression to un-normalised weights would show up here.
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn routed_moe_matches_full_softmax_reference() {
+        let dim = 256usize;
+        let hidden = 512usize;
+        let experts = 4usize;
+        let used = 2usize;
+
+        let moe = super::RoutedMoeWeights {
+            router: tiny_q4k_weight(experts, dim, 5),
+            gate_experts: tiny_q4k_expert_weight(experts, hidden, dim, 17),
+            up_experts: tiny_q4k_expert_weight(experts, hidden, dim, 29),
+            down_experts: tiny_q4k_expert_weight(experts, dim, hidden, 43),
+        };
+
+        let mut config = tiny_standard_model(0).0;
+        config.expert_count = experts;
+        config.expert_used_count = used;
+        let mut buf = super::DecodeBuffer::new(&config, 128, 1, 128);
+        for (i, cell) in buf.xn2.iter_mut().enumerate() {
+            *cell = ((i % 7) as f32 - 3.0) * 0.05;
+        }
+
+        super::routed_moe_ffn_into(&moe, used, &mut buf);
+        let got = buf.proj.clone();
+
+        // ── Reference, written independently of the implementation ──
+        let mut logits = Vec::new();
+        moe.router.matvec_into(&buf.xn2, &mut logits);
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+        let total: f32 = exps.iter().sum();
+        let probs: Vec<f32> = exps.iter().map(|e| e / total).collect();
+
+        let mut order: Vec<usize> = (0..experts).collect();
+        order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+        let chosen = &order[..used];
+        let chosen_total: f32 = chosen.iter().map(|&e| probs[e]).sum();
+
+        let mut expected = vec![0.0f32; dim];
+        for &expert in chosen {
+            let gate = moe.gate_experts.matvec_expert(expert, &buf.xn2);
+            let up = moe.up_experts.matvec_expert(expert, &buf.xn2);
+            let act: Vec<f32> = gate
+                .iter()
+                .zip(&up)
+                .map(|(&g, &u)| super::silu(g) * u)
+                .collect();
+            let down = moe.down_experts.matvec_expert(expert, &act);
+            let weight = probs[expert] / chosen_total;
+            for (slot, value) in expected.iter_mut().zip(&down) {
+                *slot += value * weight;
+            }
+        }
+
+        assert_eq!(got.len(), expected.len());
+        let scale = expected.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        for (i, (&a, &b)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-3 * scale,
+                "routed MoE output diverged at {}: {} vs {}",
+                i,
+                a,
+                b
+            );
+        }
+        // A routed block that collapsed to zero would pass the comparison above
+        // while being useless, so require a real signal.
+        assert!(
+            got.iter().any(|v| v.abs() > 1e-6),
+            "routed MoE output is zero"
+        );
+    }
+
     /// Tiny standard-path (LLaMA-style) model with all-Q4_K projections:
     /// dim 256, 2 heads (GQA 2:1), hidden 512, 2 layers, vocab 32.
     #[cfg(not(target_family = "wasm"))]
@@ -2217,6 +2671,7 @@ mod tests {
                     w1: tiny_q4k_weight(hidden, dim, s.wrapping_add(53)),
                     w2: tiny_q4k_weight(dim, hidden, s.wrapping_add(67)),
                     w3: tiny_q4k_weight(hidden, dim, s.wrapping_add(79)),
+                    moe: None,
                 }
             })
             .collect();
@@ -3203,9 +3658,57 @@ pub fn load_model(
             panic!("Missing tensor: {} (or {})", q_name, qkv_name);
         };
 
+        // Mixtral-style routed experts replace the dense gate/up/down trio.
+        // Detect them before the dense path so a MoE GGUF does not trip the
+        // "missing ffn_gate" panic below.
+        let router_name = format!("blk.{}.ffn_gate_inp.weight", l);
+        let moe = if tensor_idx.contains_key(&router_name) {
+            Some(Box::new(RoutedMoeWeights {
+                router: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &router_name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                gate_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_gate_exps.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                up_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_up_exps.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                down_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_down_exps.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+            }))
+        } else {
+            None
+        };
+
         let gate_name = format!("blk.{}.ffn_gate.weight", l);
         let up_name = format!("blk.{}.ffn_up.weight", l);
-        let (w1, w3) = if tensor_idx.contains_key(&gate_name) {
+        let (w1, w3) = if moe.is_some() {
+            // Routed layers have no dense projections; the placeholders are
+            // never read because every FFN site checks `moe` first.
+            (Weight::F32(Vec::new()), Weight::F32(Vec::new()))
+        } else if tensor_idx.contains_key(&gate_name) {
             (
                 load_weight(
                     mmap_data,
@@ -3263,6 +3766,20 @@ pub fn load_model(
             )
         };
 
+        let w2 = if moe.is_some() {
+            Weight::F32(Vec::new())
+        } else {
+            load_weight(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.ffn_down.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            )
+        };
+
         let layer = LayerWeights {
             attn_norm: load_f32_vec(
                 mmap_data,
@@ -3310,16 +3827,9 @@ pub fn load_model(
                 &inferred_sizes,
             ),
             w1,
-            w2: load_weight(
-                mmap_data,
-                data_offset,
-                &format!("blk.{}.ffn_down.weight", l),
-                &tensor_idx,
-                &inferred_sizes,
-                false,
-                borrow_quantized,
-            ),
+            w2,
             w3,
+            moe,
         };
         layers.push(layer);
         if l == 0 || (l + 1) % 8 == 0 || l + 1 == config.n_layers {
@@ -3627,6 +4137,395 @@ pub fn load_laguna_model(
 }
 
 /// Loads GPT-OSS-specific weights from a parsed GGUF file.
+/// Reads a metadata value that may be either a scalar or a per-layer array,
+/// expanding it to one entry per block.
+///
+/// Nemotron-H encodes its hybrid layout this way: `attention.head_count_kv` and
+/// `feed_forward_length` are arrays with zeros marking the blocks that are not
+/// attention or feed-forward, which is what drives layer classification.
+/// Exposes [`per_layer_metadata`] to the compatibility validator so it
+/// classifies blocks exactly as the loader will.
+pub fn per_layer_metadata_for_validation(gguf: &GGUFFile, key: &str, layers: usize) -> Vec<usize> {
+    per_layer_metadata(gguf, key, layers)
+}
+
+fn per_layer_metadata(gguf: &GGUFFile, key: &str, layers: usize) -> Vec<usize> {
+    if let Some(values) = gguf
+        .metadata
+        .get(key)
+        .and_then(crate::gguf::MetaValue::as_u32_array)
+        && values.len() >= layers
+    {
+        return values
+            .into_iter()
+            .take(layers)
+            .map(|v| v as usize)
+            .collect();
+    }
+    let scalar = gguf.get_u32(key, 0) as usize;
+    vec![scalar; layers]
+}
+
+/// Loads a Nemotron-H hybrid model (Mamba-2 + NoPE attention + optional routed
+/// MoE), the architecture behind Soofi S Isar.
+pub fn load_nemotron_h_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, NemotronHWeights) {
+    let mut config = Config::from_gguf(gguf);
+    let p = config.arch.clone();
+
+    let ssm = SsmDims {
+        d_conv: gguf.get_u32(&format!("{}.ssm.conv_kernel", p), 0) as usize,
+        d_inner: gguf.get_u32(&format!("{}.ssm.inner_size", p), 0) as usize,
+        d_state: gguf.get_u32(&format!("{}.ssm.state_size", p), 0) as usize,
+        n_head: gguf.get_u32(&format!("{}.ssm.time_step_rank", p), 0) as usize,
+        n_group: gguf.get_u32(&format!("{}.ssm.group_count", p), 0) as usize,
+    };
+    assert!(
+        ssm.d_conv > 1 && ssm.d_inner > 0 && ssm.d_state > 0 && ssm.n_head > 0 && ssm.n_group > 0,
+        "Incomplete {}.ssm.* metadata: {:?}",
+        p,
+        ssm
+    );
+    assert_eq!(
+        ssm.d_inner % ssm.n_head,
+        0,
+        "ssm.inner_size {} is not divisible by ssm head count {}",
+        ssm.d_inner,
+        ssm.n_head
+    );
+    assert_eq!(
+        ssm.n_head % ssm.n_group,
+        0,
+        "ssm head count {} is not divisible by ssm.group_count {}",
+        ssm.n_head,
+        ssm.n_group
+    );
+
+    // A trailing multi-token-prediction head is a separate draft model, not
+    // part of the trunk; including it would shift every later block index.
+    let nextn = gguf.get_u32(&format!("{}.nextn_predict_layers", p), 0) as usize;
+    let trunk_layers = config.n_layers.saturating_sub(nextn);
+    assert!(
+        trunk_layers > 0,
+        "No trunk layers left after removing MTP head"
+    );
+    config.n_layers = trunk_layers;
+
+    let head_counts =
+        per_layer_metadata(gguf, &format!("{}.attention.head_count", p), trunk_layers);
+    let kv_counts = per_layer_metadata(
+        gguf,
+        &format!("{}.attention.head_count_kv", p),
+        trunk_layers,
+    );
+    let ff_lengths = per_layer_metadata(gguf, &format!("{}.feed_forward_length", p), trunk_layers);
+
+    let router_normalize_weights = matches!(
+        gguf.metadata.get(&format!("{}.expert_weights_norm", p)),
+        Some(crate::gguf::MetaValue::Bool(true))
+    ) || gguf.get_u32(&format!("{}.expert_weights_norm", p), 0) == 1;
+    let routed_scaling_factor = gguf.get_f32(&format!("{}.expert_weights_scale", p), 1.0);
+
+    eprintln!(
+        "Config: dim={}, layers={} (+{} MTP), ssm={}x{}h/{}g state={}, experts={}/{}, vocab={}",
+        config.dim,
+        trunk_layers,
+        nextn,
+        ssm.d_inner,
+        ssm.n_head,
+        ssm.n_group,
+        ssm.d_state,
+        config.expert_used_count,
+        config.expert_count,
+        config.vocab_size
+    );
+
+    let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> = gguf
+        .tensors
+        .iter()
+        .map(|tensor| (tensor.name.clone(), tensor))
+        .collect();
+    let inferred_sizes = HashMap::new();
+    let data_offset = gguf.data_offset;
+
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output = if tensor_idx.contains_key("output.weight") {
+        load_weight(
+            mmap_data,
+            data_offset,
+            "output.weight",
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        )
+    } else {
+        token_embd.clone()
+    };
+
+    let mut layers = Vec::with_capacity(trunk_layers);
+    let mut attn_layer_count = 0usize;
+    let mut max_heads = 0usize;
+    let mut max_kv_heads = 0usize;
+
+    for l in 0..trunk_layers {
+        let kv_heads = kv_counts.get(l).copied().unwrap_or(0);
+        let ff_len = ff_lengths.get(l).copied().unwrap_or(0);
+        let heads = head_counts.get(l).copied().unwrap_or(0);
+
+        // A block is recurrent when it declares neither attention heads nor a
+        // feed-forward width; attention when it declares no feed-forward width.
+        let mixer = if kv_heads == 0 && ff_len == 0 {
+            let load_vec = |name: &str| {
+                load_f32_vec(mmap_data, data_offset, name, &tensor_idx, &inferred_sizes)
+            };
+            NemotronMixer::Mamba2(Box::new(Mamba2LayerWeights {
+                in_proj: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ssm_in.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                conv_w: load_vec(&format!("blk.{}.ssm_conv1d.weight", l)),
+                conv_b: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ssm_conv1d.bias", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    ssm.conv_dim(),
+                ),
+                dt_bias: load_vec(&format!("blk.{}.ssm_dt.bias", l)),
+                // Stored without a `.weight` suffix, unlike every other tensor.
+                a: load_vec(&format!("blk.{}.ssm_a", l)),
+                d: load_vec(&format!("blk.{}.ssm_d", l)),
+                norm: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ssm_norm.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    ssm.d_inner,
+                ),
+                out_proj: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ssm_out.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+            }))
+        } else if ff_len == 0 {
+            let attn = NemotronAttnWeights {
+                wq: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_q.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                wk: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_k.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                wv: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_v.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                wo: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_output.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                bo: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.attn_output.bias", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    config.dim,
+                ),
+                n_heads: heads.max(1),
+                n_kv_heads: kv_heads.max(1),
+                kv_slot: attn_layer_count,
+            };
+            max_heads = max_heads.max(attn.n_heads);
+            max_kv_heads = max_kv_heads.max(attn.n_kv_heads);
+            attn_layer_count += 1;
+            NemotronMixer::Attention(Box::new(attn))
+        } else if config.expert_count > 0 {
+            NemotronMixer::Moe(Box::new(NemotronMoeWeights {
+                router: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_gate_inp.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                router_bias: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.exp_probs_b.bias", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    config.expert_count,
+                ),
+                // Nemotron-H experts have no gate projection.
+                up_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_up_exps.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                down_experts: load_expert_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_down_exps.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    borrow_quantized,
+                ),
+                shared_up: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_up_shexp.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                shared_down: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_down_shexp.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+            }))
+        } else {
+            NemotronMixer::DenseFfn(Box::new(NemotronDenseFfnWeights {
+                up: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_up.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                up_bias: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_up.bias", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    ff_len,
+                ),
+                down: load_weight(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_down.weight", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ),
+                down_bias: load_optional_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &format!("blk.{}.ffn_down.bias", l),
+                    &tensor_idx,
+                    &inferred_sizes,
+                    config.dim,
+                ),
+            }))
+        };
+
+        layers.push(NemotronHLayerWeights {
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("blk.{}.attn_norm.weight", l),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            mixer,
+        });
+        if l == 0 || (l + 1) % 8 == 0 || l + 1 == trunk_layers {
+            eprintln!("  Loaded layer {}/{}", l + 1, trunk_layers);
+        }
+    }
+
+    // Buffer sizing follows the widest attention block, since blocks differ.
+    config.n_heads = max_heads.max(1);
+    config.n_kv_heads = max_kv_heads.max(1);
+    config.kv_mul = config.n_heads / config.n_kv_heads;
+    config.kv_dim = config.n_kv_heads * config.head_dim;
+    config.value_dim = config.head_dim;
+    // The feed-forward scratch must hold the widest expert or dense width.
+    config.hidden_dim = config
+        .hidden_dim
+        .max(gguf.get_u32(&format!("{}.expert_feed_forward_length", p), 0) as usize)
+        .max(gguf.get_u32(&format!("{}.expert_shared_feed_forward_length", p), 0) as usize)
+        .max(ff_lengths.iter().copied().max().unwrap_or(0));
+
+    let weights = NemotronHWeights {
+        token_embd,
+        output_norm: load_f32_vec(
+            mmap_data,
+            data_offset,
+            "output_norm.weight",
+            &tensor_idx,
+            &inferred_sizes,
+        ),
+        output,
+        layers,
+        ssm,
+        attn_layer_count,
+        router_normalize_weights,
+        routed_scaling_factor,
+    };
+    (config, weights)
+}
+
 pub fn load_gpt_oss_model(
     mmap_data: &[u8],
     gguf: &GGUFFile,
@@ -5064,6 +5963,36 @@ fn select_top_logits_into(logits: &[f32], k: usize, out: &mut Vec<(usize, f32)>)
     }
 }
 
+/// Runs a Mixtral-style routed feed-forward block, leaving the result in
+/// `buf.proj` so the caller adds it to the residual exactly as for a dense FFN.
+///
+/// The reference implementation softmaxes every expert logit, takes the top-k,
+/// then renormalises the survivors. Taking the top-k of the raw logits and
+/// softmaxing only those is equivalent — softmax is monotonic, so the same
+/// experts win, and normalising over the selected subset yields the same
+/// weights — while avoiding a full expert-wide softmax on every layer.
+fn routed_moe_ffn_into(moe: &RoutedMoeWeights, expert_used_count: usize, buf: &mut DecodeBuffer) {
+    moe.router.matvec_into(&buf.xn2, &mut buf.router_logits);
+    select_top_logits_into(&buf.router_logits, expert_used_count, &mut buf.top_experts);
+    softmax_selected_into(&buf.top_experts, &mut buf.expert_probs);
+
+    buf.moe.fill(0.0);
+    for (slot, &(expert, _)) in buf.top_experts.iter().enumerate() {
+        moe.gate_experts
+            .matvec_expert_into(expert, &buf.xn2, &mut buf.gate);
+        moe.up_experts
+            .matvec_expert_into(expert, &buf.xn2, &mut buf.up);
+        crate::simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+        moe.down_experts
+            .matvec_expert_into(expert, &buf.hidden, &mut buf.proj);
+        let scale = buf.expert_probs[slot];
+        for (sum, value) in buf.moe.iter_mut().zip(&buf.proj) {
+            *sum += value * scale;
+        }
+    }
+    buf.proj.clone_from(&buf.moe);
+}
+
 fn bubble_up_router_last(values: &mut [(usize, f32)]) {
     let mut i = values.len() - 1;
     while i > 0 && values[i].1.total_cmp(&values[i - 1].1).is_gt() {
@@ -5368,6 +6297,12 @@ fn resident_configure_once(
         if !layer.attn_q_norm.is_empty() || !layer.attn_k_norm.is_empty() {
             return false;
         }
+        // The resident decoder hard-codes a dense SwiGLU feed-forward block and
+        // has no router or expert dispatch, so routed layers must stay on the
+        // CPU/regular Metal path.
+        if layer.moe.is_some() {
+            return false;
+        }
         let ws = [
             &layer.wq, &layer.wk, &layer.wv, &layer.wo, &layer.w1, &layer.w3, &layer.w2,
         ];
@@ -5644,7 +6579,10 @@ pub fn forward_into(
             );
         }
 
+        // The fused kernels below read the dense w1/w3/w2 trio, which a routed
+        // layer does not have.
         if fused_post_attention_ffn
+            && layer.moe.is_none()
             && try_metal_mistral_post_attention_ffn_into(
                 &layer.wo,
                 &layer.w1,
@@ -5665,10 +6603,18 @@ pub fn forward_into(
             buf.x[i] += buf.proj[i];
         }
 
-        // ── FFN (SwiGLU) ──
+        // ── FFN (SwiGLU, dense or routed) ──
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
 
-        if !try_metal_mistral_ffn_into(&layer.w1, &layer.w3, &layer.w2, &buf.xn2, &mut buf.proj) {
+        if let Some(moe) = &layer.moe {
+            routed_moe_ffn_into(moe, config.expert_used_count, buf);
+        } else if !try_metal_mistral_ffn_into(
+            &layer.w1,
+            &layer.w3,
+            &layer.w2,
+            &buf.xn2,
+            &mut buf.proj,
+        ) {
             if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
                 layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
                 layer.w3.matvec_into(&buf.xn2, &mut buf.up);
@@ -5946,6 +6892,317 @@ fn select_laguna_experts(
 /// Forward pass for Gemma-4 models (initial implementation mirroring the
 /// standard LLaMA-style forward). Bias terms are currently ignored when
 /// missing; the loader warns about absent tensors.
+/// Squared ReLU, the feed-forward activation used throughout Nemotron-H.
+#[inline]
+fn relu2(value: f32) -> f32 {
+    let clamped = value.max(0.0);
+    clamped * clamped
+}
+
+/// Advances one Mamba-2 mixer by a single token, updating its recurrent state
+/// in place and writing the block output to `out`.
+///
+/// Mirrors llama.cpp's `build_mamba2_layer` plus `ggml_ssm_scan`: the fused
+/// projection splits into gate/x/B/C/dt, a depthwise causal convolution runs
+/// over x, B and C together, the scan applies a per-head scalar decay, and the
+/// result is gated by `silu(z)` *before* a per-group RMSNorm — that ordering is
+/// load-bearing and the reverse produces plausible-looking garbage.
+fn nemotron_mamba2_step(
+    layer: &Mamba2LayerWeights,
+    dims: &SsmDims,
+    conv_state: &mut [f32],
+    ssm_state: &mut [f32],
+    hidden: &[f32],
+    eps: f32,
+    scratch: &mut Mamba2Scratch,
+    out: &mut Vec<f32>,
+) {
+    let d_inner = dims.d_inner;
+    let d_state = dims.d_state;
+    let d_conv = dims.d_conv;
+    let n_group = dims.n_group;
+    let n_head = dims.n_head;
+    let head_dim = dims.head_dim();
+    let conv_dim = dims.conv_dim();
+
+    layer.in_proj.matvec_into(hidden, &mut scratch.projected);
+    let (z, rest) = scratch.projected.split_at(d_inner);
+    let (xbc, dt) = rest.split_at(conv_dim);
+
+    // ── Depthwise causal convolution over x, B and C ──
+    scratch.convolved.resize(conv_dim, 0.0);
+    let window = d_conv.saturating_sub(1);
+    for channel in 0..conv_dim {
+        let taps = &layer.conv_w[channel * d_conv..channel * d_conv + d_conv];
+        let history = &mut conv_state[channel * window..channel * window + window];
+        let mut acc = layer.conv_b.get(channel).copied().unwrap_or(0.0);
+        for (past, tap) in history.iter().zip(taps.iter()) {
+            acc += past * tap;
+        }
+        // The current sample occupies the newest tap position.
+        acc += xbc[channel] * taps[window];
+        // Roll the shift register forward, newest last.
+        if window > 0 {
+            history.copy_within(1..window, 0);
+            history[window - 1] = xbc[channel];
+        }
+        scratch.convolved[channel] = silu(acc);
+    }
+
+    let (xs, bc) = scratch.convolved.split_at(d_inner);
+    let (b_all, c_all) = bc.split_at(n_group * d_state);
+
+    // ── Selective scan, one step ──
+    scratch.y.resize(d_inner, 0.0);
+    let heads_per_group = n_head / n_group.max(1);
+    for head in 0..n_head {
+        let dt_eff = softplus(dt[head] + layer.dt_bias[head]);
+        // `a` is already stored as -exp(A_log), so no negation here.
+        let decay = (dt_eff * layer.a[head]).exp();
+        let group = head / heads_per_group.max(1);
+        let b = &b_all[group * d_state..group * d_state + d_state];
+        let c = &c_all[group * d_state..group * d_state + d_state];
+        for channel in 0..head_dim {
+            let ii = channel + head * head_dim;
+            let x_dt = xs[ii] * dt_eff;
+            let state = &mut ssm_state[ii * d_state..ii * d_state + d_state];
+            let mut sum = 0.0f32;
+            for i in 0..d_state {
+                let updated = state[i] * decay + b[i] * x_dt;
+                sum += updated * c[i];
+                state[i] = updated;
+            }
+            // Skip connection, per head and broadcast across its channels.
+            scratch.y[ii] = sum + layer.d[head] * xs[ii];
+        }
+    }
+
+    // ── Gate, then grouped RMSNorm ──
+    for (value, gate) in scratch.y.iter_mut().zip(z.iter()) {
+        *value *= silu(*gate);
+    }
+    if !layer.norm.is_empty() {
+        let group_size = d_inner / n_group.max(1);
+        for group in 0..n_group.max(1) {
+            let span = &mut scratch.y[group * group_size..group * group_size + group_size];
+            let weights = &layer.norm[group * group_size..group * group_size + group_size];
+            let mean_square = span.iter().map(|v| v * v).sum::<f32>() / group_size.max(1) as f32;
+            let inv = 1.0 / (mean_square + eps).sqrt();
+            for (value, weight) in span.iter_mut().zip(weights.iter()) {
+                *value = *value * inv * weight;
+            }
+        }
+    }
+
+    layer.out_proj.matvec_into(&scratch.y, out);
+}
+
+/// Reusable scratch buffers for the Mamba-2 mixer.
+#[derive(Default)]
+struct Mamba2Scratch {
+    projected: Vec<f32>,
+    convolved: Vec<f32>,
+    y: Vec<f32>,
+}
+
+/// Runs a Nemotron-H routed feed-forward block into `out`.
+///
+/// Routing is sigmoid-scored with an additive bias used only for *selecting*
+/// experts — the blended weights are the unbiased probabilities, matching
+/// llama.cpp's aux-loss-free load balancing. Experts have no gate projection.
+fn nemotron_moe_ffn_into(
+    moe: &NemotronMoeWeights,
+    weights: &NemotronHWeights,
+    expert_used_count: usize,
+    buf: &mut DecodeBuffer,
+) {
+    moe.router.matvec_into(&buf.xn, &mut buf.router_logits);
+    select_laguna_experts(
+        &mut buf.router_logits,
+        &moe.router_bias,
+        expert_used_count,
+        weights.router_normalize_weights,
+        &mut buf.top_experts,
+        &mut buf.expert_probs,
+    );
+
+    // A zero scale means the GGUF omitted the key; treat that as unscaled
+    // rather than silently annihilating every routed contribution.
+    let scale = if weights.routed_scaling_factor > 0.0 {
+        weights.routed_scaling_factor
+    } else {
+        1.0
+    };
+
+    buf.moe.fill(0.0);
+    for (slot, &(expert, _)) in buf.top_experts.iter().enumerate() {
+        moe.up_experts
+            .matvec_expert_into(expert, &buf.xn, &mut buf.up);
+        for value in buf.up.iter_mut() {
+            *value = relu2(*value);
+        }
+        moe.down_experts
+            .matvec_expert_into(expert, &buf.up, &mut buf.proj);
+        let weight = buf.expert_probs[slot] * scale;
+        for (sum, value) in buf.moe.iter_mut().zip(&buf.proj) {
+            *sum += value * weight;
+        }
+    }
+
+    // The always-on shared expert runs alongside the routed ones.
+    moe.shared_up.matvec_into(&buf.xn, &mut buf.up);
+    for value in buf.up.iter_mut() {
+        *value = relu2(*value);
+    }
+    moe.shared_down.matvec_into(&buf.up, &mut buf.proj);
+    for (value, routed) in buf.proj.iter_mut().zip(&buf.moe) {
+        *value += routed;
+    }
+}
+
+/// Runs one Nemotron-H decode step. Each block applies exactly one mixer —
+/// Mamba-2, attention, or a feed-forward network — to its normalised residual.
+fn forward_nemotron_h_impl(
+    config: &Config,
+    weights: &NemotronHWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: Option<&mut Vec<f32>>,
+) {
+    let dim = config.dim;
+    weights.token_embd.row_into(token as usize, dim, &mut buf.x);
+
+    let mut scratch = Mamba2Scratch::default();
+    let mut recurrent_index = 0usize;
+
+    for layer in &weights.layers {
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+
+        match &layer.mixer {
+            NemotronMixer::Mamba2(mamba) => {
+                let state = cache
+                    .ssm
+                    .as_mut()
+                    .expect("hybrid model requires recurrent state");
+                let conv = &mut state.conv[recurrent_index];
+                let ssm = &mut state.ssm[recurrent_index];
+                nemotron_mamba2_step(
+                    mamba,
+                    &weights.ssm,
+                    conv,
+                    ssm,
+                    &buf.xn,
+                    config.rms_norm_eps,
+                    &mut scratch,
+                    &mut buf.proj,
+                );
+                recurrent_index += 1;
+            }
+            NemotronMixer::Attention(attn) => {
+                attn.wq.matvec_into(&buf.xn, &mut buf.q);
+                attn.wk.matvec_into(&buf.xn, &mut buf.k);
+                attn.wv.matvec_into(&buf.xn, &mut buf.v);
+
+                // Nemotron-H attention is position-free: no RoPE is applied.
+                let head_dim = config.head_dim;
+                let k_dim = attn.n_kv_heads * head_dim;
+                let v_dim = attn.n_kv_heads * head_dim;
+                cache.write_k(attn.kv_slot, pos, &buf.k[..k_dim]);
+                cache.write_v(attn.kv_slot, pos, &buf.v[..v_dim]);
+
+                let kv_mul = attn.n_heads / attn.n_kv_heads.max(1);
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                attention_over_kv_heads(
+                    &buf.q,
+                    &cache.k[attn.kv_slot],
+                    &cache.v[attn.kv_slot],
+                    k_dim,
+                    v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    head_dim,
+                    attn.n_kv_heads,
+                    kv_mul,
+                    0,
+                    pos,
+                    scale,
+                    &mut buf.attn_out,
+                );
+                let attn_dim = attn.n_heads * head_dim;
+                attn.wo
+                    .matvec_into(&buf.attn_out[..attn_dim], &mut buf.proj);
+                add_bias_if_present(&mut buf.proj, &attn.bo);
+            }
+            NemotronMixer::Moe(moe) => {
+                nemotron_moe_ffn_into(moe, weights, config.expert_used_count, buf);
+            }
+            NemotronMixer::DenseFfn(ffn) => {
+                ffn.up.matvec_into(&buf.xn, &mut buf.up);
+                add_bias_if_present(&mut buf.up, &ffn.up_bias);
+                for value in buf.up.iter_mut() {
+                    *value = relu2(*value);
+                }
+                ffn.down.matvec_into(&buf.up, &mut buf.proj);
+                add_bias_if_present(&mut buf.proj, &ffn.down_bias);
+            }
+        }
+
+        for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
+            *residual += projection;
+        }
+    }
+
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    if let Some(logits) = logits {
+        weights.output.matvec_into(&buf.xn, logits);
+    }
+}
+
+/// Runs one Nemotron-H decode step and writes logits.
+pub fn forward_nemotron_h_into(
+    config: &Config,
+    weights: &NemotronHWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
+    forward_nemotron_h_impl(config, weights, cache, buf, token, pos, Some(logits));
+}
+
+/// Runs one Nemotron-H step and returns the final normalised hidden state.
+pub fn forward_hidden_nemotron_h<'a>(
+    config: &Config,
+    weights: &NemotronHWeights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_nemotron_h_impl(config, weights, cache, buf, token, pos, None);
+    &buf.xn
+}
+
+/// Advances a Nemotron-H model by one prompt token without producing logits.
+pub fn forward_prefill_nemotron_h(
+    config: &Config,
+    weights: &NemotronHWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    forward_nemotron_h_impl(config, weights, cache, buf, token, pos, None);
+}
+
 pub fn forward_gemma4(
     config: &Config,
     weights: &Gemma4Weights,
@@ -7236,7 +8493,15 @@ fn forward_hidden_impl<'a>(
         // token except the final one reaches this function, so falling back to
         // three independent projections needlessly adds Metal command-buffer
         // and host-buffer traffic.
-        if !try_metal_mistral_ffn_into(&layer.w1, &layer.w3, &layer.w2, &buf.xn2, &mut buf.proj) {
+        if let Some(moe) = &layer.moe {
+            routed_moe_ffn_into(moe, config.expert_used_count, buf);
+        } else if !try_metal_mistral_ffn_into(
+            &layer.w1,
+            &layer.w3,
+            &layer.w2,
+            &buf.xn2,
+            &mut buf.proj,
+        ) {
             if !try_quant_matvec2_into(&layer.w1, &layer.w3, &buf.xn2, &mut buf.gate, &mut buf.up) {
                 layer.w1.matvec_into(&buf.xn2, &mut buf.gate);
                 layer.w3.matvec_into(&buf.xn2, &mut buf.up);
@@ -7354,10 +8619,12 @@ impl PrefillBatchBuffer {
 #[cfg(not(target_family = "wasm"))]
 pub fn standard_prefill_batchable(weights: &ModelWeights) -> bool {
     weights.layers.iter().all(|layer| {
-        // The batched prefill kernel does not yet apply Q/K per-head RMSNorm.
-        // Fall back to the sequential path for Qwen3-style layers rather than
-        // filling the cache with unnormalised keys.
-        layer.attn_q_norm.is_empty()
+        // Routed layers have no dense w1/w3/w2 for the batch kernels to read.
+        layer.moe.is_none()
+            // The batched prefill kernel does not yet apply Q/K per-head RMSNorm.
+            // Fall back to the sequential path for Qwen3-style layers rather than
+            // filling the cache with unnormalised keys.
+            && layer.attn_q_norm.is_empty()
             && layer.attn_k_norm.is_empty()
             && kquant_weight_parts(&layer.wq).is_some()
             && kquant_weight_parts(&layer.wk).is_some()
