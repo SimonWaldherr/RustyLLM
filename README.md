@@ -139,6 +139,65 @@ continued rather than closed with EOS. The startup optimization summary prints
 the selected renderer, for example `chat-template=mistral-inst`, so you can
 quickly spot whether a model uses a native template or the plain fallback.
 
+### Tekken tokenizer
+
+Mistral GGUFs from Nemo onwards (Nemo, Ministral 8B, Mistral Small 3.x,
+Magistral, Devstral, Ministral 3) declare `tokenizer.ggml.pre = "tekken"`. They
+share GPT-2's byte-level vocabulary but split text differently, so they get a
+dedicated pre-tokenizer. Three differences change token counts materially:
+
+- **every digit is its own token** — `2026` is four tokens, not one;
+- **at most one leading character attaches to a word**, so a run of spaces is
+  not swallowed into the following token;
+- **a whitespace run ending in a newline is isolated**, and case boundaries
+  split `HelloWorld` into two tokens.
+
+Tekken also sets `ignore_merges`: when a whole pre-token exists verbatim in the
+vocabulary it is emitted directly and the merge loop is skipped, which can differ
+from what the merge table alone would produce.
+
+This deliberately reproduces llama.cpp's ASCII-only case handling rather than the
+stricter Unicode regex the upstream tokenizer specifies — llama.cpp collapses
+every non-ASCII letter into one class, so a "more correct" implementation would
+produce different token counts than the reference.
+
+### Tool calling
+
+`/v1/chat/completions` accepts `tools`, `role: "tool"` messages with
+`tool_call_id`, and assistant turns replaying `tool_calls`. When the model
+requests a tool the response carries an OpenAI-shaped `tool_calls` array with
+`finish_reason: "tool_calls"`; ordinary replies are unchanged and the field is
+omitted entirely.
+
+Mistral changed its tool wire format four times, and the format follows the
+*tokenizer version*, not the model family — Magistral 2506 is V7 while Magistral
+2509 is V11. RustyLLM detects it from the marker set in the GGUF's own chat
+template:
+
+| Detected | Calls | Results | Tools placed |
+| --- | --- | --- | --- |
+| V3 | `[TOOL_CALLS][{name, arguments, id}]` | `{"content", "call_id"}` | before last user turn |
+| V7 | as V3 | `[TOOL_RESULTS]id[TOOL_CONTENT]…` | before last user turn |
+| V11 | `[TOOL_CALLS]name[CALL_ID]id[ARGS]{…}` | as V7 | before last user turn |
+| V13 | `[TOOL_CALLS]name[ARGS]{…}` | `[TOOL_RESULTS]…[/TOOL_RESULTS]` | at the first user turn |
+
+`[CALL_ID]` is the only marker separating V11 from V13. V13 drops call ids
+entirely, so tool results must be sent back **in the order the calls were made**;
+RustyLLM synthesises positional ids in the API response so clients still have
+something to correlate against.
+
+Templates without a tool block ignore the `tools` parameter rather than inventing
+syntax the model was never trained on, and tool results reach those models as
+user-side context.
+
+### Streaming and Unicode
+
+Byte-level BPE routinely splits one character across two tokens — every emoji and
+most CJK text. Streaming decode reassembles them, so a character emitted over two
+tokens arrives whole instead of as two U+FFFD replacements. A character left
+truncated when generation stops surfaces as a single U+FFFD rather than
+disappearing.
+
 ### Mixtral and Mistral MoE
 
 GGUFs carrying `blk.N.ffn_gate_inp.weight` plus `ffn_{gate,up,down}_exps.weight`

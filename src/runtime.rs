@@ -4,7 +4,7 @@ use crate::model::{
     apply_rope_qk, online_attention, rms_norm_into,
 };
 use crate::sampling::{self, SamplerConfig};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, Utf8Stitcher};
 use std::cmp::Ordering;
 #[cfg(not(target_family = "wasm"))]
 use std::collections::HashSet;
@@ -27,33 +27,65 @@ pub struct TokenNeighbor {
     pub score: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ChatRole {
     System,
     User,
     Assistant,
+    /// Result of a tool the assistant invoked, fed back into the conversation.
+    Tool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Identifier correlating a tool result with the call that produced it.
+    /// Only meaningful for [`ChatRole::Tool`] messages.
+    pub tool_call_id: Option<String>,
+    /// Tool calls this assistant turn made, serialised as the model's own
+    /// format when the turn is replayed into a prompt.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// One tool invocation requested by the model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON object of arguments, kept as text because models emit it that
+    /// way and clients expect the original string back.
+    pub arguments: String,
 }
 
 impl ChatMessage {
     /// Constructs a user chat message.
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::User,
-            content: content.into(),
-        }
+        Self::new(ChatRole::User, content)
     }
 
     /// Constructs an assistant chat message.
     pub fn assistant(content: impl Into<String>) -> Self {
+        Self::new(ChatRole::Assistant, content)
+    }
+
+    /// Constructs a chat message with no tool metadata.
+    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
         Self {
-            role: ChatRole::Assistant,
+            role,
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Constructs a tool-result message answering a specific call.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -71,6 +103,11 @@ pub struct GenerationOptions {
     /// Stop generation when any of these strings appears in the output.
     /// The matched sequence is not included in the returned text.
     pub stop_sequences: Vec<String>,
+    /// Tool declarations offered to the model, each a JSON object in OpenAI
+    /// function-tool form. Rendered into the prompt only by templates that have
+    /// a tool block; other templates ignore them rather than inventing syntax
+    /// the model was never trained on.
+    pub tools: Vec<String>,
 }
 
 pub const DEFAULT_THINKING_SYSTEM_PROMPT: &str = "Formuliere den folgenden Prompt in eigenen Worten, möglichst kompakt und mit passender Fachterminologie. Identifiziere Sprache und Stil des Original-Prompts. Erkenne, ob der Prompt eine Ausgabe in einem bestimmten Stil fordert; falls kein Stil gefordert wird, orientiere dich am Prompt. Gib ausschließlich den umformulierten Prompt aus, ohne Erklärung, Vorrede oder Markdown.";
@@ -286,6 +323,7 @@ impl Default for GenerationOptions {
             speculative: SpeculativeConfig::default(),
             runtime: RuntimeOptConfig::default(),
             stop_sequences: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -762,6 +800,285 @@ pub struct Runner {
     /// computed once and cached rather than re-parsing the template string
     /// per token.
     chat_template_kind_cache: OnceLock<Option<&'static str>>,
+    /// Likewise invariant, and consulted once per message while rendering a
+    /// conversation. Detecting it means scanning the whole template for marker
+    /// substrings, so a long tool-using conversation would otherwise rescan a
+    /// multi-kilobyte string per turn.
+    mistral_tool_format_cache: OnceLock<MistralToolFormat>,
+}
+
+/// Wire format for Mistral tool calling, which changed four times.
+///
+/// The format is a property of the tokenizer version, not of the model family:
+/// Magistral-2506 is V7 while Magistral-2509 is V11. It is therefore detected
+/// from the marker set in the GGUF's own chat template, the same way llama.cpp
+/// tells Ministral-3 and Mistral-Small-3.2 apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum MistralToolFormat {
+    /// `[TOOL_CALLS][{"name", "arguments", "id"}]`, results as JSON with
+    /// `call_id`. Mistral Nemo, Ministral 8B.
+    V3,
+    /// Calls as in V3; results as `[TOOL_RESULTS]<id>[TOOL_CONTENT]<content>`.
+    /// Mistral Small 3.1, Magistral 2506.
+    V7,
+    /// `[TOOL_CALLS]<name>[CALL_ID]<id>[ARGS]<json>`. Mistral Small 3.2,
+    /// Magistral 2509.
+    V11,
+    /// `[TOOL_CALLS]<name>[ARGS]<json>` with no call id anywhere, and the tool
+    /// list moved to the front of the conversation. Devstral, Ministral 3.
+    V13,
+}
+
+impl MistralToolFormat {
+    /// Classifies the tool format from the marker set of a chat template.
+    ///
+    /// `[CALL_ID]` is what separates V11 from V13: both emit `[ARGS]`, but V13
+    /// dropped the call id entirely, so tool results must be replayed in order.
+    fn from_template(template: &str) -> Self {
+        let has_args = template.contains("[ARGS]");
+        let has_call_id = template.contains("[CALL_ID]");
+        match (has_args, has_call_id) {
+            (true, true) => Self::V11,
+            (true, false) => Self::V13,
+            (false, _) if template.contains("[TOOL_CONTENT]") => Self::V7,
+            (false, _) => Self::V3,
+        }
+    }
+
+    /// Reports whether tool declarations belong at the first user turn rather
+    /// than immediately before the last one.
+    ///
+    /// V13 moved them to the front so the tool list is a stable prompt prefix
+    /// that prompt caching can reuse across turns.
+    fn tools_at_first_user(self) -> bool {
+        matches!(self, Self::V13)
+    }
+}
+
+/// Returns the byte index just past the JSON value starting at `start`.
+///
+/// Only structural scanning is needed here — braces, brackets and string
+/// escapes — so this avoids pulling `serde_json` into the wasm build. Byte
+/// indexing is safe because every delimiter is ASCII and a UTF-8 continuation
+/// byte can never be mistaken for one.
+fn json_value_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let opened = matches!(bytes[i], b'{' | b'[');
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+                if !opened {
+                    return Some(i + 1);
+                }
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    // At depth zero this closes an enclosing container, so the
+                    // bare scalar we were reading ends just before it.
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i + 1);
+                    }
+                }
+                // A bare scalar ends at the next separator.
+                b',' if depth == 0 => return Some(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    // Unterminated value: the model was cut off mid-call.
+    None
+}
+
+/// Extracts the string value of `key` from one JSON object slice.
+fn json_object_string(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let key_at = object.find(&needle)?;
+    let colon = object[key_at + needle.len()..].find(':')? + key_at + needle.len() + 1;
+    let end = json_value_end(object, colon)?;
+    let raw = object[colon..end].trim();
+    let unquoted = raw.strip_prefix('"')?.strip_suffix('"')?;
+    Some(unescape_json_string(unquoted))
+}
+
+/// Extracts the raw JSON text of `key` from one JSON object slice.
+fn json_object_raw(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{}\"", key);
+    let key_at = object.find(&needle)?;
+    let colon = object[key_at + needle.len()..].find(':')? + key_at + needle.len() + 1;
+    let end = json_value_end(object, colon)?;
+    Some(object[colon..end].trim().to_string())
+}
+
+/// Resolves JSON escape sequences in a quoted string's contents.
+fn unescape_json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) => out.push(decoded),
+                    None => out.push('\u{FFFD}'),
+                }
+            }
+            Some(other) => out.push(other),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Splits generated text into prose and the tool calls it requested.
+///
+/// Handles all four Mistral layouts: the V3/V7 JSON array after a single
+/// `[TOOL_CALLS]` marker, and the V11/V13 form where each call repeats the
+/// marker and carries its name and id as plain text before `[ARGS]`. A call the
+/// model left unterminated is dropped rather than surfaced half-parsed.
+pub(crate) fn parse_mistral_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    const MARKER: &str = "[TOOL_CALLS]";
+    let Some(first) = text.find(MARKER) else {
+        return (text.to_string(), Vec::new());
+    };
+
+    let prose = text[..first].trim().to_string();
+    let mut calls = Vec::new();
+    let mut rest = &text[first..];
+
+    while let Some(at) = rest.find(MARKER) {
+        let after = &rest[at + MARKER.len()..];
+        let trimmed = after.trim_start();
+
+        if trimmed.starts_with('[') || trimmed.starts_with('{') {
+            // V3 / V7: one JSON array (or bare object) holding every call.
+            let offset = after.len() - trimmed.len();
+            let Some(end) = json_value_end(after, offset) else {
+                break;
+            };
+            collect_json_tool_calls(&after[offset..end], &mut calls);
+            rest = &after[end..];
+        } else {
+            // V11 / V13: name, optional [CALL_ID], then [ARGS] + JSON.
+            let Some(args_at) = after.find("[ARGS]") else {
+                break;
+            };
+            let head = &after[..args_at];
+            let (name, id) = match head.find("[CALL_ID]") {
+                Some(id_at) => (
+                    head[..id_at].trim().to_string(),
+                    head[id_at + "[CALL_ID]".len()..].trim().to_string(),
+                ),
+                None => (head.trim().to_string(), String::new()),
+            };
+            let args_start = args_at + "[ARGS]".len();
+            let Some(end) = json_value_end(after, args_start) else {
+                break;
+            };
+            if !name.is_empty() {
+                calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments: after[args_start..end].trim().to_string(),
+                });
+            }
+            rest = &after[end..];
+        }
+    }
+
+    (prose, calls)
+}
+
+/// Reads the V3/V7 JSON array form into `calls`.
+fn collect_json_tool_calls(json: &str, calls: &mut Vec<ToolCall>) {
+    let mut cursor = 0usize;
+    while let Some(open) = json[cursor..].find('{') {
+        let start = cursor + open;
+        let Some(end) = json_value_end(json, start) else {
+            break;
+        };
+        let object = &json[start..end];
+        if let Some(name) = json_object_string(object, "name") {
+            calls.push(ToolCall {
+                id: json_object_string(object, "id").unwrap_or_default(),
+                name,
+                arguments: json_object_raw(object, "arguments")
+                    .unwrap_or_else(|| String::from("{}")),
+            });
+        }
+        cursor = end;
+    }
+}
+
+/// Appends `value` to `out` as a quoted, escaped JSON string.
+///
+/// Hand-rolled because `serde_json` is behind the `cli`/`server` features and
+/// chat rendering also has to work in the dependency-free wasm build.
+fn push_json_string(value: &str, out: &mut String) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Returns tool-call arguments as a JSON value suitable for splicing.
+///
+/// Clients send `arguments` as a JSON-encoded string, and models emit it as a
+/// bare object. Anything that does not already look like an object or array is
+/// quoted so the rendered block stays parseable rather than becoming invalid
+/// JSON the model then imitates.
+fn normalized_tool_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return String::from("{}");
+    }
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return trimmed.to_string();
+    }
+    let mut quoted = String::new();
+    push_json_string(trimmed, &mut quoted);
+    quoted
 }
 
 /// Reports whether the architecture string maps to a supported loader.
@@ -1441,6 +1758,7 @@ impl Runner {
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
             chat_template_kind_cache: OnceLock::new(),
+            mistral_tool_format_cache: OnceLock::new(),
         })
     }
 
@@ -1526,6 +1844,7 @@ impl Runner {
             prefix_cache: Mutex::new(SharedPrefixCache::from_env()),
             mapped_model: Some(mmap),
             chat_template_kind_cache: OnceLock::new(),
+            mistral_tool_format_cache: OnceLock::new(),
         };
         let runner_time = t_runner.elapsed();
         let load_time = t0.elapsed();
@@ -2658,7 +2977,7 @@ impl Runner {
         }
 
         let total_start = Instant::now();
-        let tokens = self.render_messages(messages, &options.system_prompt);
+        let tokens = self.render_messages(messages, &options.system_prompt, &options.tools);
         if tokens.is_empty() {
             return Err(String::from("Prompt rendered to zero tokens."));
         }
@@ -2739,6 +3058,9 @@ impl Runner {
         let mut generated_tokens = 0usize;
         let mut pos = tokens.len();
         let mut recent = recent_token_tail(&tokens);
+        // Characters split across token boundaries are reassembled here rather
+        // than decoded per token, which would emit U+FFFD for every emoji.
+        let mut stitcher = Utf8Stitcher::new();
 
         // Pre-compute the longest stop sequence length so we only scan a small
         // trailing window of `output` on each token instead of the full string.
@@ -2763,6 +3085,7 @@ impl Runner {
                         &mut logits,
                         &mut output,
                         &mut on_token,
+                        &mut stitcher,
                         &options.stop_sequences,
                         max_stop_len,
                         &mut recent,
@@ -2791,7 +3114,7 @@ impl Runner {
                 break;
             }
 
-            let text = self.tok.decode_token(token);
+            let text = stitcher.push(&self.tok.decode_token_bytes(token));
             output.push_str(&text);
 
             // Check stop sequences only within a trailing window equal to the
@@ -2809,7 +3132,11 @@ impl Runner {
                 }
             }
 
-            on_token(&text);
+            // A token that only completed part of a character yields no text yet;
+            // emitting an empty chunk would add noise to the stream.
+            if !text.is_empty() {
+                on_token(&text);
+            }
 
             generated_tokens += 1;
             push_recent_token(&mut recent, token);
@@ -2820,6 +3147,14 @@ impl Runner {
 
             self.forward_token_into(&mut cache, &mut buf, token, pos, &mut logits);
             pos += 1;
+        }
+
+        // A character left half-emitted when generation stopped still has to
+        // surface, as U+FFFD, rather than vanishing from the result.
+        let tail = stitcher.flush();
+        if !tail.is_empty() {
+            output.push_str(&tail);
+            on_token(&tail);
         }
 
         let decode_time = t_decode.elapsed();
@@ -3011,6 +3346,7 @@ impl Runner {
         logits: &mut Vec<f32>,
         output: &mut String,
         on_token: &mut F,
+        stitcher: &mut Utf8Stitcher,
         stop_sequences: &[String],
         max_stop_len: usize,
         recent: &mut Vec<u32>,
@@ -3071,7 +3407,14 @@ impl Runner {
                 return DecodeFlow::Stop;
             }
 
-            if self.emit_token_text(token, output, on_token, stop_sequences, max_stop_len) {
+            if self.emit_token_text(
+                token,
+                output,
+                on_token,
+                stitcher,
+                stop_sequences,
+                max_stop_len,
+            ) {
                 return DecodeFlow::Stop;
             }
 
@@ -3120,13 +3463,14 @@ impl Runner {
         token: u32,
         output: &mut String,
         on_token: &mut F,
+        stitcher: &mut Utf8Stitcher,
         stop_sequences: &[String],
         max_stop_len: usize,
     ) -> bool
     where
         F: FnMut(&str),
     {
-        let text = self.tok.decode_token(token);
+        let text = stitcher.push(&self.tok.decode_token_bytes(token));
         output.push_str(&text);
 
         if max_stop_len > 0 {
@@ -3140,7 +3484,9 @@ impl Runner {
             }
         }
 
-        on_token(&text);
+        if !text.is_empty() {
+            on_token(&text);
+        }
         false
     }
 
@@ -3345,7 +3691,12 @@ impl Runner {
     }
 
     /// Chooses a chat-template renderer and tokenizes the rendered messages.
-    fn render_messages(&self, messages: &[ChatMessage], system_prompt: &str) -> Vec<u32> {
+    fn render_messages(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+        tools: &[String],
+    ) -> Vec<u32> {
         // Prefer architecture-specific chat formatting when the tokenizer
         // metadata exposes one we know how to mirror.
         if self.arch == "gpt-oss" {
@@ -3357,12 +3708,14 @@ impl Runner {
             }
         }
         if matches!(self.chat_template_kind(), Some("mistral3-inst")) {
-            if let Some(tokens) = self.render_mistral3_inst_messages(messages, system_prompt) {
+            if let Some(tokens) = self.render_mistral3_inst_messages(messages, system_prompt, tools)
+            {
                 return tokens;
             }
         }
         if matches!(self.chat_template_kind(), Some("mistral-inst")) {
-            if let Some(tokens) = self.render_mistral_inst_messages(messages, system_prompt) {
+            if let Some(tokens) = self.render_mistral_inst_messages(messages, system_prompt, tools)
+            {
                 return tokens;
             }
         }
@@ -3398,6 +3751,7 @@ impl Runner {
                 ChatRole::System => "System",
                 ChatRole::User => "User",
                 ChatRole::Assistant => "Assistant",
+                ChatRole::Tool => "Tool",
             };
             prompt.push_str(label);
             prompt.push_str(": ");
@@ -3448,6 +3802,9 @@ impl Runner {
                 ChatRole::System => system,
                 ChatRole::User => user,
                 ChatRole::Assistant => assistant,
+                // Harmony has no tool role in this renderer's vocabulary; a
+                // tool result is model input, so it enters as a user turn.
+                ChatRole::Tool => user,
             };
             tokens.push(start);
             tokens.push(role_id);
@@ -3521,6 +3878,19 @@ impl Runner {
                     self.push_gemma_turn(start, end, "user", &content, true, &mut tokens);
                     emitted_user = true;
                 }
+                // Gemma's template has no tool turn; the result is fed back as
+                // user-side context.
+                ChatRole::Tool => {
+                    self.push_gemma_turn(
+                        start,
+                        end,
+                        "user",
+                        message.content.trim(),
+                        true,
+                        &mut tokens,
+                    );
+                    emitted_user = true;
+                }
                 ChatRole::Assistant => {
                     self.push_gemma_turn(
                         start,
@@ -3553,6 +3923,7 @@ impl Runner {
         &self,
         messages: &[ChatMessage],
         system_prompt: &str,
+        tools: &[String],
     ) -> Option<Vec<u32>> {
         let inst = self.tok.special_id("[INST]")?;
         let end_inst = self.tok.special_id("[/INST]")?;
@@ -3580,6 +3951,7 @@ impl Runner {
 
         let mut last_role: Option<ChatRole> = None;
         let last_index = messages.len().saturating_sub(1);
+        let tool_anchor = self.tool_anchor_index(messages);
         for (index, message) in messages.iter().enumerate() {
             match message.role {
                 ChatRole::System => {}
@@ -3587,12 +3959,20 @@ impl Runner {
                     if matches!(last_role.as_ref(), Some(ChatRole::User)) {
                         tokens.extend(self.tok.encode_without_bos("\n"));
                     }
+                    if tool_anchor == Some(index) {
+                        self.push_mistral_available_tools(tools, &mut tokens);
+                    }
                     tokens.push(inst);
                     tokens.extend(self.tok.encode_without_bos(message.content.trim()));
                     tokens.push(end_inst);
                     last_role = Some(ChatRole::User);
                 }
+                ChatRole::Tool => {
+                    self.push_mistral_tool_results(message, &mut tokens);
+                    last_role = Some(ChatRole::Tool);
+                }
                 ChatRole::Assistant => {
+                    self.push_mistral_tool_calls(message, &mut tokens);
                     tokens.extend(self.tok.encode_without_bos(message.content.trim()));
                     // A trailing assistant turn is a prefill the model should
                     // continue, so it stays open rather than being closed here.
@@ -3605,6 +3985,138 @@ impl Runner {
         }
 
         Some(tokens)
+    }
+
+    /// Emits the tool declarations as a Mistral `[AVAILABLE_TOOLS]` block.
+    ///
+    /// Mistral places this immediately before the final user instruction, so
+    /// the tool list stays adjacent to the request it applies to instead of
+    /// scrolling out of the model's recent attention in a long conversation.
+    fn push_mistral_available_tools(&self, tools: &[String], out: &mut Vec<u32>) {
+        if tools.is_empty() {
+            return;
+        }
+        let mut json = String::from("[");
+        for (index, tool) in tools.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str(tool.trim());
+        }
+        json.push(']');
+
+        self.push_mistral_marker("[AVAILABLE_TOOLS]", out);
+        out.extend(self.tok.encode_without_bos(&json));
+        self.push_mistral_marker("[/AVAILABLE_TOOLS]", out);
+    }
+
+    /// Returns the user turn that tool declarations attach to.
+    ///
+    /// V3/V7/V11 put them immediately before the *last* user instruction so the
+    /// list stays adjacent to the request; V13 moved them to the *first* turn,
+    /// making the tool list a stable prefix that prompt caching can reuse.
+    fn tool_anchor_index(&self, messages: &[ChatMessage]) -> Option<usize> {
+        let is_user = |message: &ChatMessage| matches!(message.role, ChatRole::User);
+        if self.mistral_tool_format().tools_at_first_user() {
+            messages.iter().position(is_user)
+        } else {
+            messages.iter().rposition(is_user)
+        }
+    }
+
+    /// Returns the tool wire format this model's chat template implies.
+    fn mistral_tool_format(&self) -> MistralToolFormat {
+        *self.mistral_tool_format_cache.get_or_init(|| {
+            self.gguf
+                .metadata
+                .get("tokenizer.chat_template")
+                .and_then(|value| value.as_str())
+                .map(MistralToolFormat::from_template)
+                .unwrap_or(MistralToolFormat::V3)
+        })
+    }
+
+    /// Emits an assistant turn's tool calls as a Mistral `[TOOL_CALLS]` block.
+    ///
+    /// Replaying calls verbatim matters for multi-turn tool use: the model has
+    /// to see its own previous request to make sense of the result that follows.
+    fn push_mistral_tool_calls(&self, message: &ChatMessage, out: &mut Vec<u32>) {
+        if message.tool_calls.is_empty() {
+            return;
+        }
+        match self.mistral_tool_format() {
+            // V3/V7 emit every call as one JSON array after a single marker.
+            format @ (MistralToolFormat::V3 | MistralToolFormat::V7) => {
+                let _ = format;
+                let mut json = String::from("[");
+                for (index, call) in message.tool_calls.iter().enumerate() {
+                    if index > 0 {
+                        json.push(',');
+                    }
+                    json.push_str("{\"name\": ");
+                    push_json_string(&call.name, &mut json);
+                    // `arguments` is a JSON value on the wire, so it is spliced
+                    // in rather than quoted as a string.
+                    json.push_str(", \"arguments\": ");
+                    json.push_str(&normalized_tool_arguments(&call.arguments));
+                    if !call.id.is_empty() {
+                        json.push_str(", \"id\": ");
+                        push_json_string(&call.id, &mut json);
+                    }
+                    json.push('}');
+                }
+                json.push(']');
+                self.push_mistral_marker("[TOOL_CALLS]", out);
+                out.extend(self.tok.encode_without_bos(&json));
+            }
+            // V11/V13 repeat the marker per call and carry the name and id as
+            // plain text between control tokens.
+            format => {
+                for call in &message.tool_calls {
+                    self.push_mistral_marker("[TOOL_CALLS]", out);
+                    out.extend(self.tok.encode_without_bos(&call.name));
+                    if format == MistralToolFormat::V11 && !call.id.is_empty() {
+                        self.push_mistral_marker("[CALL_ID]", out);
+                        out.extend(self.tok.encode_without_bos(&call.id));
+                    }
+                    self.push_mistral_marker("[ARGS]", out);
+                    out.extend(
+                        self.tok
+                            .encode_without_bos(&normalized_tool_arguments(&call.arguments)),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emits a tool result as a Mistral `[TOOL_RESULTS]` block.
+    fn push_mistral_tool_results(&self, message: &ChatMessage, out: &mut Vec<u32>) {
+        self.push_mistral_marker("[TOOL_RESULTS]", out);
+        match self.mistral_tool_format() {
+            MistralToolFormat::V3 => {
+                let mut json = String::from("{\"content\": ");
+                push_json_string(&message.content, &mut json);
+                if let Some(id) = &message.tool_call_id {
+                    json.push_str(", \"call_id\": ");
+                    push_json_string(id, &mut json);
+                }
+                json.push('}');
+                out.extend(self.tok.encode_without_bos(&json));
+            }
+            MistralToolFormat::V7 | MistralToolFormat::V11 => {
+                if let Some(id) = &message.tool_call_id {
+                    out.extend(self.tok.encode_without_bos(id));
+                }
+                self.push_mistral_marker("[TOOL_CONTENT]", out);
+                out.extend(self.tok.encode_without_bos(message.content.trim()));
+            }
+            // V13 dropped the call id entirely, so results are positional and
+            // must be replayed in the order the calls were made.
+            MistralToolFormat::V13 => {
+                out.extend(self.tok.encode_without_bos(message.content.trim()));
+            }
+        }
+        self.push_mistral_marker("[/TOOL_RESULTS]", out);
     }
 
     /// Emits an instruction marker, preferring a control-token ID.
@@ -3631,6 +4143,7 @@ impl Runner {
         &self,
         messages: &[ChatMessage],
         system_prompt: &str,
+        tools: &[String],
     ) -> Option<Vec<u32>> {
         let mut system_parts = Vec::new();
         if !system_prompt.trim().is_empty() {
@@ -3645,10 +4158,14 @@ impl Runner {
 
         let mut tokens = vec![self.tok.bos_id];
         let last_index = messages.len().saturating_sub(1);
+        let tool_anchor = self.tool_anchor_index(messages);
         for (index, message) in messages.iter().enumerate() {
             match message.role {
                 ChatRole::System => {}
                 ChatRole::User => {
+                    if tool_anchor == Some(index) {
+                        self.push_mistral_available_tools(tools, &mut tokens);
+                    }
                     self.push_mistral_marker("[INST]", &mut tokens);
                     // The system prompt rides inside the first instruction
                     // block; later turns carry the user text alone.
@@ -3662,7 +4179,11 @@ impl Runner {
                     tokens.extend(self.tok.encode_without_bos(&content));
                     self.push_mistral_marker("[/INST]", &mut tokens);
                 }
+                ChatRole::Tool => {
+                    self.push_mistral_tool_results(message, &mut tokens);
+                }
                 ChatRole::Assistant => {
+                    self.push_mistral_tool_calls(message, &mut tokens);
                     tokens.extend(self.tok.encode_without_bos(message.content.trim()));
                     // A trailing assistant turn is a prefill the model should
                     // continue, so it stays open; earlier turns are closed.
@@ -3747,6 +4268,9 @@ impl Runner {
                 ChatRole::System => system,
                 ChatRole::User => user,
                 ChatRole::Assistant => assistant,
+                // No dedicated tool header token in this vocabulary; the result
+                // reaches the model as user-side input.
+                ChatRole::Tool => user,
             };
             push_header(role_id, &mut tokens);
             tokens.extend(self.tok.encode_without_bos(&message.content));
@@ -3791,6 +4315,9 @@ impl Runner {
                 ChatRole::System => "system",
                 ChatRole::User => "user",
                 ChatRole::Assistant => "assistant",
+                // ChatML carries a literal role name, so "tool" needs no
+                // dedicated control token.
+                ChatRole::Tool => "tool",
             };
             push_turn(role, message.content.trim(), &mut tokens);
         }
@@ -3843,6 +4370,13 @@ impl Runner {
                     tokens.extend(self.tok.encode_without_bos("</system>\n"));
                 }
                 ChatRole::User => {
+                    tokens.extend(self.tok.encode_without_bos("<user>"));
+                    tokens.extend(self.tok.encode_without_bos(message.content.trim()));
+                    tokens.extend(self.tok.encode_without_bos("</user>\n"));
+                }
+                // Laguna's template has no tool block; surface the result as
+                // user-side context so it still reaches the model.
+                ChatRole::Tool => {
                     tokens.extend(self.tok.encode_without_bos("<user>"));
                     tokens.extend(self.tok.encode_without_bos(message.content.trim()));
                     tokens.extend(self.tok.encode_without_bos("</user>\n"));
@@ -4073,7 +4607,7 @@ impl Runner {
         let total_start = Instant::now();
         session.last_used = total_start;
 
-        let tokens = self.render_messages(messages, &options.system_prompt);
+        let tokens = self.render_messages(messages, &options.system_prompt, &options.tools);
         if tokens.is_empty() {
             return Err(String::from("Prompt rendered to zero tokens."));
         }
@@ -4176,6 +4710,9 @@ impl Runner {
             sampling::Rng::new(options.seed)
         };
 
+        // Reassembles characters that byte-level BPE split across tokens.
+        let mut stitcher = Utf8Stitcher::new();
+
         'decode: for _ in 0..options.max_tokens {
             let token = sampling::sample_with_scratch(
                 &mut logits,
@@ -4189,7 +4726,7 @@ impl Runner {
                 break;
             }
 
-            let text = self.tok.decode_token(token);
+            let text = stitcher.push(&self.tok.decode_token_bytes(token));
             output.push_str(&text);
 
             if max_stop_len > 0 {
@@ -4203,7 +4740,11 @@ impl Runner {
                 }
             }
 
-            on_token(&text);
+            // A token that only completed part of a character yields no text yet;
+            // emitting an empty chunk would add noise to the stream.
+            if !text.is_empty() {
+                on_token(&text);
+            }
 
             generated_tokens += 1;
             session.cached_tokens.push(token);
@@ -4221,6 +4762,13 @@ impl Runner {
                 &mut logits,
             );
             pos += 1;
+        }
+
+        // Surface any half-emitted trailing character as U+FFFD.
+        let tail = stitcher.flush();
+        if !tail.is_empty() {
+            output.push_str(&tail);
+            on_token(&tail);
         }
 
         // Save logits as the starting point for the next turn's sampling.
@@ -4963,6 +5511,86 @@ mod tests {
             );
         }
         assert_eq!(RuntimeProfile::MistralUltra.as_str(), "mistral-ultra");
+    }
+
+    #[test]
+    /// Verifies the tool wire format is read from the template's marker set.
+    ///
+    /// `[CALL_ID]` is the only thing separating V11 from V13, and getting it
+    /// wrong sends Ministral 3 a call layout it was never trained on.
+    fn mistral_tool_format_detects_all_four_versions() {
+        use super::MistralToolFormat;
+        assert_eq!(
+            MistralToolFormat::from_template("[TOOL_CALLS][{\"name\": x}] [TOOL_RESULTS]"),
+            MistralToolFormat::V3
+        );
+        assert_eq!(
+            MistralToolFormat::from_template("[TOOL_RESULTS]id[TOOL_CONTENT]x[/TOOL_RESULTS]"),
+            MistralToolFormat::V7
+        );
+        assert_eq!(
+            MistralToolFormat::from_template("[TOOL_CALLS]name[CALL_ID]id[ARGS]{}"),
+            MistralToolFormat::V11
+        );
+        assert_eq!(
+            MistralToolFormat::from_template("[TOOL_CALLS]name[ARGS]{}[THINK]"),
+            MistralToolFormat::V13
+        );
+    }
+
+    #[test]
+    /// Verifies the V11/V13 control-token layout round-trips back into calls.
+    fn parse_mistral_tool_calls_reads_args_layout() {
+        let (prose, calls) = super::parse_mistral_tool_calls(
+            "Let me check.[TOOL_CALLS]get_weather[CALL_ID]abc123xyz[ARGS]{\"city\": \"Bonn\"}",
+        );
+        assert_eq!(prose, "Let me check.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].id, "abc123xyz");
+        assert_eq!(calls[0].arguments, "{\"city\": \"Bonn\"}");
+
+        // V13 drops the call id entirely.
+        let (_, calls) = super::parse_mistral_tool_calls("[TOOL_CALLS]ping[ARGS]{}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "ping");
+        assert!(calls[0].id.is_empty());
+
+        // Two calls in one turn must both survive.
+        let (_, calls) =
+            super::parse_mistral_tool_calls("[TOOL_CALLS]a[ARGS]{\"x\": 1}[TOOL_CALLS]b[ARGS]{}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].name, "b");
+    }
+
+    #[test]
+    /// Verifies the V3/V7 JSON-array layout, including nested braces in the
+    /// arguments object, which a naive brace scan would truncate.
+    fn parse_mistral_tool_calls_reads_json_array_layout() {
+        let (prose, calls) = super::parse_mistral_tool_calls(
+            "[TOOL_CALLS][{\"name\": \"search\", \"arguments\": {\"q\": {\"deep\": \"}\"}}, \"id\": \"VvvODy9mT\"}]",
+        );
+        assert!(prose.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].id, "VvvODy9mT");
+        // The brace inside the string literal must not end the value early.
+        assert_eq!(calls[0].arguments, "{\"q\": {\"deep\": \"}\"}}");
+    }
+
+    #[test]
+    /// Verifies that ordinary replies are untouched and a truncated call is
+    /// dropped rather than surfaced half-parsed.
+    fn parse_mistral_tool_calls_ignores_plain_and_truncated_output() {
+        let (prose, calls) = super::parse_mistral_tool_calls("Just a normal answer.");
+        assert_eq!(prose, "Just a normal answer.");
+        assert!(calls.is_empty());
+
+        let (_, calls) = super::parse_mistral_tool_calls("[TOOL_CALLS]weather[ARGS]{\"city\": ");
+        assert!(
+            calls.is_empty(),
+            "unterminated arguments must not yield a call"
+        );
     }
 
     #[test]

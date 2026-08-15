@@ -1870,6 +1870,7 @@ fn chat_message_json(message: &ChatMessage) -> serde_json::Value {
         rusty_llm::runtime::ChatRole::System => "system",
         rusty_llm::runtime::ChatRole::User => "user",
         rusty_llm::runtime::ChatRole::Assistant => "assistant",
+        rusty_llm::runtime::ChatRole::Tool => "tool",
     };
     serde_json::json!({ "role": role, "content": message.content })
 }

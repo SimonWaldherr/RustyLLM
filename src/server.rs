@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::gguf::MetaValue;
-use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner};
+use crate::runtime::{ChatMessage, ChatRole, GenerationOptions, Runner, ToolCall};
 use crate::session::SessionStore;
 #[cfg(feature = "tls")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -126,6 +126,13 @@ enum ApiMessageContent {
     Parts(Vec<ContentPart>),
 }
 
+impl Default for ApiMessageContent {
+    /// An assistant turn that only requests tool calls has null content.
+    fn default() -> Self {
+        Self::Text(String::new())
+    }
+}
+
 impl ApiMessageContent {
     /// Extract just the text, describing images with a placeholder.
     fn into_text(self) -> String {
@@ -211,7 +218,12 @@ struct GenerateRequest {
 #[derive(Deserialize)]
 struct ApiMessage {
     role: String,
+    #[serde(default)]
     content: ApiMessageContent,
+    /// Set on `role: "tool"` messages to identify the call being answered.
+    tool_call_id: Option<String>,
+    /// Set on assistant turns replaying tool calls the model previously made.
+    tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -235,6 +247,9 @@ struct OpenAiCompletionsRequest {
     thinking_max_tokens: Option<usize>,
     stop: Option<StopSpec>,
     response_format: Option<serde_json::Value>,
+    /// Accepted but unused: the legacy completions endpoint has no chat
+    /// structure to render a tool block into. Rejecting the field outright
+    /// would break clients that send one config to both endpoints.
     #[allow(dead_code)]
     tools: Option<Vec<serde_json::Value>>,
     #[allow(dead_code)]
@@ -524,6 +539,49 @@ struct OpenAiUsage {
 struct OpenAiChatMessage {
     role: &'static str,
     content: String,
+    /// Omitted entirely unless the model requested tools, so ordinary replies
+    /// keep the exact response shape clients already parse.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<OpenAiToolCall>,
+}
+
+/// One tool call in an OpenAI-compatible response.
+#[derive(Serialize)]
+struct OpenAiToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: OpenAiToolCallFunction,
+}
+
+#[derive(Serialize)]
+struct OpenAiToolCallFunction {
+    name: String,
+    /// OpenAI transports arguments as a JSON-encoded string, not an object,
+    /// even though Mistral emits them as an object on the wire.
+    arguments: String,
+}
+
+impl OpenAiToolCall {
+    /// Converts a runtime tool call into the OpenAI response shape.
+    ///
+    /// Mistral V13 emits no call id, but clients need one to correlate their
+    /// tool result, so a positional id is synthesised when it is missing.
+    fn from_runtime(index: usize, call: &ToolCall) -> Self {
+        let id = if call.id.is_empty() {
+            format!("call_{:08}", index)
+        } else {
+            call.id.clone()
+        };
+        Self {
+            id,
+            call_type: "function",
+            function: OpenAiToolCallFunction {
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1003,10 +1061,7 @@ fn parse_mcp_messages(items: &[serde_json::Value]) -> Result<Vec<ChatMessage>, (
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, String::from("message.content must be a string")))?;
             match role {
-                "system" => Ok(ChatMessage {
-                    role: ChatRole::System,
-                    content: content.to_string(),
-                }),
+                "system" => Ok(ChatMessage::new(ChatRole::System, content.to_string())),
                 "user" => Ok(ChatMessage::user(content.to_string())),
                 "assistant" => Ok(ChatMessage::assistant(content.to_string())),
                 other => Err((-32602, format!("Unsupported role: {}", other))),
@@ -2462,6 +2517,7 @@ fn route_openai_chat(
                 payload.thinking_max_tokens,
             );
             apply_response_format_hint(&mut generation, payload.response_format.as_ref());
+            generation.tools = tool_declarations(payload.tools.as_deref());
             let use_session = payload.cache_prompt.unwrap_or(false);
             let conv_id = payload.conversation_id.clone();
             let result = generate_with_optional_session(
@@ -2484,6 +2540,20 @@ fn route_openai_chat(
                     };
                     let cache_stats =
                         make_cache_stats(&result.stats, use_session, conv_id.as_deref());
+                    // A model that requested tools reports `tool_calls` as its
+                    // finish reason, which is how clients know to run them and
+                    // send results back rather than showing the text.
+                    let (content, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+                    let tool_calls: Vec<OpenAiToolCall> = calls
+                        .iter()
+                        .enumerate()
+                        .map(|(index, call)| OpenAiToolCall::from_runtime(index, call))
+                        .collect();
+                    let finish_reason = if tool_calls.is_empty() {
+                        "stop"
+                    } else {
+                        "tool_calls"
+                    };
                     json_response(OpenAiChatCompletionResponse {
                         id: format!("chatcmpl-rustyllm-{}", created),
                         object: "chat.completion",
@@ -2493,9 +2563,10 @@ fn route_openai_chat(
                             index: 0,
                             message: OpenAiChatMessage {
                                 role: "assistant",
-                                content: result.text,
+                                content,
+                                tool_calls,
                             },
-                            finish_reason: "stop",
+                            finish_reason,
                         }],
                         usage,
                         cache_stats,
@@ -3186,10 +3257,7 @@ fn parse_ollama_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage
     messages
         .into_iter()
         .map(|message| match message.role.as_str() {
-            "system" => Ok(ChatMessage {
-                role: ChatRole::System,
-                content: message.content,
-            }),
+            "system" => Ok(ChatMessage::new(ChatRole::System, message.content)),
             "user" => Ok(ChatMessage::user(message.content)),
             "assistant" => Ok(ChatMessage::assistant(message.content)),
             other => Err(format!("Unsupported role: {}", other)),
@@ -3286,8 +3354,16 @@ fn history_message_json(message: &ChatMessage) -> serde_json::Value {
         ChatRole::System => "system",
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Tool => "tool",
     };
-    serde_json::json!({ "role": role, "content": message.content })
+    match &message.tool_call_id {
+        Some(id) => serde_json::json!({
+            "role": role,
+            "content": message.content,
+            "tool_call_id": id,
+        }),
+        None => serde_json::json!({ "role": role, "content": message.content }),
+    }
 }
 
 /// Writes one named Server-Sent Event with a JSON body.
@@ -3541,10 +3617,7 @@ fn parse_response_message_item(value: &serde_json::Value) -> Result<Option<ChatM
         return Ok(None);
     }
     match role {
-        "system" | "developer" => Ok(Some(ChatMessage {
-            role: ChatRole::System,
-            content,
-        })),
+        "system" | "developer" => Ok(Some(ChatMessage::new(ChatRole::System, content))),
         "user" => Ok(Some(ChatMessage::user(content))),
         "assistant" => Ok(Some(ChatMessage::assistant(content))),
         other => Err(format!("Unsupported role: {}", other)),
@@ -3611,18 +3684,67 @@ fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, Str
     messages
         .into_iter()
         .map(|message| {
+            let role = message.role.clone();
+            let tool_call_id = message.tool_call_id.clone();
+            let tool_calls = message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.iter().filter_map(parse_api_tool_call).collect())
+                .unwrap_or_default();
             let content = message.content.into_text();
-            match message.role.as_str() {
-                "system" => Ok(ChatMessage {
-                    role: ChatRole::System,
-                    content,
-                }),
+            match role.as_str() {
+                "system" | "developer" => Ok(ChatMessage::new(ChatRole::System, content)),
                 "user" => Ok(ChatMessage::user(content)),
-                "assistant" => Ok(ChatMessage::assistant(content)),
+                "assistant" => {
+                    let mut assistant = ChatMessage::assistant(content);
+                    assistant.tool_calls = tool_calls;
+                    Ok(assistant)
+                }
+                "tool" => Ok(ChatMessage::tool_result(
+                    tool_call_id.unwrap_or_default(),
+                    content,
+                )),
                 other => Err(format!("Unsupported role: {}", other)),
             }
         })
         .collect()
+}
+
+/// Serialises OpenAI tool declarations for the prompt renderer.
+///
+/// The declarations are passed through as JSON text rather than re-modelled,
+/// because Mistral's `[AVAILABLE_TOOLS]` block expects the same OpenAI
+/// function-tool objects the client already sent.
+fn tool_declarations(tools: Option<&[serde_json::Value]>) -> Vec<String> {
+    tools
+        .unwrap_or_default()
+        .iter()
+        .map(|tool| tool.to_string())
+        .collect()
+}
+
+/// Converts one OpenAI `tool_calls` entry into a runtime [`ToolCall`].
+///
+/// OpenAI nests the payload under `function` and encodes `arguments` as a JSON
+/// *string*; entries missing a name are skipped rather than replayed as a
+/// malformed call the model would then imitate.
+fn parse_api_tool_call(value: &serde_json::Value) -> Option<ToolCall> {
+    let function = value.get("function").unwrap_or(value);
+    let name = function.get("name")?.as_str()?.to_string();
+    let arguments = match function.get("arguments") {
+        Some(serde_json::Value::String(raw)) => raw.clone(),
+        Some(other) => other.to_string(),
+        None => String::from("{}"),
+    };
+    Some(ToolCall {
+        id: value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        name,
+        arguments,
+    })
 }
 
 /// Resolve the requested model ID to a canonical name.
@@ -4094,6 +4216,7 @@ mod tests {
             ChatRole::System => "system",
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
+            ChatRole::Tool => "tool",
         }
     }
 }
