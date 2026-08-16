@@ -7258,6 +7258,153 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib bf16_kv_neon_speedup -- --ignored --nocapture"]
+    /// Compares the bf16-stored KV dot/axpy kernels against the equivalent
+    /// f32-stored path at a representative head_dim, to confirm the bf16 KV
+    /// cache (`KVCache::enable_bf16`) actually saves time on this machine
+    /// rather than just DRAM traffic, given the per-element widen cost.
+    fn bf16_kv_neon_speedup() {
+        const HEAD_DIM: usize = 128;
+        const POSITIONS: usize = 65536; // exceeds L2, matches long-context decode
+        const RUNS: usize = 4;
+
+        let query: Vec<f32> = (0..HEAD_DIM)
+            .map(|i| (i as f32 * 0.017).sin())
+            .collect();
+        let keys_f32: Vec<f32> = (0..POSITIONS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.0031).cos() * 0.5)
+            .collect();
+        let keys_bf16: Vec<u16> = keys_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let measure_f32 = || {
+            let mut checksum = 0.0f32;
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for pos in 0..POSITIONS {
+                    let row = &keys_f32[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                    checksum += dot_f32(&query, row);
+                }
+            }
+            (start.elapsed(), std::hint::black_box(checksum))
+        };
+        let measure_bf16 = || {
+            let mut checksum = 0.0f32;
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for pos in 0..POSITIONS {
+                    let row = &keys_bf16[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                    checksum += dot_bf16_f32(&query, row);
+                }
+            }
+            (start.elapsed(), std::hint::black_box(checksum))
+        };
+
+        // Correctness is checked per-position, not on the timing loops' summed
+        // checksums: with RUNS*POSITIONS additions of signed near-cancelling
+        // terms, an aggregate sum comparison is dominated by cancellation
+        // noise rather than actual per-dot bf16 rounding error.
+        let max_abs_err = (0..POSITIONS)
+            .map(|pos| {
+                let row_f32 = &keys_f32[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                let row_bf16 = &keys_bf16[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                (dot_bf16_f32(&query, row_bf16) - dot_f32(&query, row_f32)).abs()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_err <= 0.1,
+            "bf16 KV dot: max per-position error {max_abs_err} exceeds bf16 rounding budget"
+        );
+
+        let (f32_time, f32_sum) = measure_f32();
+        let (bf16_time, bf16_sum) = measure_bf16();
+        let speedup = f32_time.as_secs_f64() / bf16_time.as_secs_f64();
+        eprintln!(
+            "bf16 KV dot: f32={:.3} ms, bf16={:.3} ms, speedup={:.2}x (checksums f32={f32_sum:.3} bf16={bf16_sum:.3}, max per-position err={max_abs_err:.4})",
+            f32_time.as_secs_f64() * 1000.0,
+            bf16_time.as_secs_f64() * 1000.0,
+            speedup,
+        );
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib bf16x4_kv_neon_speedup -- --ignored --nocapture"]
+    /// Same comparison as `bf16_kv_neon_speedup` but for the fused 4-head GQA
+    /// kernels (`dot_bf16x4_f32` vs `dot_f32x4`), which is the kernel pair
+    /// actually used on the model's kv_mul == 4 decode path (model.rs:5662).
+    fn bf16x4_kv_neon_speedup() {
+        const HEAD_DIM: usize = 128;
+        const POSITIONS: usize = 65536; // exceeds L2, matches long-context decode
+        const RUNS: usize = 4;
+
+        let q: [Vec<f32>; 4] = std::array::from_fn(|h| {
+            (0..HEAD_DIM)
+                .map(|i| (i as f32 * 0.017 + h as f32).sin())
+                .collect()
+        });
+        let keys_f32: Vec<f32> = (0..POSITIONS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.0031).cos() * 0.5)
+            .collect();
+        let keys_bf16: Vec<u16> = keys_f32.iter().map(|&v| f32_to_bf16(v)).collect();
+
+        let measure_f32 = || {
+            let mut checksum = [0.0f32; 4];
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for pos in 0..POSITIONS {
+                    let row = &keys_f32[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                    let s = dot_f32x4(&q[0], &q[1], &q[2], &q[3], row);
+                    for i in 0..4 {
+                        checksum[i] += s[i];
+                    }
+                }
+            }
+            (start.elapsed(), std::hint::black_box(checksum))
+        };
+        let measure_bf16 = || {
+            let mut checksum = [0.0f32; 4];
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                for pos in 0..POSITIONS {
+                    let row = &keys_bf16[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                    let s = dot_bf16x4_f32(&q[0], &q[1], &q[2], &q[3], row);
+                    for i in 0..4 {
+                        checksum[i] += s[i];
+                    }
+                }
+            }
+            (start.elapsed(), std::hint::black_box(checksum))
+        };
+
+        // See bf16_kv_neon_speedup: compare per-position, not the timing
+        // loops' summed checksums, which cancel down to noise-dominated values.
+        let max_abs_err = (0..POSITIONS)
+            .map(|pos| {
+                let row_f32 = &keys_f32[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                let row_bf16 = &keys_bf16[pos * HEAD_DIM..(pos + 1) * HEAD_DIM];
+                let f32_scores = dot_f32x4(&q[0], &q[1], &q[2], &q[3], row_f32);
+                let bf16_scores = dot_bf16x4_f32(&q[0], &q[1], &q[2], &q[3], row_bf16);
+                (0..4)
+                    .map(|h| (bf16_scores[h] - f32_scores[h]).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_err <= 0.1,
+            "bf16x4 KV dot: max per-position error {max_abs_err} exceeds bf16 rounding budget"
+        );
+
+        let (f32_time, f32_sum) = measure_f32();
+        let (bf16_time, bf16_sum) = measure_bf16();
+        let speedup = f32_time.as_secs_f64() / bf16_time.as_secs_f64();
+        eprintln!(
+            "bf16x4 KV dot: f32={:.3} ms, bf16={:.3} ms, speedup={:.2}x (checksums f32={f32_sum:?} bf16={bf16_sum:?}, max per-position err={max_abs_err:.4})",
+            f32_time.as_secs_f64() * 1000.0,
+            bf16_time.as_secs_f64() * 1000.0,
+            speedup,
+        );
+    }
+
+    #[test]
     /// Verifies that fused Q4_K two-projection output matches separate projections.
     fn q4k_matvec2_matches_separate_matvecs() {
         set_num_threads(3);
