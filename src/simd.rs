@@ -7268,9 +7268,7 @@ mod tests {
         const POSITIONS: usize = 65536; // exceeds L2, matches long-context decode
         const RUNS: usize = 4;
 
-        let query: Vec<f32> = (0..HEAD_DIM)
-            .map(|i| (i as f32 * 0.017).sin())
-            .collect();
+        let query: Vec<f32> = (0..HEAD_DIM).map(|i| (i as f32 * 0.017).sin()).collect();
         let keys_f32: Vec<f32> = (0..POSITIONS * HEAD_DIM)
             .map(|i| (i as f32 * 0.0031).cos() * 0.5)
             .collect();
