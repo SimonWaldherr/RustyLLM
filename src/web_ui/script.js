@@ -43,13 +43,102 @@ function renderMarkdown(raw) {
   return out.replace(/^(<br>)+/, "").replace(/(<br>)+$/, "");
 }
 
-function appendText(el, text) {
-  el.dataset.raw = (el.dataset.raw || "") + text;
-  const btn = el.querySelector(".copy-btn");
-  el.innerHTML = renderMarkdown(el.dataset.raw);
-  if (btn) el.appendChild(btn);
-  const scrollEl = document.getElementById("scroll");
-  if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+const SCROLL_FOLLOW_THRESHOLD = 80;
+
+function isNearBottom(scrollEl) {
+  return !scrollEl
+    || scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight <= SCROLL_FOLLOW_THRESHOLD;
+}
+
+function followLatestIfNeeded(scrollEl, shouldFollow, onScrollStateChange) {
+  if (scrollEl && shouldFollow) scrollEl.scrollTop = scrollEl.scrollHeight;
+  if (onScrollStateChange) onScrollStateChange();
+}
+
+function messageContentEl(el) {
+  return el.querySelector(".msg-content") || el;
+}
+
+function setAssistantContent(el, text, markdown) {
+  el.dataset.raw = text;
+  const contentEl = messageContentEl(el);
+  if (markdown) contentEl.innerHTML = renderMarkdown(text);
+  else contentEl.textContent = text;
+}
+
+/*
+ * Keep the streaming hot path intentionally small: tokens are collected until
+ * the next animation frame and rendered as plain text. Markdown is parsed only
+ * when the response has finished, avoiding a full reparse and DOM replacement
+ * for every token.
+ */
+function createStreamingRenderer(outputEl, scrollEl, onScrollStateChange, liveRegionEl) {
+  const contentEl = messageContentEl(outputEl);
+  let output = outputEl.dataset.raw || "";
+  let pending = "";
+  let frameId = null;
+  let textNode = null;
+  let finished = false;
+  const previousLive = liveRegionEl?.getAttribute("aria-live") || "polite";
+
+  const requestFrame = typeof requestAnimationFrame === "function"
+    ? requestAnimationFrame
+    : (callback) => setTimeout(callback, 16);
+  const cancelFrame = typeof cancelAnimationFrame === "function"
+    ? cancelAnimationFrame
+    : clearTimeout;
+
+  outputEl.classList.add("is-streaming");
+  if (liveRegionEl) liveRegionEl.setAttribute("aria-live", "off");
+
+  function ensureTextNode() {
+    if (textNode) return;
+    textNode = document.createTextNode(output);
+    contentEl.replaceChildren(textNode);
+  }
+
+  function renderPending() {
+    if (!pending) return;
+    const shouldFollow = isNearBottom(scrollEl);
+    output += pending;
+    pending = "";
+    ensureTextNode();
+    textNode.data = output;
+    outputEl.dataset.raw = output;
+    followLatestIfNeeded(scrollEl, shouldFollow, onScrollStateChange);
+  }
+
+  function flush() {
+    if (frameId !== null) {
+      cancelFrame(frameId);
+      frameId = null;
+    }
+    renderPending();
+  }
+
+  return {
+    append(text) {
+      if (!text || finished) return;
+      pending += text;
+      if (frameId !== null) return;
+      frameId = requestFrame(() => {
+        frameId = null;
+        renderPending();
+      });
+    },
+    finish() {
+      if (finished) return output;
+      flush();
+      const shouldFollow = isNearBottom(scrollEl);
+      outputEl.dataset.raw = output;
+      contentEl.innerHTML = renderMarkdown(output);
+      outputEl.classList.remove("is-streaming");
+      finished = true;
+      if (liveRegionEl) liveRegionEl.setAttribute("aria-live", previousLive);
+      followLatestIfNeeded(scrollEl, shouldFollow, onScrollStateChange);
+      return output;
+    }
+  };
 }
 
 function attachCopyButton(el, onCopied) {
@@ -175,19 +264,23 @@ function initExpert() {
   }
 
   function addMessage(role, text, kind) {
+    const shouldFollow = isNearBottom(scrollEl);
     emptyEl.hidden = true;
     const el = document.createElement("article");
     el.className = "msg " + (kind || role);
     el.setAttribute("aria-label", role === "user" ? "Your message" : role === "assistant" ? "Assistant response" : "System message");
     el.dataset.raw = text;
     if (role === "assistant") {
-      el.innerHTML = renderMarkdown(text);
+      const contentEl = document.createElement("div");
+      contentEl.className = "msg-content";
+      contentEl.innerHTML = renderMarkdown(text);
+      el.appendChild(contentEl);
     } else {
       el.textContent = text;
     }
     attachCopyButton(el, () => announce("Message copied to clipboard"));
     messagesEl.appendChild(el);
-    scrollEl.scrollTop = scrollEl.scrollHeight;
+    followLatestIfNeeded(scrollEl, shouldFollow);
     return el;
   }
 
@@ -291,49 +384,57 @@ function initExpert() {
   }
 
   async function runStreaming(path, payload, mode, outputEl, signal) {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...payload, stream: true }),
-      signal
-    });
-    if (!response.ok || !response.body) {
-      throw new Error(apiErrorMessage(null, await response.text(), response.status));
-    }
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "", output = "", tokenCount = 0;
-    const startTime = Date.now();
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      buffer += decoder.decode(chunk.value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      for (const part of parts) {
-        const line = part.split("\n").find((l) => l.startsWith("data: "));
-        if (!line) continue;
-        const data = line.slice(6).trim();
-        if (data === "[DONE]") continue;
-        let evt;
-        try { evt = JSON.parse(data); } catch (_) { continue; }
-        const token = mode === "chat"
-          ? evt.choices?.[0]?.delta?.content || ""
-          : evt.choices?.[0]?.text || "";
-        if (token) {
-          output += token;
-          tokenCount++;
-          appendText(outputEl, token);
-          const elapsed = (Date.now() - startTime) / 1000;
-          if (elapsed > 0.3) updateStats((tokenCount / elapsed).toFixed(1) + " tok/s");
+    const liveRegionEl = outputEl === ragAnswerEl ? ragAnswerEl : messagesEl;
+    const renderer = createStreamingRenderer(outputEl, scrollEl, undefined, liveRegionEl);
+    announce("Generation started");
+    try {
+      const response = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...payload, stream: true }),
+        signal
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(apiErrorMessage(null, await response.text(), response.status));
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "", tokenCount = 0;
+      const startTime = Date.now();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          const line = part.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") continue;
+          let evt;
+          try { evt = JSON.parse(data); } catch (_) { continue; }
+          const token = mode === "chat"
+            ? evt.choices?.[0]?.delta?.content || ""
+            : evt.choices?.[0]?.text || "";
+          if (token) {
+            tokenCount++;
+            renderer.append(token);
+            const elapsed = (Date.now() - startTime) / 1000;
+            if (elapsed > 0.3) updateStats((tokenCount / elapsed).toFixed(1) + " tok/s");
+          }
         }
       }
+      const elapsed = (Date.now() - startTime) / 1000;
+      const output = renderer.finish();
+      if (tokenCount > 0 && elapsed > 0) {
+        updateStats(tokenCount + " tokens · " + (tokenCount / elapsed).toFixed(1) + " tok/s");
+      }
+      announce(tokenCount > 0 ? "Generation complete, " + tokenCount + " tokens" : "Generation complete");
+      return output;
+    } finally {
+      renderer.finish();
     }
-    const elapsed = (Date.now() - startTime) / 1000;
-    if (tokenCount > 0 && elapsed > 0) {
-      updateStats(tokenCount + " tokens · " + (tokenCount / elapsed).toFixed(1) + " tok/s");
-    }
-    return output;
   }
 
   function cosineSim(a, b) {
@@ -523,8 +624,7 @@ function initExpert() {
         } else {
           const result = await fetchJson("/v1/chat/completions", payload, turn.signal);
           answer = result.choices?.[0]?.message?.content || "";
-          assistantEl.dataset.raw = answer;
-          assistantEl.innerHTML = renderMarkdown(answer);
+          setAssistantContent(assistantEl, answer, true);
           updateStats("prompt " + result.usage.prompt_tokens + " / completion " + result.usage.completion_tokens + " / total " + result.usage.total_tokens);
         }
         if (turn.id === activeTurn) history.push(userMessage, { role: "assistant", content: answer });
@@ -538,8 +638,7 @@ function initExpert() {
         } else {
           const result = await fetchJson("/v1/completions", payload, turn.signal);
           const answer = result.choices?.[0]?.text || "";
-          assistantEl.dataset.raw = answer;
-          assistantEl.innerHTML = renderMarkdown(answer);
+          setAssistantContent(assistantEl, answer, true);
           updateStats("prompt " + result.usage.prompt_tokens + " / completion " + result.usage.completion_tokens + " / total " + result.usage.total_tokens);
         }
 
@@ -605,11 +704,15 @@ function initChat() {
   const statsEl          = document.getElementById("stats");
   const scrollBtnEl      = document.getElementById("scroll-btn");
   const announceEl       = document.getElementById("announce");
+  const retryConnectionEl = document.getElementById("retry-connection");
 
   const history = [];
   let controller = null;
   let activeTurn = 0;
   let currentSessionId = genId();
+  let serverReady = false;
+  let connectionAttempt = 0;
+  let readyStatus = "Ready";
 
   function genId() {
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -622,6 +725,44 @@ function initChat() {
 
   function updateStats(text) {
     statsEl.textContent = text || "";
+  }
+
+  async function fetchConnectionData(path) {
+    const response = await fetch(path);
+    const text = await response.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!response.ok) throw new Error(apiErrorMessage(parsed, text, response.status));
+    return parsed;
+  }
+
+  async function checkConnection() {
+    const attempt = ++connectionAttempt;
+    serverReady = false;
+    if (!controller) sendEl.disabled = true;
+    retryConnectionEl.hidden = true;
+    setStatus(statusEl, "busy", "Connecting…");
+    try {
+      const [health, models] = await Promise.all([
+        fetchConnectionData("/health"),
+        fetchConnectionData("/v1/models")
+      ]);
+      if (attempt !== connectionAttempt) return;
+      serverReady = true;
+      if (!controller) sendEl.disabled = false;
+      const modelCount = Array.isArray(models.data) ? models.data.length : 0;
+      const modelLabel = modelCount === 1 ? "1 model" : modelCount + " models";
+      readyStatus = modelCount ? "Ready · " + modelLabel : "Ready";
+      setStatus(statusEl, "ready", readyStatus);
+      announce("RustyLLM is ready" + (health?.status ? ", health " + health.status : ""));
+    } catch (err) {
+      if (attempt !== connectionAttempt) return;
+      serverReady = false;
+      if (!controller) sendEl.disabled = true;
+      retryConnectionEl.hidden = false;
+      setStatus(statusEl, "error", "Server unavailable");
+      announce("RustyLLM is unavailable. Retry connection.");
+    }
   }
 
   /* ── Preferences persistence ── */
@@ -704,7 +845,13 @@ function initChat() {
       const item = document.createElement("div");
       item.className = "history-item" + (s.id === currentSessionId ? " active" : "");
       item.setAttribute("role", "listitem");
-      item.title = s.title;
+
+      const selectBtn = document.createElement("button");
+      selectBtn.className = "history-item-select";
+      selectBtn.type = "button";
+      selectBtn.title = s.title;
+      selectBtn.setAttribute("aria-label", "Open conversation: " + s.title);
+      if (s.id === currentSessionId) selectBtn.setAttribute("aria-current", "page");
 
       const info = document.createElement("div");
       info.className = "history-item-info";
@@ -731,9 +878,10 @@ function initChat() {
 
       info.appendChild(titleEl);
       info.appendChild(dateEl);
-      item.appendChild(info);
+      selectBtn.appendChild(info);
+      item.appendChild(selectBtn);
       item.appendChild(delBtn);
-      item.addEventListener("click", () => loadSession(s));
+      selectBtn.addEventListener("click", () => loadSession(s));
       historyListEl.appendChild(item);
     }
   }
@@ -746,7 +894,10 @@ function initChat() {
       el.className = "msg " + msg.role;
       el.dataset.raw = msg.content;
       if (msg.role === "assistant") {
-        el.innerHTML = renderMarkdown(msg.content);
+        const contentEl = document.createElement("div");
+        contentEl.className = "msg-content";
+        contentEl.innerHTML = renderMarkdown(msg.content);
+        el.appendChild(contentEl);
       } else {
         el.textContent = msg.content;
       }
@@ -754,6 +905,7 @@ function initChat() {
       messagesEl.appendChild(el);
     }
     scrollEl.scrollTop = scrollEl.scrollHeight;
+    syncScrollButton();
   }
 
   function loadSession(session) {
@@ -797,11 +949,15 @@ function initChat() {
   });
 
   newChatEl.addEventListener("click", () => startNew());
+  retryConnectionEl.addEventListener("click", () => { checkConnection(); });
 
   /* ── Scroll-to-bottom button ── */
+  function syncScrollButton() {
+    scrollBtnEl.hidden = isNearBottom(scrollEl);
+  }
+
   scrollEl.addEventListener("scroll", () => {
-    const nearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 80;
-    scrollBtnEl.hidden = nearBottom;
+    syncScrollButton();
   });
   scrollBtnEl.addEventListener("click", () => {
     scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -818,16 +974,17 @@ function initChat() {
   });
 
   function setBusy(busy) {
-    sendEl.disabled = busy;
+    sendEl.disabled = busy || !serverReady;
     stopEl.disabled = !busy;
     if (busy) setStatus(statusEl, "busy", "Generating…");
-    else if (statusEl.dataset.state === "busy") setStatus(statusEl, "ready", "Ready");
+    else if (statusEl.dataset.state === "busy") setStatus(statusEl, "ready", readyStatus);
   }
 
   function beginTurn() {
     activeTurn += 1;
     controller = new AbortController();
     setBusy(true);
+    announce("Generation started");
     return { id: activeTurn, signal: controller.signal };
   }
 
@@ -839,20 +996,24 @@ function initChat() {
   }
 
   function addMessage(role, text) {
+    const shouldFollow = isNearBottom(scrollEl);
     emptyEl.hidden = true;
     const el = document.createElement("div");
     el.className = "msg " + role;
     el.dataset.raw = text;
     if (role === "assistant") {
-      el.innerHTML = text
+      const contentEl = document.createElement("div");
+      contentEl.className = "msg-content";
+      contentEl.innerHTML = text
         ? renderMarkdown(text)
         : '<span class="dots"><span>•</span><span>•</span><span>•</span></span>';
+      el.appendChild(contentEl);
     } else {
       el.textContent = text;
     }
     attachCopyButton(el);
     messagesEl.appendChild(el);
-    scrollEl.scrollTop = scrollEl.scrollHeight;
+    followLatestIfNeeded(scrollEl, shouldFollow, syncScrollButton);
     return el;
   }
 
@@ -875,6 +1036,10 @@ function initChat() {
     event.preventDefault();
     const text = promptEl.value.trim();
     if (!text || controller) return;
+    if (!serverReady) {
+      announce("RustyLLM is unavailable. Retry connection.");
+      return;
+    }
 
     promptEl.value = "";
     promptEl.style.height = "";
@@ -882,6 +1047,7 @@ function initChat() {
     addMessage("user", text);
     const userMessage = { role: "user", content: text };
     const assistantEl = addMessage("assistant", "");
+    const streamRenderer = createStreamingRenderer(assistantEl, scrollEl, syncScrollButton, messagesEl);
     let assistantText = "";
     let tokenCount = 0;
     const startTime = Date.now();
@@ -930,16 +1096,18 @@ function initChat() {
           if (token) {
             assistantText += token;
             tokenCount++;
-            appendText(assistantEl, token);
+            streamRenderer.append(token);
             const elapsed = (Date.now() - startTime) / 1000;
             if (elapsed > 0.3) updateStats((tokenCount / elapsed).toFixed(1) + " tok/s");
           }
         }
       }
+      streamRenderer.finish();
       const elapsed = (Date.now() - startTime) / 1000;
       if (tokenCount > 0 && elapsed > 0) {
         updateStats(tokenCount + " tokens · " + (tokenCount / elapsed).toFixed(1) + " tok/s");
       }
+      announce(tokenCount > 0 ? "Generation complete, " + tokenCount + " tokens" : "Generation complete");
       if (turn.id === activeTurn) {
         history.push(userMessage, { role: "assistant", content: assistantText });
         saveCurrentSession();
@@ -947,7 +1115,8 @@ function initChat() {
       }
     } catch (err) {
       if (err.name === "AbortError") {
-        appendText(assistantEl, "\n[stopped]");
+        streamRenderer.append("\n[stopped]");
+        streamRenderer.finish();
         announce("Generation stopped");
         if (assistantText && turn.id === activeTurn) {
           history.push(userMessage, { role: "assistant", content: assistantText });
@@ -955,8 +1124,8 @@ function initChat() {
           if (!historyPanelEl.hidden) renderHistoryList();
         }
       } else {
-        assistantEl.dataset.raw = "Error: " + err.message;
-        assistantEl.textContent = "Error: " + err.message;
+        streamRenderer.finish();
+        setAssistantContent(assistantEl, "Error: " + err.message, false);
         setStatus(statusEl, "error", "Error");
         announce("Error: " + err.message);
       }
@@ -964,6 +1133,9 @@ function initChat() {
       finishTurn(turn);
     }
   });
+
+  syncScrollButton();
+  checkConnection();
 }
 
 /* ── Bootstrap ── */

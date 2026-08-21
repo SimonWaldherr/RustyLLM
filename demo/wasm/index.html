@@ -15,7 +15,7 @@
       --accent:   #e05c2e;
       --accent2:  #5c8dee;
       --text:     #e8eaf0;
-      --muted:    #7a7f9a;
+      --muted:    #a2a8c0;
       --success:  #4caf82;
       --danger:   #e05555;
       --radius:   8px;
@@ -122,6 +122,8 @@
       border-color: var(--accent);
       background: rgba(224,92,46,0.05);
     }
+    .drop-zone.is-disabled { opacity: 0.55; cursor: wait; }
+    .drop-zone.is-disabled input[type=file] { cursor: wait; }
     .drop-zone input[type=file] {
       position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
     }
@@ -145,6 +147,7 @@
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex-shrink: 0; }
     .model-info span { font-size: 0.85rem; }
     .model-info .model-name { font-family: var(--font-mono); color: var(--success); font-size: 0.82rem; }
+    .model-actions { margin-left: auto; }
 
     /* ── Progress bar ── */
     .progress-wrap { margin-top: 14px; display: none; }
@@ -328,6 +331,18 @@
     }
     .error-msg.visible { display: block; }
 
+    .warning-msg {
+      background: rgba(224,176,46,0.1); border: 1px solid rgba(224,176,46,0.35);
+      border-radius: 8px; color: #f0c95a; font-size: 0.83rem;
+      padding: 10px 14px; margin-top: 12px; display: none;
+    }
+    .warning-msg.visible { display: block; }
+
+    .sr-only {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
+
     .kbd {
       display: inline-block; background: rgba(255,255,255,0.08);
       border: 1px solid rgba(255,255,255,0.15); border-radius: 4px;
@@ -342,6 +357,10 @@
       transition: opacity 0.2s, transform 0.2s; pointer-events: none;
     }
     .copy-toast.show { opacity: 1; transform: translateY(0); }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+    }
 
     @media (max-width: 820px) {
       header { padding: 16px 18px; }
@@ -398,25 +417,26 @@
   <!-- Model loader -->
   <div class="loader-card">
     <h2>Load Model</h2>
-    <div class="loader-tabs">
-      <button class="loader-tab active" type="button" data-ltab="file">Local file</button>
-      <button class="loader-tab" type="button" data-ltab="url">From URL</button>
+    <div class="loader-tabs" role="tablist" aria-label="Model source">
+      <button class="loader-tab active" id="loader-tab-file" type="button" role="tab" aria-selected="true" aria-controls="ltab-file" tabindex="0" data-ltab="file">Local file</button>
+      <button class="loader-tab" id="loader-tab-url" type="button" role="tab" aria-selected="false" aria-controls="ltab-url" tabindex="-1" data-ltab="url">From URL</button>
     </div>
 
-    <div class="loader-panel active" id="ltab-file">
+    <div class="loader-panel active" id="ltab-file" role="tabpanel" aria-labelledby="loader-tab-file">
       <div class="drop-zone" id="dropZone">
-        <input type="file" id="fileInput" accept=".gguf">
+        <input type="file" id="fileInput" accept=".gguf" aria-label="Choose a local GGUF model file" aria-describedby="fileHint">
         <p><strong>Drop a GGUF file here</strong> or click to browse<br>
-        <span style="font-size:0.78rem">Recommended: nomic-embed-text, all-MiniLM-L6-v2 (&lt;500 MB)</span></p>
+        <span id="fileHint" style="font-size:0.78rem">Recommended: nomic-embed-text, all-MiniLM-L6-v2 (&lt;500 MB)</span></p>
       </div>
     </div>
 
-    <div class="loader-panel" id="ltab-url">
+    <div class="loader-panel" id="ltab-url" role="tabpanel" aria-labelledby="loader-tab-url" hidden>
       <div class="url-row">
-        <input type="url" id="urlInput" placeholder="https://…/model.gguf">
+        <label class="sr-only" for="urlInput">GGUF model URL</label>
+        <input type="url" id="urlInput" placeholder="https://…/model.gguf" aria-describedby="urlHint">
         <button class="primary" id="urlLoadBtn" type="button">Load</button>
       </div>
-      <p class="url-hint">The server must send <code>Access-Control-Allow-Origin: *</code>.<br>
+      <p class="url-hint" id="urlHint">The server must send <code>Access-Control-Allow-Origin: *</code>.<br>
         Many models on <a href="https://huggingface.co" target="_blank" rel="noopener">Hugging Face</a> GGUF CDN support CORS.</p>
     </div>
 
@@ -425,48 +445,51 @@
         <span id="progressLabel">Loading…</span>
         <span id="progressPct"></span>
       </div>
-      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div class="progress-bar" role="progressbar" aria-label="Model load progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-fill" id="progressFill"></div></div>
+      <span class="sr-only" id="loadStatus" role="status" aria-live="polite"></span>
     </div>
     <div class="model-info" id="modelInfo">
       <div class="dot"></div>
-      <span>Model loaded:</span>
-      <span class="model-name" id="modelName">—</span>
+      <span id="modelStatus" role="status" aria-live="polite">No model loaded</span>
+      <span class="model-name" id="modelName" aria-hidden="true">—</span>
+      <div class="model-actions"><button class="secondary" id="unloadModelBtn" type="button">Unload model</button></div>
     </div>
-    <div class="error-msg" id="loaderError"></div>
+    <div class="warning-msg" id="modelWarning" role="status" aria-live="polite"></div>
+    <div class="error-msg" id="loaderError" role="alert"></div>
   </div>
 
   <!-- Tabs -->
   <div class="tabs" id="tabs">
-    <div class="tab-bar">
-      <button class="tab-btn active" type="button" data-tab="embedding">Embedding Search</button>
-      <button class="tab-btn" type="button" data-tab="generation">Text Generation</button>
+    <div class="tab-bar" role="tablist" aria-label="Model task">
+      <button class="tab-btn active" id="tab-button-embedding" type="button" role="tab" aria-selected="true" aria-controls="tab-embedding" tabindex="0" data-tab="embedding">Embedding Search</button>
+      <button class="tab-btn" id="tab-button-generation" type="button" role="tab" aria-selected="false" aria-controls="tab-generation" tabindex="-1" data-tab="generation">Text Generation</button>
     </div>
 
     <!-- Embedding tab -->
-    <div class="tab-panel active" id="tab-embedding">
+    <div class="tab-panel active" id="tab-embedding" role="tabpanel" aria-labelledby="tab-button-embedding">
       <div class="embedding-layout">
         <div class="card">
-          <label>Corpus</label>
+          <label for="corpusText1">Corpus</label>
           <div class="texts-grid" id="textsGrid">
             <div class="text-entry">
-              <div class="label-bubble">A</div>
-              <textarea>Albert Einstein was a theoretical physicist who developed the theory of relativity.</textarea>
-              <button class="remove-btn" type="button" title="Remove">×</button>
+              <div class="label-bubble" aria-hidden="true">A</div>
+              <textarea id="corpusText1" aria-label="Corpus text A">Albert Einstein was a theoretical physicist who developed the theory of relativity.</textarea>
+              <button class="remove-btn" type="button" title="Remove corpus item A" aria-label="Remove corpus item A">×</button>
             </div>
             <div class="text-entry">
-              <div class="label-bubble">B</div>
-              <textarea>Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.</textarea>
-              <button class="remove-btn" type="button" title="Remove">×</button>
+              <div class="label-bubble" aria-hidden="true">B</div>
+              <textarea id="corpusText2" aria-label="Corpus text B">Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.</textarea>
+              <button class="remove-btn" type="button" title="Remove corpus item B" aria-label="Remove corpus item B">×</button>
             </div>
             <div class="text-entry">
-              <div class="label-bubble">C</div>
-              <textarea>Bananas are sweet tropical fruit often used in smoothies and baked desserts.</textarea>
-              <button class="remove-btn" type="button" title="Remove">×</button>
+              <div class="label-bubble" aria-hidden="true">C</div>
+              <textarea id="corpusText3" aria-label="Corpus text C">Bananas are sweet tropical fruit often used in smoothies and baked desserts.</textarea>
+              <button class="remove-btn" type="button" title="Remove corpus item C" aria-label="Remove corpus item C">×</button>
             </div>
             <div class="text-entry">
-              <div class="label-bubble">D</div>
-              <textarea>Retrieval augmented generation finds relevant documents before asking a language model to answer.</textarea>
-              <button class="remove-btn" type="button" title="Remove">×</button>
+              <div class="label-bubble" aria-hidden="true">D</div>
+              <textarea id="corpusText4" aria-label="Corpus text D">Retrieval augmented generation finds relevant documents before asking a language model to answer.</textarea>
+              <button class="remove-btn" type="button" title="Remove corpus item D" aria-label="Remove corpus item D">×</button>
             </div>
           </div>
           <div class="text-entry-footer">
@@ -481,7 +504,7 @@
 
         <div>
           <div class="card query-box">
-            <label>Query</label>
+            <label for="queryInput">Query</label>
             <textarea id="queryInput">Who discovered relativity?</textarea>
           </div>
           <div class="card" id="rankingCard" style="display:none">
@@ -505,18 +528,18 @@
     </div>
 
     <!-- Generation tab -->
-    <div class="tab-panel" id="tab-generation">
+    <div class="tab-panel" id="tab-generation" role="tabpanel" aria-labelledby="tab-button-generation" hidden>
       <div class="card">
-        <label>Prompt</label>
+        <label for="promptInput">Prompt</label>
         <textarea id="promptInput" style="min-height:100px" placeholder="Who was Marie Curie?"></textarea>
 
         <div class="gen-controls" style="margin-top:14px;">
           <div>
-            <label>Max tokens</label>
+            <label for="maxTokens">Max tokens</label>
             <input type="number" id="maxTokens" value="128" min="1" max="2048">
           </div>
           <div>
-            <label>Temperature</label>
+            <label for="temperature">Temperature</label>
             <input type="number" id="temperature" value="0.7" min="0" max="2" step="0.05">
           </div>
           <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-start;">
@@ -534,7 +557,7 @@
             <button class="secondary" id="clearBtn" type="button">Clear</button>
           </div>
         </div>
-        <div class="output-box" id="genOutput"></div>
+        <div class="output-box" id="genOutput" role="region" aria-label="Generated output" tabindex="0"></div>
         <div class="stats-bar" id="genStats"></div>
       </div>
       <div class="error-msg" id="genError"></div>
@@ -543,15 +566,23 @@
 
 </main>
 
-<div class="copy-toast" id="copyToast">Copied!</div>
+<div class="copy-toast" id="copyToast" role="status" aria-live="polite">Copied!</div>
 
 <script type="module">
   import init, { WasmRunner } from './pkg/rusty_llm.js';
 
-  await init();
+  let wasmInitError = null;
+  try {
+    await init();
+  } catch (error) {
+    wasmInitError = error;
+  }
 
   let runner = null;
+  let loadInProgress = false;
+  let lastProgressAnnouncement = '';
   const embedCache = new Map(); // text -> Float32Array
+  const MODEL_WARNING_BYTES = 500 * 1024 * 1024;
   const SAMPLE_TEXTS = [
     'Albert Einstein was a theoretical physicist who developed the theory of relativity.',
     'Marie Curie researched radioactivity and won Nobel Prizes in physics and chemistry.',
@@ -562,14 +593,38 @@
   const LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
   // ── Loader sub-tabs ───────────────────────────────────────────────────────────
-  document.querySelectorAll('.loader-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.loader-tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.loader-panel').forEach(p => p.classList.remove('active'));
-      tab.classList.add('active');
-      document.getElementById('ltab-' + tab.dataset.ltab).classList.add('active');
+  function installTabs(tabSelector, panelPrefix, dataKey) {
+    const tabs = [...document.querySelectorAll(tabSelector)];
+
+    function activate(tab, focus = false) {
+      tabs.forEach(candidate => {
+        const active = candidate === tab;
+        candidate.classList.toggle('active', active);
+        candidate.setAttribute('aria-selected', String(active));
+        candidate.tabIndex = active ? 0 : -1;
+        const panel = document.getElementById(panelPrefix + candidate.dataset[dataKey]);
+        panel.classList.toggle('active', active);
+        panel.hidden = !active;
+      });
+      if (focus) tab.focus();
+    }
+
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => activate(tab));
+      tab.addEventListener('keydown', event => {
+        let nextIndex = null;
+        if (event.key === 'ArrowRight' || event.key === 'ArrowDown') nextIndex = (index + 1) % tabs.length;
+        if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') nextIndex = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === 'Home') nextIndex = 0;
+        if (event.key === 'End') nextIndex = tabs.length - 1;
+        if (nextIndex === null) return;
+        event.preventDefault();
+        activate(tabs[nextIndex], true);
+      });
     });
-  });
+  }
+
+  installTabs('.loader-tab', 'ltab-', 'ltab');
 
   // ── Helpers ───────────────────────────────────────────────────────────────────
   function showError(id, msg) {
@@ -582,10 +637,25 @@
     document.getElementById(id).classList.remove('visible');
   }
 
+  function showWarning(msg) {
+    const el = document.getElementById('modelWarning');
+    el.textContent = msg;
+    el.classList.add('visible');
+  }
+
+  function hideWarning() {
+    document.getElementById('modelWarning').classList.remove('visible');
+  }
+
   function setProgress(pct, label, right = '') {
     document.getElementById('progressFill').style.width = pct + '%';
     document.getElementById('progressLabel').textContent = label;
     document.getElementById('progressPct').textContent = right;
+    document.querySelector('.progress-bar').setAttribute('aria-valuenow', String(Math.round(pct)));
+    if (label !== lastProgressAnnouncement) {
+      document.getElementById('loadStatus').textContent = label;
+      lastProgressAnnouncement = label;
+    }
   }
 
   function escapeHtml(text) {
@@ -608,46 +678,157 @@
 
   function setButtonBusy(btn, label, busy) {
     btn.disabled = busy;
-    btn.innerHTML = busy ? `<span class="spinner"></span>${label}` : label;
+    btn.innerHTML = busy ? `<span class="spinner" aria-hidden="true"></span>${label}` : label;
   }
 
   // ── Model loading ─────────────────────────────────────────────────────────────
-  async function loadBytes(fetchFn, displayName) {
-    hideError('loaderError');
-    embedCache.clear();
-    const progressWrap = document.getElementById('progressWrap');
-    const modelInfo    = document.getElementById('modelInfo');
+  class ModelLoadCancelledError extends Error {}
 
+  function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return 'an unknown size';
+    if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+    return `${Math.ceil(bytes / 1024 ** 2)} MB`;
+  }
+
+  function largeModelWarning(bytes, displayName) {
+    const size = formatBytes(bytes);
+    const estimatedPeak = formatBytes(bytes * 2.5);
+    return `${displayName} is ${size}. This demo keeps both model data and WebAssembly weights in browser memory; loading can need roughly ${estimatedPeak} of RAM. For large Qwen GGUFs, use native RustyLLM instead.`;
+  }
+
+  function confirmLargeModel(bytes, displayName) {
+    if (!Number.isFinite(bytes) || bytes < MODEL_WARNING_BYTES) return true;
+    const warning = largeModelWarning(bytes, displayName);
+    showWarning(warning);
+    return window.confirm(`${warning}\n\nContinue loading it in this browser?`);
+  }
+
+  function clearModelResults() {
+    document.getElementById('simCard').style.display = 'none';
+    document.getElementById('rankingCard').style.display = 'none';
+    document.getElementById('genOutputCard').style.display = 'none';
+    document.getElementById('genOutput').textContent = '';
+    document.getElementById('genStats').innerHTML = '';
+    hideError('embedError');
+    hideError('genError');
+  }
+
+  function setTaskAvailability(available) {
+    const enabled = available && !loadInProgress && !wasmInitError;
+    document.getElementById('embedBtn').disabled = !enabled;
+    document.getElementById('generateBtn').disabled = !enabled;
+    document.getElementById('unloadModelBtn').disabled = !runner || loadInProgress;
+  }
+
+  function setModelAvailable(available) {
+    document.getElementById('tabs').classList.toggle('visible', available);
+    document.getElementById('modelInfo').classList.toggle('visible', available);
+    if (!available) {
+      document.getElementById('modelName').textContent = '—';
+      document.getElementById('modelStatus').textContent = 'No model loaded';
+      clearModelResults();
+    }
+    setTaskAvailability(available && !loadInProgress);
+  }
+
+  function releaseRunner() {
+    const previousRunner = runner;
+    runner = null;
+    embedCache.clear();
+    if (!previousRunner) return;
+    try {
+      previousRunner.free();
+    } catch (error) {
+      // The next model load must not be blocked if a partially constructed runner cannot free itself.
+      console.warn('Could not release the previous WASM model:', error);
+    }
+  }
+
+  function setLoaderBusy(busy) {
+    const disabled = busy || Boolean(wasmInitError);
+    document.getElementById('fileInput').disabled = disabled;
+    document.getElementById('urlInput').disabled = disabled;
+    document.getElementById('urlLoadBtn').disabled = disabled;
+    document.getElementById('dropZone').classList.toggle('is-disabled', disabled);
+    document.getElementById('dropZone').setAttribute('aria-disabled', String(disabled));
+    document.getElementById('unloadModelBtn').disabled = disabled || !runner;
+  }
+
+  async function loadBytes(fetchFn, displayName) {
+    if (wasmInitError) {
+      showError('loaderError', 'The WebAssembly runtime is unavailable. Rebuild the demo package, then reload this page.');
+      return;
+    }
+    if (loadInProgress) {
+      showWarning('A model is already loading. Wait for it to finish before choosing another model.');
+      return;
+    }
+
+    loadInProgress = true;
+    hideError('loaderError');
+    const progressWrap = document.getElementById('progressWrap');
+    setLoaderBusy(true);
+    setTaskAvailability(false);
     progressWrap.classList.add('visible');
-    modelInfo.classList.remove('visible');
     setProgress(2, `Reading ${displayName}…`);
 
     let bytes;
+    let candidateRunner = null;
+    let previousRunnerReleased = false;
     try {
-      bytes = await fetchFn(pct => setProgress(2 + pct * 0.65, 'Reading…', `${pct.toFixed(0)}%`));
-    } catch (e) {
+      const loaded = await fetchFn(pct => setProgress(2 + pct * 0.65, 'Reading…', `${pct.toFixed(0)}%`));
+      bytes = loaded instanceof Uint8Array ? loaded : loaded?.bytes;
+      if (!bytes?.byteLength) throw new Error('The selected file is empty.');
+      if (loaded?.sizeWasReported === false && bytes.byteLength >= MODEL_WARNING_BYTES && !confirmLargeModel(bytes.byteLength, displayName)) {
+        throw new ModelLoadCancelledError();
+      }
+
+      // Releasing first avoids briefly holding two complete models in browser memory.
+      setProgress(70, 'Releasing previous model…', '');
+      releaseRunner();
+      previousRunnerReleased = true;
+      setModelAvailable(false);
+      await yieldToBrowser();
+
+      setProgress(78, 'Parsing model weights…', '');
+      candidateRunner = new WasmRunner(bytes);
+      const modelName = candidateRunner.model_name || displayName;
+      bytes = null;
+      runner = candidateRunner;
+      candidateRunner = null;
+
+      setProgress(100, 'Done!', '');
+      document.getElementById('modelName').textContent = modelName;
+      document.getElementById('modelStatus').textContent = `Model loaded: ${modelName}`;
+      setModelAvailable(true);
+      setTimeout(() => {
+        if (!loadInProgress) progressWrap.classList.remove('visible');
+      }, 800);
+    } catch (error) {
       progressWrap.classList.remove('visible');
-      showError('loaderError', `Failed to read file: ${e}`);
-      return;
+      if (candidateRunner) {
+        try { candidateRunner.free(); } catch {}
+      }
+      if (previousRunnerReleased) {
+        releaseRunner();
+        setModelAvailable(false);
+      }
+      if (error instanceof ModelLoadCancelledError) {
+        showWarning('Model loading was cancelled. Choose a smaller GGUF or use native RustyLLM for large models.');
+      } else {
+        showError('loaderError', `Could not load ${displayName}: ${errorMessage(error)}`);
+      }
+      // A read failure leaves the previously loaded model intact; a parse failure does not.
+      setTaskAvailability(Boolean(runner));
+    } finally {
+      loadInProgress = false;
+      setLoaderBusy(false);
+      setTaskAvailability(Boolean(runner));
     }
-
-    setProgress(70, 'Parsing model weights…', '');
-    try {
-      runner = new WasmRunner(bytes);
-    } catch (e) {
-      progressWrap.classList.remove('visible');
-      showError('loaderError', `Failed to load model: ${e}`);
-      return;
-    }
-
-    setProgress(100, 'Done!', '');
-    setTimeout(() => progressWrap.classList.remove('visible'), 800);
-
-    document.getElementById('modelName').textContent = runner.model_name;
-    modelInfo.classList.add('visible');
-    document.getElementById('embedBtn').disabled    = false;
-    document.getElementById('generateBtn').disabled = false;
-    document.getElementById('tabs').classList.add('visible');
   }
 
   function readFile(file) {
@@ -660,10 +841,20 @@
     });
   }
 
-  async function fetchWithProgress(url, onProgress) {
+  async function fetchWithProgress(url, onProgress, onSize) {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
     const total  = parseInt(resp.headers.get('Content-Length') || '0', 10);
+    if (total > 0 && onSize && !onSize(total)) throw new ModelLoadCancelledError();
+    if (total <= 0) {
+      showWarning('This server did not provide a download size. The full model must still fit in browser memory before it can be loaded.');
+    }
+    if (!resp.body) {
+      return {
+        bytes: new Uint8Array(await resp.arrayBuffer()),
+        sizeWasReported: total > 0
+      };
+    }
     const reader = resp.body.getReader();
     const chunks = [];
     let loaded = 0;
@@ -677,50 +868,81 @@
     const out = new Uint8Array(loaded);
     let off = 0;
     for (const chunk of chunks) { out.set(chunk, off); off += chunk.length; }
-    return out;
+    return { bytes: out, sizeWasReported: total > 0 };
   }
 
   // ── Drag & drop ───────────────────────────────────────────────────────────────
   const dropZone  = document.getElementById('dropZone');
   const fileInput = document.getElementById('fileInput');
 
-  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  function loadFile(file) {
+    hideWarning();
+    if (!confirmLargeModel(file.size, file.name)) return;
+    loadBytes(readFile(file), file.name);
+  }
+
+  dropZone.addEventListener('dragover', e => {
+    if (loadInProgress || wasmInitError) return;
+    e.preventDefault();
+    dropZone.classList.add('drag-over');
+  });
   dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
   dropZone.addEventListener('drop', e => {
     e.preventDefault();
     dropZone.classList.remove('drag-over');
+    if (loadInProgress || wasmInitError) return;
     const f = e.dataTransfer.files[0];
-    if (f) loadBytes(readFile(f), f.name);
+    if (f) loadFile(f);
   });
   fileInput.addEventListener('change', () => {
     const f = fileInput.files[0];
-    if (f) loadBytes(readFile(f), f.name);
+    if (f) loadFile(f);
+    fileInput.value = '';
   });
 
   document.getElementById('urlLoadBtn').addEventListener('click', () => {
     const url = document.getElementById('urlInput').value.trim();
     if (!url) return;
     const name = url.split('/').pop() || 'model.gguf';
-    loadBytes(onProgress => fetchWithProgress(url, onProgress), name);
+    hideWarning();
+    loadBytes(onProgress => fetchWithProgress(url, onProgress, size => confirmLargeModel(size, name)), name);
   });
 
   // ── Main tabs ─────────────────────────────────────────────────────────────────
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    });
+  installTabs('.tab-btn', 'tab-', 'tab');
+
+  document.getElementById('unloadModelBtn').addEventListener('click', () => {
+    if (loadInProgress || !runner) return;
+    releaseRunner();
+    setModelAvailable(false);
+    hideError('loaderError');
   });
+
+  if (wasmInitError) {
+    setLoaderBusy(true);
+    showError(
+      'loaderError',
+      `The WebAssembly runtime could not start. Run make wasm, then serve demo/wasm/pkg/rusty_llm_bg.wasm with application/wasm. (${errorMessage(wasmInitError)})`
+    );
+  } else {
+    setLoaderBusy(false);
+  }
+
+  window.addEventListener('pagehide', releaseRunner, { once: true });
 
   // ── Text entries ──────────────────────────────────────────────────────────────
   function syncTextUI() {
     const entries = [...document.querySelectorAll('#textsGrid .text-entry')];
     entries.forEach((entry, i) => {
-      entry.querySelector('.label-bubble').textContent = LABELS[i];
+      const label = LABELS[i];
+      entry.querySelector('.label-bubble').textContent = label;
+      const textarea = entry.querySelector('textarea');
+      textarea.id = `corpusText${i + 1}`;
+      textarea.setAttribute('aria-label', `Corpus text ${label}`);
       const btn = entry.querySelector('.remove-btn');
       btn.disabled = entries.length <= 2;
+      btn.title = `Remove corpus item ${label}`;
+      btn.setAttribute('aria-label', `Remove corpus item ${label}`);
     });
     document.getElementById('textCount').textContent = `${entries.length} / 8`;
     document.getElementById('addTextBtn').disabled = entries.length >= 8;
@@ -747,7 +969,7 @@
       const entry = document.createElement('div');
       entry.className = 'text-entry';
       entry.innerHTML = `
-        <div class="label-bubble"></div>
+        <div class="label-bubble" aria-hidden="true"></div>
         <textarea></textarea>
         <button class="remove-btn" type="button" title="Remove">×</button>`;
       entry.querySelector('textarea').value = text;
@@ -758,7 +980,7 @@
       const entry = document.createElement('div');
       entry.className = 'text-entry';
       entry.innerHTML = `
-        <div class="label-bubble"></div>
+        <div class="label-bubble" aria-hidden="true"></div>
         <textarea placeholder="Enter text…"></textarea>
         <button class="remove-btn" type="button" title="Remove">×</button>`;
       grid.appendChild(entry);
@@ -788,7 +1010,7 @@
     const entry = document.createElement('div');
     entry.className = 'text-entry';
     entry.innerHTML = `
-      <div class="label-bubble"></div>
+      <div class="label-bubble" aria-hidden="true"></div>
       <textarea placeholder="Enter text…"></textarea>
       <button class="remove-btn" type="button" title="Remove">×</button>`;
     grid.appendChild(entry);
@@ -861,11 +1083,11 @@
       }
     }
 
-    let html = '<table><thead><tr><th></th>';
-    entries.forEach(entry => { html += `<th>${entry.label}</th>`; });
+    let html = '<table><caption class="sr-only">Cosine similarity between corpus texts</caption><thead><tr><th scope="col"></th>';
+    entries.forEach(entry => { html += `<th scope="col">${entry.label}</th>`; });
     html += '</tr></thead><tbody>';
     for (let i = 0; i < n; i++) {
-      html += `<tr><th>${entries[i].label}</th>`;
+      html += `<tr><th scope="row">${entries[i].label}</th>`;
       for (let j = 0; j < n; j++) {
         if (i === j) {
           html += '<td class="self">—</td>';
@@ -909,6 +1131,10 @@
 
   async function runEmbedding() {
     hideError('embedError');
+    if (!runner || loadInProgress) {
+      showError('embedError', 'Load an embedding-capable model before running retrieval.');
+      return;
+    }
     const btn = document.getElementById('embedBtn');
     setButtonBusy(btn, 'Embedding…', true);
     await yieldToBrowser();
@@ -928,17 +1154,17 @@
     try {
       embeddings = [];
       for (let i = 0; i < entries.length; i++) {
-        btn.innerHTML = `<span class="spinner"></span>Embedding ${i + 1}/${entries.length}`;
+        btn.innerHTML = `<span class="spinner" aria-hidden="true"></span>Embedding ${i + 1}/${entries.length}`;
         await yieldToBrowser();
         embeddings.push(await embedText(entries[i].text, counters));
       }
       if (query) {
-        btn.innerHTML = '<span class="spinner"></span>Ranking';
+        btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Ranking';
         await yieldToBrowser();
         queryEmbedding = await embedText(query, counters);
       }
-    } catch (e) {
-      showError('embedError', `Embedding failed: ${e}`);
+    } catch (error) {
+      showError('embedError', `Embedding failed: ${errorMessage(error)}`);
       setButtonBusy(btn, 'Run retrieval', false);
       return;
     }
@@ -967,6 +1193,10 @@
   // ── Generation ────────────────────────────────────────────────────────────────
   function runGeneration() {
     hideError('genError');
+    if (!runner || loadInProgress) {
+      showError('genError', 'Load a text-generation-capable model before generating.');
+      return;
+    }
     const btn    = document.getElementById('generateBtn');
     const prompt = document.getElementById('promptInput').value.trim();
     if (!prompt) { showError('genError', 'Please enter a prompt.'); return; }
@@ -975,7 +1205,8 @@
     const temp      = parseFloat(document.getElementById('temperature').value) || 0.7;
 
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Generating…';
+    btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Generating…';
+    document.getElementById('genOutput').setAttribute('aria-busy', 'true');
 
     const t0 = performance.now();
 
@@ -985,10 +1216,11 @@
       try {
         result  = runner.generate(prompt, maxTokens, temp);
         elapsed = (performance.now() - t0) / 1000;
-      } catch (e) {
-        showError('genError', `Generation failed: ${e}`);
+      } catch (error) {
+        showError('genError', `Generation failed: ${errorMessage(error)}`);
         btn.disabled = false;
         btn.textContent = 'Generate';
+        document.getElementById('genOutput').setAttribute('aria-busy', 'false');
         return;
       }
 
@@ -997,17 +1229,18 @@
       outEl.classList.remove('placeholder');
 
       const wordCount = result.split(/\s+/).filter(Boolean).length;
-      const tokPerSec = (wordCount / elapsed).toFixed(1);
+      const wordsPerSec = (wordCount / elapsed).toFixed(1);
       document.getElementById('genStats').innerHTML =
         `<span class="stat">Time: <strong>${elapsed.toFixed(2)}s</strong></span>` +
         `<span class="stat">~Words: <strong>${wordCount}</strong></span>` +
-        `<span class="stat">~Tok/s: <strong>${tokPerSec}</strong></span>`;
+        `<span class="stat">~Words/s: <strong>${wordsPerSec}</strong></span>`;
 
       document.getElementById('genOutputCard').style.display = 'block';
       try { sessionStorage.setItem('lastPrompt', prompt); } catch {}
 
       btn.disabled = false;
       btn.textContent = 'Generate';
+      outEl.setAttribute('aria-busy', 'false');
     }, 20);
   }
 

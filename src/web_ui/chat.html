@@ -39,7 +39,8 @@
         <a href="/chat?expert">Expert</a>
         <a href="/explorer">Explorer</a>
       </nav>
-      <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+      <div id="status" class="status" role="status" aria-live="polite" data-state="busy">Connecting…</div>
+      <button id="retry-connection" class="ghost connection-retry" type="button" hidden>Retry</button>
     </div>
   </header>
 
@@ -52,7 +53,7 @@
     <main id="scroll" aria-label="Conversation">
       <div class="messages" id="messages" role="log" aria-label="Message history" aria-live="polite" aria-relevant="additions">
         <div class="empty" id="empty">
-          <p class="eyebrow">Ready when you are</p>
+          <p class="eyebrow">Local inference workspace</p>
           <h2>What would you like to explore?</h2>
           <p>Start with a prompt below or write your own message.</p>
           <div class="suggestions" aria-label="Example prompts">
@@ -90,7 +91,7 @@
         <span id="tempValue">0.70</span>
       </label>
       <label class="toggle"><input id="thinking" type="checkbox" autocomplete="off"> Thinking</label>
-      <div id="stats" class="stats" aria-live="polite" aria-atomic="true"></div>
+      <div id="stats" class="stats" aria-live="off" aria-atomic="true"></div>
     </div>
     <details id="thinkingDetails" class="thinking-details">
       <summary>Thinking prompt</summary>

@@ -62,6 +62,14 @@ impl Session {
         self.cached_tokens.clear();
         self.last_logits.clear();
         self.recent.clear();
+        // Attention KV rows are bounded by the current prompt positions and
+        // are overwritten on a cold prefill. Hybrid Gated-DeltaNet/Mamba
+        // state is position-independent and updated in place, so it must be
+        // cleared explicitly or a reset conversation would retain the prior
+        // turn's recurrent history.
+        if let Some(ssm) = &mut self.kv_cache.ssm {
+            ssm.reset();
+        }
         self.cached_tokens_served = 0;
         self.evaluated_tokens = 0;
     }
@@ -156,7 +164,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Config, DecodeBuffer, KVCache};
+    use crate::model::{Config, DecodeBuffer, KVCache, SsmDims, SsmState};
 
     /// Builds a minimal session used by store behavior tests.
     fn dummy_session() -> Session {
@@ -201,6 +209,28 @@ mod tests {
         assert!(s.last_logits.is_empty());
         assert_eq!(s.cached_tokens_served, 0);
         assert_eq!(s.evaluated_tokens, 0);
+    }
+
+    #[test]
+    fn session_reset_clears_hybrid_recurrent_state() {
+        let mut session = dummy_session();
+        let dims = SsmDims {
+            d_conv: 4,
+            d_inner: 2,
+            d_state: 1,
+            n_head: 2,
+            n_group: 1,
+        };
+        let mut ssm = SsmState::new(1, dims);
+        ssm.conv[0].fill(1.0);
+        ssm.ssm[0].fill(-2.0);
+        session.kv_cache.ssm = Some(ssm);
+
+        session.reset();
+
+        let cleared = session.kv_cache.ssm.as_ref().expect("recurrent state");
+        assert!(cleared.conv[0].iter().all(|value| *value == 0.0));
+        assert!(cleared.ssm[0].iter().all(|value| *value == 0.0));
     }
 
     #[test]

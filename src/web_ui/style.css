@@ -214,6 +214,8 @@ input, select, textarea { accent-color: var(--accent); }
   background: var(--assistant);
   white-space: normal;
 }
+.msg.is-streaming .msg-content,
+.rag-answer.is-streaming { white-space: pre-wrap; }
 .msg.tool { padding-top: 14px; }
 .msg pre {
   margin: 8px 0;
@@ -1094,12 +1096,10 @@ body.chat .history-item {
   grid-template-columns: 1fr auto;
   gap: 4px;
   align-items: start;
-  padding: 9px 10px;
+  padding: 3px 4px 3px 8px;
   border-radius: 8px;
-  cursor: pointer;
   border: 1px solid transparent;
   transition: background 0.12s, border-color 0.12s;
-  user-select: none;
 }
 body.chat .history-item:hover {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
@@ -1108,6 +1108,18 @@ body.chat .history-item:hover {
 body.chat .history-item.active {
   background: color-mix(in srgb, var(--accent) 13%, transparent);
   border-color: color-mix(in srgb, var(--accent) 38%, var(--line));
+}
+body.chat .history-item-select {
+  min-height: auto;
+  width: 100%;
+  padding: 6px 2px;
+  overflow: hidden;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
 }
 body.chat .history-item-info { overflow: hidden; }
 body.chat .history-item-title {
@@ -1136,7 +1148,12 @@ body.chat .history-item-del {
   flex-shrink: 0;
 }
 body.chat .history-item:hover .history-item-del { opacity: 1; }
+body.chat .history-item:focus-within .history-item-del { opacity: 1; }
 body.chat .history-item-del:hover { color: var(--accent-2); filter: none; }
+
+@media (hover: none) {
+  body.chat .history-item-del { opacity: 1; }
+}
 
 body.chat main {
   flex: 1;

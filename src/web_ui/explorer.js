@@ -9,9 +9,25 @@
   const tensorFilterEl = $("tensorFilter");
   const statusEl = $("status");
   const announceEl = $("announce");
+  const exploreButton = $("explore");
+  const clearTokenButton = $("clearToken");
+  const retryModelButton = $("retryModel");
+  const modelStateEl = $("modelState");
+  const showMoreTensorsButton = $("showMoreTensors");
 
   let modelInfo = null;
   let allTensors = [];
+  let tensorSearchIndex = [];
+  let tensorPage = 0;
+  let tensorFilterTimer = null;
+  let modelReady = false;
+  let exploreController = null;
+  let exploreRequestId = 0;
+  let modelController = null;
+  let modelRequestId = 0;
+
+  const TENSOR_PAGE_SIZE = 250;
+  const TENSOR_FILTER_DEBOUNCE_MS = 150;
 
   function announce(message) {
     statusEl.textContent = message;
@@ -28,7 +44,7 @@
     return String(message).slice(0, 280);
   }
 
-  async function fetchJson(path, payload) {
+  async function fetchJson(path, payload, signal) {
     const options = payload === undefined
       ? {}
       : {
@@ -36,6 +52,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         };
+    if (signal) options.signal = signal;
     const res = await fetch(path, options);
     const text = await res.text();
     let data = {};
@@ -169,9 +186,13 @@
   }
 
   function renderError(target, title, message) {
+    renderPanelState(target, title, message, true);
+  }
+
+  function renderPanelState(target, title, message, isError = false) {
     target.innerHTML = "";
     const state = document.createElement("div");
-    state.className = "panel-state error";
+    state.className = "panel-state" + (isError ? " error" : "");
     state.setAttribute("role", "status");
     const heading = document.createElement("h3");
     heading.textContent = title;
@@ -179,6 +200,43 @@
     detail.textContent = message;
     state.append(heading, detail);
     target.appendChild(state);
+  }
+
+  function setModelAvailability(ready, message) {
+    modelReady = ready;
+    exploreButton.disabled = !ready;
+    clearTokenButton.disabled = !ready;
+    tensorFilterEl.disabled = !ready;
+    showMoreTensorsButton.disabled = !ready;
+    retryModelButton.hidden = ready;
+    modelStateEl.textContent = message;
+  }
+
+  function renderModelUnavailable(message) {
+    modelInfo = null;
+    allTensors = [];
+    tensorSearchIndex = [];
+    tensorPage = 0;
+    if (tensorFilterTimer) {
+      clearTimeout(tensorFilterTimer);
+      tensorFilterTimer = null;
+    }
+    $("modelFacts").replaceChildren();
+    $("modelCatalog").replaceChildren();
+    $("catalogCount").textContent = "";
+    $("tensorCount").textContent = "";
+    $("tokenCount").textContent = "";
+    $("vectorSource").textContent = "";
+    $("neighborNote").textContent = "";
+    $("tensorNote").textContent = "";
+    showMoreTensorsButton.hidden = true;
+    renderError($("anatomy"), "Could not load model data", message);
+    renderPanelState($("tokens"), "Tokenizer unavailable", "Load a model, then retry discovery.");
+    renderPanelState($("vectorStats"), "Vector unavailable", "Model metadata is required before vectors can be inspected.");
+    $("vectorBars").replaceChildren();
+    renderPanelState($("neighbors"), "Neighbors unavailable", "Load a model, then retry discovery.");
+    $("neighborMap").replaceChildren();
+    renderPanelState($("tensorTable"), "Tensor directory unavailable", "Load a model, then retry discovery.");
   }
 
   function renderModel(data) {
@@ -314,28 +372,38 @@
   }
 
   function renderTensorTable(tensors) {
-    allTensors = tensors;
+    allTensors = Array.isArray(tensors) ? tensors : [];
+    tensorSearchIndex = allTensors.map((tensor) => ({
+      tensor,
+      haystack: [
+        tensor.name,
+        tensor.dtype,
+        tensor.family,
+        (tensor.dims || []).join(" x ")
+      ].join(" ").toLowerCase()
+    }));
+    tensorPage = 0;
     renderTensorRows();
   }
 
   function renderTensorRows() {
     const table = $("tensorTable");
-    table.innerHTML = "";
     const query = tensorFilterEl.value.trim().toLowerCase();
-    const tensors = allTensors.filter((tensor) => {
-      if (!query) return true;
-      const haystack = [
-        tensor.name,
-        tensor.dtype,
-        tensor.family,
-        (tensor.dims || []).join(" x ")
-      ].join(" ").toLowerCase();
-      return haystack.includes(query);
-    });
-    $("tensorNote").textContent = tensors.length + " / " + allTensors.length + " tensors";
+    const tensors = query
+      ? tensorSearchIndex.filter((entry) => entry.haystack.includes(query)).map((entry) => entry.tensor)
+      : allTensors;
+    const visibleCount = Math.min(tensors.length, (tensorPage + 1) * TENSOR_PAGE_SIZE);
+    const visibleTensors = tensors.slice(0, visibleCount);
+    const totalNote = query ? " matching · " + allTensors.length + " total" : " tensors";
+    $("tensorNote").textContent = visibleCount + " / " + tensors.length + totalNote;
+    const fragment = document.createDocumentFragment();
 
     if (!tensors.length) {
-      table.textContent = "No tensors match the current filter.";
+      const empty = document.createElement("p");
+      empty.textContent = query ? "No tensors match the current filter." : "No tensor data is available for this model.";
+      fragment.appendChild(empty);
+      table.replaceChildren(fragment);
+      showMoreTensorsButton.hidden = true;
       return;
     }
 
@@ -346,9 +414,9 @@
       cell.textContent = label;
       head.appendChild(cell);
     }
-    table.appendChild(head);
+    fragment.appendChild(head);
 
-    for (const tensor of tensors) {
+    for (const tensor of visibleTensors) {
       const row = document.createElement("div");
       row.className = "tensor-row";
       const name = document.createElement("span");
@@ -363,8 +431,13 @@
       const elements = document.createElement("span");
       elements.textContent = fmt(tensor.elements);
       row.append(name, dims, dtype, family, elements);
-      table.appendChild(row);
+      fragment.appendChild(row);
     }
+    table.replaceChildren(fragment);
+
+    const remaining = tensors.length - visibleCount;
+    showMoreTensorsButton.hidden = remaining <= 0;
+    showMoreTensorsButton.textContent = "Show " + Math.min(TENSOR_PAGE_SIZE, remaining) + " more tensors (" + remaining + " remaining)";
   }
 
   function renderTokens(tokens) {
@@ -575,12 +648,29 @@
     target.appendChild(svg);
   }
 
+  function isAbortError(error) {
+    return error?.name === "AbortError";
+  }
+
   async function runExplore() {
+    if (!modelReady) {
+      announce("Model unavailable");
+      renderError($("neighbors"), "Model unavailable", "Load a model, then retry discovery.");
+      return;
+    }
+
     const tokenId = tokenIdEl.value.trim();
     const useToken = tokenId !== "";
+    const numericTokenId = Number(tokenId);
+    if (useToken && (!Number.isInteger(numericTokenId) || numericTokenId < 0)) {
+      announce("Enter a valid token ID");
+      renderError($("neighbors"), "Invalid token ID", "Enter a non-negative whole token ID, or use text instead.");
+      tokenIdEl.focus();
+      return;
+    }
     const limit = Math.max(1, Math.min(60, Number(limitEl.value) || 24));
     const base = useToken
-      ? { token_id: Number(tokenId) }
+      ? { token_id: numericTokenId }
       : { input: inputEl.value };
     const neighborPayload = {
       ...base,
@@ -588,28 +678,38 @@
       include_special: includeSpecialEl.checked
     };
 
+    if (exploreController) exploreController.abort();
+    const controller = new AbortController();
+    const requestId = ++exploreRequestId;
+    exploreController = controller;
     announce("Exploring...");
     form.setAttribute("aria-busy", "true");
     try {
-      const vectorPromise = fetchJson("/api/explorer/vector", base);
-      const neighborPromise = fetchJson("/api/explorer/neighbors", neighborPayload);
+      const vectorPromise = fetchJson("/api/explorer/vector", base, controller.signal);
+      const neighborPromise = fetchJson("/api/explorer/neighbors", neighborPayload, controller.signal);
       const tokenizePromise = useToken
         ? null
-        : fetchJson("/api/explorer/tokenize", { input: inputEl.value, add_bos: false });
+        : fetchJson("/api/explorer/tokenize", { input: inputEl.value, add_bos: false }, controller.signal);
       const [vector, neighbors, tokenize] = await Promise.all([
         vectorPromise,
         neighborPromise,
         tokenizePromise
       ]);
+      if (requestId !== exploreRequestId || controller.signal.aborted) return;
       renderTokens(useToken ? vector.tokens || [] : tokenize.tokens || []);
       renderVector(vector);
       renderNeighbors(neighbors);
       announce("Ready");
     } catch (err) {
+      if (requestId !== exploreRequestId || controller.signal.aborted || isAbortError(err)) return;
+      controller.abort();
       announce("Error");
       renderError($("neighbors"), "Could not refresh token data", err.message);
     } finally {
-      form.removeAttribute("aria-busy");
+      if (requestId === exploreRequestId) {
+        form.removeAttribute("aria-busy");
+        if (exploreController === controller) exploreController = null;
+      }
     }
   }
 
@@ -617,26 +717,52 @@
     event.preventDefault();
     runExplore();
   });
+  tensorFilterEl.addEventListener("input", () => {
+    tensorPage = 0;
+    if (tensorFilterTimer) clearTimeout(tensorFilterTimer);
+    $("tensorNote").textContent = "Filtering tensors…";
+    tensorFilterTimer = setTimeout(() => {
+      tensorFilterTimer = null;
+      renderTensorRows();
+    }, TENSOR_FILTER_DEBOUNCE_MS);
+  });
 
-  tensorFilterEl.addEventListener("input", renderTensorRows);
+  showMoreTensorsButton.addEventListener("click", () => {
+    tensorPage += 1;
+    renderTensorRows();
+  });
 
-  $("clearToken").addEventListener("click", () => {
+  clearTokenButton.addEventListener("click", () => {
     tokenIdEl.value = "";
     inputEl.focus();
     runExplore();
   });
 
   async function init() {
+    if (modelController) modelController.abort();
+    if (exploreController) exploreController.abort();
+    const controller = new AbortController();
+    const requestId = ++modelRequestId;
+    modelController = controller;
+    setModelAvailability(false, "Loading model metadata…");
     try {
       announce("Loading model...");
-      const data = await fetchJson("/api/explorer/model");
+      const data = await fetchJson("/api/explorer/model", undefined, controller.signal);
+      if (requestId !== modelRequestId || controller.signal.aborted) return;
       renderModel(data);
+      setModelAvailability(true, "Model ready. Explore its tokenizer, vectors, and tensors.");
       await runExplore();
     } catch (err) {
+      if (requestId !== modelRequestId || controller.signal.aborted || isAbortError(err)) return;
       announce("Error");
-      renderError($("anatomy"), "Could not load model data", err.message);
+      setModelAvailability(false, "Model discovery failed. Check the server and retry.");
+      renderModelUnavailable(err.message);
+    } finally {
+      if (modelController === controller) modelController = null;
     }
   }
+
+  retryModelButton.addEventListener("click", init);
 
   init();
 })();

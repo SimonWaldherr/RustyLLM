@@ -621,6 +621,8 @@ enum LoadedWeights {
     Laguna(crate::model::LagunaWeights),
     /// Hybrid Mamba-2 / attention / MoE decoder (Nemotron-H, Soofi S Isar).
     NemotronH(crate::model::NemotronHWeights),
+    /// Hybrid Gated-DeltaNet / gated-attention decoder (Qwen3.5/Qwen3.8).
+    Qwen35(crate::model::Qwen35Weights),
     Gemma4(crate::model::Gemma4Weights),
     /// BERT-style encoder (nomic-bert) — embedding-only, no decode path.
     NomicBert(crate::model::NomicBertWeights),
@@ -1083,7 +1085,7 @@ fn normalized_tool_arguments(arguments: &str) -> String {
 
 /// Reports whether the architecture string maps to a supported loader.
 pub fn architecture_supported(arch: &str) -> bool {
-    if is_gemma_arch(arch) || is_nemotron_hybrid_arch(arch) {
+    if is_gemma_arch(arch) || is_nemotron_hybrid_arch(arch) || is_qwen35_arch(arch) {
         return true;
     }
     matches!(
@@ -1172,6 +1174,12 @@ fn batch_prefill_enabled() -> bool {
 /// both share one loader and one forward pass, which branches per block.
 pub(crate) fn is_nemotron_hybrid_arch(arch: &str) -> bool {
     matches!(arch, "nemotron_h" | "nemotron_h_moe")
+}
+
+/// Reports whether an architecture uses Qwen3.5's hybrid Gated DeltaNet path.
+/// Qwen 3.8 GGUFs are emitted with this architecture identifier.
+pub(crate) fn is_qwen35_arch(arch: &str) -> bool {
+    matches!(arch, "qwen35")
 }
 
 pub(crate) fn is_gemma_arch(arch: &str) -> bool {
@@ -1303,6 +1311,10 @@ fn validate_tensor_layout(gguf: &GGUFFile, arch: &str, report: &mut Compatibilit
         }
         _ if is_nemotron_hybrid_arch(arch) => {
             validate_nemotron_h_layout(gguf, &config, report);
+            return;
+        }
+        _ if is_qwen35_arch(arch) => {
+            validate_qwen35_layout(gguf, &config, report);
             return;
         }
         _ if is_nomic_bert_arch(arch) => {
@@ -1497,6 +1509,150 @@ fn validate_nemotron_h_layout(gguf: &GGUFFile, config: &Config, report: &mut Com
     }
 }
 
+/// Validates the Qwen3.5/Qwen3.8 hybrid layout before the dedicated loader
+/// sees it. Treating it as a regular Qwen3 transformer would silently pair the
+/// wrong tensors, so this checks the two mixer families explicitly.
+fn validate_qwen35_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
+    let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
+    let p = &config.arch;
+    if config.dim == 0
+        || config.n_layers == 0
+        || config.n_heads == 0
+        || config.n_kv_heads == 0
+        || config.n_heads % config.n_kv_heads != 0
+        || config.head_dim == 0
+        || config.value_dim != config.head_dim
+    {
+        report.unsupported_layouts.push(String::from(
+            "missing or inconsistent qwen35 attention metadata",
+        ));
+        return;
+    }
+
+    let metadata = |key: &str| gguf.get_u32(&format!("{}.ssm.{}", p, key), 0) as usize;
+    let d_conv = metadata("conv_kernel");
+    let d_inner = metadata("inner_size");
+    let d_state = metadata("state_size");
+    let n_value_heads = metadata("time_step_rank");
+    let n_key_heads = metadata("group_count");
+    if d_conv <= 1
+        || d_inner == 0
+        || d_state == 0
+        || n_value_heads == 0
+        || n_key_heads == 0
+        || d_inner % n_value_heads != 0
+        || n_value_heads % n_key_heads != 0
+        || d_inner / n_value_heads != d_state
+    {
+        report
+            .unsupported_layouts
+            .push(format!("invalid {}.ssm.* Gated DeltaNet metadata", p));
+        return;
+    }
+    let rotary_dim = gguf.get_u32(&format!("{}.rope.dimension_count", p), 0) as usize;
+    let sections_ok = gguf
+        .metadata
+        .get(&format!("{}.rope.dimension_sections", p))
+        .and_then(crate::gguf::MetaValue::as_u32_array)
+        .is_some_and(|sections| {
+            sections.len() >= 3 && sections[..3].iter().all(|value| *value > 0)
+        });
+    if rotary_dim == 0 || rotary_dim > config.head_dim || rotary_dim % 2 != 0 || !sections_ok {
+        report.unsupported_layouts.push(format!(
+            "{} requires an even partial MRoPE dimension and three non-empty dimension sections",
+            p
+        ));
+        return;
+    }
+
+    // A trailing MTP/NextN block is deliberately excluded from the ordinary
+    // trunk, where it would otherwise shift every mixer/cache index by one.
+    let nextn = gguf.get_u32(&format!("{}.nextn_predict_layers", p), 0) as usize;
+    let trunk = config.n_layers.saturating_sub(nextn);
+    if trunk == 0 {
+        report.unsupported_layouts.push(String::from(
+            "qwen35 has no decoder trunk after MTP exclusion",
+        ));
+        return;
+    }
+
+    for name in ["token_embd.weight", "output_norm.weight"] {
+        if !has(name) {
+            report.missing_tensors.push(name.to_string());
+        }
+    }
+
+    let key_dim = n_key_heads * d_state;
+    let value_dim = d_inner;
+    let mut recurrent = 0usize;
+    let mut attention = 0usize;
+    for layer in 0..trunk {
+        let prefix = format!("blk.{layer}.");
+        for suffix in [
+            "attn_norm.weight",
+            "post_attention_norm.weight",
+            "ffn_gate.weight",
+            "ffn_up.weight",
+            "ffn_down.weight",
+        ] {
+            let name = format!("{prefix}{suffix}");
+            if !has(&name) {
+                report.missing_tensors.push(name);
+            }
+        }
+
+        let qkv = format!("{prefix}attn_qkv.weight");
+        if has(&qkv) {
+            recurrent += 1;
+            validate_row_count(gguf, &qkv, 2 * key_dim + value_dim, report);
+            for (suffix, rows) in [
+                ("attn_gate.weight", value_dim),
+                ("ssm_alpha.weight", n_value_heads),
+                ("ssm_beta.weight", n_value_heads),
+                ("ssm_conv1d.weight", 2 * key_dim + value_dim),
+                ("ssm_dt.bias", n_value_heads),
+                ("ssm_a", n_value_heads),
+                ("ssm_norm.weight", d_state),
+                ("ssm_out.weight", config.dim),
+            ] {
+                let name = format!("{prefix}{suffix}");
+                if !has(&name) {
+                    report.missing_tensors.push(name);
+                } else if matches!(suffix, "ssm_dt.bias" | "ssm_a" | "ssm_norm.weight") {
+                    validate_element_count(gguf, &name, rows, report);
+                } else {
+                    validate_row_count(gguf, &name, rows, report);
+                }
+            }
+        } else {
+            attention += 1;
+            for (suffix, rows) in [
+                ("attn_q.weight", 2 * config.n_heads * config.head_dim),
+                ("attn_k.weight", config.n_kv_heads * config.head_dim),
+                ("attn_v.weight", config.n_kv_heads * config.value_dim),
+                ("attn_q_norm.weight", config.head_dim),
+                ("attn_k_norm.weight", config.head_dim),
+                ("attn_output.weight", config.dim),
+            ] {
+                let name = format!("{prefix}{suffix}");
+                if !has(&name) {
+                    report.missing_tensors.push(name);
+                } else if matches!(suffix, "attn_q_norm.weight" | "attn_k_norm.weight") {
+                    validate_element_count(gguf, &name, rows, report);
+                } else {
+                    validate_row_count(gguf, &name, rows, report);
+                }
+            }
+        }
+    }
+    if recurrent == 0 || attention == 0 {
+        report.unsupported_layouts.push(format!(
+            "{} must contain both Gated DeltaNet and full-attention trunk blocks",
+            p
+        ));
+    }
+}
+
 fn validate_laguna_layout(gguf: &GGUFFile, config: &Config, report: &mut CompatibilityReport) {
     let has = |name: &str| gguf.tensors.iter().any(|tensor| tensor.name == name);
     if config.dim == 0 || config.n_layers == 0 || config.n_heads == 0 || config.n_kv_heads == 0 {
@@ -1670,6 +1826,23 @@ fn validate_row_count(
     }
 }
 
+fn validate_element_count(
+    gguf: &GGUFFile,
+    name: &str,
+    required_elements: usize,
+    report: &mut CompatibilityReport,
+) {
+    if let Some(tensor) = gguf.tensors.iter().find(|tensor| tensor.name == name) {
+        let elements = tensor.numel();
+        if elements < required_elements {
+            report.unsupported_layouts.push(format!(
+                "{} has {} elements, expected at least {}",
+                name, elements, required_elements
+            ));
+        }
+    }
+}
+
 /// Checks that every tensor in `gguf` uses a quantization type that the
 /// inference kernels support.  Returns a descriptive error for any tensor
 /// whose dtype would cause a panic inside `load_weight`.
@@ -1730,6 +1903,10 @@ impl Runner {
             arch if is_nemotron_hybrid_arch(arch) => {
                 let (config, weights) = model::load_nemotron_h_model(data, &gguf, false);
                 (config, LoadedWeights::NemotronH(weights))
+            }
+            arch if is_qwen35_arch(arch) => {
+                let (config, weights) = model::load_qwen35_model(data, &gguf, false);
+                (config, LoadedWeights::Qwen35(weights))
             }
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(data, &gguf, false);
@@ -1815,6 +1992,14 @@ impl Runner {
             "laguna" => {
                 let (config, weights) = model::load_laguna_model(mmap.as_slice(), &gguf, true);
                 (config, LoadedWeights::Laguna(weights))
+            }
+            arch if is_nemotron_hybrid_arch(arch) => {
+                let (config, weights) = model::load_nemotron_h_model(mmap.as_slice(), &gguf, true);
+                (config, LoadedWeights::NemotronH(weights))
+            }
+            arch if is_qwen35_arch(arch) => {
+                let (config, weights) = model::load_qwen35_model(mmap.as_slice(), &gguf, true);
+                (config, LoadedWeights::Qwen35(weights))
             }
             arch if is_gemma_arch(arch) => {
                 let (config, weights) = model::load_gemma4_model(mmap.as_slice(), &gguf, true);
@@ -2002,6 +2187,7 @@ impl Runner {
             LoadedWeights::GptOss(weights) => &weights.token_embd,
             LoadedWeights::Laguna(weights) => &weights.token_embd,
             LoadedWeights::NemotronH(weights) => &weights.token_embd,
+            LoadedWeights::Qwen35(weights) => &weights.token_embd,
             LoadedWeights::Gemma4(weights) => &weights.token_embd,
             LoadedWeights::NomicBert(weights) => &weights.token_embd,
         }
@@ -2066,7 +2252,10 @@ impl Runner {
         items.push(format!("chat-template={}", chat_template));
         let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
             && !crate::metal::enabled()
-            && matches!(self.weights, LoadedWeights::Standard(_));
+            && matches!(
+                self.weights,
+                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
+            );
         items.push(match options.runtime.kv_cache_dtype {
             KvCacheDType::Auto => String::from("kv-cache=f32(auto)"),
             KvCacheDType::F32 => String::from("kv-cache=f32"),
@@ -2166,6 +2355,13 @@ impl Runner {
                 self.effective_max_context(options)
             ));
         }
+        if self.arch == "qwen35" && options.runtime.max_context.is_none() {
+            warnings.push(format!(
+                "Qwen3.5/Qwen3.8 advertises {} tokens, but the default is capped at {} until compressed KV cache support is available; pass --max-context to override.",
+                self.config.max_seq_len,
+                self.effective_max_context(options)
+            ));
+        }
         if profile == RuntimeProfile::MistralUltra && !crate::metal::enabled() {
             warnings.push(String::from(
                 "Mistral ultra profile requested, but Metal is unavailable or disabled; falling back to native SIMD CPU kernels.",
@@ -2207,14 +2403,17 @@ impl Runner {
         }
         let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
             && !crate::metal::enabled()
-            && matches!(self.weights, LoadedWeights::Standard(_));
+            && matches!(
+                self.weights,
+                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
+            );
         if options.runtime.kv_cache_dtype == KvCacheDType::Q8 {
             warnings.push(String::from(
                 "Requested Q8 KV cache is not activated yet; f32 KV is kept until it is implemented.",
             ));
         } else if options.runtime.kv_cache_dtype == KvCacheDType::Bf16 && !bf16_kv_will_activate {
             warnings.push(String::from(
-                "Requested bf16 KV cache only has a kernel for the Standard (non-Metal) forward path; f32 KV is kept for this model/backend.",
+                "Requested bf16 KV cache only has a kernel for the Standard or CPU Qwen3.5 forward paths; f32 KV is kept for this model/backend.",
             ));
         } else if options.runtime.kv_cache_dtype == KvCacheDType::Auto
             && self.effective_max_context(options) > 16_384
@@ -2296,6 +2495,13 @@ impl Runner {
             self.effective_profile(options),
             RuntimeProfile::Mistral | RuntimeProfile::MistralUltra
         ) {
+            return self.config.max_seq_len.clamp(1, 8192);
+        }
+        // Qwen3.8's 262K metadata would allocate roughly 32 GiB of f32 KV
+        // state even though only 16 of its 64 trunk blocks use attention.
+        // Keep normal CLI/API use safe; an explicit --max-context remains an
+        // intentional override for machines with enough memory.
+        if self.arch == "qwen35" {
             return self.config.max_seq_len.clamp(1, 8192);
         }
         self.config.max_seq_len.max(1)
@@ -2427,6 +2633,9 @@ impl Runner {
             )),
             LoadedWeights::NemotronH(_) => Err(String::from(
                 "--kernel-bench does not yet provide a Nemotron-H hybrid Mamba-2 profile.",
+            )),
+            LoadedWeights::Qwen35(_) => Err(String::from(
+                "--kernel-bench does not yet provide a Qwen3.5 Gated DeltaNet hybrid profile.",
             )),
             LoadedWeights::Gemma4(_) => Err(String::from(
                 "--kernel-bench currently supports standard transformer and gpt-oss MoE weights only.",
@@ -2999,13 +3208,15 @@ impl Runner {
             sliding_window,
         );
         self.attach_recurrent_state(&mut cache);
-        // bf16 KV halves per-token cache traffic; only the Standard forward
-        // path (forward_into/forward_hidden_impl/forward_prefill_batch) has a
-        // bf16-aware attention kernel, and Metal keeps its own resident GPU
-        // KV cache instead of `cache.k`/`cache.v` so it would never see this.
+        // bf16 KV halves per-token cache traffic. The Standard and CPU Qwen35
+        // paths read it directly; Metal keeps a resident GPU cache instead of
+        // `cache.k`/`cache.v`, so it would never see this storage.
         if options.runtime.kv_cache_dtype == KvCacheDType::Bf16
             && !crate::metal::enabled()
-            && matches!(self.weights, LoadedWeights::Standard(_))
+            && matches!(
+                self.weights,
+                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
+            )
         {
             cache.enable_bf16();
         }
@@ -3515,6 +3726,9 @@ impl Runner {
                 pos,
                 logits,
             ),
+            LoadedWeights::Qwen35(weights) => {
+                model::forward_qwen35_into(&self.config, weights, cache, buf, token, pos, logits)
+            }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_gemma4_into(&self.config, weights, cache, buf, token, pos, logits)
             }
@@ -3546,6 +3760,9 @@ impl Runner {
             LoadedWeights::NemotronH(weights) => {
                 model::forward_hidden_nemotron_h(&self.config, weights, cache, buf, token, pos)
             }
+            LoadedWeights::Qwen35(weights) => {
+                model::forward_hidden_qwen35(&self.config, weights, cache, buf, token, pos)
+            }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_hidden_gemma4(&self.config, weights, cache, buf, token, pos)
             }
@@ -3576,6 +3793,9 @@ impl Runner {
             }
             LoadedWeights::NemotronH(weights) => {
                 model::forward_prefill_nemotron_h(&self.config, weights, cache, buf, token, pos)
+            }
+            LoadedWeights::Qwen35(weights) => {
+                model::forward_prefill_qwen35(&self.config, weights, cache, buf, token, pos)
             }
             LoadedWeights::Gemma4(weights) => {
                 model::forward_prefill_gemma4(&self.config, weights, cache, buf, token, pos)
@@ -3701,6 +3921,12 @@ impl Runner {
         // metadata exposes one we know how to mirror.
         if self.arch == "gpt-oss" {
             return self.render_gpt_oss_messages(messages, system_prompt);
+        }
+        if is_qwen35_arch(&self.arch)
+            && let Some(tokens) =
+                render_qwen35_chatml_messages(&self.tok, messages, system_prompt, tools)
+        {
+            return tokens;
         }
         if matches!(self.chat_template_kind(), Some("gemma-turn")) {
             if let Some(tokens) = self.render_gemma_turn_messages(messages, system_prompt) {
@@ -4457,19 +4683,29 @@ impl Runner {
     fn kv_layer_count(&self) -> usize {
         match &self.weights {
             LoadedWeights::NemotronH(weights) => weights.attn_layer_count.max(1),
+            LoadedWeights::Qwen35(weights) => weights.attn_layer_count.max(1),
             _ => self.config.n_layers,
         }
     }
 
-    /// Attaches zeroed Mamba-2 recurrent state when the model has any.
+    /// Attaches zeroed recurrent state when the model has any.
     fn attach_recurrent_state(&self, cache: &mut KVCache) {
-        if let LoadedWeights::NemotronH(weights) = &self.weights {
-            let recurrent = weights
-                .layers
-                .iter()
-                .filter(|layer| matches!(layer.mixer, crate::model::NemotronMixer::Mamba2(_)))
-                .count();
-            cache.ssm = Some(crate::model::SsmState::new(recurrent, weights.ssm));
+        match &self.weights {
+            LoadedWeights::NemotronH(weights) => {
+                let recurrent = weights
+                    .layers
+                    .iter()
+                    .filter(|layer| matches!(layer.mixer, crate::model::NemotronMixer::Mamba2(_)))
+                    .count();
+                cache.ssm = Some(crate::model::SsmState::new(recurrent, weights.ssm));
+            }
+            LoadedWeights::Qwen35(weights) => {
+                cache.ssm = Some(crate::model::SsmState::new(
+                    weights.recurrent_layer_count,
+                    weights.ssm,
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -4790,6 +5026,78 @@ impl Runner {
             },
         })
     }
+}
+
+/// Renders Qwen3.5/3.8's text-only ChatML template.
+///
+/// Qwen's default `add_generation_prompt` opens its assistant turn with the
+/// dedicated `<think>` token. Generic ChatML stops at `assistant\n`, which
+/// sends a thinking-capable Qwen model an off-distribution prompt. Native tool
+/// XML is intentionally not synthesized here yet: callers with tools or tool
+/// history fall through to the existing generic renderer instead.
+fn render_qwen35_chatml_messages(
+    tok: &Tokenizer,
+    messages: &[ChatMessage],
+    system_prompt: &str,
+    tools: &[String],
+) -> Option<Vec<u32>> {
+    if !tools.is_empty()
+        || messages
+            .iter()
+            .any(|message| matches!(message.role, ChatRole::Tool) || !message.tool_calls.is_empty())
+    {
+        return None;
+    }
+
+    let im_start = tok.special_id("<|im_start|>")?;
+    let im_end = tok.special_id("<|im_end|>")?;
+    let think = tok.special_id("<think>")?;
+    let mut tokens = Vec::new();
+    if tok.adds_bos_token() {
+        tokens.push(tok.bos_id);
+    }
+
+    let push_turn = |role: &str, content: &str, out: &mut Vec<u32>| {
+        out.push(im_start);
+        out.extend(tok.encode_without_bos(role));
+        out.extend(tok.encode_without_bos("\n"));
+        out.extend(tok.encode_without_bos(content.trim()));
+        out.push(im_end);
+        out.extend(tok.encode_without_bos("\n"));
+    };
+
+    // Qwen's template accepts one leading system turn. Preserve every
+    // API-level system instruction by joining them in that turn rather than
+    // placing an out-of-order system message after user content.
+    let explicit_system = messages
+        .iter()
+        .filter(|message| matches!(message.role, ChatRole::System))
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !explicit_system.is_empty() {
+        push_turn("system", &explicit_system, &mut tokens);
+    } else if !system_prompt.trim().is_empty() {
+        push_turn("system", system_prompt, &mut tokens);
+    }
+
+    for message in messages {
+        let role = match message.role {
+            ChatRole::System => continue,
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+            // Tool history returned above, before any tokens were emitted.
+            ChatRole::Tool => unreachable!("tool messages use the generic renderer"),
+        };
+        push_turn(role, &message.content, &mut tokens);
+    }
+
+    tokens.push(im_start);
+    tokens.extend(tok.encode_without_bos("assistant\n"));
+    tokens.push(think);
+    tokens.extend(tok.encode_without_bos("\n"));
+    Some(tokens)
 }
 
 /// Measures one matrix-vector kernel and returns timing statistics.
@@ -5332,11 +5640,46 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendPolicy, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
+        BackendPolicy, ChatMessage, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
         architecture_preparation_note, architecture_supported, clean_thinking_prompt,
-        cosine_similarity, is_nemotron_hybrid_arch, l2_normalize_in_place, mean_pool_in_place,
-        push_recent_token, recent_token_tail, trailing_char_boundary_start,
+        cosine_similarity, is_nemotron_hybrid_arch, is_qwen35_arch, l2_normalize_in_place,
+        mean_pool_in_place, push_recent_token, recent_token_tail, render_qwen35_chatml_messages,
+        trailing_char_boundary_start,
     };
+    use crate::gguf::MetaValue;
+    use crate::tokenizer::Tokenizer;
+    use std::collections::HashMap;
+
+    fn qwen35_test_tokenizer() -> Tokenizer {
+        let mut vocab = vec![
+            "<unk>".to_string(),
+            "<s>".to_string(),
+            "</s>".to_string(),
+            "<|im_start|>".to_string(),
+            "<|im_end|>".to_string(),
+            "<think>".to_string(),
+            "Ċ".to_string(),
+        ];
+        vocab.extend((b'a'..=b'z').map(|byte| char::from(byte).to_string()));
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            String::from("tokenizer.ggml.tokens"),
+            MetaValue::Array(vocab.into_iter().map(MetaValue::Str).collect()),
+        );
+        metadata.insert(
+            String::from("tokenizer.ggml.model"),
+            MetaValue::Str(String::from("gpt2")),
+        );
+        metadata.insert(
+            String::from("tokenizer.ggml.pre"),
+            MetaValue::Str(String::from("qwen35")),
+        );
+        metadata.insert(
+            String::from("tokenizer.ggml.add_bos_token"),
+            MetaValue::Bool(false),
+        );
+        Tokenizer::from_metadata(&metadata)
+    }
 
     #[test]
     /// Verifies shared prompt snapshots restore only active KV rows and logits.
@@ -5698,6 +6041,49 @@ mod tests {
         // The dense `nemotron` architecture is a different, non-hybrid model
         // and must keep running through the standard loader.
         assert!(!is_nemotron_hybrid_arch("nemotron"));
+    }
+
+    #[test]
+    fn qwen35_architecture_is_supported_by_its_own_loader_path() {
+        assert!(is_qwen35_arch("qwen35"));
+        assert!(architecture_supported("qwen35"));
+        assert!(architecture_preparation_note("qwen35").is_none());
+        assert!(!is_qwen35_arch("qwen3"));
+    }
+
+    #[test]
+    fn qwen35_chat_renderer_opens_the_native_thinking_turn() {
+        let tok = qwen35_test_tokenizer();
+        let tokens =
+            render_qwen35_chatml_messages(&tok, &[ChatMessage::user("hello")], "rules", &[])
+                .expect("Qwen35 tokenizer has the required special tokens");
+        let im_start = tok.special_id("<|im_start|>").unwrap();
+        let im_end = tok.special_id("<|im_end|>").unwrap();
+        let think = tok.special_id("<think>").unwrap();
+        let mut expected_suffix = vec![im_start];
+        expected_suffix.extend(tok.encode_without_bos("assistant\n"));
+        expected_suffix.push(think);
+        expected_suffix.extend(tok.encode_without_bos("\n"));
+
+        assert!(tokens.ends_with(&expected_suffix));
+        // One normalized system turn, one user turn, and the still-open
+        // assistant turn; only the completed turns carry im_end.
+        assert_eq!(tokens.iter().filter(|&&token| token == im_start).count(), 3);
+        assert_eq!(tokens.iter().filter(|&&token| token == im_end).count(), 2);
+    }
+
+    #[test]
+    fn qwen35_chat_renderer_defers_tool_xml_to_the_existing_fallback() {
+        let tok = qwen35_test_tokenizer();
+        assert!(
+            render_qwen35_chatml_messages(
+                &tok,
+                &[ChatMessage::user("hello")],
+                "",
+                &[String::from("{}")],
+            )
+            .is_none()
+        );
     }
 
     #[test]

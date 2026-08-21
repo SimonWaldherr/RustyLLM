@@ -69,6 +69,8 @@
           <button id="explore" type="submit">Explore</button>
           <button id="clearToken" class="secondary" type="button">Use text</button>
         </div>
+        <p id="modelState" class="hint" role="status">Loading model metadata…</p>
+        <button id="retryModel" class="secondary" type="button" hidden>Retry model discovery</button>
       </form>
 
       <section class="explorer-side-section" aria-labelledby="modelTitle">
@@ -131,9 +133,10 @@
           </div>
           <div class="field tensor-filter">
             <label for="tensorFilter">Filter tensors</label>
-            <input id="tensorFilter" type="search" autocomplete="off" spellcheck="false" placeholder="name, family, dtype, dimension">
+            <input id="tensorFilter" type="search" autocomplete="off" spellcheck="false" placeholder="name, family, dtype, dimension" aria-describedby="tensorNote" aria-controls="tensorTable">
           </div>
           <div id="tensorTable" class="tensor-table"></div>
+          <button id="showMoreTensors" class="secondary" type="button" aria-controls="tensorTable" hidden>Show more tensors</button>
         </article>
       </section>
     </main>

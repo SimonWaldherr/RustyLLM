@@ -1181,6 +1181,81 @@ pub struct NemotronHWeights {
     pub routed_scaling_factor: f32,
 }
 
+/// Gated DeltaNet mixer used by Qwen3.5/Qwen3.8 recurrent blocks.
+///
+/// These tensors deliberately do not reuse [`Mamba2LayerWeights`]: Qwen's
+/// recurrence is a delta-rule associative memory rather than a Mamba scan.
+pub struct Qwen35LinearWeights {
+    /// Concatenated Q/K/V projection: `[Q | K | V]`.
+    pub qkv: Weight,
+    /// Per-value-channel output gate (`z`).
+    pub gate: Weight,
+    /// Channel-major depthwise causal convolution, `conv_dim * d_conv`.
+    pub conv_w: Vec<f32>,
+    /// Per-value-head decay bias.
+    pub dt_bias: Vec<f32>,
+    /// Stored as `-exp(A_log)` by the GGUF converter.
+    pub a: Vec<f32>,
+    /// Per-value-head beta projection.
+    pub beta: Weight,
+    /// Per-value-head alpha projection.
+    pub alpha: Weight,
+    /// Shared RMSNorm vector for every value head.
+    pub norm: Vec<f32>,
+    /// Output projection back to the residual stream.
+    pub out: Weight,
+}
+
+/// Full-attention mixer used every fourth Qwen3.5/Qwen3.8 block.
+pub struct Qwen35AttentionWeights {
+    /// Joint Q + sigmoid-gate projection. The two vectors are interleaved per
+    /// head as `[Q_h | gate_h]`, not split into two global halves.
+    pub q_gate: Weight,
+    pub k: Weight,
+    pub v: Weight,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+    pub out: Weight,
+    /// Slot in the compact cache containing only the full-attention blocks.
+    pub kv_slot: usize,
+}
+
+pub enum Qwen35Mixer {
+    Linear(Box<Qwen35LinearWeights>),
+    Attention(Box<Qwen35AttentionWeights>),
+}
+
+/// One Qwen3.5/Qwen3.8 trunk block. Both mixer kinds are followed by the
+/// same post-attention RMSNorm and dense SwiGLU FFN.
+pub struct Qwen35LayerWeights {
+    pub attn_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    pub mixer: Qwen35Mixer,
+    pub ffn_gate: Weight,
+    pub ffn_up: Weight,
+    pub ffn_down: Weight,
+}
+
+/// Text decoder portion of a Qwen3.5/Qwen3.8 GGUF.
+///
+/// The optional final MTP/NextN block is intentionally not represented here:
+/// it is a speculative draft head, not part of the normal decoder trunk.
+pub struct Qwen35Weights {
+    pub token_embd: Weight,
+    pub output_norm: Vec<f32>,
+    pub output: Weight,
+    pub layers: Vec<Qwen35LayerWeights>,
+    /// Gated DeltaNet dimensions, sharing the physical cache storage type used
+    /// by the existing hybrid implementation.
+    pub ssm: SsmDims,
+    pub recurrent_layer_count: usize,
+    pub attn_layer_count: usize,
+    /// Only this prefix of the 256-wide full-attention heads is rotary.
+    pub rotary_dim: usize,
+    /// Text uses the same scalar position on all MRoPE axes.
+    pub rope_inv_freq: Vec<f32>,
+}
+
 /// Per-layer recurrent state for Mamba-2 blocks — the state-space equivalent of
 /// a KV cache. Unlike keys and values this does not grow with position: each
 /// token overwrites it in place, so a rewind requires a replay from the start.
@@ -1304,10 +1379,9 @@ impl KVCache {
     }
 
     /// Switches this (freshly constructed, not-yet-written) cache to store
-    /// keys/values as bf16 instead of f32. Only the `Standard` (LLaMA-style)
-    /// forward path (`forward_into`/`forward_hidden_impl`/
-    /// `forward_prefill_batch`) knows how to read/write the bf16 storage;
-    /// callers must not enable this for other architectures.
+    /// keys/values as bf16 instead of f32. The Standard LLaMA-style path and
+    /// the CPU Qwen3.5 hybrid path both read/write this storage; other model
+    /// families must keep f32 cache buffers.
     pub fn enable_bf16(&mut self) {
         if self.bf16 {
             return;
@@ -1456,11 +1530,11 @@ mod tests {
     }
 
     #[test]
-    fn grouped_four_head_attention_matches_individual_heads() {
+    fn grouped_six_head_attention_matches_individual_heads() {
         const HEAD_DIM: usize = 8;
         const VALUE_DIM: usize = 6;
         const TOKENS: usize = 11;
-        let queries: Vec<f32> = (0..4 * HEAD_DIM).map(|i| i as f32 * 0.013 - 0.2).collect();
+        let queries: Vec<f32> = (0..6 * HEAD_DIM).map(|i| i as f32 * 0.013 - 0.2).collect();
         let keys: Vec<f32> = (0..TOKENS * HEAD_DIM)
             .map(|i| i as f32 * 0.021 - 0.3)
             .collect();
@@ -1468,7 +1542,7 @@ mod tests {
             .map(|i| i as f32 * 0.009 - 0.4)
             .collect();
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let mut grouped = vec![0.0; 4 * VALUE_DIM];
+        let mut grouped = vec![0.0; 6 * VALUE_DIM];
         super::online_attention_grouped(
             &queries,
             &keys,
@@ -1478,13 +1552,13 @@ mod tests {
             TOKENS,
             HEAD_DIM,
             VALUE_DIM,
-            4,
+            6,
             0,
             TOKENS - 1,
             scale,
             &mut grouped,
         );
-        for head in 0..4 {
+        for head in 0..6 {
             let mut expected = vec![0.0; VALUE_DIM];
             super::online_attention(
                 &queries[head * HEAD_DIM..(head + 1) * HEAD_DIM],
@@ -1659,13 +1733,11 @@ mod tests {
         assert_eq!(cache.k[0].len(), 0);
     }
 
-    #[test]
-    fn grouped_attention_bf16_matches_f32_within_bf16_precision() {
+    fn assert_grouped_attention_bf16_matches_f32_within_precision(kv_mul: usize) {
         const HEAD_DIM: usize = 8;
         const VALUE_DIM: usize = 6;
         const TOKENS: usize = 5;
-        const KV_MUL: usize = 4;
-        let queries: Vec<f32> = (0..KV_MUL * HEAD_DIM)
+        let queries: Vec<f32> = (0..kv_mul * HEAD_DIM)
             .map(|i| i as f32 * 0.017 - 0.15)
             .collect();
         let keys: Vec<f32> = (0..TOKENS * HEAD_DIM)
@@ -1681,7 +1753,7 @@ mod tests {
             .collect();
 
         let scale = 1.0 / (HEAD_DIM as f32).sqrt();
-        let mut f32_out = vec![0.0; KV_MUL * VALUE_DIM];
+        let mut f32_out = vec![0.0; kv_mul * VALUE_DIM];
         super::online_attention_grouped(
             &queries,
             &keys,
@@ -1691,13 +1763,13 @@ mod tests {
             TOKENS,
             HEAD_DIM,
             VALUE_DIM,
-            KV_MUL,
+            kv_mul,
             0,
             TOKENS - 1,
             scale,
             &mut f32_out,
         );
-        let mut bf16_out = vec![0.0; KV_MUL * VALUE_DIM];
+        let mut bf16_out = vec![0.0; kv_mul * VALUE_DIM];
         super::online_attention_grouped_bf16(
             &queries,
             &keys_bf16,
@@ -1707,7 +1779,7 @@ mod tests {
             TOKENS,
             HEAD_DIM,
             VALUE_DIM,
-            KV_MUL,
+            kv_mul,
             0,
             TOKENS - 1,
             scale,
@@ -1719,6 +1791,16 @@ mod tests {
                 "got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn grouped_four_head_attention_bf16_matches_f32_within_bf16_precision() {
+        assert_grouped_attention_bf16_matches_f32_within_precision(4);
+    }
+
+    #[test]
+    fn grouped_six_head_attention_bf16_matches_f32_within_bf16_precision() {
+        assert_grouped_attention_bf16_matches_f32_within_precision(6);
     }
 
     #[test]
@@ -2511,6 +2593,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qwen35_delta_step_updates_then_reads_transposed_memory() {
+        // State rows are V channels and columns are K channels. This fixture
+        // catches both the transpose and the load-bearing update-before-read
+        // ordering of the gated delta rule.
+        let mut state = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![0.0f32; 2];
+        super::qwen35_delta_head_step(
+            &[3.0, 4.0],
+            &[1.0, 2.0],
+            &[5.0, 6.0],
+            0.5,
+            0.25,
+            &mut state,
+            &mut out,
+        );
+        let expected_state = [1.125f32, 2.25, 1.625, 2.25];
+        let expected_out = [8.750_446f32, 9.811_107];
+        for (got, expected) in state.iter().zip(expected_state) {
+            assert!((got - expected).abs() < 1e-6, "state {got} != {expected}");
+        }
+        for (got, expected) in out.iter().zip(expected_out) {
+            assert!((got - expected).abs() < 2e-6, "output {got} != {expected}");
+        }
+    }
+
+    #[test]
+    fn qwen35_delta_heads_use_tiled_key_mapping() {
+        // GGUF conversion tiles Qwen's value-head-indexed tensors, so h=2
+        // maps back to key head 0 rather than to key head 1 (h / 2).
+        let q = [2.0f32, 3.0];
+        let k = [5.0f32, 7.0];
+        let v = [10.0f32, 20.0, 30.0, 40.0];
+        let mut state = vec![0.0f32; 4];
+        let mut out = vec![0.0f32; 4];
+        for value_head in 0..4 {
+            let key_head = super::qwen35_key_head_for_value_head(value_head, 2);
+            super::qwen35_delta_head_step(
+                &q[key_head..key_head + 1],
+                &k[key_head..key_head + 1],
+                &v[value_head..value_head + 1],
+                1.0,
+                1.0,
+                &mut state[value_head..value_head + 1],
+                &mut out[value_head..value_head + 1],
+            );
+        }
+        assert_eq!(out, vec![100.0, 420.0, 300.0, 840.0]);
+        assert_eq!(state, vec![50.0, 140.0, 150.0, 280.0]);
+    }
+
+    #[test]
+    fn qwen35_l2_norm_clamps_the_denominator_not_its_square() {
+        let mut values = vec![3e-7f32, 4e-7];
+        super::qwen35_l2_normalize_heads(&mut values, 2, 1, 1e-6);
+        assert!((values[0] - 0.3).abs() < 1e-6);
+        assert!((values[1] - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen35_full_attention_q_and_gate_are_interleaved_per_head() {
+        let raw = vec![1.0f32, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0];
+        let mut q = Vec::new();
+        let mut gate = Vec::new();
+        super::qwen35_split_q_gate(&raw, 2, 2, &mut q, &mut gate);
+        assert_eq!(q, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(gate, vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn qwen35_gates_after_per_head_rms_norm() {
+        let mut y = vec![3.0f32, 4.0];
+        super::rms_norm_heads_in_place(&mut y, 2, 1, Some(&[2.0, 0.5]), 0.0);
+        let z = [0.0f32, 1.0];
+        for (value, gate) in y.iter_mut().zip(z) {
+            *value *= super::silu(gate);
+        }
+        assert!(y[0].abs() < 1e-6);
+        assert!((y[1] - 0.413_549_18).abs() < 1e-6);
+    }
+
     /// Builds a synthetic Q4_K expert stack laid out exactly as GGUF stores
     /// `ffn_*_exps` tensors: expert-major, each expert a full `rows x cols`
     /// matrix. Every expert gets distinct nibbles so routing differences are
@@ -2829,6 +2992,15 @@ pub struct DecodeBuffer {
     pub rope_inv_freq: Vec<f32>,
     pub rope_gpt_oss_inv_freq: Vec<f32>,
     pub rope_gpt_oss_concentration: f32,
+    /// Qwen3.5 Gated DeltaNet `[Q | K | V]` projection / convolution buffer.
+    pub qwen35_qkv: Vec<f32>,
+    /// Qwen3.5 Gated DeltaNet z gate or full-attention gate.
+    pub qwen35_gate: Vec<f32>,
+    /// Joint full-attention Q/gate projection before per-head deinterleaving.
+    pub qwen35_q_gate: Vec<f32>,
+    /// Per-value-head recurrent parameters.
+    pub qwen35_alpha: Vec<f32>,
+    pub qwen35_beta: Vec<f32>,
 }
 
 /// Precomputes inverse frequencies for rotary positional embeddings.
@@ -2935,6 +3107,11 @@ impl DecodeBuffer {
             rope_inv_freq,
             rope_gpt_oss_inv_freq,
             rope_gpt_oss_concentration,
+            qwen35_qkv: Vec::new(),
+            qwen35_gate: Vec::new(),
+            qwen35_q_gate: Vec::new(),
+            qwen35_alpha: Vec::new(),
+            qwen35_beta: Vec::new(),
         }
     }
 }
@@ -4526,6 +4703,456 @@ pub fn load_nemotron_h_model(
     (config, weights)
 }
 
+/// Loads the text-decoder trunk of a Qwen3.5/Qwen3.8 GGUF.
+///
+/// Qwen3.8 uses `general.architecture = qwen35`: a hybrid decoder with three
+/// Gated DeltaNet blocks followed by one gated full-attention block. It cannot
+/// use the generic Qwen3/LLaMA loader because its recurrent tensors, joint
+/// Q+gate projection, post-attention norm, and trailing MTP block all have a
+/// different layout.
+pub fn load_qwen35_model(
+    mmap_data: &[u8],
+    gguf: &GGUFFile,
+    borrow_quantized: bool,
+) -> (Config, Qwen35Weights) {
+    let mut config = Config::from_gguf(gguf);
+    let p = config.arch.clone();
+
+    let ssm = SsmDims {
+        d_conv: gguf.get_u32(&format!("{}.ssm.conv_kernel", p), 0) as usize,
+        d_inner: gguf.get_u32(&format!("{}.ssm.inner_size", p), 0) as usize,
+        d_state: gguf.get_u32(&format!("{}.ssm.state_size", p), 0) as usize,
+        // Qwen calls this the number of value heads, despite using the shared
+        // GGUF `time_step_rank` key.
+        n_head: gguf.get_u32(&format!("{}.ssm.time_step_rank", p), 0) as usize,
+        // Qwen calls this the number of key heads/groups.
+        n_group: gguf.get_u32(&format!("{}.ssm.group_count", p), 0) as usize,
+    };
+    assert!(
+        ssm.d_conv > 1 && ssm.d_inner > 0 && ssm.d_state > 0 && ssm.n_head > 0 && ssm.n_group > 0,
+        "Incomplete {}.ssm.* metadata: {:?}",
+        p,
+        ssm
+    );
+    assert_eq!(
+        ssm.d_inner % ssm.n_head,
+        0,
+        "qwen35 ssm.inner_size must be divisible by its value-head count"
+    );
+    assert_eq!(
+        ssm.n_head % ssm.n_group,
+        0,
+        "qwen35 value-head count must be divisible by its key-head count"
+    );
+    // The GGUF/reference kernel represents every per-value-head memory as a
+    // square `[value_dim, key_dim]` matrix. Current qwen35 dense models keep
+    // both dimensions equal; reject a future incompatible variant explicitly.
+    assert_eq!(
+        ssm.head_dim(),
+        ssm.d_state,
+        "qwen35 Gated DeltaNet requires equal key and value head widths"
+    );
+    assert_eq!(
+        config.value_dim, config.head_dim,
+        "qwen35 full-attention key/value widths must match"
+    );
+    assert!(
+        config.n_heads > 0 && config.n_kv_heads > 0 && config.n_heads % config.n_kv_heads == 0,
+        "Invalid qwen35 attention-head metadata"
+    );
+
+    // The final NextN/MTP block is a draft head. It is not a 65th ordinary
+    // decoder layer and must never consume a KV-cache or recurrent-state slot.
+    let nextn = gguf.get_u32(&format!("{}.nextn_predict_layers", p), 0) as usize;
+    let trunk_layers = config.n_layers.saturating_sub(nextn);
+    assert!(
+        trunk_layers > 0,
+        "No qwen35 trunk layers remain after excluding MTP/NextN blocks"
+    );
+    config.n_layers = trunk_layers;
+
+    let rotary_dim = gguf.get_u32(&format!("{}.rope.dimension_count", p), 0) as usize;
+    assert!(
+        rotary_dim > 0 && rotary_dim <= config.head_dim && rotary_dim % 2 == 0,
+        "Invalid qwen35 rotary dimension {} for head width {}",
+        rotary_dim,
+        config.head_dim
+    );
+    let rope_sections = gguf
+        .metadata
+        .get(&format!("{}.rope.dimension_sections", p))
+        .and_then(crate::gguf::MetaValue::as_u32_array)
+        .unwrap_or_default();
+    assert!(
+        rope_sections.len() >= 3 && rope_sections[..3].iter().all(|section| *section > 0),
+        "qwen35 requires non-empty MRoPE dimension sections"
+    );
+
+    let conv_dim = ssm.conv_dim();
+    let key_dim = ssm.n_group * ssm.d_state;
+    let value_dim = ssm.d_inner;
+    let value_head_dim = ssm.head_dim();
+    eprintln!(
+        "Config: qwen35 dim={}, trunk_layers={} (+{} MTP), full_attn_heads={}/{}, GDN={}v/{}k x {}, hidden={}, vocab={}, ctx={}",
+        config.dim,
+        trunk_layers,
+        nextn,
+        config.n_heads,
+        config.n_kv_heads,
+        ssm.n_head,
+        ssm.n_group,
+        ssm.d_state,
+        config.hidden_dim,
+        config.vocab_size,
+        config.max_seq_len
+    );
+
+    let tensor_idx: HashMap<String, &crate::gguf::TensorInfo> = gguf
+        .tensors
+        .iter()
+        .map(|tensor| (tensor.name.clone(), tensor))
+        .collect();
+    // All qwen35 tensors use standard f32/K-quant layouts, so their sizes are
+    // known from the dtype and no adjacent-offset inference is needed.
+    let inferred_sizes = HashMap::new();
+    let data_offset = gguf.data_offset;
+
+    let token_embd = load_weight(
+        mmap_data,
+        data_offset,
+        "token_embd.weight",
+        &tensor_idx,
+        &inferred_sizes,
+        false,
+        borrow_quantized,
+    );
+    let output = if tensor_idx.contains_key("output.weight") {
+        load_weight(
+            mmap_data,
+            data_offset,
+            "output.weight",
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        )
+    } else {
+        token_embd.clone()
+    };
+
+    let mut layers = Vec::with_capacity(trunk_layers);
+    let mut recurrent_layer_count = 0usize;
+    let mut attn_layer_count = 0usize;
+    for layer_index in 0..trunk_layers {
+        let prefix = format!("blk.{}", layer_index);
+        let qkv_name = format!("{}.attn_qkv.weight", prefix);
+        let mixer = if tensor_idx.contains_key(&qkv_name) {
+            let qkv = load_weight(
+                mmap_data,
+                data_offset,
+                &qkv_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&qkv_name, &qkv, 2 * key_dim + value_dim, config.dim);
+
+            let gate_name = format!("{}.attn_gate.weight", prefix);
+            let gate = load_weight(
+                mmap_data,
+                data_offset,
+                &gate_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&gate_name, &gate, value_dim, config.dim);
+
+            let alpha_name = format!("{}.ssm_alpha.weight", prefix);
+            let alpha = load_weight(
+                mmap_data,
+                data_offset,
+                &alpha_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&alpha_name, &alpha, ssm.n_head, config.dim);
+
+            let beta_name = format!("{}.ssm_beta.weight", prefix);
+            let beta = load_weight(
+                mmap_data,
+                data_offset,
+                &beta_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&beta_name, &beta, ssm.n_head, config.dim);
+
+            let conv_name = format!("{}.ssm_conv1d.weight", prefix);
+            let conv_w = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &conv_name,
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            assert_eq!(
+                conv_w.len(),
+                conv_dim * ssm.d_conv,
+                "Shape mismatch for {}",
+                conv_name
+            );
+            let dt_name = format!("{}.ssm_dt.bias", prefix);
+            let dt_bias = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &dt_name,
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            assert_eq!(dt_bias.len(), ssm.n_head, "Shape mismatch for {}", dt_name);
+            let a_name = format!("{}.ssm_a", prefix);
+            let a = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &a_name,
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            assert_eq!(a.len(), ssm.n_head, "Shape mismatch for {}", a_name);
+            let norm_name = format!("{}.ssm_norm.weight", prefix);
+            let norm = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &norm_name,
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            assert_eq!(
+                norm.len(),
+                value_head_dim,
+                "Shape mismatch for {}",
+                norm_name
+            );
+            let out_name = format!("{}.ssm_out.weight", prefix);
+            let out = load_weight(
+                mmap_data,
+                data_offset,
+                &out_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&out_name, &out, config.dim, value_dim);
+
+            recurrent_layer_count += 1;
+            Qwen35Mixer::Linear(Box::new(Qwen35LinearWeights {
+                qkv,
+                gate,
+                conv_w,
+                dt_bias,
+                a,
+                beta,
+                alpha,
+                norm,
+                out,
+            }))
+        } else {
+            let q_gate_name = format!("{}.attn_q.weight", prefix);
+            let q_gate = load_weight(
+                mmap_data,
+                data_offset,
+                &q_gate_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(
+                &q_gate_name,
+                &q_gate,
+                2 * config.n_heads * config.head_dim,
+                config.dim,
+            );
+            let k_name = format!("{}.attn_k.weight", prefix);
+            let k = load_weight(
+                mmap_data,
+                data_offset,
+                &k_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(&k_name, &k, config.n_kv_heads * config.head_dim, config.dim);
+            let v_name = format!("{}.attn_v.weight", prefix);
+            let v = load_weight(
+                mmap_data,
+                data_offset,
+                &v_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(
+                &v_name,
+                &v,
+                config.n_kv_heads * config.value_dim,
+                config.dim,
+            );
+            let q_norm = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("{}.attn_q_norm.weight", prefix),
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            let k_norm = load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("{}.attn_k_norm.weight", prefix),
+                &tensor_idx,
+                &inferred_sizes,
+            );
+            assert_eq!(
+                q_norm.len(),
+                config.head_dim,
+                "qwen35 Q-norm width mismatch"
+            );
+            assert_eq!(
+                k_norm.len(),
+                config.head_dim,
+                "qwen35 K-norm width mismatch"
+            );
+            let out_name = format!("{}.attn_output.weight", prefix);
+            let out = load_weight(
+                mmap_data,
+                data_offset,
+                &out_name,
+                &tensor_idx,
+                &inferred_sizes,
+                false,
+                borrow_quantized,
+            );
+            validate_global_shape(
+                &out_name,
+                &out,
+                config.dim,
+                config.n_heads * config.value_dim,
+            );
+
+            let kv_slot = attn_layer_count;
+            attn_layer_count += 1;
+            Qwen35Mixer::Attention(Box::new(Qwen35AttentionWeights {
+                q_gate,
+                k,
+                v,
+                q_norm,
+                k_norm,
+                out,
+                kv_slot,
+            }))
+        };
+
+        let ffn_gate_name = format!("{}.ffn_gate.weight", prefix);
+        let ffn_gate = load_weight(
+            mmap_data,
+            data_offset,
+            &ffn_gate_name,
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        validate_global_shape(&ffn_gate_name, &ffn_gate, config.hidden_dim, config.dim);
+        let ffn_up_name = format!("{}.ffn_up.weight", prefix);
+        let ffn_up = load_weight(
+            mmap_data,
+            data_offset,
+            &ffn_up_name,
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        validate_global_shape(&ffn_up_name, &ffn_up, config.hidden_dim, config.dim);
+        let ffn_down_name = format!("{}.ffn_down.weight", prefix);
+        let ffn_down = load_weight(
+            mmap_data,
+            data_offset,
+            &ffn_down_name,
+            &tensor_idx,
+            &inferred_sizes,
+            false,
+            borrow_quantized,
+        );
+        validate_global_shape(&ffn_down_name, &ffn_down, config.dim, config.hidden_dim);
+
+        layers.push(Qwen35LayerWeights {
+            attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("{}.attn_norm.weight", prefix),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            post_attn_norm: load_f32_vec(
+                mmap_data,
+                data_offset,
+                &format!("{}.post_attention_norm.weight", prefix),
+                &tensor_idx,
+                &inferred_sizes,
+            ),
+            mixer,
+            ffn_gate,
+            ffn_up,
+            ffn_down,
+        });
+        if layer_index == 0 || (layer_index + 1) % 8 == 0 || layer_index + 1 == trunk_layers {
+            eprintln!(
+                "  Loaded qwen35 trunk layer {}/{}",
+                layer_index + 1,
+                trunk_layers
+            );
+        }
+    }
+    assert!(
+        recurrent_layer_count > 0 && attn_layer_count > 0,
+        "qwen35 trunk must contain both Gated DeltaNet and full-attention blocks"
+    );
+
+    let weights = Qwen35Weights {
+        token_embd,
+        output_norm: load_f32_vec(
+            mmap_data,
+            data_offset,
+            "output_norm.weight",
+            &tensor_idx,
+            &inferred_sizes,
+        ),
+        output,
+        layers,
+        ssm,
+        recurrent_layer_count,
+        attn_layer_count,
+        rotary_dim,
+        rope_inv_freq: build_rope_inv_freq(
+            config.rope_theta,
+            rotary_dim,
+            config.rope_scaling_factor,
+        ),
+    };
+    (config, weights)
+}
+
 pub fn load_gpt_oss_model(
     mmap_data: &[u8],
     gguf: &GGUFFile,
@@ -5436,7 +6063,11 @@ pub(crate) fn online_attention_grouped(
         let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
-        if kv_mul == 4 {
+        // Qwen3.8-27B is 24Q/4KV GQA, i.e. six query heads share every
+        // cached K/V row. Reuse the x4 SIMD path for its first four heads and
+        // finish the remaining pair below; this keeps the row hot and avoids
+        // falling back to six independent scalar dot/AXPY streams.
+        if kv_mul == 4 || kv_mul == 6 {
             let q0 = unsafe { queries.get_unchecked(0..key_head_dim) };
             let q1 = unsafe { queries.get_unchecked(key_head_dim..2 * key_head_dim) };
             let q2 = unsafe { queries.get_unchecked(2 * key_head_dim..3 * key_head_dim) };
@@ -5461,10 +6092,40 @@ pub(crate) fn online_attention_grouped(
                     denom[g] += alpha[g];
                 }
             }
-            let (out0, rest) = out.split_at_mut(value_head_dim);
-            let (out1, rest) = rest.split_at_mut(value_head_dim);
-            let (out2, out3) = rest.split_at_mut(value_head_dim);
-            simd::affine_add_f32x4(out0, out1, out2, out3, multiplier, alpha, value_row);
+            {
+                let (out0, rest) = out.split_at_mut(value_head_dim);
+                let (out1, rest) = rest.split_at_mut(value_head_dim);
+                let (out2, rest) = rest.split_at_mut(value_head_dim);
+                let (out3, _) = rest.split_at_mut(value_head_dim);
+                simd::affine_add_f32x4(out0, out1, out2, out3, multiplier, alpha, value_row);
+            }
+            if kv_mul == 6 {
+                for g in 4..6 {
+                    let q_sub = unsafe {
+                        queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
+                    };
+                    let score = simd::dot_f32(q_sub, keys_sub) * scale;
+                    let out_sub = unsafe {
+                        out.get_unchecked_mut(
+                            g * value_head_dim..g * value_head_dim + value_head_dim,
+                        )
+                    };
+                    if score > max_score[g] {
+                        let old_scale = if max_score[g].is_finite() {
+                            exp_attn(max_score[g] - score)
+                        } else {
+                            0.0
+                        };
+                        simd::scale_add_f32(out_sub, old_scale, value_row);
+                        denom[g] = denom[g] * old_scale + 1.0;
+                        max_score[g] = score;
+                    } else {
+                        let weight = exp_attn(score - max_score[g]);
+                        simd::axpy_f32(out_sub, weight, value_row);
+                        denom[g] += weight;
+                    }
+                }
+            }
             slot += 1;
             if slot == slot_count {
                 slot = 0;
@@ -5650,11 +6311,10 @@ pub(crate) fn online_attention_grouped_bf16(
         let v_off = slot * value_stride;
         let value_row = unsafe { values.get_unchecked(v_off..v_off + value_head_dim) };
 
-        // Mirrors the f32 kv_mul == 4 fast path: without this, the generic
-        // per-g loop below would re-widen the same bf16 key/value row four
-        // times (once per query head) instead of once, which measured as a
-        // real decode regression versus f32 rather than the expected win.
-        if kv_mul == 4 {
+        // Mirrors the f32 x4 path. Qwen3.8's six-query-head GQA layout uses
+        // it for the first four heads and evaluates the remaining pair below,
+        // so each bf16 K/V element is widened once for the SIMD quartet.
+        if kv_mul == 4 || kv_mul == 6 {
             let q0 = unsafe { queries.get_unchecked(0..key_head_dim) };
             let q1 = unsafe { queries.get_unchecked(key_head_dim..2 * key_head_dim) };
             let q2 = unsafe { queries.get_unchecked(2 * key_head_dim..3 * key_head_dim) };
@@ -5679,10 +6339,40 @@ pub(crate) fn online_attention_grouped_bf16(
                     denom[g] += alpha[g];
                 }
             }
-            let (out0, rest) = out.split_at_mut(value_head_dim);
-            let (out1, rest) = rest.split_at_mut(value_head_dim);
-            let (out2, out3) = rest.split_at_mut(value_head_dim);
-            simd::affine_add_bf16x4_f32(out0, out1, out2, out3, multiplier, alpha, value_row);
+            {
+                let (out0, rest) = out.split_at_mut(value_head_dim);
+                let (out1, rest) = rest.split_at_mut(value_head_dim);
+                let (out2, rest) = rest.split_at_mut(value_head_dim);
+                let (out3, _) = rest.split_at_mut(value_head_dim);
+                simd::affine_add_bf16x4_f32(out0, out1, out2, out3, multiplier, alpha, value_row);
+            }
+            if kv_mul == 6 {
+                for g in 4..6 {
+                    let q_sub = unsafe {
+                        queries.get_unchecked(g * key_head_dim..g * key_head_dim + key_head_dim)
+                    };
+                    let score = simd::dot_bf16_f32(q_sub, keys_sub) * scale;
+                    let out_sub = unsafe {
+                        out.get_unchecked_mut(
+                            g * value_head_dim..g * value_head_dim + value_head_dim,
+                        )
+                    };
+                    if score > max_score[g] {
+                        let old_scale = if max_score[g].is_finite() {
+                            exp_attn(max_score[g] - score)
+                        } else {
+                            0.0
+                        };
+                        simd::scale_add_bf16_f32(out_sub, old_scale, value_row);
+                        denom[g] = denom[g] * old_scale + 1.0;
+                        max_score[g] = score;
+                    } else {
+                        let weight = exp_attn(score - max_score[g]);
+                        simd::axpy_bf16_f32(out_sub, weight, value_row);
+                        denom[g] += weight;
+                    }
+                }
+            }
             slot += 1;
             if slot == slot_count {
                 slot = 0;
@@ -6849,6 +7539,541 @@ fn softplus(value: f32) -> f32 {
     } else {
         value.exp().ln_1p()
     }
+}
+
+/// Qwen3.5's Gated DeltaNet uses true L2 normalisation, unlike RMSNorm.
+///
+/// llama.cpp intentionally clamps the norm itself (`max(sqrt(sum_sq), eps)`),
+/// rather than adding epsilon under the square root. Keeping that distinction
+/// matters for exact replay and for zero-valued test vectors.
+fn qwen35_l2_normalize_heads(x: &mut [f32], head_dim: usize, heads: usize, eps: f32) {
+    if head_dim == 0 || heads == 0 {
+        return;
+    }
+    debug_assert!(x.len() >= head_dim * heads);
+    for head in 0..heads {
+        let values = &mut x[head * head_dim..(head + 1) * head_dim];
+        let denom = simd::dot_f32(values, values).sqrt().max(eps);
+        for value in values {
+            *value /= denom;
+        }
+    }
+}
+
+#[inline]
+fn qwen35_key_head_for_value_head(value_head: usize, key_heads: usize) -> usize {
+    value_head % key_heads
+}
+
+/// Splits Qwen3.5's full-attention joint projection. Its layout alternates Q
+/// and gate per head, unlike common fused projections that put all Q rows
+/// before all gate rows.
+fn qwen35_split_q_gate(
+    q_gate: &[f32],
+    head_dim: usize,
+    heads: usize,
+    q: &mut Vec<f32>,
+    gate: &mut Vec<f32>,
+) {
+    debug_assert_eq!(q_gate.len(), 2 * heads * head_dim);
+    q.resize(heads * head_dim, 0.0);
+    gate.resize(heads * head_dim, 0.0);
+    for head in 0..heads {
+        let source = head * 2 * head_dim;
+        let target = head * head_dim;
+        q[target..target + head_dim].copy_from_slice(&q_gate[source..source + head_dim]);
+        gate[target..target + head_dim]
+            .copy_from_slice(&q_gate[source + head_dim..source + 2 * head_dim]);
+    }
+}
+
+/// Advances one value-head of Qwen3.5's Gated DeltaNet associative memory.
+///
+/// `state` is laid out as `[value_row][key_column]`, the transpose of the
+/// mathematical `S[key][value]` notation. It makes each value row contiguous
+/// for the two dot products and exactly matches the GGUF reference kernel.
+fn qwen35_delta_head_step(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    decay: f32,
+    beta: f32,
+    state: &mut [f32],
+    out: &mut [f32],
+) {
+    let width = q.len();
+    debug_assert_eq!(k.len(), width);
+    debug_assert_eq!(v.len(), width);
+    debug_assert_eq!(out.len(), width);
+    debug_assert_eq!(state.len(), width * width);
+
+    let q_scale = 1.0 / (width as f32).sqrt();
+    for value_row in 0..width {
+        let row = &mut state[value_row * width..(value_row + 1) * width];
+        for entry in row.iter_mut() {
+            *entry *= decay;
+        }
+        let predicted = simd::dot_f32(row, k);
+        let delta = (v[value_row] - predicted) * beta;
+        for key_index in 0..width {
+            row[key_index] += delta * k[key_index];
+        }
+        // The reference applies the 1/sqrt(d) scale to Q after the state
+        // update, so the output must read the new, not the old, memory.
+        out[value_row] = simd::dot_f32(row, q) * q_scale;
+    }
+}
+
+/// Raw context for the independent value-head updates in one Gated DeltaNet
+/// layer. Each worker owns complete `[value_dim, key_dim]` state matrices, so
+/// head-parallel execution has no synchronisation or reduction overhead.
+#[cfg(not(target_family = "wasm"))]
+struct Qwen35DeltaHeadsCtx {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    alpha: *const f32,
+    beta: *const f32,
+    a: *const f32,
+    dt_bias: *const f32,
+    state: *mut f32,
+    out: *mut f32,
+    key_heads: usize,
+    head_dim: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn qwen35_delta_heads_range(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `parallel_range` blocks for the context lifetime. The caller
+    // assigns disjoint head ranges, and each head writes a separate state
+    // matrix/output row while Q/K/V and recurrence parameters are immutable.
+    let ctx = unsafe { &*(ctx as *const Qwen35DeltaHeadsCtx) };
+    for value_head in start..end {
+        let key_head = qwen35_key_head_for_value_head(value_head, ctx.key_heads);
+        let q =
+            unsafe { std::slice::from_raw_parts(ctx.q.add(key_head * ctx.head_dim), ctx.head_dim) };
+        let k =
+            unsafe { std::slice::from_raw_parts(ctx.k.add(key_head * ctx.head_dim), ctx.head_dim) };
+        let v = unsafe {
+            std::slice::from_raw_parts(ctx.v.add(value_head * ctx.head_dim), ctx.head_dim)
+        };
+        let state = unsafe {
+            std::slice::from_raw_parts_mut(
+                ctx.state.add(value_head * ctx.head_dim * ctx.head_dim),
+                ctx.head_dim * ctx.head_dim,
+            )
+        };
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(ctx.out.add(value_head * ctx.head_dim), ctx.head_dim)
+        };
+        let alpha = softplus(unsafe { *ctx.alpha.add(value_head) + *ctx.dt_bias.add(value_head) });
+        let decay = (unsafe { *ctx.a.add(value_head) } * alpha).exp();
+        let beta = 1.0 / (1.0 + (-unsafe { *ctx.beta.add(value_head) }).exp());
+        qwen35_delta_head_step(q, k, v, decay, beta, state, out);
+    }
+}
+
+/// Evaluates all independent Qwen Gated DeltaNet value heads. This puts the
+/// 48 x 128x128 recurrent update on the shared worker pool after the quantized
+/// projections complete; it avoids allocating per-token work buffers.
+fn qwen35_delta_heads(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    a: &[f32],
+    dt_bias: &[f32],
+    state: &mut [f32],
+    out: &mut [f32],
+    key_heads: usize,
+    value_heads: usize,
+    head_dim: usize,
+) {
+    debug_assert_eq!(q.len(), key_heads * head_dim);
+    debug_assert_eq!(k.len(), key_heads * head_dim);
+    debug_assert_eq!(v.len(), value_heads * head_dim);
+    debug_assert_eq!(alpha.len(), value_heads);
+    debug_assert_eq!(beta.len(), value_heads);
+    debug_assert_eq!(a.len(), value_heads);
+    debug_assert_eq!(dt_bias.len(), value_heads);
+    debug_assert_eq!(state.len(), value_heads * head_dim * head_dim);
+    debug_assert_eq!(out.len(), value_heads * head_dim);
+
+    #[cfg(not(target_family = "wasm"))]
+    if value_heads >= 4 && crate::simd::num_threads() > 1 {
+        let ctx = Qwen35DeltaHeadsCtx {
+            q: q.as_ptr(),
+            k: k.as_ptr(),
+            v: v.as_ptr(),
+            alpha: alpha.as_ptr(),
+            beta: beta.as_ptr(),
+            a: a.as_ptr(),
+            dt_bias: dt_bias.as_ptr(),
+            state: state.as_mut_ptr(),
+            out: out.as_mut_ptr(),
+            key_heads,
+            head_dim,
+        };
+        // SAFETY: each callback range owns distinct value-head state/output
+        // regions, described by the raw context above.
+        unsafe {
+            crate::simd::parallel_range(
+                value_heads,
+                qwen35_delta_heads_range,
+                &ctx as *const Qwen35DeltaHeadsCtx as *const (),
+            );
+        }
+        return;
+    }
+
+    for value_head in 0..value_heads {
+        let key_head = qwen35_key_head_for_value_head(value_head, key_heads);
+        let q = &q[key_head * head_dim..(key_head + 1) * head_dim];
+        let k = &k[key_head * head_dim..(key_head + 1) * head_dim];
+        let v = &v[value_head * head_dim..(value_head + 1) * head_dim];
+        let state =
+            &mut state[value_head * head_dim * head_dim..(value_head + 1) * head_dim * head_dim];
+        let out = &mut out[value_head * head_dim..(value_head + 1) * head_dim];
+        let alpha = softplus(alpha[value_head] + dt_bias[value_head]);
+        let decay = (a[value_head] * alpha).exp();
+        let beta = 1.0 / (1.0 + (-beta[value_head]).exp());
+        qwen35_delta_head_step(q, k, v, decay, beta, state, out);
+    }
+}
+
+/// Runs one causal Qwen3.5 Gated DeltaNet mixer and writes its residual-space
+/// projection to `buf.proj`.
+fn qwen35_linear_step(
+    layer: &Qwen35LinearWeights,
+    dims: &SsmDims,
+    conv_state: &mut [f32],
+    ssm_state: &mut [f32],
+    eps: f32,
+    buf: &mut DecodeBuffer,
+) {
+    let key_dim = dims.n_group * dims.d_state;
+    let value_dim = dims.d_inner;
+    let value_head_dim = dims.head_dim();
+    let conv_dim = dims.conv_dim();
+    let qkv_dim = 2 * key_dim + value_dim;
+    debug_assert_eq!(qkv_dim, conv_dim);
+    debug_assert_eq!(layer.conv_w.len(), conv_dim * dims.d_conv);
+    debug_assert_eq!(layer.dt_bias.len(), dims.n_head);
+    debug_assert_eq!(layer.a.len(), dims.n_head);
+    debug_assert_eq!(layer.norm.len(), value_head_dim);
+    debug_assert_eq!(conv_state.len(), conv_dim * (dims.d_conv - 1));
+    debug_assert_eq!(ssm_state.len(), value_dim * dims.d_state);
+
+    let hidden = &buf.xn;
+
+    if !try_quant_matvec2_into(
+        &layer.qkv,
+        &layer.gate,
+        hidden,
+        &mut buf.qwen35_qkv,
+        &mut buf.qwen35_gate,
+    ) {
+        layer.qkv.matvec_into(hidden, &mut buf.qwen35_qkv);
+        layer.gate.matvec_into(hidden, &mut buf.qwen35_gate);
+    }
+    if !try_quant_matvec2_into(
+        &layer.alpha,
+        &layer.beta,
+        hidden,
+        &mut buf.qwen35_alpha,
+        &mut buf.qwen35_beta,
+    ) {
+        layer.alpha.matvec_into(hidden, &mut buf.qwen35_alpha);
+        layer.beta.matvec_into(hidden, &mut buf.qwen35_beta);
+    }
+    debug_assert_eq!(buf.qwen35_qkv.len(), qkv_dim);
+    debug_assert_eq!(buf.qwen35_gate.len(), value_dim);
+    debug_assert_eq!(buf.qwen35_alpha.len(), dims.n_head);
+    debug_assert_eq!(buf.qwen35_beta.len(), dims.n_head);
+
+    // Depthwise causal convolution. The shift register is oldest-to-newest,
+    // with the current sample occupying the final tap; this mirrors Conv1d's
+    // left padding convention used by the Qwen reference implementation.
+    let history_len = dims.d_conv - 1;
+    for channel in 0..conv_dim {
+        let current = buf.qwen35_qkv[channel];
+        let taps = &layer.conv_w[channel * dims.d_conv..(channel + 1) * dims.d_conv];
+        let history = &mut conv_state[channel * history_len..(channel + 1) * history_len];
+        let mut convolved = current * taps[history_len];
+        for (past, tap) in history.iter().zip(&taps[..history_len]) {
+            convolved += past * tap;
+        }
+        history.copy_within(1..history_len, 0);
+        history[history_len - 1] = current;
+        // Keep the convolution result in place until the complete vector is
+        // available. Applying SiLU below through the shared SIMD SwiGLU
+        // kernel avoids a scalar `expf` call for each of Q/K/V's 10,240
+        // channels in every recurrent layer.
+        buf.qwen35_qkv[channel] = convolved;
+    }
+    crate::simd::silu_mul_into(&buf.qwen35_qkv, &buf.qwen35_qkv, &mut buf.attn_out);
+    std::mem::swap(&mut buf.qwen35_qkv, &mut buf.attn_out);
+
+    let (q_all, rest) = buf.qwen35_qkv.split_at_mut(key_dim);
+    let (k_all, v_all) = rest.split_at_mut(key_dim);
+    qwen35_l2_normalize_heads(q_all, dims.d_state, dims.n_group, eps);
+    qwen35_l2_normalize_heads(k_all, dims.d_state, dims.n_group, eps);
+
+    buf.attn_out.resize(value_dim, 0.0);
+    // Qwen GGUF conversion reorders all value-head-indexed tensors from HF's
+    // grouped order into tiled order. Thus V head `h` uses Q/K head `h % Hk`.
+    qwen35_delta_heads(
+        q_all,
+        k_all,
+        v_all,
+        &buf.qwen35_alpha,
+        &buf.qwen35_beta,
+        &layer.a,
+        &layer.dt_bias,
+        ssm_state,
+        &mut buf.attn_out,
+        dims.n_group,
+        dims.n_head,
+        value_head_dim,
+    );
+
+    // Qwen's ordering is RMSNorm first, then SiLU(z). Reversing the two
+    // produces plausible-looking but incorrect generations.
+    rms_norm_heads_in_place(
+        &mut buf.attn_out,
+        value_head_dim,
+        dims.n_head,
+        Some(&layer.norm),
+        eps,
+    );
+    // Reuse the normal SwiGLU SIMD kernel for DeltaNet's output gate. `hidden`
+    // is scratch at this point and will be overwritten by the following FFN.
+    crate::simd::silu_mul_into(&buf.qwen35_gate, &buf.attn_out, &mut buf.hidden);
+    layer.out.matvec_into(&buf.hidden, &mut buf.proj);
+}
+
+/// Runs one gated full-attention Qwen3.5 mixer and writes its residual-space
+/// projection to `buf.proj`. Text positions use the same scalar on all three
+/// MRoPE axes; vision/video position construction is deliberately separate.
+fn qwen35_attention_step(
+    config: &Config,
+    weights: &Qwen35Weights,
+    layer: &Qwen35AttentionWeights,
+    cache: &mut KVCache,
+    pos: usize,
+    buf: &mut DecodeBuffer,
+) {
+    let query_dim = config.n_heads * config.head_dim;
+    let key_dim = config.n_kv_heads * config.head_dim;
+    let value_dim = config.n_kv_heads * config.value_dim;
+
+    let hidden = &buf.xn;
+    // Qwen3.8-27B-Q4_K_M stores these as Q4_K/Q4_K/Q6_K.  The generic
+    // three-projection K-quant kernel shares activation preparation and one
+    // worker-pool dispatch across the joint Q+gate, K, and V projections;
+    // other quantizations retain their individually equivalent fallback.
+    if !try_quant_matvec3_into(
+        &layer.q_gate,
+        &layer.k,
+        &layer.v,
+        hidden,
+        &mut buf.qwen35_q_gate,
+        &mut buf.k,
+        &mut buf.v,
+    ) {
+        layer.q_gate.matvec_into(hidden, &mut buf.qwen35_q_gate);
+        layer.k.matvec_into(hidden, &mut buf.k);
+        layer.v.matvec_into(hidden, &mut buf.v);
+    }
+    debug_assert_eq!(buf.qwen35_q_gate.len(), 2 * query_dim);
+    qwen35_split_q_gate(
+        &buf.qwen35_q_gate,
+        config.head_dim,
+        config.n_heads,
+        &mut buf.q,
+        &mut buf.qwen35_gate,
+    );
+    debug_assert_eq!(buf.k.len(), key_dim);
+    debug_assert_eq!(buf.v.len(), value_dim);
+
+    apply_qk_norm_if_present(
+        &mut buf.q,
+        &mut buf.k,
+        config.head_dim,
+        config.n_heads,
+        config.n_kv_heads,
+        &layer.q_norm,
+        &layer.k_norm,
+        config.rms_norm_eps,
+    );
+    // Qwen3.5 uses interleaved MRoPE frequencies with the NeoX rotate-half
+    // layout. For text all MRoPE axes equal `pos`, leaving this partial helper
+    // numerically equivalent to the full multi-axis operation.
+    apply_rope_qk_neox_partial(
+        &mut buf.q,
+        &mut buf.k,
+        pos,
+        config.head_dim,
+        weights.rotary_dim,
+        config.n_heads,
+        config.n_kv_heads,
+        &weights.rope_inv_freq,
+    );
+
+    cache.write_k(layer.kv_slot, pos, &buf.k[..key_dim]);
+    cache.write_v(layer.kv_slot, pos, &buf.v[..value_dim]);
+    buf.attn_out.resize(query_dim, 0.0);
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+    if cache.bf16 {
+        attention_over_kv_heads_bf16(
+            &buf.q,
+            &cache.k_bf16[layer.kv_slot],
+            &cache.v_bf16[layer.kv_slot],
+            cache.per_pos_k_dim,
+            cache.per_pos_v_dim,
+            cache.storage_len,
+            config.head_dim,
+            config.value_dim,
+            config.n_kv_heads,
+            config.kv_mul,
+            0,
+            pos,
+            scale,
+            &mut buf.attn_out,
+        );
+    } else {
+        attention_over_kv_heads(
+            &buf.q,
+            &cache.k[layer.kv_slot],
+            &cache.v[layer.kv_slot],
+            cache.per_pos_k_dim,
+            cache.per_pos_v_dim,
+            cache.storage_len,
+            config.head_dim,
+            config.value_dim,
+            config.n_kv_heads,
+            config.kv_mul,
+            0,
+            pos,
+            scale,
+            &mut buf.attn_out,
+        );
+    }
+    crate::simd::sigmoid_mul_in_place(&mut buf.attn_out, &buf.qwen35_gate);
+    layer.out.matvec_into(&buf.attn_out, &mut buf.proj);
+}
+
+fn forward_qwen35_impl(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: Option<&mut Vec<f32>>,
+) {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    let mut recurrent_index = 0usize;
+
+    for layer in &weights.layers {
+        rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
+        match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => {
+                let state = cache
+                    .ssm
+                    .as_mut()
+                    .expect("qwen35 requires Gated DeltaNet recurrent state");
+                qwen35_linear_step(
+                    linear,
+                    &weights.ssm,
+                    &mut state.conv[recurrent_index],
+                    &mut state.ssm[recurrent_index],
+                    config.rms_norm_eps,
+                    buf,
+                );
+                recurrent_index += 1;
+            }
+            Qwen35Mixer::Attention(attn) => {
+                qwen35_attention_step(config, weights, attn, cache, pos, buf);
+            }
+        }
+        for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
+            *residual += projection;
+        }
+
+        rms_norm_into(
+            &buf.x,
+            &layer.post_attn_norm,
+            config.rms_norm_eps,
+            &mut buf.xn2,
+        );
+        if !try_quant_matvec2_into(
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &buf.xn2,
+            &mut buf.gate,
+            &mut buf.up,
+        ) {
+            layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+            layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+        }
+        crate::simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+        layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+        for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
+            *residual += projection;
+        }
+    }
+    debug_assert_eq!(recurrent_index, weights.recurrent_layer_count);
+    rms_norm_into(
+        &buf.x,
+        &weights.output_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    if let Some(logits) = logits {
+        weights.output.matvec_into(&buf.xn, logits);
+    }
+}
+
+/// Runs one Qwen3.5/Qwen3.8 decode step and writes logits.
+pub fn forward_qwen35_into(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) {
+    forward_qwen35_impl(config, weights, cache, buf, token, pos, Some(logits));
+}
+
+/// Runs one Qwen3.5/Qwen3.8 step and returns the final normalised hidden state.
+pub fn forward_hidden_qwen35<'a>(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &'a mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) -> &'a [f32] {
+    forward_qwen35_impl(config, weights, cache, buf, token, pos, None);
+    &buf.xn
+}
+
+/// Advances a Qwen3.5/Qwen3.8 prompt token without producing logits.
+pub fn forward_prefill_qwen35(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+) {
+    forward_qwen35_impl(config, weights, cache, buf, token, pos, None);
 }
 
 fn select_laguna_experts(

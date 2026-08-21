@@ -101,7 +101,7 @@ RustyLLM accepts GGUF files whose `general.architecture` metadata matches one of
 the supported architecture identifiers:
 
 `llama`, `llama2`, `llama3`, `mistral`, `mistral3`, `mixtral`, `ministral`,
-`qwen2`, `qwen3`, `gpt-oss`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
+`qwen2`, `qwen3`, `qwen35`, `gpt-oss`, `gemma`, `gemma2`, `gemma3`, `gemma4`,
 `gemma4n`, `gemma4-assistant`, `granite`, `granite3`, `granite4`,
 `deepseek`, `deepseek-v2`, `deepseek2`, `nemotron`, `nemotron_h`,
 `nemotron_h_moe`, `hermes`, `phi`, `phi2`,
@@ -206,6 +206,27 @@ run as routed mixture-of-experts layers: a softmax router selects the top
 outputs. Routed layers stay on the CPU/regular Metal path — the GPU-resident
 decoder, the fused FFN kernels, and batched prefill all assume dense weights and
 are disabled per layer when experts are present.
+
+### Qwen 3.8 / Qwen3.5 hybrid
+
+Qwen 3.8 text GGUFs identify themselves as `qwen35`, rather than `qwen3`.
+RustyLLM runs the 64-block text trunk: 48 Gated DeltaNet recurrent blocks and
+16 full-attention blocks. A trailing multi-token-prediction block is recognised
+and excluded from ordinary generation.
+
+The CPU path keeps only the 16 attention KV slots, parallelises the independent
+DeltaNet value heads, and supports `--kv-cache-dtype bf16` for those attention
+slots. Although the model metadata advertises a 262k context, the default is
+capped at 8192 tokens because the full f32 attention cache would otherwise need
+about 32 GiB; pass `--max-context` explicitly when enough memory is available.
+
+`tokenizer.ggml.pre = qwen35` selects Qwen's native BPE splitter (individual
+numeric code points and combining marks retained with their words). Normal chat
+generation also opens Qwen's default `<think>` turn. Its 24-query/4-KV-head
+attention uses a six-head grouped SIMD path, including the BF16-KV variant.
+
+This path currently covers text generation only. Vision/MMProj inputs and the
+MTP head are intentionally not advertised as supported.
 
 ### Soofi S Isar / Nemotron-H
 

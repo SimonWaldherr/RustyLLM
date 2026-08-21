@@ -2235,11 +2235,49 @@ pub fn silu_mul_into(gate: &[f32], up: &[f32], out: &mut Vec<f32>) {
     }
 }
 
+/// Multiplies `values[i]` by `sigmoid(gate[i])` in place.
+///
+/// Qwen3.5's full-attention blocks apply this gate after attention and before
+/// their output projection. Keeping it in place avoids a scratch allocation
+/// while sharing the same SIMD exp approximation as [`silu_mul_into`].
+pub fn sigmoid_mul_in_place(values: &mut [f32], gate: &[f32]) {
+    debug_assert_eq!(values.len(), gate.len());
+    let n = values.len().min(gate.len());
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    {
+        unsafe { sigmoid_mul_neon(&mut values[..n], &gate[..n]) }
+        return;
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    {
+        if has_avx2_fma() {
+            unsafe { sigmoid_mul_avx2(&mut values[..n], &gate[..n]) }
+        } else {
+            sigmoid_mul_scalar(&mut values[..n], &gate[..n]);
+        }
+        return;
+    }
+    #[cfg(not(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(target_family = "wasm")
+    )))]
+    {
+        sigmoid_mul_scalar(&mut values[..n], &gate[..n]);
+    }
+}
+
 /// Scalar reference for `silu_mul_into` (also the wasm/non-AVX2 path).
 fn silu_mul_scalar(gate: &[f32], up: &[f32], out: &mut [f32]) {
     for i in 0..out.len() {
         let g = gate[i];
         out[i] = g / (1.0 + (-g).exp()) * up[i];
+    }
+}
+
+/// Scalar reference for [`sigmoid_mul_in_place`].
+fn sigmoid_mul_scalar(values: &mut [f32], gate: &[f32]) {
+    for (value, gate) in values.iter_mut().zip(gate) {
+        *value *= 1.0 / (1.0 + (-*gate).exp());
     }
 }
 
@@ -2312,6 +2350,25 @@ unsafe fn silu_mul_avx2(gate: &[f32], up: &[f32], out: &mut [f32]) {
     silu_mul_scalar(&gate[main..], &up[main..], &mut out[main..]);
 }
 
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn sigmoid_mul_avx2(values: &mut [f32], gate: &[f32]) {
+    use std::arch::x86_64::*;
+    let n = values.len();
+    let main = n / 8 * 8;
+    let one = _mm256_set1_ps(1.0);
+    let mut i = 0usize;
+    while i < main {
+        let value = _mm256_loadu_ps(values.as_ptr().add(i));
+        let g = _mm256_loadu_ps(gate.as_ptr().add(i));
+        let e = exp_ps_avx2(_mm256_sub_ps(_mm256_setzero_ps(), g));
+        let sigmoid = _mm256_div_ps(one, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(values.as_mut_ptr().add(i), _mm256_mul_ps(value, sigmoid));
+        i += 8;
+    }
+    sigmoid_mul_scalar(&mut values[main..], &gate[main..]);
+}
+
 #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
 #[inline]
 unsafe fn exp_ps_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
@@ -2349,6 +2406,24 @@ unsafe fn silu_mul_neon(gate: &[f32], up: &[f32], out: &mut [f32]) {
         i += 4;
     }
     silu_mul_scalar(&gate[main..], &up[main..], &mut out[main..]);
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+unsafe fn sigmoid_mul_neon(values: &mut [f32], gate: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = values.len();
+    let main = n / 4 * 4;
+    let one = vdupq_n_f32(1.0);
+    let mut i = 0usize;
+    while i < main {
+        let value = vld1q_f32(values.as_ptr().add(i));
+        let g = vld1q_f32(gate.as_ptr().add(i));
+        let e = exp_ps_neon(vnegq_f32(g));
+        let sigmoid = vdivq_f32(one, vaddq_f32(one, e));
+        vst1q_f32(values.as_mut_ptr().add(i), vmulq_f32(value, sigmoid));
+        i += 4;
+    }
+    sigmoid_mul_scalar(&mut values[main..], &gate[main..]);
 }
 
 #[inline]
@@ -8305,6 +8380,96 @@ mod tests {
                 expect[i]
             );
         }
+    }
+
+    #[test]
+    fn sigmoid_mul_simd_matches_scalar() {
+        let n = 1003usize;
+        let gate: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / (n as f32 - 1.0)) * 180.0 - 90.0)
+            .collect();
+        let seed: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.37).sin()) * 2.0).collect();
+        let mut expect = seed.clone();
+        sigmoid_mul_scalar(&mut expect, &gate);
+        let mut got = seed;
+        sigmoid_mul_in_place(&mut got, &gate);
+        for i in 0..n {
+            let tol = 1e-5f32.max(expect[i].abs() * 1e-5);
+            assert!(
+                (got[i] - expect[i]).abs() <= tol,
+                "i={i} gate={} got {} expect {}",
+                gate[i],
+                got[i],
+                expect[i]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib qwen35_silu_neon_speedup -- --ignored --nocapture"]
+    /// Measures the two SiLU shapes used by every Qwen3.5 Gated DeltaNet
+    /// block: its 10,240-wide causal convolution and 6,144-wide output gate.
+    /// Both runs cover all 48 recurrent blocks in one Qwen3.8 decode token.
+    fn qwen35_silu_neon_speedup() {
+        const CONV_DIM: usize = 10_240;
+        const VALUE_DIM: usize = 6_144;
+        const RECURRENT_LAYERS: usize = 48;
+        const RUNS: usize = 64;
+
+        let conv: Vec<f32> = (0..CONV_DIM)
+            .map(|i| (i as f32 * 0.017).sin() * 5.0)
+            .collect();
+        let gate: Vec<f32> = (0..VALUE_DIM)
+            .map(|i| (i as f32 * 0.023).cos() * 5.0)
+            .collect();
+        let value: Vec<f32> = (0..VALUE_DIM)
+            .map(|i| (i as f32 * 0.031).sin() * 2.0)
+            .collect();
+
+        let mut scalar_conv = vec![0.0; CONV_DIM];
+        let mut scalar_gate = vec![0.0; VALUE_DIM];
+        silu_mul_scalar(&conv, &conv, &mut scalar_conv);
+        silu_mul_scalar(&gate, &value, &mut scalar_gate);
+        let mut simd_conv = Vec::new();
+        let mut simd_gate = Vec::new();
+        silu_mul_into(&conv, &conv, &mut simd_conv);
+        silu_mul_into(&gate, &value, &mut simd_gate);
+        for (actual, expected) in simd_conv.iter().zip(&scalar_conv) {
+            assert!((actual - expected).abs() <= 1e-5f32.max(expected.abs() * 1e-5));
+        }
+        for (actual, expected) in simd_gate.iter().zip(&scalar_gate) {
+            assert!((actual - expected).abs() <= 1e-5f32.max(expected.abs() * 1e-5));
+        }
+
+        let scalar_start = std::time::Instant::now();
+        let mut scalar_sum = 0.0f32;
+        for _ in 0..RUNS {
+            for _ in 0..RECURRENT_LAYERS {
+                silu_mul_scalar(&conv, &conv, &mut scalar_conv);
+                silu_mul_scalar(&gate, &value, &mut scalar_gate);
+                scalar_sum += scalar_conv[0] + scalar_gate[0];
+            }
+        }
+        let scalar_time = scalar_start.elapsed();
+
+        let simd_start = std::time::Instant::now();
+        let mut simd_sum = 0.0f32;
+        for _ in 0..RUNS {
+            for _ in 0..RECURRENT_LAYERS {
+                silu_mul_into(&conv, &conv, &mut simd_conv);
+                silu_mul_into(&gate, &value, &mut simd_gate);
+                simd_sum += simd_conv[0] + simd_gate[0];
+            }
+        }
+        let simd_time = simd_start.elapsed();
+
+        std::hint::black_box((scalar_sum, simd_sum));
+        let speedup = scalar_time.as_secs_f64() / simd_time.as_secs_f64();
+        eprintln!(
+            "Qwen35 GDN SiLU: scalar={:.3} ms, SIMD={:.3} ms, speedup={speedup:.2}x",
+            scalar_time.as_secs_f64() * 1000.0,
+            simd_time.as_secs_f64() * 1000.0,
+        );
     }
 
     /// End-to-end: the public Q4_0 matvec (worker pool + caller-side shared
