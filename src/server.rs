@@ -2309,7 +2309,12 @@ where
     if use_session {
         if let (Some(id), Some(store)) = (conv_id, &options.session_store) {
             let max_cached = store.max_cached_tokens();
-            let session_arc = store.get_or_create(id, || runner.new_session(max_cached));
+            // The KV dtype is fixed when the cache is allocated, so an explicit
+            // --kv-cache-dtype has to reach this call: without it, server
+            // sessions silently stayed f32 while the one-shot path honoured it.
+            let session_arc = store.get_or_create(id, || {
+                runner.new_session_with_options(max_cached, generation)
+            });
             let mut session = session_arc.lock().expect("session lock poisoned");
             return runner.generate_chat_with_session_with_skill_memory(
                 messages,

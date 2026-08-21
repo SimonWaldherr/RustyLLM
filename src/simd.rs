@@ -30,6 +30,20 @@ static WORKER_POLL_SPINS: AtomicUsize = AtomicUsize::new(2_000);
 const MATVEC_CHUNK_ROWS: usize = 64;
 #[cfg(not(target_family = "wasm"))]
 const KQUANT_BATCH_CHUNK_ROWS: usize = 32;
+/// How many tokens the batched K-quant kernels keep in flight against one
+/// weight row. Unpacking a K-quant block — f16 scale conversion, 6-bit
+/// scale/min extraction, nibble or 2-bit-plane reassembly — costs more vector
+/// work than the `maddubs`/`sdot` products it feeds, and none of it depends on
+/// the activation, so paying it once per four tokens instead of once per token
+/// is what makes a prefill chunk cheaper than the same tokens run singly.
+/// Four lanes keep the per-lane accumulators plus the unpacked weights inside
+/// the 16 AVX2 registers. Eight was measured and rejected: the eight
+/// `__m256i` accumulators spill, and end-to-end prefill dropped from 26.9 to
+/// 19.2 tok/s on the i7-10850H (203-token prompt, paired round). Raising this
+/// only makes sense together with a register-blocked kernel that reduces its
+/// accumulator count, e.g. by narrowing to i16 before the widening add.
+#[cfg(not(target_family = "wasm"))]
+const KQUANT_BATCH_TOKENS: usize = 4;
 #[cfg(not(target_family = "wasm"))]
 const MIN_DYNAMIC_CHUNKS_PER_WORKER: usize = 4;
 
@@ -1046,6 +1060,71 @@ unsafe fn dot_row(
     }
 }
 
+/// Computes one weight row against `lanes` (<= `KQUANT_BATCH_TOKENS`)
+/// activations at once, writing lane `t` to `out[t]`.
+///
+/// Only the K-quant integer paths have a blocked kernel; every other dtype,
+/// and any call with fewer than a full set of lanes, falls through to
+/// `dot_row` per lane. The blocked kernels keep each lane's accumulation order
+/// identical to the single-token version, so this returns bit-identical
+/// results either way — the batch path is a pure scheduling change, not a
+/// numerics change.
+#[cfg(not(target_family = "wasm"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot_row_x4(
+    kind: MatvecKind,
+    data: *const u8,
+    xs: &[*const f32; KQUANT_BATCH_TOKENS],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    lanes: usize,
+    row: usize,
+    cols: usize,
+    row_span: usize,
+    out: &mut [f32; KQUANT_BATCH_TOKENS],
+) {
+    if lanes == KQUANT_BATCH_TOKENS && xqs.iter().all(XQuant::present) {
+        let row_ptr = data.add(row * row_span);
+        let row_bytes = std::slice::from_raw_parts(row_ptr, row_span);
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        match kind {
+            MatvecKind::Q4K => {
+                *out = dot_q4_k_q8k_avx2_x4(row_bytes, xqs, cols);
+                return;
+            }
+            MatvecKind::Q5K => {
+                *out = dot_q5_k_q8k_avx2_x4(row_bytes, xqs, cols);
+                return;
+            }
+            MatvecKind::Q6K => {
+                *out = dot_q6_k_q8k_avx2_x4(row_bytes, xqs, cols);
+                return;
+            }
+            _ => {}
+        }
+        #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+        match kind {
+            MatvecKind::Q4K => {
+                *out = dot_q4_k_q8k_neon_x4(row_bytes, xqs, cols);
+                return;
+            }
+            MatvecKind::Q5K => {
+                *out = dot_q5_k_q8k_neon_x4(row_bytes, xqs, cols);
+                return;
+            }
+            MatvecKind::Q6K => {
+                *out = dot_q6_k_q8k_neon_x4(row_bytes, xqs, cols);
+                return;
+            }
+            _ => {}
+        }
+        let _ = row_bytes;
+    }
+    for t in 0..lanes {
+        out[t] = dot_row(kind, data, xs[t], xqs[t], row, cols, row_span);
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct MatvecJob {
@@ -1410,56 +1489,110 @@ impl KQuantBatch3Job {
         let (b_start, b_end) = clipped_range(start, end, self.rows_a, self.rows_b);
         let (c_start, c_end) = clipped_range(start, end, self.rows_a + self.rows_b, self.rows_c);
 
-        // Token-outer/row-inner deliberately. Swapping to row-outer to keep one
-        // weight row in L1 measured SLOWER here: a Q4_K row at cols=3072 is
-        // 1728 B, but one token's quantized activation is 3072 B, so the
-        // activations are the larger operand. Row-outer would stream all
-        // `tokens` activations (192 KiB at a 64-token microbatch) per row
-        // instead of one row chunk (55 KiB) per token, moving the thrashing to
-        // the worse side. Fixing this properly needs register blocking over both
-        // dimensions (unpack a weight block once, apply it to ~4 tokens), not a
-        // loop interchange.
-        for token in 0..self.tokens {
-            let x = self.inputs.add(token * self.cols);
-            // Row ownership reuses weight rows across tokens. Activations are
-            // pre-quantized once for the whole batch when the architecture has
-            // an integer-dot kernel, avoiding one quantization per worker.
-            let xq = self.xq_for_token(token, x);
+        // Token-blocked: `KQUANT_BATCH_TOKENS` tokens are carried through the
+        // row range together so each weight block is unpacked once for the
+        // whole group (see `dot_row_x4`). A plain loop interchange to
+        // row-outer/token-inner was measured SLOWER — a Q4_K row at cols=3072
+        // is 1728 B but one token's quantized activation is 3072 B, so making
+        // the activations the streamed operand moves the thrashing to the worse
+        // side. Blocking keeps both resident: four activations (12 KiB) plus
+        // one row stay in L1 while the row chunk (55 KiB) streams from L2.
+        //
+        // Lane grouping requires the batch-wide activation quantization: with
+        // `batch_qs` null, `xq_for_token` hands out the *same* thread-local
+        // scratch for every token, so only one lane can be live at a time.
+        let lane_stride = if self.batch_qs.is_null() {
+            1
+        } else {
+            KQUANT_BATCH_TOKENS
+        };
+        let mut token = 0usize;
+        while token < self.tokens {
+            let lanes = (self.tokens - token).min(lane_stride);
+            let mut xs = [std::ptr::null::<f32>(); KQUANT_BATCH_TOKENS];
+            let mut xqs = [XQuant::NONE; KQUANT_BATCH_TOKENS];
+            for t in 0..lanes {
+                xs[t] = self.inputs.add((token + t) * self.cols);
+                // Row ownership reuses weight rows across tokens. Activations
+                // are pre-quantized once for the whole batch when the
+                // architecture has an integer-dot kernel, avoiding one
+                // quantization per worker.
+                xqs[t] = self.xq_for_token(token + t, xs[t]);
+            }
             if a_end > a_start {
-                self.run_rows_range(
+                self.run_rows_range_x4(
                     self.kind_a,
                     self.a_data,
-                    self.out_a.add(token * self.rows_a),
+                    self.out_a,
+                    self.rows_a,
                     self.row_span_a,
                     a_start,
                     a_end,
-                    x,
-                    xq,
+                    token,
+                    lanes,
+                    &xs,
+                    &xqs,
                 );
             }
             if b_end > b_start {
-                self.run_rows_range(
+                self.run_rows_range_x4(
                     self.kind_b,
                     self.b_data,
-                    self.out_b.add(token * self.rows_b),
+                    self.out_b,
+                    self.rows_b,
                     self.row_span_b,
                     b_start,
                     b_end,
-                    x,
-                    xq,
+                    token,
+                    lanes,
+                    &xs,
+                    &xqs,
                 );
             }
             if c_end > c_start {
-                self.run_rows_range(
+                self.run_rows_range_x4(
                     self.kind_c,
                     self.c_data,
-                    self.out_c.add(token * self.rows_c),
+                    self.out_c,
+                    self.rows_c,
                     self.row_span_c,
                     c_start,
                     c_end,
-                    x,
-                    xq,
+                    token,
+                    lanes,
+                    &xs,
+                    &xqs,
                 );
+            }
+            token += lanes;
+        }
+    }
+
+    /// Runs rows `start..end` of one matrix against `lanes` activations,
+    /// scattering lane `t` to its own token row of `out`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_rows_range_x4(
+        self,
+        kind: MatvecKind,
+        data: *const u8,
+        out: *mut f32,
+        rows: usize,
+        row_span: usize,
+        start: usize,
+        end: usize,
+        token_base: usize,
+        lanes: usize,
+        xs: &[*const f32; KQUANT_BATCH_TOKENS],
+        xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    ) {
+        let mut vals = [0.0f32; KQUANT_BATCH_TOKENS];
+        for row in start..end {
+            dot_row_x4(
+                kind, data, xs, xqs, lanes, row, self.cols, row_span, &mut vals,
+            );
+            for t in 0..lanes {
+                *out.add((token_base + t) * rows + row) = vals[t];
             }
         }
     }
@@ -5259,6 +5392,247 @@ unsafe fn dot_q5_k_q8k_neon(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
     acc
 }
 
+/// Q4_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+///
+/// Arithmetic per lane is identical to `dot_q4_k_q8k_neon`, in the same order:
+/// only the token-independent weight work — the two f16 scale conversions, the
+/// eight `get_scale_min_k4` unpacks and the nibble split — moves out of the
+/// token loop, so each lane stays bit-identical to the single-token kernel
+/// while that setup is paid once instead of four times. Not yet run on Apple
+/// hardware; the parity test covers it wherever it does run.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q4_k_q8k_neon_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::aarch64::*;
+    let nb = n / 256;
+    let mask = vdupq_n_u8(0x0F);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 144);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q4_k scales size");
+        let q = block.add(16);
+
+        let mut isum = [vdupq_n_s32(0); KQUANT_BATCH_TOKENS];
+        let mut imin = [0i32; KQUANT_BATCH_TOKENS];
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let sc1_v = vdupq_n_s32(sc1 as i32);
+            let sc2_v = vdupq_n_s32(sc2 as i32);
+
+            let n0 = vld1q_u8(q.add(c * 32));
+            let n1 = vld1q_u8(q.add(c * 32 + 16));
+            let a0 = vreinterpretq_s8_u8(vandq_u8(n0, mask));
+            let a1 = vreinterpretq_s8_u8(vandq_u8(n1, mask));
+            let b0 = vreinterpretq_s8_u8(vshrq_n_u8(n0, 4));
+            let b1 = vreinterpretq_s8_u8(vshrq_n_u8(n1, 4));
+
+            for t in 0..KQUANT_BATCH_TOKENS {
+                let xqb = xqs[t].qs.add(b * 256);
+                let bsb = xqs[t].bsums.add(b * 8);
+                let xa0 = vld1q_s8(xqb.add(c * 64));
+                let xa1 = vld1q_s8(xqb.add(c * 64 + 16));
+                let xb0 = vld1q_s8(xqb.add(c * 64 + 32));
+                let xb1 = vld1q_s8(xqb.add(c * 64 + 48));
+
+                let qa = sdot(sdot(vdupq_n_s32(0), a0, xa0), a1, xa1);
+                let qb = sdot(sdot(vdupq_n_s32(0), b0, xb0), b1, xb1);
+                isum[t] = vaddq_s32(
+                    isum[t],
+                    vaddq_s32(vmulq_s32(qa, sc1_v), vmulq_s32(qb, sc2_v)),
+                );
+                imin[t] +=
+                    m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+            }
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            let total = vaddvq_s32(isum[t]) as f32;
+            acc[t] += dx * (d * total - dmin * imin[t] as f32);
+        }
+    }
+    acc
+}
+
+/// Q5_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+/// Token-blocked mirror of `dot_q5_k_q8k_neon`; expanding the fifth weight bit
+/// from the `qh` planes is weight-side work and hoists out with the rest.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q5_k_q8k_neon_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::aarch64::*;
+    let nb = n / 256;
+    let mask = vdupq_n_u8(0x0F);
+    let hbit = vdupq_n_u8(0x10);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 176);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q5_k scales size");
+        let qh0 = vld1q_u8(block.add(16));
+        let qh1 = vld1q_u8(block.add(32));
+        let q = block.add(48);
+
+        let mut isum = [vdupq_n_s32(0); KQUANT_BATCH_TOKENS];
+        let mut imin = [0i32; KQUANT_BATCH_TOKENS];
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let sc1_v = vdupq_n_s32(sc1 as i32);
+            let sc2_v = vdupq_n_s32(sc2 as i32);
+            let u1 = vdupq_n_u8(1u8 << (2 * c));
+            let u2 = vdupq_n_u8(2u8 << (2 * c));
+
+            let n0 = vld1q_u8(q.add(c * 32));
+            let n1 = vld1q_u8(q.add(c * 32 + 16));
+            let a0 = vreinterpretq_s8_u8(vorrq_u8(
+                vandq_u8(n0, mask),
+                vandq_u8(vtstq_u8(qh0, u1), hbit),
+            ));
+            let a1 = vreinterpretq_s8_u8(vorrq_u8(
+                vandq_u8(n1, mask),
+                vandq_u8(vtstq_u8(qh1, u1), hbit),
+            ));
+            let b0 = vreinterpretq_s8_u8(vorrq_u8(
+                vshrq_n_u8(n0, 4),
+                vandq_u8(vtstq_u8(qh0, u2), hbit),
+            ));
+            let b1 = vreinterpretq_s8_u8(vorrq_u8(
+                vshrq_n_u8(n1, 4),
+                vandq_u8(vtstq_u8(qh1, u2), hbit),
+            ));
+
+            for t in 0..KQUANT_BATCH_TOKENS {
+                let xqb = xqs[t].qs.add(b * 256);
+                let bsb = xqs[t].bsums.add(b * 8);
+                let xa0 = vld1q_s8(xqb.add(c * 64));
+                let xa1 = vld1q_s8(xqb.add(c * 64 + 16));
+                let xb0 = vld1q_s8(xqb.add(c * 64 + 32));
+                let xb1 = vld1q_s8(xqb.add(c * 64 + 48));
+
+                let qa = sdot(sdot(vdupq_n_s32(0), a0, xa0), a1, xa1);
+                let qb = sdot(sdot(vdupq_n_s32(0), b0, xb0), b1, xb1);
+                isum[t] = vaddq_s32(
+                    isum[t],
+                    vaddq_s32(vmulq_s32(qa, sc1_v), vmulq_s32(qb, sc2_v)),
+                );
+                imin[t] +=
+                    m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+            }
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            let total = vaddvq_s32(isum[t]) as f32;
+            acc[t] += dx * (d * total - dmin * imin[t] as f32);
+        }
+    }
+    acc
+}
+
+/// Q6_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+/// Token-blocked mirror of `dot_q6_k_q8k_neon`. Q6_K gains the most: each
+/// 16-byte sub-vector costs a load plus five ops to reassemble the 6-bit
+/// weights and fold the `-32` bias, and none of that depends on the token.
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q6_k_q8k_neon_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::aarch64::*;
+    let nb = n / 256;
+    let mask_lo4 = vdupq_n_u8(0x0F);
+    let mask_03 = vdupq_n_u8(0x03);
+    let sub32 = vdupq_n_u8(32);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 210);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+        let mut ql_ptr = block;
+        let mut qh_ptr = block.add(128);
+        let mut sc_ptr = block.add(192);
+        let mut grp_x_base = 0usize;
+        let mut isum = [vdupq_n_s32(0); KQUANT_BATCH_TOKENS];
+
+        for _grp in 0..2 {
+            for half in 0..2usize {
+                let l = half * 16;
+                let is = half;
+
+                let ql1 = vld1q_u8(ql_ptr.add(l));
+                let ql2 = vld1q_u8(ql_ptr.add(l + 32));
+                let qhv = vld1q_u8(qh_ptr.add(l));
+
+                let lo1 = vandq_u8(ql1, mask_lo4);
+                let hi1 = vshrq_n_u8(ql1, 4);
+                let lo2 = vandq_u8(ql2, mask_lo4);
+                let hi2 = vshrq_n_u8(ql2, 4);
+
+                let h1 = vandq_u8(qhv, mask_03);
+                let h2 = vandq_u8(vshrq_n_u8(qhv, 2), mask_03);
+                let h3 = vandq_u8(vshrq_n_u8(qhv, 4), mask_03);
+                let h4 = vshrq_n_u8(qhv, 6);
+
+                let q1 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo1, vshlq_n_u8(h1, 4)), sub32));
+                let q2 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(lo2, vshlq_n_u8(h2, 4)), sub32));
+                let q3 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(hi1, vshlq_n_u8(h3, 4)), sub32));
+                let q4 = vreinterpretq_s8_u8(vsubq_u8(vorrq_u8(hi2, vshlq_n_u8(h4, 4)), sub32));
+
+                let s1 = vdupq_n_s32((*sc_ptr.add(is) as i8) as i32);
+                let s2 = vdupq_n_s32((*sc_ptr.add(is + 2) as i8) as i32);
+                let s3 = vdupq_n_s32((*sc_ptr.add(is + 4) as i8) as i32);
+                let s4 = vdupq_n_s32((*sc_ptr.add(is + 6) as i8) as i32);
+
+                let x_off = grp_x_base + l;
+                for t in 0..KQUANT_BATCH_TOKENS {
+                    let xqb = xqs[t].qs.add(b * 256);
+                    let p1 = sdot(vdupq_n_s32(0), q1, vld1q_s8(xqb.add(x_off)));
+                    let p2 = sdot(vdupq_n_s32(0), q2, vld1q_s8(xqb.add(x_off + 32)));
+                    let p3 = sdot(vdupq_n_s32(0), q3, vld1q_s8(xqb.add(x_off + 64)));
+                    let p4 = sdot(vdupq_n_s32(0), q4, vld1q_s8(xqb.add(x_off + 96)));
+                    isum[t] = vaddq_s32(
+                        isum[t],
+                        vaddq_s32(
+                            vaddq_s32(vmulq_s32(p1, s1), vmulq_s32(p2, s2)),
+                            vaddq_s32(vmulq_s32(p3, s3), vmulq_s32(p4, s4)),
+                        ),
+                    );
+                }
+            }
+            ql_ptr = ql_ptr.add(64);
+            qh_ptr = qh_ptr.add(32);
+            sc_ptr = sc_ptr.add(8);
+            grp_x_base += 128;
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            acc[t] += d * dx * vaddvq_s32(isum[t]) as f32;
+        }
+    }
+    acc
+}
+
 /// Q4_0 · Q8_K integer dot product: the `-8` nibble bias is folded into the
 /// signed weights, so each 32-weight block is exactly two `sdot` instructions.
 /// Eight Q4_0 blocks share one Q8_K activation super-block scale.
@@ -6543,6 +6917,213 @@ unsafe fn dot_q6_k_q8k_avx2(qdata: &[u8], xq: XQuant, n: usize) -> f32 {
             }
         }
         acc += dx * d * hsum_i32_avx2(isum_v) as f32;
+    }
+    acc
+}
+
+/// Q4_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+///
+/// Arithmetic per lane is identical to `dot_q4_k_q8k_avx2`, in the same order:
+/// only the token-independent weight work — the two f16 scale conversions, the
+/// eight `get_scale_min_k4` unpacks, the scale broadcasts and the nibble split
+/// — moves out of the token loop, so each lane stays bit-identical to the
+/// single-token kernel while that setup is paid once instead of four times.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_k_q8k_avx2_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 144);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q4_k scales size");
+        let q = block.add(16);
+
+        let mut isum_v = [_mm256_setzero_si256(); KQUANT_BATCH_TOKENS];
+        let mut imin = [0i32; KQUANT_BATCH_TOKENS];
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let sc1_v = _mm256_set1_epi16(sc1 as i16);
+            let sc2_v = _mm256_set1_epi16(sc2 as i16);
+
+            let raw = _mm256_loadu_si256(q.add(c * 32) as *const __m256i);
+            let lo = _mm256_and_si256(raw, lowmask);
+            let hi = _mm256_and_si256(_mm256_srli_epi16(raw, 4), lowmask);
+
+            for t in 0..KQUANT_BATCH_TOKENS {
+                let xqb = xqs[t].qs.add(b * 256);
+                let bsb = xqs[t].bsums.add(b * 8);
+                let x_lo = _mm256_loadu_si256(xqb.add(c * 64) as *const __m256i);
+                let x_hi = _mm256_loadu_si256(xqb.add(c * 64 + 32) as *const __m256i);
+
+                let p_lo = _mm256_maddubs_epi16(lo, x_lo);
+                let p_hi = _mm256_maddubs_epi16(hi, x_hi);
+                isum_v[t] = _mm256_add_epi32(isum_v[t], _mm256_madd_epi16(p_lo, sc1_v));
+                isum_v[t] = _mm256_add_epi32(isum_v[t], _mm256_madd_epi16(p_hi, sc2_v));
+                imin[t] +=
+                    m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+            }
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            let isum = hsum_i32_avx2(isum_v[t]);
+            acc[t] += dx * (d * isum as f32 - dmin * imin[t] as f32);
+        }
+    }
+    acc
+}
+
+/// Q5_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+/// Token-blocked mirror of `dot_q5_k_q8k_avx2`; expanding the fifth weight bit
+/// from the `qh` plane is weight-side work and hoists out with the rest.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q5_k_q8k_avx2_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let hbit = _mm256_set1_epi8(0x10);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 176);
+        let d = f16_to_f32(u16::from_le_bytes([*block, *block.add(1)]));
+        let dmin = f16_to_f32(u16::from_le_bytes([*block.add(2), *block.add(3)]));
+        let scales: &[u8; 12] = std::slice::from_raw_parts(block.add(4), 12)
+            .try_into()
+            .expect("q5_k scales size");
+        let qh = _mm256_loadu_si256(block.add(16) as *const __m256i);
+        let q = block.add(48);
+
+        let mut isum_v = [_mm256_setzero_si256(); KQUANT_BATCH_TOKENS];
+        let mut imin = [0i32; KQUANT_BATCH_TOKENS];
+        for c in 0..4usize {
+            let is = c * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let sc1_v = _mm256_set1_epi16(sc1 as i16);
+            let sc2_v = _mm256_set1_epi16(sc2 as i16);
+            let u1 = _mm256_set1_epi8((1u8 << (2 * c)) as i8);
+            let u2 = _mm256_set1_epi8((2u8 << (2 * c)) as i8);
+
+            let raw = _mm256_loadu_si256(q.add(c * 32) as *const __m256i);
+            let hi1 = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, u1), u1), hbit);
+            let hi2 = _mm256_and_si256(_mm256_cmpeq_epi8(_mm256_and_si256(qh, u2), u2), hbit);
+            let lo = _mm256_or_si256(_mm256_and_si256(raw, lowmask), hi1);
+            let hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(raw, 4), lowmask), hi2);
+
+            for t in 0..KQUANT_BATCH_TOKENS {
+                let xqb = xqs[t].qs.add(b * 256);
+                let bsb = xqs[t].bsums.add(b * 8);
+                let x_lo = _mm256_loadu_si256(xqb.add(c * 64) as *const __m256i);
+                let x_hi = _mm256_loadu_si256(xqb.add(c * 64 + 32) as *const __m256i);
+
+                let p_lo = _mm256_maddubs_epi16(lo, x_lo);
+                let p_hi = _mm256_maddubs_epi16(hi, x_hi);
+                isum_v[t] = _mm256_add_epi32(isum_v[t], _mm256_madd_epi16(p_lo, sc1_v));
+                isum_v[t] = _mm256_add_epi32(isum_v[t], _mm256_madd_epi16(p_hi, sc2_v));
+                imin[t] +=
+                    m1 as i32 * (*bsb.add(is) as i32) + m2 as i32 * (*bsb.add(is + 1) as i32);
+            }
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            let isum = hsum_i32_avx2(isum_v[t]);
+            acc[t] += dx * (d * isum as f32 - dmin * imin[t] as f32);
+        }
+    }
+    acc
+}
+
+/// Q6_K · Q8_K for `KQUANT_BATCH_TOKENS` activations against one weight row.
+/// Token-blocked mirror of `dot_q6_k_q8k_avx2`. Q6_K gains the most from the
+/// blocking: reassembling each 6-bit sub-vector costs four vector ops plus the
+/// `-32` bias fold and the `abs` that puts the signed product into `maddubs`
+/// form, and all of it is token independent. The four sub-vectors are rebuilt
+/// per index instead of kept in an array so the four per-lane accumulators fit
+/// alongside them without spilling.
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q6_k_q8k_avx2_x4(
+    qdata: &[u8],
+    xqs: &[XQuant; KQUANT_BATCH_TOKENS],
+    n: usize,
+) -> [f32; KQUANT_BATCH_TOKENS] {
+    use std::arch::x86_64::*;
+    let nb = n / 256;
+    let lowmask = _mm256_set1_epi8(0x0F);
+    let m3 = _mm256_set1_epi8(0x03);
+    let sub32 = _mm256_set1_epi8(32);
+    let mut acc = [0.0f32; KQUANT_BATCH_TOKENS];
+
+    for b in 0..nb {
+        let block = qdata.as_ptr().add(b * 210);
+        let d = f16_to_f32(u16::from_le_bytes([*block.add(208), *block.add(209)]));
+        let sc_base = block.add(192) as *const i8;
+
+        let mut isum_v = [_mm256_setzero_si256(); KQUANT_BATCH_TOKENS];
+        for g in 0..2usize {
+            let ql0 = _mm256_loadu_si256(block.add(g * 64) as *const __m256i);
+            let ql1 = _mm256_loadu_si256(block.add(g * 64 + 32) as *const __m256i);
+            let qhv = _mm256_loadu_si256(block.add(128 + g * 32) as *const __m256i);
+            let scs = sc_base.add(g * 8);
+            let x_base = g * 128;
+
+            for idx in 0..4usize {
+                // Same reassembly as the single-token kernel: x offsets
+                // base+0/32/64/96, high bits from the 2-bit planes.
+                let qv = match idx {
+                    0 => _mm256_or_si256(
+                        _mm256_and_si256(ql0, lowmask),
+                        _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4),
+                    ),
+                    1 => _mm256_or_si256(
+                        _mm256_and_si256(ql1, lowmask),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 2), m3), 4),
+                    ),
+                    2 => _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16(ql0, 4), lowmask),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 4), m3), 4),
+                    ),
+                    _ => _mm256_or_si256(
+                        _mm256_and_si256(_mm256_srli_epi16(ql1, 4), lowmask),
+                        _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qhv, 6), m3), 4),
+                    ),
+                };
+                let qs = _mm256_sub_epi8(qv, sub32);
+                let absq = _mm256_abs_epi8(qs);
+                let sc_a = *scs.add(idx * 2) as i16;
+                let sc_b = *scs.add(idx * 2 + 1) as i16;
+                let sc_v = _mm256_set_m128i(_mm_set1_epi16(sc_b), _mm_set1_epi16(sc_a));
+
+                for t in 0..KQUANT_BATCH_TOKENS {
+                    let xqb = xqs[t].qs.add(b * 256);
+                    let xv = _mm256_loadu_si256(xqb.add(x_base + idx * 32) as *const __m256i);
+                    let p = _mm256_maddubs_epi16(absq, _mm256_sign_epi8(xv, qs));
+                    isum_v[t] = _mm256_add_epi32(isum_v[t], _mm256_madd_epi16(p, sc_v));
+                }
+            }
+        }
+        for t in 0..KQUANT_BATCH_TOKENS {
+            let dx = *xqs[t].d.add(b);
+            acc[t] += dx * d * hsum_i32_avx2(isum_v[t]) as f32;
+        }
     }
     acc
 }
@@ -7948,6 +8529,82 @@ mod tests {
         assert_close_slice(&out_q_single, &expected_q, 1e-5);
         assert_close_slice(&out_q, &expected_q, 1e-5);
         assert_close_slice(&out_k_pair, &expected_k, 1e-5);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    /// The token-blocked kernels must be a pure scheduling change: every lane
+    /// keeps the single-token accumulation order, so results are bit-identical,
+    /// not merely close. Token counts sweep 1..=9 so the partial tail group
+    /// (1, 2 and 3 live lanes) is exercised alongside full groups of four.
+    fn kquant_token_blocked_batch_is_bit_identical() {
+        let cols = 512;
+        let q_rows = 37;
+        let k_rows = 9;
+        let v_rows = 41;
+        let q = make_q4k_weights(q_rows, cols, 5);
+        let k = make_q5k_weights(k_rows, cols, 17);
+        let v = make_q6k_weights(v_rows, cols, 29);
+
+        for tokens in 1..=9usize {
+            let inputs: Vec<f32> = (0..tokens * cols)
+                .map(|i| {
+                    let token = i / cols;
+                    let col = i % cols;
+                    ((col as f32 * 0.011 + token as f32 * 0.37).cos() * 0.4)
+                        - ((col % 7) as f32 * 0.019)
+                })
+                .collect();
+
+            let mut expected_q = Vec::new();
+            let mut expected_k = Vec::new();
+            let mut expected_v = Vec::new();
+            for input in inputs.chunks_exact(cols) {
+                let mut q_row = Vec::new();
+                let mut k_row = Vec::new();
+                let mut v_row = Vec::new();
+                assert!(matvec_kquant3_into(
+                    (KQuantMatvecKind::Q4K, &q, q_rows, cols),
+                    (KQuantMatvecKind::Q5K, &k, k_rows, cols),
+                    (KQuantMatvecKind::Q6K, &v, v_rows, cols),
+                    input,
+                    &mut q_row,
+                    &mut k_row,
+                    &mut v_row,
+                ));
+                expected_q.extend(q_row);
+                expected_k.extend(k_row);
+                expected_v.extend(v_row);
+            }
+
+            let mut out_q = Vec::new();
+            let mut out_k = Vec::new();
+            let mut out_v = Vec::new();
+            assert!(matvec_kquant3_batch_into(
+                (KQuantMatvecKind::Q4K, &q, q_rows, cols),
+                (KQuantMatvecKind::Q5K, &k, k_rows, cols),
+                (KQuantMatvecKind::Q6K, &v, v_rows, cols),
+                &inputs,
+                &mut out_q,
+                &mut out_k,
+                &mut out_v,
+            ));
+
+            for (label, actual, expected) in [
+                ("q4_k", &out_q, &expected_q),
+                ("q5_k", &out_k, &expected_k),
+                ("q6_k", &out_v, &expected_v),
+            ] {
+                assert_eq!(actual.len(), expected.len(), "{label} length at {tokens}");
+                for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        e.to_bits(),
+                        "{label} tokens={tokens} value[{idx}] blocked {a} vs single {e}"
+                    );
+                }
+            }
+        }
     }
 
     fn assert_close_slice(actual: &[f32], expected: &[f32], relative: f32) {

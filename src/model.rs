@@ -300,6 +300,24 @@ impl Weight {
     }
 }
 
+/// Reports whether the forward pass may fuse several projections that share
+/// one activation into a single dispatch (default on; set
+/// `RUSTY_LLM_FUSED_PROJ=0` to force one dispatch per matrix, e.g. for A/B
+/// measurement). Fusion trades a barrier for a wider row range per dispatch,
+/// and which side wins is machine dependent, so this stays measurable at
+/// runtime rather than being baked in.
+#[cfg(not(target_family = "wasm"))]
+fn fused_projections_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("RUSTY_LLM_FUSED_PROJ").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
 #[cfg(not(target_family = "wasm"))]
 /// Attempts fused K-quant triple-projection fast paths and reports whether one ran.
 fn try_quant_matvec3_into(
@@ -311,6 +329,9 @@ fn try_quant_matvec3_into(
     k: &mut Vec<f32>,
     v: &mut Vec<f32>,
 ) -> bool {
+    if !fused_projections_enabled() {
+        return false;
+    }
     match (wq, wk, wv) {
         (
             Weight::Quantized {
@@ -490,6 +511,9 @@ fn try_quant_matvec2_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
+    if !fused_projections_enabled() {
+        return false;
+    }
     match (a, b) {
         (
             Weight::Quantized {

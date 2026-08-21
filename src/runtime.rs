@@ -2250,12 +2250,7 @@ impl Runner {
             self.chat_template_kind().unwrap_or("plain")
         };
         items.push(format!("chat-template={}", chat_template));
-        let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
-            && !crate::metal::enabled()
-            && matches!(
-                self.weights,
-                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
-            );
+        let bf16_kv_will_activate = self.kv_cache_wants_bf16(options);
         items.push(match options.runtime.kv_cache_dtype {
             KvCacheDType::Auto => String::from("kv-cache=f32(auto)"),
             KvCacheDType::F32 => String::from("kv-cache=f32"),
@@ -2401,12 +2396,7 @@ impl Runner {
                 "MTP assistant is loaded, but MTP is greedy-only and will stay disabled unless --temp 0 is used.",
             ));
         }
-        let bf16_kv_will_activate = options.runtime.kv_cache_dtype == KvCacheDType::Bf16
-            && !crate::metal::enabled()
-            && matches!(
-                self.weights,
-                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
-            );
+        let bf16_kv_will_activate = self.kv_cache_wants_bf16(options);
         if options.runtime.kv_cache_dtype == KvCacheDType::Q8 {
             warnings.push(String::from(
                 "Requested Q8 KV cache is not activated yet; f32 KV is kept until it is implemented.",
@@ -3208,16 +3198,7 @@ impl Runner {
             sliding_window,
         );
         self.attach_recurrent_state(&mut cache);
-        // bf16 KV halves per-token cache traffic. The Standard and CPU Qwen35
-        // paths read it directly; Metal keeps a resident GPU cache instead of
-        // `cache.k`/`cache.v`, so it would never see this storage.
-        if options.runtime.kv_cache_dtype == KvCacheDType::Bf16
-            && !crate::metal::enabled()
-            && matches!(
-                self.weights,
-                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
-            )
-        {
+        if self.kv_cache_wants_bf16(options) {
             cache.enable_bf16();
         }
         let mut buf = DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
@@ -4744,13 +4725,51 @@ impl Runner {
         }
     }
 
-    /// Create a blank [`crate::session::Session`] pre-allocated for this model.
+    /// Reports whether a KV cache allocated for `options` should hold bf16
+    /// keys and values.
+    ///
+    /// bf16 halves the bytes read from RAM per scanned KV position, which is
+    /// the dominant remaining lever once decode is DRAM-bandwidth-bound and
+    /// the context is long enough that the cache rivals the weights. Only the
+    /// Standard and CPU Qwen3.5 forward paths have bf16 attention kernels, and
+    /// Metal keeps a resident GPU cache instead of `cache.k`/`cache.v`, so it
+    /// would never see this storage.
+    fn kv_cache_wants_bf16(&self, options: &GenerationOptions) -> bool {
+        options.runtime.kv_cache_dtype == KvCacheDType::Bf16
+            && !crate::metal::enabled()
+            && matches!(
+                self.weights,
+                LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
+            )
+    }
+
+    /// Create a blank [`crate::session::Session`] pre-allocated for this model,
+    /// with f32 KV state.
     ///
     /// `max_cached_tokens` caps the KV-cache length at the given token count
-    /// (clamped to `config.max_seq_len`).
+    /// (clamped to `config.max_seq_len`). Kept for callers without a
+    /// [`GenerationOptions`] at hand; prefer
+    /// [`Runner::new_session_with_options`] so an explicit
+    /// `--kv-cache-dtype bf16` reaches server sessions too.
     #[cfg(all(not(target_family = "wasm"), feature = "server"))]
-    /// Creates a server session with KV cache and decode buffers for this runner.
     pub fn new_session(&self, max_cached_tokens: usize) -> crate::session::Session {
+        self.new_session_with_options(max_cached_tokens, &GenerationOptions::default())
+    }
+
+    /// Allocates a persistent chat session, honouring the requested KV dtype.
+    ///
+    /// The dtype is fixed when the session is allocated, so it is decided by
+    /// the request that *creates* the conversation — a later request for the
+    /// same conversation id reuses the existing cache and cannot change it.
+    /// This matches how the session store already treats its token capacity.
+    /// A bf16 session also forgoes shared prefix-cache reuse, whose snapshot
+    /// format is f32-only (see `SharedPrefixCache::insert`).
+    #[cfg(all(not(target_family = "wasm"), feature = "server"))]
+    pub fn new_session_with_options(
+        &self,
+        max_cached_tokens: usize,
+        options: &GenerationOptions,
+    ) -> crate::session::Session {
         let cap = max_cached_tokens.min(self.config.max_seq_len).max(1);
         let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
         // Laguna interleaves full-attention and sliding-window layers. A
@@ -4765,6 +4784,9 @@ impl Runner {
             sliding_window,
         );
         self.attach_recurrent_state(&mut kv_cache);
+        if self.kv_cache_wants_bf16(options) {
+            kv_cache.enable_bf16();
+        }
         let decode_buf =
             DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim);
         crate::session::Session::new(kv_cache, decode_buf)
