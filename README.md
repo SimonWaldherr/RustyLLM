@@ -88,7 +88,8 @@ Additional documentation:
   `models` tools.
 - Text embeddings via `Runner::embed`, mean-pooled over the last transformer
   layer and L2-normalized for cosine similarity.
-- Batched `nomic-bert` embedding encoder with shared Q8_K activations,
+- Batched `nomic-bert` embedding encoder with shared Q8_K activations and
+  attention-isolated micro-batches for OpenAI/Ollama input arrays,
   cache-friendly weight-row reuse, and dynamic worker scheduling.
 - Minimal browser chat UI served from `/chat`, an expert UI from
   `/chat?expert`, and a GGUF explorer from `/explorer`.
@@ -872,6 +873,11 @@ The encoder's batched Q5_K/Q4_K/Q6_K path deliberately stays on CPU even when
 these 768-wide projections. The Metal-enabled column is therefore a runtime
 profile measurement, not a claim of GPU embedding throughput. See
 [BENCHMARK.md](BENCHMARK.md) for the reproducible methodology and raw latency.
+
+For array inputs, RustyLLM automatically widens Nomic encoder micro-batches to
+the available physical cores when useful. Use `--threads-batch <N>` to choose
+that worker count explicitly, or `--no-auto-batch-threads` to keep the regular
+`--threads` setting.
 
 Ollama-style embeddings:
 

@@ -2971,6 +2971,44 @@ mod tests {
     }
 
     #[test]
+    fn nomic_batched_embeddings_keep_inputs_attention_isolated() {
+        let (config, weights) = quantized_nomic_model();
+        // The flattened total is at least eight tokens, so this exercises the
+        // batch path while ensuring each sequence keeps local RoPE positions
+        // and cannot attend to the other sequence.
+        let first = [1u32, 2, 3, 4];
+        let second = [5u32, 6, 7, 8];
+        let pooled = super::forward_nomic_bert_pooled_batch(
+            &config,
+            &weights,
+            &[first.as_slice(), second.as_slice()],
+        );
+        assert_eq!(pooled.len(), 2);
+
+        for (tokens, embedding) in [first.as_slice(), second.as_slice()]
+            .into_iter()
+            .zip(&pooled)
+        {
+            let hidden = super::forward_nomic_bert_hidden(&config, &weights, tokens);
+            let mut expected = vec![0.0f32; config.dim];
+            for row in hidden.chunks_exact(config.dim) {
+                for (value, hidden) in expected.iter_mut().zip(row) {
+                    *value += hidden;
+                }
+            }
+            for value in &mut expected {
+                *value /= tokens.len() as f32;
+            }
+            for (index, (actual, expected)) in embedding.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= expected.abs().max(1.0) * 2e-5,
+                    "embedding[{index}] batched={actual} expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn quantized_nomic_batched_forward_matches_per_token_path() {
         let (config, weights) = quantized_nomic_model();
         let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
@@ -10965,6 +11003,10 @@ struct NomicAttentionBatch {
     head_dim: usize,
     kv_row: usize,
     scale: f32,
+    /// Inclusive/exclusive token ranges for each flattened input sequence.
+    /// Attention is bidirectional within one range, never across ranges.
+    sequence_starts: *const usize,
+    sequence_ends: *const usize,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -10975,15 +11017,20 @@ unsafe fn nomic_attention_batch_range(ctx: *const (), start: usize, end: usize) 
     let q_all = unsafe { std::slice::from_raw_parts(ctx.q, ctx.n * ctx.kv_row) };
     let k_all = unsafe { std::slice::from_raw_parts(ctx.k, ctx.n * ctx.kv_row) };
     let v_all = unsafe { std::slice::from_raw_parts(ctx.v, ctx.n * ctx.kv_row) };
+    let sequence_starts = unsafe { std::slice::from_raw_parts(ctx.sequence_starts, ctx.n) };
+    let sequence_ends = unsafe { std::slice::from_raw_parts(ctx.sequence_ends, ctx.n) };
     for i in start..end {
+        let sequence_start = sequence_starts[i];
+        let sequence_end = sequence_ends[i];
+        let sequence_len = sequence_end - sequence_start;
         let attn_out =
             unsafe { std::slice::from_raw_parts_mut(ctx.out.add(i * ctx.kv_row), ctx.kv_row) };
         attn_out.fill(0.0);
         for h in 0..ctx.n_heads {
             let q_head =
                 &q_all[i * ctx.kv_row + h * ctx.head_dim..i * ctx.kv_row + (h + 1) * ctx.head_dim];
-            let keys = &k_all[h * ctx.head_dim..];
-            let values = &v_all[h * ctx.head_dim..];
+            let keys = &k_all[sequence_start * ctx.kv_row + h * ctx.head_dim..];
+            let values = &v_all[sequence_start * ctx.kv_row + h * ctx.head_dim..];
             let out_head = &mut attn_out[h * ctx.head_dim..(h + 1) * ctx.head_dim];
             online_attention_grouped(
                 q_head,
@@ -10991,12 +11038,12 @@ unsafe fn nomic_attention_batch_range(ctx: *const (), start: usize, end: usize) 
                 values,
                 ctx.kv_row,
                 ctx.kv_row,
-                ctx.n,
+                sequence_len,
                 ctx.head_dim,
                 ctx.head_dim,
                 1,
                 0,
-                ctx.n - 1,
+                sequence_len - 1,
                 ctx.scale,
                 out_head,
             );
@@ -11016,6 +11063,51 @@ pub fn forward_nomic_bert_hidden(
     forward_nomic_bert_hidden_impl(config, weights, tokens, true)
 }
 
+/// Runs multiple independent Nomic/BERT inputs as one flattened micro-batch
+/// and mean-pools each sequence. Projection kernels can then reuse hot weight
+/// rows across short texts, while per-token sequence ranges keep attention and
+/// RoPE positions identical to separate encoder calls.
+pub fn forward_nomic_bert_pooled_batch(
+    config: &Config,
+    weights: &NomicBertWeights,
+    sequences: &[&[u32]],
+) -> Vec<Vec<f32>> {
+    if sequences.is_empty() {
+        return Vec::new();
+    }
+    let total_tokens = sequences.iter().map(|sequence| sequence.len()).sum();
+    let mut tokens = Vec::with_capacity(total_tokens);
+    let mut boundaries = Vec::with_capacity(sequences.len() + 1);
+    boundaries.push(0);
+    for sequence in sequences {
+        assert!(
+            !sequence.is_empty(),
+            "Nomic embedding batch contains an empty sequence"
+        );
+        tokens.extend_from_slice(sequence);
+        boundaries.push(tokens.len());
+    }
+    let hidden =
+        forward_nomic_bert_hidden_segmented_impl(config, weights, &tokens, &boundaries, true);
+    let mut pooled = Vec::with_capacity(sequences.len());
+    for boundary in boundaries.windows(2) {
+        let start = boundary[0];
+        let end = boundary[1];
+        let mut sum = vec![0.0f32; config.dim];
+        for row in hidden[start * config.dim..end * config.dim].chunks_exact(config.dim) {
+            for (value, hidden) in sum.iter_mut().zip(row) {
+                *value += hidden;
+            }
+        }
+        let scale = 1.0 / (end - start) as f32;
+        for value in &mut sum {
+            *value *= scale;
+        }
+        pooled.push(sum);
+    }
+    pooled
+}
+
 /// Internal Nomic BERT forward implementation. The test-only serial switch
 /// lets the quantized batched path be checked against the established
 /// per-token execution without changing production behavior.
@@ -11025,7 +11117,27 @@ fn forward_nomic_bert_hidden_impl(
     tokens: &[u32],
     _allow_batched: bool,
 ) -> Vec<f32> {
+    forward_nomic_bert_hidden_segmented_impl(
+        config,
+        weights,
+        tokens,
+        &[0, tokens.len()],
+        _allow_batched,
+    )
+}
+
+fn forward_nomic_bert_hidden_segmented_impl(
+    config: &Config,
+    weights: &NomicBertWeights,
+    tokens: &[u32],
+    boundaries: &[usize],
+    _allow_batched: bool,
+) -> Vec<f32> {
     let n = tokens.len();
+    assert!(n > 0, "Nomic encoder requires at least one token");
+    assert_eq!(boundaries.first(), Some(&0));
+    assert_eq!(boundaries.last(), Some(&n));
+    assert!(boundaries.windows(2).all(|range| range[0] < range[1]));
     let dim = config.dim;
     let head_dim = config.head_dim;
     let n_heads = config.n_heads;
@@ -11033,6 +11145,21 @@ fn forward_nomic_bert_hidden_impl(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let inv_freq = build_rope_inv_freq(config.rope_theta, head_dim, 1.0);
     let kv_row = n_heads * head_dim;
+
+    // Store the local RoPE position and attention bounds for every flattened
+    // token once. They are reused by every encoder layer.
+    let mut token_positions = vec![0usize; n];
+    let mut sequence_starts = vec![0usize; n];
+    let mut sequence_ends = vec![n; n];
+    for range in boundaries.windows(2) {
+        let start = range[0];
+        let end = range[1];
+        for (position, index) in (start..end).enumerate() {
+            token_positions[index] = position;
+            sequence_starts[index] = start;
+            sequence_ends[index] = end;
+        }
+    }
 
     // Embedding + token-type row 0, then embedding LayerNorm.
     let mut hs = vec![0.0f32; n * dim];
@@ -11090,7 +11217,15 @@ fn forward_nomic_bert_hidden_impl(
                 add_bias_if_present(q, &layer.bq);
                 add_bias_if_present(k, &layer.bk);
                 add_bias_if_present(v, &layer.bv);
-                apply_rope_qk_neox(q, k, i, head_dim, n_heads, config.n_kv_heads, &inv_freq);
+                apply_rope_qk_neox(
+                    q,
+                    k,
+                    token_positions[i],
+                    head_dim,
+                    n_heads,
+                    config.n_kv_heads,
+                    &inv_freq,
+                );
             }
 
             let attention = NomicAttentionBatch {
@@ -11103,6 +11238,8 @@ fn forward_nomic_bert_hidden_impl(
                 head_dim,
                 kv_row,
                 scale,
+                sequence_starts: sequence_starts.as_ptr(),
+                sequence_ends: sequence_ends.as_ptr(),
             };
             unsafe {
                 simd::parallel_range(
@@ -11181,7 +11318,7 @@ fn forward_nomic_bert_hidden_impl(
             apply_rope_qk_neox(
                 &mut q_buf,
                 &mut k_buf,
-                i,
+                token_positions[i],
                 head_dim,
                 n_heads,
                 config.n_kv_heads,
@@ -11198,11 +11335,14 @@ fn forward_nomic_bert_hidden_impl(
             for value in attn_out.iter_mut() {
                 *value = 0.0;
             }
+            let sequence_start = sequence_starts[i];
+            let sequence_end = sequence_ends[i];
+            let sequence_len = sequence_end - sequence_start;
             for h in 0..n_heads {
                 let q_head =
                     &q_all[i * kv_row + h * head_dim..i * kv_row + h * head_dim + head_dim];
-                let keys = &k_all[h * head_dim..];
-                let values = &v_all[h * head_dim..];
+                let keys = &k_all[sequence_start * kv_row + h * head_dim..];
+                let values = &v_all[sequence_start * kv_row + h * head_dim..];
                 let out_head = &mut attn_out[h * head_dim..(h + 1) * head_dim];
                 online_attention_grouped(
                     q_head,
@@ -11210,12 +11350,12 @@ fn forward_nomic_bert_hidden_impl(
                     values,
                     kv_row,
                     kv_row,
-                    n,
+                    sequence_len,
                     head_dim,
                     head_dim,
                     1,
                     0,
-                    n - 1,
+                    sequence_len - 1,
                     scale,
                     out_head,
                 );

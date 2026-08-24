@@ -2655,22 +2655,26 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
                 return (400, json_error("input must not be empty."));
             }
 
-            let mut data = Vec::new();
-            for (index, text) in inputs.iter().enumerate() {
-                match runner.embed(text) {
-                    Ok(result) => data.push(serde_json::json!({
+            let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
+            let results = match runner.embed_batch(&input_refs) {
+                Ok(results) => results,
+                Err(err) => return (400, json_error(&err)),
+            };
+            let total_tokens = results
+                .iter()
+                .map(|result| result.token_count)
+                .sum::<usize>();
+            let data = results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    serde_json::json!({
                         "object": "embedding",
                         "embedding": result.embedding,
                         "index": index,
-                    })),
-                    Err(err) => return (400, json_error(&err)),
-                }
-            }
-
-            let total_tokens = inputs
-                .iter()
-                .map(|text| runner.tokenizer().encode(text).len())
-                .sum::<usize>();
+                    })
+                })
+                .collect::<Vec<_>>();
             let response = serde_json::json!({
                 "object": "list",
                 "data": data,
@@ -3209,13 +3213,14 @@ fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -
             if inputs.is_empty() {
                 return (400, json_error("input must not be empty."));
             }
-            let mut embeddings = Vec::with_capacity(inputs.len());
-            for input in &inputs {
-                match runner.embed(input) {
-                    Ok(result) => embeddings.push(result.embedding),
-                    Err(err) => return (400, json_error(&err)),
-                }
-            }
+            let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
+            let mut embeddings = match runner.embed_batch(&input_refs) {
+                Ok(results) => results
+                    .into_iter()
+                    .map(|result| result.embedding)
+                    .collect::<Vec<_>>(),
+                Err(err) => return (400, json_error(&err)),
+            };
             if embeddings.len() == 1 {
                 json_response(serde_json::json!({
                     "model": model,

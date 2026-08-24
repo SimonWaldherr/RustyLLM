@@ -63,8 +63,8 @@
           <div class="hint" id="modelHint" aria-live="polite">Loading models…</div>
         </div>
 
-        <div class="field">
-          <label for="prompt">Input</label>
+        <div class="field" id="prompt-field">
+          <label for="prompt" id="promptLabel">Message</label>
           <textarea
             id="prompt"
             name="prompt"
@@ -79,7 +79,7 @@
         </div>
 
         <details id="advanced">
-          <summary>Advanced settings</summary>
+          <summary>Response tuning <span class="details-summary-hint">Optional</span></summary>
           <div class="inner-stack">
 
             <div class="field">
@@ -152,7 +152,7 @@
           </div>
         </details>
 
-        <div class="actions" role="group" aria-label="Session controls">
+        <div id="session-controls" class="actions" role="group" aria-label="Session controls">
           <button id="send" type="submit" aria-label="Send message">Send</button>
           <button id="abort" class="secondary" type="button" disabled aria-label="Stop generation">Stop</button>
           <button id="clear" class="secondary" type="button" aria-label="Clear conversation history">Clear</button>
@@ -201,7 +201,10 @@
             </div>
             <button id="rag-search-btn" type="button">Search</button>
             <div id="rag-results" class="rag-results" aria-live="polite" aria-label="Search results"></div>
-            <button id="rag-ask-btn" type="button" hidden>Answer with LLM</button>
+            <div class="rag-answer-actions" role="group" aria-label="RAG answer actions">
+              <button id="rag-ask-btn" type="button" hidden>Answer with model</button>
+              <button id="rag-abort-btn" class="secondary" type="button" hidden>Stop answer</button>
+            </div>
             <div id="rag-answer" class="rag-answer" aria-live="polite"></div>
           </section>
         </div>

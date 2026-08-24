@@ -79,24 +79,28 @@
         aria-required="true"
         aria-describedby="promptHint"
       ></textarea>
-      <div class="actions">
+      <div class="actions" role="group" aria-label="Message actions">
         <button id="send" type="submit" aria-label="Send message">Send</button>
         <button id="stop" class="secondary" type="button" disabled aria-label="Stop generation">Stop</button>
       </div>
     </div>
-    <div class="settings">
-      <label>Max tokens <input id="maxTokens" type="number" min="1" max="4096" value="512" inputmode="numeric" autocomplete="off"></label>
-      <label>Temperature
-        <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0.7">
-        <span id="tempValue">0.70</span>
-      </label>
-      <label class="toggle"><input id="thinking" type="checkbox" autocomplete="off"> Thinking</label>
-      <div id="stats" class="stats" aria-live="off" aria-atomic="true"></div>
-    </div>
-    <details id="thinkingDetails" class="thinking-details">
+    <details id="responseControls" class="response-controls">
+      <summary>Response controls <span id="responseControlsSummary" class="details-summary-hint">512 tokens · 0.70 temperature</span></summary>
+      <div class="settings" role="group" aria-label="Response controls">
+        <label for="maxTokens">Max tokens <input id="maxTokens" type="number" min="1" max="4096" value="512" inputmode="numeric" autocomplete="off"></label>
+        <label for="temperature">Temperature
+          <input id="temperature" type="range" min="0" max="2" step="0.05" value="0.7" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0.7" aria-valuetext="0.70">
+          <span id="tempValue">0.70</span>
+        </label>
+        <label class="toggle" for="thinking"><input id="thinking" type="checkbox" autocomplete="off" aria-describedby="thinkingHint"> Thinking</label>
+        <p id="thinkingHint" class="setting-help">Uses a separate reasoning pass; responses can take longer.</p>
+      </div>
+    </details>
+    <details id="thinkingDetails" class="thinking-details" hidden>
       <summary>Thinking prompt</summary>
       <textarea id="thinkingPrompt" rows="3" placeholder="Optional meta-prompt override" autocomplete="off"></textarea>
     </details>
+    <div id="stats" class="stats" aria-live="off" aria-atomic="true"></div>
     <div class="hint" id="promptHint">Press <kbd>Ctrl</kbd>+<kbd>Enter</kbd> or <kbd>⌘</kbd>+<kbd>Enter</kbd> to send</div>
   </form>
 </div>

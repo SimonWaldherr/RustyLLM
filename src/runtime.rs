@@ -491,6 +491,10 @@ enum RuntimePhase {
 }
 
 const RECENT_TOKEN_LIMIT: usize = 64;
+/// Bound a flattened encoder micro-batch so a large HTTP array cannot turn
+/// temporary Nomic attention buffers into an unbounded allocation. This still
+/// combines the short texts that dominate retrieval ingestion workloads.
+const EMBEDDING_BATCH_TOKEN_LIMIT: usize = 512;
 
 #[inline]
 /// Mean-pools consecutive token vectors in place.
@@ -794,6 +798,10 @@ pub struct Runner {
     /// Shared completed-prompt KV snapshots for stateless requests. This is
     /// bounded and never shares mutable state with a live generation.
     prefix_cache: Mutex<SharedPrefixCache>,
+    /// Embedding requests do not carry per-call generation options, so retain
+    /// the load-time batch-thread policy for their encoder micro-batches.
+    embedding_batch_threads: Option<usize>,
+    embedding_auto_batch_threads: bool,
     #[allow(dead_code)]
     #[cfg(not(target_family = "wasm"))]
     mapped_model: Option<crate::mmap::MmapFile>,
@@ -1932,6 +1940,8 @@ impl Runner {
             speculative_assistant: None,
             generation_lock: Mutex::new(()),
             prefix_cache: Mutex::new(SharedPrefixCache::from_env()),
+            embedding_batch_threads: None,
+            embedding_auto_batch_threads: true,
             #[cfg(not(target_family = "wasm"))]
             mapped_model: None,
             chat_template_kind_cache: OnceLock::new(),
@@ -2027,6 +2037,8 @@ impl Runner {
             speculative_assistant: None,
             generation_lock: Mutex::new(()),
             prefix_cache: Mutex::new(SharedPrefixCache::from_env()),
+            embedding_batch_threads: options.runtime.batch_threads,
+            embedding_auto_batch_threads: options.runtime.auto_batch_threads,
             mapped_model: Some(mmap),
             chat_template_kind_cache: OnceLock::new(),
             mistral_tool_format_cache: OnceLock::new(),
@@ -2586,6 +2598,24 @@ impl Runner {
         // out to every physical core, because batched prefill has enough work
         // per dispatch and steals chunks dynamically, so the efficiency cores
         // add throughput instead of setting the barrier (M2 Max: 8 -> 12).
+        let target = crate::simd::available_threads().min(crate::simd::physical_threads());
+        let current = crate::simd::num_threads();
+        (target > current).then_some(target)
+    }
+
+    /// Applies the same physical-core widening policy as batched prompt
+    /// prefill to Nomic encoder micro-batches. A multi-input embedding request
+    /// has row-parallel quantized projections just like prefill, so Apple
+    /// Silicon efficiency cores increase throughput rather than setting the
+    /// latency of a token-serial decode barrier. `--threads-batch` remains an
+    /// explicit override and `--no-auto-batch-threads` disables this entirely.
+    fn effective_embedding_batch_threads(&self, token_count: usize) -> Option<usize> {
+        if let Some(threads) = self.embedding_batch_threads {
+            return Some(threads);
+        }
+        if !self.embedding_auto_batch_threads || token_count < 32 {
+            return None;
+        }
         let target = crate::simd::available_threads().min(crate::simd::physical_threads());
         let current = crate::simd::num_threads();
         (target > current).then_some(target)
@@ -3797,10 +3827,82 @@ impl Runner {
     /// returned vector has dimension `config.dim` and is suitable for cosine
     /// similarity comparisons (RAG retrieval, semantic search, etc.).
     pub fn embed(&self, text: &str) -> Result<EmbeddingResult, String> {
+        self.embed_batch(&[text])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| String::from("embed: batch returned no result"))
+    }
+
+    /// Embeds independent texts. Nomic/BERT models combine short inputs into
+    /// attention-isolated micro-batches, allowing the quantized projection
+    /// kernels to reuse weights across the request. Other architectures retain
+    /// their established per-input path but avoid repeatedly acquiring the
+    /// runner's single-entry worker-pool lock.
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<EmbeddingResult>, String> {
         let _guard = self
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let LoadedWeights::NomicBert(weights) = &self.weights else {
+            return texts.iter().map(|text| self.embed_locked(text)).collect();
+        };
+
+        let mut inputs = Vec::with_capacity(texts.len());
+        for text in texts {
+            let mut tokens = self.tok.encode(text);
+            if tokens.is_empty() {
+                return Err(String::from("embed: input tokenised to zero tokens"));
+            }
+            if tokens.len() > self.config.max_seq_len {
+                // Keep the trailing [SEP] while matching the single-input path.
+                let sep = *tokens.last().expect("non-empty tokens");
+                tokens.truncate(self.config.max_seq_len);
+                if let Some(last) = tokens.last_mut() {
+                    *last = sep;
+                }
+            }
+            inputs.push(tokens);
+        }
+
+        let mut results = Vec::with_capacity(inputs.len());
+        let total_tokens = inputs.iter().map(Vec::len).sum();
+        let _thread_guard =
+            SimdThreadGuard::set_temporarily(self.effective_embedding_batch_threads(total_tokens));
+        let mut start = 0;
+        while start < inputs.len() {
+            let mut end = start;
+            let mut token_total = 0usize;
+            while end < inputs.len() {
+                let next = inputs[end].len();
+                if end > start && token_total.saturating_add(next) > EMBEDDING_BATCH_TOKEN_LIMIT {
+                    break;
+                }
+                token_total += next;
+                end += 1;
+            }
+            let sequences = inputs[start..end]
+                .iter()
+                .map(Vec::as_slice)
+                .collect::<Vec<_>>();
+            let pooled = model::forward_nomic_bert_pooled_batch(&self.config, weights, &sequences);
+            for (embedding, tokens) in pooled.into_iter().zip(&inputs[start..end]) {
+                let mut embedding = embedding;
+                l2_normalize_in_place(&mut embedding);
+                results.push(EmbeddingResult {
+                    embedding,
+                    token_count: tokens.len(),
+                });
+            }
+            start = end;
+        }
+        Ok(results)
+    }
+
+    fn embed_locked(&self, text: &str) -> Result<EmbeddingResult, String> {
         let mut tokens = self.tok.encode(text);
         if tokens.is_empty() {
             return Err(String::from("embed: input tokenised to zero tokens"));

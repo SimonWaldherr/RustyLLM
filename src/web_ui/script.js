@@ -191,6 +191,8 @@ function initExpert() {
   const modelEl       = document.getElementById("model");
   const modelHintEl   = document.getElementById("modelHint");
   const promptEl      = document.getElementById("prompt");
+  const promptFieldEl = document.getElementById("prompt-field");
+  const promptLabelEl = document.getElementById("promptLabel");
   const systemPromptEl = document.getElementById("systemPrompt");
   const thinkingEl    = document.getElementById("thinking");
   const thinkingPromptEl = document.getElementById("thinkingPrompt");
@@ -203,6 +205,8 @@ function initExpert() {
   const abortEl       = document.getElementById("abort");
   const clearEl       = document.getElementById("clear");
   const refreshEl     = document.getElementById("refresh");
+  const advancedEl    = document.getElementById("advanced");
+  const sessionControlsEl = document.getElementById("session-controls");
   const maxTokensEl   = document.getElementById("maxTokens");
   const seedEl        = document.getElementById("seed");
   const temperatureEl = document.getElementById("temperature");
@@ -225,6 +229,7 @@ function initExpert() {
   const ragSearchBtn    = document.getElementById("rag-search-btn");
   const ragResultsEl    = document.getElementById("rag-results");
   const ragAskBtn       = document.getElementById("rag-ask-btn");
+  const ragAbortBtn     = document.getElementById("rag-abort-btn");
   const ragAnswerEl     = document.getElementById("rag-answer");
 
   const history = [];
@@ -338,14 +343,47 @@ function initExpert() {
   }
 
   function syncModeGuide() {
-    const guides = {
-      chat: "Continue a multi-turn conversation with the selected model.",
-      completion: "Continue a text prefix without applying chat formatting.",
-      generate: "Use RustyLLM's native generation endpoint for a direct response.",
-      embeddings: "Turn input into a vector for retrieval and similarity work.",
-      rag: "Add passages, search them semantically, then answer from the strongest matches."
+    const configs = {
+      chat: {
+        guide: "Continue a multi-turn conversation with the selected model.",
+        inputLabel: "Message", placeholder: "Message RustyLLM", action: "Send"
+      },
+      completion: {
+        guide: "Continue a text prefix without applying chat formatting.",
+        inputLabel: "Text prefix", placeholder: "Start a text prefix to complete", action: "Complete"
+      },
+      generate: {
+        guide: "Use RustyLLM's native generation endpoint for a direct response.",
+        inputLabel: "Prompt", placeholder: "Describe what you want to generate", action: "Generate"
+      },
+      embeddings: {
+        guide: "Turn input into a vector for retrieval and similarity work.",
+        inputLabel: "Text to embed", placeholder: "Paste text to turn into a vector", action: "Create embedding"
+      },
+      rag: {
+        guide: "Add passages, search them semantically, then answer from the strongest matches."
+      }
     };
-    modeGuideEl.textContent = guides[modeEl.value] || "Choose how the selected model should process your input.";
+    const mode = modeEl.value;
+    const config = configs[mode] || configs.chat;
+    const isRag = mode === "rag";
+    const isEmbeddings = mode === "embeddings";
+    modeGuideEl.textContent = config.guide;
+    transcriptPanel.hidden = isRag;
+    ragPanel.hidden = !isRag;
+    promptFieldEl.hidden = isRag;
+    sessionControlsEl.hidden = isRag;
+    advancedEl.hidden = isRag || isEmbeddings;
+    streamEl.disabled = !(mode === "chat" || mode === "completion");
+    if (!isRag) {
+      promptLabelEl.textContent = config.inputLabel;
+      promptEl.placeholder = config.placeholder;
+      promptEl.required = true;
+      sendEl.textContent = config.action;
+      sendEl.setAttribute("aria-label", config.action);
+    } else {
+      promptEl.required = false;
+    }
   }
 
   async function fetchJson(path, payload, signal) {
@@ -552,6 +590,7 @@ function initExpert() {
     };
     const turn = beginTurn();
     ragAskBtn.disabled = true;
+    ragAbortBtn.hidden = false;
     try {
       await runStreaming("/v1/chat/completions", payload, "chat", ragAnswerEl, turn.signal);
     } catch (err) {
@@ -561,9 +600,12 @@ function initExpert() {
       }
     } finally {
       ragAskBtn.disabled = false;
+      ragAbortBtn.hidden = true;
       finishTurn(turn);
     }
   });
+
+  ragAbortBtn.addEventListener("click", () => { if (controller) controller.abort(); });
 
   temperatureEl.addEventListener("input", () => {
     const val = Number(temperatureEl.value).toFixed(2);
@@ -590,11 +632,6 @@ function initExpert() {
   refreshEl.addEventListener("click", () => { loadModels(); });
 
   modeEl.addEventListener("change", () => {
-    const isRag = modeEl.value === "rag";
-    transcriptPanel.hidden = isRag;
-    ragPanel.hidden = !isRag;
-    streamEl.disabled = !(modeEl.value === "chat" || modeEl.value === "completion");
-    promptEl.placeholder = modeEl.value === "embeddings" ? "Text to embed" : "Message RustyLLM";
     syncModeGuide();
   });
 
@@ -700,6 +737,9 @@ function initChat() {
   const tempValueEl      = document.getElementById("tempValue");
   const thinkingEl       = document.getElementById("thinking");
   const thinkingPromptEl = document.getElementById("thinkingPrompt");
+  const responseControlsEl = document.getElementById("responseControls");
+  const responseControlsSummaryEl = document.getElementById("responseControlsSummary");
+  const thinkingDetailsEl = document.getElementById("thinkingDetails");
   const scrollEl         = document.getElementById("scroll");
   const statsEl          = document.getElementById("stats");
   const scrollBtnEl      = document.getElementById("scroll-btn");
@@ -789,10 +829,25 @@ function initChat() {
       }));
     } catch (_) {}
   }
+
+  function syncResponseControls() {
+    const temperature = Number(temperatureEl.value).toFixed(2);
+    tempValueEl.textContent = temperature;
+    temperatureEl.setAttribute("aria-valuenow", temperature);
+    temperatureEl.setAttribute("aria-valuetext", temperature);
+    responseControlsSummaryEl.textContent = (Number(maxTokensEl.value) || 512) + " tokens · " + temperature + " temperature";
+    const thinkingEnabled = thinkingEl.checked;
+    thinkingDetailsEl.hidden = !thinkingEnabled;
+    thinkingPromptEl.disabled = !thinkingEnabled;
+    if (!thinkingEnabled) thinkingDetailsEl.open = false;
+    if (thinkingEnabled) responseControlsEl.open = true;
+  }
+
   loadPrefs();
-  maxTokensEl.addEventListener("change", savePrefs);
-  temperatureEl.addEventListener("change", savePrefs);
-  thinkingEl.addEventListener("change", savePrefs);
+  syncResponseControls();
+  maxTokensEl.addEventListener("change", () => { savePrefs(); syncResponseControls(); });
+  temperatureEl.addEventListener("change", () => { savePrefs(); syncResponseControls(); });
+  thinkingEl.addEventListener("change", () => { savePrefs(); syncResponseControls(); });
   thinkingPromptEl.addEventListener("change", savePrefs);
 
   /* ── Session / history storage ── */
@@ -1018,7 +1073,7 @@ function initChat() {
   }
 
   temperatureEl.addEventListener("input", () => {
-    tempValueEl.textContent = Number(temperatureEl.value).toFixed(2);
+    syncResponseControls();
   });
 
   promptEl.addEventListener("input", () => {

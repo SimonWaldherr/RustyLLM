@@ -438,6 +438,14 @@ body.expert summary::after {
   display: inline-block;
 }
 body.expert details[open] summary::after { transform: rotate(270deg); }
+body.expert .details-summary-hint,
+body.chat .details-summary-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
 body.expert .inner-stack {
   display: flex;
   flex-direction: column;
@@ -469,6 +477,12 @@ body.expert .rag-search h2 {
   align-items: center;
   gap: 8px;
 }
+body.expert .rag-answer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+body.expert .rag-answer-actions button { width: auto; }
 .rag-badge {
   display: inline-flex;
   align-items: center;
@@ -1268,7 +1282,7 @@ body.chat .settings {
   color: var(--muted);
   font-size: 13px;
 }
-body.chat .stats { font-size: 12px; color: var(--muted); margin-left: auto; }
+body.chat .stats { width: min(880px, 100%); margin: 8px auto 0; font-size: 12px; color: var(--muted); min-height: 18px; }
 body.chat .hint { width: min(900px, 100%); margin: 6px auto 0; color: var(--muted); font-size: 12px; }
 body.chat label { display: inline-flex; align-items: center; gap: 7px; }
 body.chat label.toggle { white-space: nowrap; }
@@ -1283,6 +1297,7 @@ body.chat input[type="number"] {
   font: inherit;
 }
 body.chat input[type="range"] { accent-color: var(--accent); }
+body.chat .response-controls,
 body.chat .thinking-details {
   width: min(880px, 100%);
   margin: 8px auto 0;
@@ -1290,13 +1305,29 @@ body.chat .thinking-details {
   border-radius: 7px;
   overflow: hidden;
 }
+body.chat .response-controls summary,
 body.chat .thinking-details summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   cursor: pointer;
   padding: 7px 10px;
   color: var(--muted);
   font-size: 12px;
   font-weight: 650;
   background: color-mix(in srgb, var(--line) 28%, transparent);
+}
+body.chat .response-controls summary::-webkit-details-marker,
+body.chat .thinking-details summary::-webkit-details-marker { display: none; }
+body.chat .response-controls .settings { margin: 0; padding: 10px; }
+body.chat .setting-help {
+  flex: 1 0 100%;
+  margin: -3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
 }
 body.chat .thinking-details textarea {
   border: 0;
@@ -1328,6 +1359,27 @@ body.chat .thinking-details textarea {
   body.chat .settings { align-items: stretch; }
   body.chat .settings label { justify-content: space-between; width: 100%; }
   body.chat .stats { width: 100%; margin-left: 0; }
+}
+
+@media (pointer: coarse) {
+  button,
+  .page-nav a,
+  .scroll-to-bottom {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  button.ghost,
+  body.chat .history-item-select,
+  body.chat .suggestion,
+  body.chat .scroll-to-bottom,
+  body.expert .rag-kb-item button {
+    min-height: 44px;
+  }
+  body.chat .history-item-del {
+    width: 44px;
+    height: 44px;
+  }
+  body.chat input[type="number"] { min-height: 44px; }
 }
 
 @media (max-width: 620px) {
