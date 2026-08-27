@@ -216,10 +216,12 @@ RustyLLM runs the 64-block text trunk: 48 Gated DeltaNet recurrent blocks and
 and excluded from ordinary generation.
 
 The CPU path keeps only the 16 attention KV slots, parallelises the independent
-DeltaNet value heads, and supports `--kv-cache-dtype bf16` for those attention
-slots. Although the model metadata advertises a 262k context, the default is
-capped at 8192 tokens because the full f32 attention cache would otherwise need
-about 32 GiB; pass `--max-context` explicitly when enough memory is available.
+DeltaNet value heads, and updates four recurrent-state rows per SIMD pass so
+their shared K/Q vectors are loaded once. Its attention slots also support bf16
+storage via `--kv-cache-dtype bf16`. Although the model metadata advertises a
+262k context, the default is capped at 8192 tokens because the full f32
+attention cache would otherwise need about 32 GiB; pass `--max-context`
+explicitly when enough memory is available.
 
 `tokenizer.ggml.pre = qwen35` selects Qwen's native BPE splitter (individual
 numeric code points and combining marks retained with their words). Normal chat

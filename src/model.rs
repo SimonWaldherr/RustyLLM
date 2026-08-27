@@ -2673,6 +2673,126 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_delta_x4_matches_reference_recurrence() {
+        let width = 128usize;
+        let q: Vec<f32> = (0..width)
+            .map(|i| ((i * 17 % 61) as f32 - 30.0) * 0.009)
+            .collect();
+        let k: Vec<f32> = (0..width)
+            .map(|i| ((i * 29 % 67) as f32 - 33.0) * 0.008)
+            .collect();
+        let mut state: Vec<f32> = (0..width * width)
+            .map(|i| ((i * 13 % 71) as f32 - 35.0) * 0.0007)
+            .collect();
+        let mut reference = state.clone();
+        let mut got = vec![0.0f32; width];
+        let mut expected = vec![0.0f32; width];
+        let decay = 0.93f32;
+        let beta = 0.37f32;
+
+        for step in 0..4 {
+            let v: Vec<f32> = (0..width)
+                .map(|i| ((i * 7 + step * 11) % 53) as f32 * 0.006 - 0.15)
+                .collect();
+            super::qwen35_delta_head_step(&q, &k, &v, decay, beta, &mut state, &mut got);
+
+            let q_scale = 1.0 / (width as f32).sqrt();
+            for value_row in 0..width {
+                let row = &mut reference[value_row * width..(value_row + 1) * width];
+                for entry in row.iter_mut() {
+                    *entry *= decay;
+                }
+                let predicted = crate::simd::dot_f32(row, &k);
+                let delta = (v[value_row] - predicted) * beta;
+                crate::simd::axpy_f32(row, delta, &k);
+                expected[value_row] = crate::simd::dot_f32(row, &q) * q_scale;
+            }
+        }
+
+        for (index, (&actual, &want)) in state.iter().zip(&reference).enumerate() {
+            let tolerance = 2e-5 * (1.0 + want.abs());
+            assert!(
+                (actual - want).abs() <= tolerance,
+                "state[{index}]={actual}, reference={want}"
+            );
+        }
+        for (index, (&actual, &want)) in got.iter().zip(&expected).enumerate() {
+            let tolerance = 2e-5 * (1.0 + want.abs());
+            assert!(
+                (actual - want).abs() <= tolerance,
+                "out[{index}]={actual}, reference={want}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release benchmark; run cargo test --release --lib qwen35_delta_x4_speedup -- --ignored --nocapture"]
+    fn qwen35_delta_x4_speedup() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let width = 128usize;
+        let heads = 64usize;
+        let rounds = 16usize;
+        let q: Vec<f32> = (0..width)
+            .map(|i| ((i * 17 % 61) as f32 - 30.0) * 0.009)
+            .collect();
+        let k: Vec<f32> = (0..width)
+            .map(|i| ((i * 29 % 67) as f32 - 33.0) * 0.008)
+            .collect();
+        let v: Vec<f32> = (0..width)
+            .map(|i| ((i * 7 % 53) as f32) * 0.006 - 0.15)
+            .collect();
+        let initial: Vec<f32> = (0..heads * width * width)
+            .map(|i| ((i * 13 % 71) as f32 - 35.0) * 0.0007)
+            .collect();
+        let mut reference_state = initial.clone();
+        let mut optimized_state = initial;
+        let mut out = vec![0.0f32; width];
+        let decay = 0.93f32;
+        let beta = 0.37f32;
+        let q_scale = 1.0 / (width as f32).sqrt();
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for head in 0..heads {
+                let state = &mut reference_state[head * width * width..(head + 1) * width * width];
+                for value_row in 0..width {
+                    let row = &mut state[value_row * width..(value_row + 1) * width];
+                    for entry in row.iter_mut() {
+                        *entry *= decay;
+                    }
+                    let predicted = crate::simd::dot_f32(row, &k);
+                    let delta = (v[value_row] - predicted) * beta;
+                    crate::simd::axpy_f32(row, delta, &k);
+                    out[value_row] = crate::simd::dot_f32(row, &q) * q_scale;
+                }
+                black_box(&out);
+            }
+        }
+        let reference_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for head in 0..heads {
+                let state = &mut optimized_state[head * width * width..(head + 1) * width * width];
+                super::qwen35_delta_head_step(&q, &k, &v, decay, beta, state, &mut out);
+                black_box(&out);
+            }
+        }
+        let optimized_elapsed = started.elapsed();
+        black_box((&reference_state, &optimized_state));
+
+        let speedup = reference_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64();
+        eprintln!(
+            "Qwen35 DeltaNet x4: scalar={:.3} ms, x4={:.3} ms, speedup={speedup:.2}x",
+            reference_elapsed.as_secs_f64() * 1e3,
+            optimized_elapsed.as_secs_f64() * 1e3,
+        );
+        assert!(speedup > 1.05, "x4 recurrence unexpectedly regressed");
+    }
+
+    #[test]
     fn qwen35_delta_heads_use_tiled_key_mapping() {
         // GGUF conversion tiles Qwen's value-head-indexed tensors, so h=2
         // maps back to key head 0 rather than to key head 1 (h / 2).
@@ -7883,18 +8003,53 @@ fn qwen35_delta_head_step(
     debug_assert_eq!(state.len(), width * width);
 
     let q_scale = 1.0 / (width as f32).sqrt();
-    for value_row in 0..width {
+    let mut value_row = 0usize;
+
+    // Four rows share the same K/Q vectors and recurrence coefficients. The
+    // x4 kernels load those shared vectors once per SIMD block, and the affine
+    // update folds the separate decay and delta passes into one state write.
+    // This cuts the dominant 128x128 state walk from four passes to three for
+    // Qwen3.8's real head width while preserving update-before-read ordering.
+    while value_row + 4 <= width {
+        let rows = &mut state[value_row * width..(value_row + 4) * width];
+        let (row0, rows) = rows.split_at_mut(width);
+        let (row1, rows) = rows.split_at_mut(width);
+        let (row2, row3) = rows.split_at_mut(width);
+
+        // Scaling every state element before the dot product is algebraically
+        // equivalent to scaling the four reductions and avoids an extra full
+        // write/read pass over the recurrent memory.
+        let mut predicted = simd::dot_f32x4(row0, row1, row2, row3, k);
+        for score in &mut predicted {
+            *score *= decay;
+        }
+        let delta = [
+            (v[value_row] - predicted[0]) * beta,
+            (v[value_row + 1] - predicted[1]) * beta,
+            (v[value_row + 2] - predicted[2]) * beta,
+            (v[value_row + 3] - predicted[3]) * beta,
+        ];
+        simd::affine_add_f32x4(row0, row1, row2, row3, [decay; 4], delta, k);
+
+        // The reference applies the 1/sqrt(d) scale to Q after the state
+        // update, so these projections must read the new memory.
+        let projected = simd::dot_f32x4(row0, row1, row2, row3, q);
+        for lane in 0..4 {
+            out[value_row + lane] = projected[lane] * q_scale;
+        }
+        value_row += 4;
+    }
+
+    // Future model variants may use a width that is not divisible by four.
+    // Keep the original operation order for that small tail.
+    for value_row in value_row..width {
         let row = &mut state[value_row * width..(value_row + 1) * width];
         for entry in row.iter_mut() {
             *entry *= decay;
         }
         let predicted = simd::dot_f32(row, k);
         let delta = (v[value_row] - predicted) * beta;
-        for key_index in 0..width {
-            row[key_index] += delta * k[key_index];
-        }
-        // The reference applies the 1/sqrt(d) scale to Q after the state
-        // update, so the output must read the new, not the old, memory.
+        simd::axpy_f32(row, delta, k);
         out[value_row] = simd::dot_f32(row, q) * q_scale;
     }
 }
