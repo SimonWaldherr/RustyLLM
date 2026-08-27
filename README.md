@@ -217,8 +217,11 @@ and excluded from ordinary generation.
 
 The CPU path keeps only the 16 attention KV slots, parallelises the independent
 DeltaNet value heads, and updates four recurrent-state rows per SIMD pass so
-their shared K/Q vectors are loaded once. Its attention slots also support bf16
-storage via `--kv-cache-dtype bf16`. Although the model metadata advertises a
+their shared K/Q vectors are loaded once. Prompt prefill batches the K-quant
+QKV, gate, recurrent, output, and FFN projections layerwise across `--ubatch`;
+only causal convolution, DeltaNet memory updates, and attention scans remain
+token-ordered. Its attention slots also support bf16 storage via
+`--kv-cache-dtype bf16`. Although the model metadata advertises a
 262k context, the default is capped at 8192 tokens because the full f32
 attention cache would otherwise need about 32 GiB; pass `--max-context`
 explicitly when enough memory is available.
@@ -522,9 +525,10 @@ Generation options:
 - `--threads-batch <N>` overrides the SIMD worker thread count only during
   prompt/prefill processing, mirroring llama.cpp's split between generation
   threads and batch/prompt threads.
-- `--ubatch <N>` sets the logical prefill chunk size. This is the runtime
-  planning layer for llama.cpp-style microbatch prefill; current kernels still
-  evaluate tokens sequentially inside each chunk.
+- `--ubatch <N>` sets the logical prefill chunk size. Dense K-quant
+  LLaMA/Mistral and Qwen3.5/Qwen3.8 models evaluate their large projections
+  layerwise across each CPU chunk; causal attention and recurrent updates keep
+  their required token ordering.
 - `--no-auto-batch-threads` disables automatic widening of prefill worker
   threads when decode was configured with fewer workers than the machine offers.
 - `--poll <N>` controls how many spin iterations SIMD worker threads use while
@@ -1194,11 +1198,11 @@ No generated WASM binaries are written back to the repository branch.
   feature and the backend compiled and is available, Metal is used by default.
   Set `RUSTY_LLM_METAL=0` to force the CPU path; `RUSTY_LLM_METAL=1` keeps it
   explicit.
-- `RUSTY_LLM_BATCH_PREFILL`: batched CPU prompt prefill for standard-path
-  K-quant models (each weight matrix runs once per prompt chunk instead of
-  once per token). On by default whenever Metal is disabled or unavailable;
-  set `RUSTY_LLM_BATCH_PREFILL=0` to force the per-token path, e.g. for A/B
-  measurement.
+- `RUSTY_LLM_BATCH_PREFILL`: batched CPU prompt prefill for dense standard-path
+  and Qwen3.5/Qwen3.8 K-quant models (each weight matrix runs once per prompt
+  chunk instead of once per token). On by default whenever Metal is disabled
+  or unavailable; set `RUSTY_LLM_BATCH_PREFILL=0` to force the per-token path,
+  e.g. for A/B measurement.
 - `RUSTY_LLM_ATTN_PARALLEL_MIN_WORK`: minimum attention work
   (`scanned positions × KV heads`, default 4096) before the decode attention
   scan fans out across the worker pool. Set very high to force the serial

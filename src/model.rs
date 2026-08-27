@@ -3020,6 +3020,180 @@ mod tests {
         (config, weights)
     }
 
+    /// Small all-Q4_K hybrid model that exercises one DeltaNet and one full
+    /// attention block through the real Qwen batched-prefill implementation.
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_qwen35_model() -> (super::Config, super::Qwen35Weights) {
+        let dim = 256usize;
+        let head_dim = 256usize;
+        let hidden = 256usize;
+        let ssm = super::SsmDims {
+            d_conv: 2,
+            d_inner: 256,
+            d_state: 256,
+            n_head: 1,
+            n_group: 1,
+        };
+        let config = super::Config {
+            arch: "qwen35".to_string(),
+            dim,
+            hidden_dim: hidden,
+            n_layers: 2,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: 32,
+            max_seq_len: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+            head_dim,
+            kv_dim: head_dim,
+            kv_mul: 1,
+            value_dim: head_dim,
+            sliding_window: 0,
+            expert_count: 0,
+            expert_used_count: 0,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        let token_embd = tiny_q4k_weight(config.vocab_size, dim, 7);
+        let ffn = |seed: u8| {
+            (
+                tiny_q4k_weight(hidden, dim, seed),
+                tiny_q4k_weight(hidden, dim, seed.wrapping_add(11)),
+                tiny_q4k_weight(dim, hidden, seed.wrapping_add(23)),
+            )
+        };
+        let (linear_gate, linear_up, linear_down) = ffn(31);
+        let linear = super::Qwen35LayerWeights {
+            attn_norm: vec![1.0; dim],
+            post_attn_norm: vec![1.0; dim],
+            mixer: super::Qwen35Mixer::Linear(Box::new(super::Qwen35LinearWeights {
+                qkv: tiny_q4k_weight(ssm.conv_dim(), dim, 41),
+                gate: tiny_q4k_weight(ssm.d_inner, dim, 43),
+                conv_w: (0..ssm.conv_dim())
+                    .flat_map(|i| [0.02 + (i % 3) as f32 * 0.005, 0.08])
+                    .collect(),
+                dt_bias: vec![0.0; ssm.n_head],
+                a: vec![-0.01; ssm.n_head],
+                beta: tiny_q4k_weight(ssm.n_head, dim, 47),
+                alpha: tiny_q4k_weight(ssm.n_head, dim, 53),
+                norm: vec![1.0; ssm.head_dim()],
+                out: tiny_q4k_weight(dim, ssm.d_inner, 59),
+            })),
+            ffn_gate: linear_gate,
+            ffn_up: linear_up,
+            ffn_down: linear_down,
+        };
+        let (attn_gate, attn_up, attn_down) = ffn(67);
+        let attention = super::Qwen35LayerWeights {
+            attn_norm: vec![1.0; dim],
+            post_attn_norm: vec![1.0; dim],
+            mixer: super::Qwen35Mixer::Attention(Box::new(super::Qwen35AttentionWeights {
+                q_gate: tiny_q4k_weight(2 * dim, dim, 71),
+                k: tiny_q4k_weight(dim, dim, 73),
+                v: tiny_q4k_weight(dim, dim, 79),
+                q_norm: vec![1.0; head_dim],
+                k_norm: vec![1.0; head_dim],
+                out: tiny_q4k_weight(dim, dim, 83),
+                kv_slot: 0,
+            })),
+            ffn_gate: attn_gate,
+            ffn_up: attn_up,
+            ffn_down: attn_down,
+        };
+        let weights = super::Qwen35Weights {
+            token_embd: token_embd.clone(),
+            output_norm: vec![1.0; dim],
+            output: token_embd,
+            layers: vec![linear, attention],
+            ssm,
+            recurrent_layer_count: 1,
+            attn_layer_count: 1,
+            rotary_dim: head_dim,
+            rope_inv_freq: super::build_rope_inv_freq(10_000.0, head_dim, 1.0),
+        };
+        (config, weights)
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn qwen35_batched_prefill_matches_sequential_next_token() {
+        let (config, weights) = tiny_qwen35_model();
+        assert!(super::qwen35_prefill_batchable(&weights));
+        let prompt = [3u32, 8, 13, 21];
+
+        let mut sequential = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut seq_buf = super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        for (pos, &token) in prompt.iter().enumerate() {
+            super::forward_prefill_qwen35(
+                &config,
+                &weights,
+                &mut sequential,
+                &mut seq_buf,
+                token,
+                pos,
+            );
+        }
+
+        let mut batched = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        assert!(super::forward_prefill_batch_qwen35(
+            &config,
+            &weights,
+            &mut batched,
+            &mut batch_buf,
+            &prompt,
+            0,
+        ));
+
+        let mut seq_logits = Vec::new();
+        let mut batch_logits = Vec::new();
+        let mut next_seq_buf =
+            super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        let mut next_batch_buf =
+            super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        super::forward_qwen35_into(
+            &config,
+            &weights,
+            &mut sequential,
+            &mut next_seq_buf,
+            5,
+            prompt.len(),
+            &mut seq_logits,
+        );
+        super::forward_qwen35_into(
+            &config,
+            &weights,
+            &mut batched,
+            &mut next_batch_buf,
+            5,
+            prompt.len(),
+            &mut batch_logits,
+        );
+        assert_eq!(seq_logits.len(), batch_logits.len());
+        for (index, (&seq, &batch)) in seq_logits.iter().zip(&batch_logits).enumerate() {
+            let tolerance = 2e-3 * seq.abs().max(1.0);
+            assert!(
+                (seq - batch).abs() <= tolerance,
+                "logits[{index}] sequential={seq} batched={batch}"
+            );
+        }
+    }
+
     /// The batched prefill must fill the KV cache identically to the
     /// sequential per-token path (same kernels, same order per token).
     #[cfg(not(target_family = "wasm"))]
@@ -10251,6 +10425,12 @@ pub struct PrefillBatchBuffer {
     gate: Vec<f32>,
     up: Vec<f32>,
     hidden: Vec<f32>,
+    qwen35_qkv: Vec<f32>,
+    qwen35_activated: Vec<f32>,
+    qwen35_gate: Vec<f32>,
+    qwen35_q_gate: Vec<f32>,
+    qwen35_alpha: Vec<f32>,
+    qwen35_beta: Vec<f32>,
     embd_row: Vec<f32>,
     rope_inv_freq: Vec<f32>,
     /// Token-major RoPE angles, prepared once per prompt chunk instead of once
@@ -10274,6 +10454,12 @@ impl PrefillBatchBuffer {
             gate: Vec::new(),
             up: Vec::new(),
             hidden: Vec::new(),
+            qwen35_qkv: Vec::new(),
+            qwen35_activated: Vec::new(),
+            qwen35_gate: Vec::new(),
+            qwen35_q_gate: Vec::new(),
+            qwen35_alpha: Vec::new(),
+            qwen35_beta: Vec::new(),
             embd_row: Vec::new(),
             // Matches DecodeBuffer::new for the standard path.
             rope_inv_freq: build_rope_inv_freq(config.rope_theta, config.head_dim, 1.0),
@@ -10303,6 +10489,33 @@ pub fn standard_prefill_batchable(weights: &ModelWeights) -> bool {
             && kquant_weight_parts(&layer.w1).is_some()
             && kquant_weight_parts(&layer.w3).is_some()
             && kquant_weight_parts(&layer.w2).is_some()
+    })
+}
+
+/// Reports whether all Qwen3.5/Qwen3.8 trunk projections can use the
+/// row-major K-quant batch kernels.
+#[cfg(not(target_family = "wasm"))]
+pub fn qwen35_prefill_batchable(weights: &Qwen35Weights) -> bool {
+    weights.layers.iter().all(|layer| {
+        let mixer_batchable = match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => {
+                kquant_weight_parts(&linear.qkv).is_some()
+                    && kquant_weight_parts(&linear.gate).is_some()
+                    && kquant_weight_parts(&linear.alpha).is_some()
+                    && kquant_weight_parts(&linear.beta).is_some()
+                    && kquant_weight_parts(&linear.out).is_some()
+            }
+            Qwen35Mixer::Attention(attn) => {
+                kquant_weight_parts(&attn.q_gate).is_some()
+                    && kquant_weight_parts(&attn.k).is_some()
+                    && kquant_weight_parts(&attn.v).is_some()
+                    && kquant_weight_parts(&attn.out).is_some()
+            }
+        };
+        mixer_batchable
+            && kquant_weight_parts(&layer.ffn_gate).is_some()
+            && kquant_weight_parts(&layer.ffn_up).is_some()
+            && kquant_weight_parts(&layer.ffn_down).is_some()
     })
 }
 
@@ -10526,6 +10739,325 @@ pub fn forward_prefill_batch(
         }
     }
 
+    true
+}
+
+/// Batched prompt prefill for Qwen3.5/Qwen3.8 hybrid decoders.
+///
+/// The recurrent DeltaNet update and causal attention remain token ordered,
+/// while every quantized projection is evaluated once for the complete
+/// micro-batch. This is particularly important for the 27B model: it reuses
+/// each decoded K-quant weight row across all prompt activations before that
+/// row leaves cache instead of streaming the model once per prompt token.
+#[cfg(not(target_family = "wasm"))]
+pub fn forward_prefill_batch_qwen35(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut PrefillBatchBuffer,
+    tokens: &[u32],
+    start_pos: usize,
+) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    if !qwen35_prefill_batchable(weights) {
+        return false;
+    }
+
+    let b = tokens.len();
+    let dim = config.dim;
+    let query_dim = config.n_heads * config.head_dim;
+    let key_dim = config.n_kv_heads * config.head_dim;
+    let value_dim = config.n_kv_heads * config.value_dim;
+    let scale = 1.0 / (config.head_dim as f32).sqrt();
+
+    buf.x.resize(b * dim, 0.0);
+    buf.xn.resize(b * dim, 0.0);
+    for (t, &token) in tokens.iter().enumerate() {
+        weights
+            .token_embd
+            .row_into(token as usize, dim, &mut buf.embd_row);
+        buf.x[t * dim..(t + 1) * dim].copy_from_slice(&buf.embd_row);
+    }
+
+    let mut recurrent_index = 0usize;
+    for layer in &weights.layers {
+        for t in 0..b {
+            rms_norm_slice_into(
+                &buf.x[t * dim..(t + 1) * dim],
+                &layer.attn_norm,
+                config.rms_norm_eps,
+                &mut buf.xn[t * dim..(t + 1) * dim],
+            );
+        }
+
+        match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => {
+                let dims = &weights.ssm;
+                let recurrent_key_dim = dims.n_group * dims.d_state;
+                let recurrent_value_dim = dims.d_inner;
+                let value_head_dim = dims.head_dim();
+                let conv_dim = dims.conv_dim();
+                let qkv_dim = 2 * recurrent_key_dim + recurrent_value_dim;
+                debug_assert_eq!(qkv_dim, conv_dim);
+
+                if !try_kquant_matvec2_batch_into(
+                    &linear.qkv,
+                    &linear.gate,
+                    &buf.xn[..b * dim],
+                    &mut buf.qwen35_qkv,
+                    &mut buf.qwen35_gate,
+                ) || !try_kquant_matvec2_batch_into(
+                    &linear.alpha,
+                    &linear.beta,
+                    &buf.xn[..b * dim],
+                    &mut buf.qwen35_alpha,
+                    &mut buf.qwen35_beta,
+                ) {
+                    debug_assert!(false, "batchable Qwen DeltaNet projection rejected");
+                    return false;
+                }
+
+                buf.qwen35_activated.resize(b * qkv_dim, 0.0);
+                buf.attn_out.resize(b * recurrent_value_dim, 0.0);
+                buf.hidden.resize(b * recurrent_value_dim, 0.0);
+                let state = cache
+                    .ssm
+                    .as_mut()
+                    .expect("qwen35 requires Gated DeltaNet recurrent state");
+                let conv_state = &mut state.conv[recurrent_index];
+                let ssm_state = &mut state.ssm[recurrent_index];
+                let history_len = dims.d_conv - 1;
+
+                // The convolution and associative-memory update are causal,
+                // so only this comparatively small part stays token-major.
+                for t in 0..b {
+                    let qkv_row = &mut buf.qwen35_qkv[t * qkv_dim..(t + 1) * qkv_dim];
+                    for channel in 0..conv_dim {
+                        let current = qkv_row[channel];
+                        let taps =
+                            &linear.conv_w[channel * dims.d_conv..(channel + 1) * dims.d_conv];
+                        let history =
+                            &mut conv_state[channel * history_len..(channel + 1) * history_len];
+                        let mut convolved = current * taps[history_len];
+                        for (past, tap) in history.iter().zip(&taps[..history_len]) {
+                            convolved += past * tap;
+                        }
+                        history.copy_within(1..history_len, 0);
+                        history[history_len - 1] = current;
+                        qkv_row[channel] = convolved;
+                    }
+
+                    let activated = &mut buf.qwen35_activated[t * qkv_dim..(t + 1) * qkv_dim];
+                    simd::silu_mul_slice_into(qkv_row, qkv_row, activated);
+                    let (q_all, rest) = activated.split_at_mut(recurrent_key_dim);
+                    let (k_all, v_all) = rest.split_at_mut(recurrent_key_dim);
+                    qwen35_l2_normalize_heads(
+                        q_all,
+                        dims.d_state,
+                        dims.n_group,
+                        config.rms_norm_eps,
+                    );
+                    qwen35_l2_normalize_heads(
+                        k_all,
+                        dims.d_state,
+                        dims.n_group,
+                        config.rms_norm_eps,
+                    );
+
+                    let out_row =
+                        &mut buf.attn_out[t * recurrent_value_dim..(t + 1) * recurrent_value_dim];
+                    qwen35_delta_heads(
+                        q_all,
+                        k_all,
+                        v_all,
+                        &buf.qwen35_alpha[t * dims.n_head..(t + 1) * dims.n_head],
+                        &buf.qwen35_beta[t * dims.n_head..(t + 1) * dims.n_head],
+                        &linear.a,
+                        &linear.dt_bias,
+                        ssm_state,
+                        out_row,
+                        dims.n_group,
+                        dims.n_head,
+                        value_head_dim,
+                    );
+                    rms_norm_heads_in_place(
+                        out_row,
+                        value_head_dim,
+                        dims.n_head,
+                        Some(&linear.norm),
+                        config.rms_norm_eps,
+                    );
+                    simd::silu_mul_slice_into(
+                        &buf.qwen35_gate[t * recurrent_value_dim..(t + 1) * recurrent_value_dim],
+                        out_row,
+                        &mut buf.hidden[t * recurrent_value_dim..(t + 1) * recurrent_value_dim],
+                    );
+                }
+                recurrent_index += 1;
+
+                if !try_kquant_matvec_batch_into(
+                    &linear.out,
+                    &buf.hidden[..b * recurrent_value_dim],
+                    &mut buf.proj,
+                ) {
+                    debug_assert!(false, "batchable Qwen DeltaNet output rejected");
+                    return false;
+                }
+            }
+            Qwen35Mixer::Attention(attn) => {
+                if !try_kquant_matvec3_batch_into(
+                    &attn.q_gate,
+                    &attn.k,
+                    &attn.v,
+                    &buf.xn[..b * dim],
+                    &mut buf.qwen35_q_gate,
+                    &mut buf.k,
+                    &mut buf.v,
+                ) {
+                    debug_assert!(false, "batchable Qwen attention projection rejected");
+                    return false;
+                }
+
+                buf.q.resize(b * query_dim, 0.0);
+                buf.qwen35_gate.resize(b * query_dim, 0.0);
+                buf.attn_out.resize(b * query_dim, 0.0);
+                for t in 0..b {
+                    let joint = &buf.qwen35_q_gate[t * 2 * query_dim..(t + 1) * 2 * query_dim];
+                    let q_row = &mut buf.q[t * query_dim..(t + 1) * query_dim];
+                    let gate_row = &mut buf.qwen35_gate[t * query_dim..(t + 1) * query_dim];
+                    for head in 0..config.n_heads {
+                        let source = head * 2 * config.head_dim;
+                        let target = head * config.head_dim;
+                        q_row[target..target + config.head_dim]
+                            .copy_from_slice(&joint[source..source + config.head_dim]);
+                        gate_row[target..target + config.head_dim].copy_from_slice(
+                            &joint[source + config.head_dim..source + 2 * config.head_dim],
+                        );
+                    }
+
+                    let k_row = &mut buf.k[t * key_dim..(t + 1) * key_dim];
+                    apply_qk_norm_if_present(
+                        q_row,
+                        k_row,
+                        config.head_dim,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        &attn.q_norm,
+                        &attn.k_norm,
+                        config.rms_norm_eps,
+                    );
+                    let pos = start_pos + t;
+                    apply_rope_qk_neox_partial(
+                        q_row,
+                        k_row,
+                        pos,
+                        config.head_dim,
+                        weights.rotary_dim,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        &weights.rope_inv_freq,
+                    );
+
+                    let v_row = &buf.v[t * value_dim..(t + 1) * value_dim];
+                    cache.write_k(attn.kv_slot, pos, k_row);
+                    cache.write_v(attn.kv_slot, pos, v_row);
+                    let out_row = &mut buf.attn_out[t * query_dim..(t + 1) * query_dim];
+                    if cache.bf16 {
+                        attention_over_kv_heads_bf16(
+                            q_row,
+                            &cache.k_bf16[attn.kv_slot],
+                            &cache.v_bf16[attn.kv_slot],
+                            cache.per_pos_k_dim,
+                            cache.per_pos_v_dim,
+                            cache.storage_len,
+                            config.head_dim,
+                            config.value_dim,
+                            config.n_kv_heads,
+                            config.kv_mul,
+                            0,
+                            pos,
+                            scale,
+                            out_row,
+                        );
+                    } else {
+                        attention_over_kv_heads(
+                            q_row,
+                            &cache.k[attn.kv_slot],
+                            &cache.v[attn.kv_slot],
+                            cache.per_pos_k_dim,
+                            cache.per_pos_v_dim,
+                            cache.storage_len,
+                            config.head_dim,
+                            config.value_dim,
+                            config.n_kv_heads,
+                            config.kv_mul,
+                            0,
+                            pos,
+                            scale,
+                            out_row,
+                        );
+                    }
+                    simd::sigmoid_mul_in_place(out_row, gate_row);
+                }
+
+                if !try_kquant_matvec_batch_into(
+                    &attn.out,
+                    &buf.attn_out[..b * query_dim],
+                    &mut buf.proj,
+                ) {
+                    debug_assert!(false, "batchable Qwen attention output rejected");
+                    return false;
+                }
+            }
+        }
+
+        for t in 0..b {
+            let projection = &buf.proj[t * dim..(t + 1) * dim];
+            let residual = &mut buf.x[t * dim..(t + 1) * dim];
+            for i in 0..dim {
+                residual[i] += projection[i];
+            }
+            rms_norm_slice_into(
+                residual,
+                &layer.post_attn_norm,
+                config.rms_norm_eps,
+                &mut buf.xn[t * dim..(t + 1) * dim],
+            );
+        }
+
+        if !try_kquant_matvec2_batch_into(
+            &layer.ffn_gate,
+            &layer.ffn_up,
+            &buf.xn[..b * dim],
+            &mut buf.gate,
+            &mut buf.up,
+        ) {
+            debug_assert!(false, "batchable Qwen FFN gate/up rejected");
+            return false;
+        }
+        let hidden_len = b * config.hidden_dim;
+        simd::silu_mul_into(
+            &buf.gate[..hidden_len],
+            &buf.up[..hidden_len],
+            &mut buf.hidden,
+        );
+        if !try_kquant_matvec_batch_into(&layer.ffn_down, &buf.hidden[..hidden_len], &mut buf.proj)
+        {
+            debug_assert!(false, "batchable Qwen FFN down rejected");
+            return false;
+        }
+        for t in 0..b {
+            let projection = &buf.proj[t * dim..(t + 1) * dim];
+            let residual = &mut buf.x[t * dim..(t + 1) * dim];
+            for i in 0..dim {
+                residual[i] += projection[i];
+            }
+        }
+    }
+
+    debug_assert_eq!(recurrent_index, weights.recurrent_layer_count);
     true
 }
 

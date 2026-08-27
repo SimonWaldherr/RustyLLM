@@ -3432,13 +3432,13 @@ impl Runner {
         let ubatch = self.effective_prefill_ubatch(options, tokens.len());
 
         // Batched prefill runs every weight matrix once per chunk instead of
-        // once per token (see model::forward_prefill_batch). It is gated on
+        // once per token (standard and Qwen3.5/Qwen3.8 paths). It is gated on
         // Metal being fully disabled so macOS keeps its per-token fused-Metal
         // and GPU-resident prefill paths untouched; the batchability check is
         // hoisted out of the chunk loop so unsupported models skip straight
         // to the per-token fallback.
         #[cfg(not(target_family = "wasm"))]
-        let mut batch_state = match &self.weights {
+        let mut standard_batch_state = match &self.weights {
             LoadedWeights::Standard(weights)
                 if !crate::metal::enabled()
                     && tokens.len() > 2
@@ -3449,13 +3449,40 @@ impl Runner {
             }
             _ => None,
         };
+        #[cfg(not(target_family = "wasm"))]
+        let mut qwen35_batch_state = match &self.weights {
+            LoadedWeights::Qwen35(weights)
+                if !crate::metal::enabled()
+                    && tokens.len() > 2
+                    && batch_prefill_enabled()
+                    && model::qwen35_prefill_batchable(weights) =>
+            {
+                Some((weights, model::PrefillBatchBuffer::new(&self.config)))
+            }
+            _ => None,
+        };
 
         for (chunk_idx, chunk) in tokens[..last_idx].chunks(ubatch).enumerate() {
             let chunk_start = chunk_idx * ubatch;
             #[cfg(not(target_family = "wasm"))]
-            if let Some((weights, batch_buf)) = batch_state.as_mut() {
+            if let Some((weights, batch_buf)) = standard_batch_state.as_mut() {
                 if chunk.len() > 1
                     && model::forward_prefill_batch(
+                        &self.config,
+                        weights,
+                        cache,
+                        batch_buf,
+                        chunk,
+                        start_pos + chunk_start,
+                    )
+                {
+                    continue;
+                }
+            }
+            #[cfg(not(target_family = "wasm"))]
+            if let Some((weights, batch_buf)) = qwen35_batch_state.as_mut() {
+                if chunk.len() > 1
+                    && model::forward_prefill_batch_qwen35(
                         &self.config,
                         weights,
                         cache,

@@ -2345,6 +2345,16 @@ pub fn silu_mul_into(gate: &[f32], up: &[f32], out: &mut Vec<f32>) {
     debug_assert_eq!(gate.len(), up.len());
     let n = gate.len().min(up.len());
     out.resize(n, 0.0);
+    silu_mul_slice_into(&gate[..n], &up[..n], &mut out[..n]);
+}
+
+/// Slice-output variant of [`silu_mul_into`] for row-major batch scratch.
+/// Keeping the destination size fixed lets callers write directly into one
+/// token row without allocating or copying a temporary `Vec`.
+pub fn silu_mul_slice_into(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(gate.len(), up.len());
+    debug_assert_eq!(gate.len(), out.len());
+    let n = gate.len().min(up.len()).min(out.len());
     #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
     {
         unsafe { silu_mul_neon(&gate[..n], &up[..n], &mut out[..n]) }
