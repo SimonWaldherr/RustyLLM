@@ -1965,6 +1965,35 @@ mod tests {
     }
 
     #[test]
+    fn prepared_rope_matches_per_layer_angle_calculation() {
+        let inv = vec![0.73, 0.19, 0.05, 0.01];
+        let mut sin = vec![0.0; inv.len()];
+        let mut cos = vec![0.0; inv.len()];
+        super::prepare_rope_sin_cos_into(17, &inv, &mut sin, &mut cos);
+
+        let q: Vec<f32> = (0..16).map(|i| i as f32 * 0.07 - 0.3).collect();
+        let k: Vec<f32> = (0..8).map(|i| i as f32 * -0.11 + 0.2).collect();
+
+        let mut expected_q = q.clone();
+        let mut expected_k = k.clone();
+        super::apply_rope_qk(&mut expected_q, &mut expected_k, 17, 8, 2, 1, &inv);
+        let mut prepared_q = q.clone();
+        let mut prepared_k = k.clone();
+        super::apply_rope_qk_prepared(&mut prepared_q, &mut prepared_k, 8, 2, 1, &sin, &cos);
+        assert_eq!(prepared_q, expected_q);
+        assert_eq!(prepared_k, expected_k);
+
+        let mut expected_q = q.clone();
+        let mut expected_k = k.clone();
+        super::apply_rope_qk_neox(&mut expected_q, &mut expected_k, 17, 8, 2, 1, &inv);
+        let mut prepared_q = q;
+        let mut prepared_k = k;
+        super::apply_rope_qk_neox_prepared(&mut prepared_q, &mut prepared_k, 8, 2, 1, &sin, &cos);
+        assert_eq!(prepared_q, expected_q);
+        assert_eq!(prepared_k, expected_k);
+    }
+
+    #[test]
     fn qwen_rope_uses_rotate_half_layout() {
         let config = super::Config {
             arch: "qwen3".to_string(),
@@ -3052,6 +3081,12 @@ pub struct DecodeBuffer {
     pub expert_probs: Vec<f32>,
     pub sampler_candidates: Vec<(usize, f32)>,
     pub rope_inv_freq: Vec<f32>,
+    /// Per-position RoPE angles, prepared once before all transformer layers.
+    /// Standard decoder blocks share the same RoPE frequencies, so recalculating
+    /// `sin_cos` in every layer is pure duplicate work (notably 26 times for
+    /// Ministral 3).
+    pub rope_sin: Vec<f32>,
+    pub rope_cos: Vec<f32>,
     pub rope_gpt_oss_inv_freq: Vec<f32>,
     pub rope_gpt_oss_concentration: f32,
     /// Qwen3.5 Gated DeltaNet `[Q | K | V]` projection / convolution buffer.
@@ -3167,6 +3202,8 @@ impl DecodeBuffer {
             expert_probs: Vec::with_capacity(config.expert_used_count),
             sampler_candidates: Vec::with_capacity(64),
             rope_inv_freq,
+            rope_sin: vec![0.0; max_head_dim / 2],
+            rope_cos: vec![0.0; max_head_dim / 2],
             rope_gpt_oss_inv_freq,
             rope_gpt_oss_concentration,
             qwen35_qkv: Vec::new(),
@@ -5559,6 +5596,7 @@ fn apply_qk_norm_if_present(
 /// Qwen3 use Hugging Face's `rotate_half` convention: each element in the
 /// first half of a head rotates with its counterpart in the second half.
 /// LLaMA-family GGUFs use adjacent pairs instead.
+#[cfg(test)]
 #[inline]
 fn apply_model_rope(config: &Config, q: &mut [f32], k: &mut [f32], pos: usize, inv_freq: &[f32]) {
     if matches!(config.arch.as_str(), "qwen2" | "qwen3") {
@@ -5580,6 +5618,51 @@ fn apply_model_rope(config: &Config, q: &mut [f32], k: &mut [f32], pos: usize, i
             config.n_heads,
             config.n_kv_heads,
             inv_freq,
+        );
+    }
+}
+
+/// Fills reusable RoPE angle scratch for one position. The same angles apply
+/// to every standard decoder layer at that position, so callers prepare them
+/// once and reuse them through the complete layer stack.
+#[inline]
+fn prepare_rope_sin_cos_into(pos: usize, inv_freq: &[f32], sin: &mut [f32], cos: &mut [f32]) {
+    debug_assert_eq!(sin.len(), inv_freq.len());
+    debug_assert_eq!(cos.len(), inv_freq.len());
+    for ((&freq, sin), cos) in inv_freq.iter().zip(sin.iter_mut()).zip(cos.iter_mut()) {
+        (*sin, *cos) = (pos as f32 * freq).sin_cos();
+    }
+}
+
+/// Applies already prepared RoPE angles using the layout expected by a
+/// standard decoder architecture.
+#[inline]
+fn apply_model_rope_prepared(
+    config: &Config,
+    q: &mut [f32],
+    k: &mut [f32],
+    sin: &[f32],
+    cos: &[f32],
+) {
+    if matches!(config.arch.as_str(), "qwen2" | "qwen3") {
+        apply_rope_qk_neox_prepared(
+            q,
+            k,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            sin,
+            cos,
+        );
+    } else {
+        apply_rope_qk_prepared(
+            q,
+            k,
+            config.head_dim,
+            config.n_heads,
+            config.n_kv_heads,
+            sin,
+            cos,
         );
     }
 }
@@ -5640,6 +5723,53 @@ pub(crate) fn apply_rope_qk(
     }
 }
 
+/// Applies adjacent-pair RoPE using caller-prepared sine/cosine angles.
+#[inline]
+fn apply_rope_qk_prepared(
+    q: &mut [f32],
+    k: &mut [f32],
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    sin: &[f32],
+    cos: &[f32],
+) {
+    let last = head_dim - (head_dim % 2);
+    let pairs = last / 2;
+    debug_assert!(sin.len() >= pairs && cos.len() >= pairs);
+    for pair in 0..pairs {
+        let i = pair * 2;
+        let sin_a = sin[pair];
+        let cos_a = cos[pair];
+
+        for h in 0..n_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = idx0 + 1;
+            if idx1 >= q.len() {
+                break;
+            }
+            let v0 = q[idx0];
+            let v1 = q[idx1];
+            q[idx0] = v0 * cos_a - v1 * sin_a;
+            q[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+
+        for h in 0..n_kv_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = idx0 + 1;
+            if idx1 >= k.len() {
+                break;
+            }
+            let v0 = k[idx0];
+            let v1 = k[idx1];
+            k[idx0] = v0 * cos_a - v1 * sin_a;
+            k[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
 /// Applies NeoX-style RoPE where each pair spans the first and second half of a head.
 pub(crate) fn apply_rope_qk_neox(
     q: &mut [f32],
@@ -5655,6 +5785,51 @@ pub(crate) fn apply_rope_qk_neox(
     for i in 0..half {
         let angle = pos as f32 * inv_freq[i];
         let (sin_a, cos_a) = angle.sin_cos();
+
+        for h in 0..n_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + half;
+            if idx1 >= q.len() {
+                break;
+            }
+            let v0 = q[idx0];
+            let v1 = q[idx1];
+            q[idx0] = v0 * cos_a - v1 * sin_a;
+            q[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+
+        for h in 0..n_kv_heads {
+            let off = h * head_dim;
+            let idx0 = off + i;
+            let idx1 = off + i + half;
+            if idx1 >= k.len() {
+                break;
+            }
+            let v0 = k[idx0];
+            let v1 = k[idx1];
+            k[idx0] = v0 * cos_a - v1 * sin_a;
+            k[idx1] = v0 * sin_a + v1 * cos_a;
+        }
+    }
+}
+
+/// Applies NeoX rotate-half RoPE using caller-prepared sine/cosine angles.
+#[inline]
+fn apply_rope_qk_neox_prepared(
+    q: &mut [f32],
+    k: &mut [f32],
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    sin: &[f32],
+    cos: &[f32],
+) {
+    let half = head_dim / 2;
+    debug_assert!(sin.len() >= half && cos.len() >= half);
+    for i in 0..half {
+        let sin_a = sin[i];
+        let cos_a = cos[i];
 
         for h in 0..n_heads {
             let off = h * head_dim;
@@ -5914,16 +6089,39 @@ const ATTENTION_PARALLEL_MIN_WORK: usize = 4096;
 /// Returns the attention-parallelization work threshold, allowing an override
 /// via `RUSTY_LLM_ATTN_PARALLEL_MIN_WORK` (set very high to force the serial
 /// scan, e.g. for A/B measurement or tuning).
+///
+/// Ministral 3's exact 32Q/8KV, 128-wide GQA layout has eight independent,
+/// expensive grouped scans per layer. On Apple Silicon, distributing those
+/// scans is already profitable at short contexts: 26 layers amortize the
+/// worker rendezvous within one token. Keep the conservative threshold for
+/// every other shape and platform, and honour an explicit environment override
+/// before applying the targeted fast path.
 #[cfg(not(target_family = "wasm"))]
-fn attention_parallel_min_work() -> usize {
+fn attention_parallel_min_work(
+    n_kv_heads: usize,
+    kv_mul: usize,
+    head_dim: usize,
+    value_dim: usize,
+    threads: usize,
+) -> usize {
     use std::sync::OnceLock;
-    static MIN_WORK: OnceLock<usize> = OnceLock::new();
-    *MIN_WORK.get_or_init(|| {
+    static USER_MIN_WORK: OnceLock<Option<usize>> = OnceLock::new();
+    if let Some(min_work) = *USER_MIN_WORK.get_or_init(|| {
         std::env::var("RUSTY_LLM_ATTN_PARALLEL_MIN_WORK")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(ATTENTION_PARALLEL_MIN_WORK)
-    })
+    }) {
+        return min_work;
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if n_kv_heads == 8 && kv_mul == 4 && head_dim == 128 && value_dim == 128 && threads >= 4 {
+        return 1;
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = (n_kv_heads, kv_mul, head_dim, value_dim, threads);
+
+    ATTENTION_PARALLEL_MIN_WORK
 }
 
 /// Raw context for the parallel attention-over-heads trampoline. All pointers
@@ -6011,7 +6209,10 @@ pub(crate) fn attention_over_kv_heads(
     let threads = crate::simd::num_threads();
 
     #[cfg(not(target_family = "wasm"))]
-    if n_kv_heads > 1 && threads > 1 && work >= attention_parallel_min_work() {
+    if n_kv_heads > 1
+        && threads > 1
+        && work >= attention_parallel_min_work(n_kv_heads, kv_mul, head_dim, value_dim, threads)
+    {
         let ctx = AttnHeadsCtx {
             q: queries.as_ptr(),
             k: keys.as_ptr(),
@@ -6563,7 +6764,10 @@ pub(crate) fn attention_over_kv_heads_bf16(
     let threads = crate::simd::num_threads();
 
     #[cfg(not(target_family = "wasm"))]
-    if n_kv_heads > 1 && threads > 1 && work >= attention_parallel_min_work() {
+    if n_kv_heads > 1
+        && threads > 1
+        && work >= attention_parallel_min_work(n_kv_heads, kv_mul, head_dim, value_dim, threads)
+    {
         let ctx = AttnHeadsCtxBf16 {
             q: queries.as_ptr(),
             k: keys.as_ptr(),
@@ -7236,6 +7440,15 @@ pub fn forward_into(
         return;
     }
 
+    buf.rope_sin.resize(buf.rope_inv_freq.len(), 0.0);
+    buf.rope_cos.resize(buf.rope_inv_freq.len(), 0.0);
+    prepare_rope_sin_cos_into(
+        pos,
+        &buf.rope_inv_freq,
+        &mut buf.rope_sin,
+        &mut buf.rope_cos,
+    );
+
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
@@ -7265,7 +7478,7 @@ pub fn forward_into(
             config.rms_norm_eps,
         );
 
-        apply_model_rope(config, &mut buf.q, &mut buf.k, pos, &buf.rope_inv_freq);
+        apply_model_rope_prepared(config, &mut buf.q, &mut buf.k, &buf.rope_sin, &buf.rope_cos);
 
         // Store KV (keys and values may have different per-head dims)
         let kv_k_dim = cache.per_pos_k_dim;
@@ -9678,6 +9891,15 @@ fn forward_hidden_impl<'a>(
 
     weights.token_embd.row_into(token as usize, dim, &mut buf.x);
 
+    buf.rope_sin.resize(buf.rope_inv_freq.len(), 0.0);
+    buf.rope_cos.resize(buf.rope_inv_freq.len(), 0.0);
+    prepare_rope_sin_cos_into(
+        pos,
+        &buf.rope_inv_freq,
+        &mut buf.rope_sin,
+        &mut buf.rope_cos,
+    );
+
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
 
@@ -9706,7 +9928,7 @@ fn forward_hidden_impl<'a>(
             config.rms_norm_eps,
         );
 
-        apply_model_rope(config, &mut buf.q, &mut buf.k, pos, &buf.rope_inv_freq);
+        apply_model_rope_prepared(config, &mut buf.q, &mut buf.k, &buf.rope_sin, &buf.rope_cos);
 
         let kv_k_dim = cache.per_pos_k_dim;
         let kv_v_dim = cache.per_pos_v_dim;
@@ -9876,6 +10098,10 @@ pub struct PrefillBatchBuffer {
     hidden: Vec<f32>,
     embd_row: Vec<f32>,
     rope_inv_freq: Vec<f32>,
+    /// Token-major RoPE angles, prepared once per prompt chunk instead of once
+    /// per layer. This removes 26 redundant `sin_cos` passes for Ministral 3.
+    rope_sin: Vec<f32>,
+    rope_cos: Vec<f32>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -9896,6 +10122,8 @@ impl PrefillBatchBuffer {
             embd_row: Vec::new(),
             // Matches DecodeBuffer::new for the standard path.
             rope_inv_freq: build_rope_inv_freq(config.rope_theta, config.head_dim, 1.0),
+            rope_sin: Vec::new(),
+            rope_cos: Vec::new(),
         }
     }
 }
@@ -9989,6 +10217,18 @@ pub fn forward_prefill_batch(
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sliding_window = active_sliding_window(config, cache);
+    let rope_pairs = buf.rope_inv_freq.len();
+    buf.rope_sin.resize(b * rope_pairs, 0.0);
+    buf.rope_cos.resize(b * rope_pairs, 0.0);
+    for t in 0..b {
+        let rope_start = t * rope_pairs;
+        prepare_rope_sin_cos_into(
+            start_pos + t,
+            &buf.rope_inv_freq,
+            &mut buf.rope_sin[rope_start..rope_start + rope_pairs],
+            &mut buf.rope_cos[rope_start..rope_start + rope_pairs],
+        );
+    }
 
     for l in 0..config.n_layers {
         let layer = &weights.layers[l];
@@ -10029,7 +10269,14 @@ pub fn forward_prefill_batch(
             add_bias_if_present(k_row, &layer.bk);
             add_bias_if_present(v_row, &layer.bv);
 
-            apply_model_rope(config, q_row, k_row, pos, &buf.rope_inv_freq);
+            let rope_start = t * rope_pairs;
+            apply_model_rope_prepared(
+                config,
+                q_row,
+                k_row,
+                &buf.rope_sin[rope_start..rope_start + rope_pairs],
+                &buf.rope_cos[rope_start..rope_start + rope_pairs],
+            );
 
             cache.write_k(l, pos, k_row);
             cache.write_v(l, pos, v_row);

@@ -691,6 +691,13 @@ impl SharedPrefixCache {
         }
     }
 
+    /// Drops every completed-prompt snapshot without changing the cache's
+    /// configured capacity. Benchmark callers use this before each sample so
+    /// a prior run cannot turn a full prefill measurement into a cache hit.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     /// Restores an exact prompt snapshot into a freshly allocated KV cache.
     /// The copied slices contain only active prompt rows; the remaining cache
     /// capacity is already zeroed by `KVCache::with_sliding_window`.
@@ -2068,6 +2075,17 @@ impl Runner {
     /// Returns the optional model name from GGUF metadata.
     pub fn model_name(&self) -> Option<&str> {
         self.gguf.get_str("general.name")
+    }
+
+    /// Clears reusable completed-prompt snapshots.
+    ///
+    /// This is primarily useful to benchmarking and test tooling that needs
+    /// every sample to include a complete prompt prefill. Normal generation
+    /// should leave this cache intact to retain its latency benefit.
+    pub fn clear_shared_prefix_cache(&self) {
+        if let Ok(mut prefix_cache) = self.prefix_cache.lock() {
+            prefix_cache.clear();
+        }
     }
 
     /// Returns the tokenizer used by this runner.
@@ -5838,6 +5856,9 @@ mod tests {
         assert_eq!(got_logits, logits);
         assert_eq!(restored.k, source.k);
         assert_eq!(restored.v, source.v);
+
+        shared.clear();
+        assert!(shared.restore(&tokens, &mut restored).is_none());
     }
 
     #[test]

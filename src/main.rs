@@ -1204,9 +1204,10 @@ fn run_benchmark(
     println!("load_ms={}", load_info.load_time.as_millis());
     println!("runs={}", runs);
     println!("max_tokens={}", options.max_tokens);
+    println!("shared_prefix_cache=cleared_before_each_run");
     println!();
     println!(
-        "run,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s,mtp_accept_rate,mtp_draft_tok_s"
+        "run,prompt_tokens,generated_tokens,cached_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s,mtp_accept_rate,mtp_draft_tok_s"
     );
 
     let mut total_prompt_tokens = 0usize;
@@ -1222,6 +1223,7 @@ fn run_benchmark(
             run_options.seed = options.seed.wrapping_add(run as u64);
         }
 
+        runner.clear_shared_prefix_cache();
         let wall_start = Instant::now();
         let mut loaded_skills = HashSet::new();
         let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
@@ -1243,10 +1245,11 @@ fn run_benchmark(
             .unwrap_or(0.0);
 
         println!(
-            "{},{},{},{},{},{},{},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2}",
             run + 1,
             result.stats.prompt_tokens,
             result.stats.generated_tokens,
+            result.stats.cached_tokens,
             result.stats.prefill_time.as_millis(),
             result.stats.decode_time.as_millis(),
             result.stats.total_time.as_millis(),
@@ -1332,6 +1335,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
         println!("load_ms={}", load_info.load_time.as_millis());
         println!("runs={}", runs);
         println!("max_tokens={}", options.max_tokens);
+        println!("shared_prefix_cache=cleared_before_each_run");
         println!();
         println!(
             "threads,avg_prompt_tokens,avg_generated_tokens,avg_prefill_ms,avg_decode_ms,avg_total_ms,avg_wall_ms,aggregate_prefill_tok_s,aggregate_decode_tok_s"
@@ -1358,6 +1362,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
                 run_options.seed = options.seed.wrapping_add(run as u64);
             }
 
+            runner.clear_shared_prefix_cache();
             let wall_start = Instant::now();
             let mut loaded_skills = HashSet::new();
             let result =
@@ -1373,6 +1378,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
                     "run": run + 1,
                     "prompt_tokens": result.stats.prompt_tokens,
                     "generated_tokens": result.stats.generated_tokens,
+                    "cached_tokens": result.stats.cached_tokens,
                     "prefill_ms": result.stats.prefill_time.as_millis(),
                     "decode_ms": result.stats.decode_time.as_millis(),
                     "total_ms": result.stats.total_time.as_millis(),
@@ -1447,6 +1453,9 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
             "architecture": runner.architecture(),
             "load_ms": load_info.load_time.as_millis(),
             "max_tokens": options.max_tokens,
+            "measurement": {
+                "shared_prefix_cache": "cleared_before_each_run",
+            },
             "runtime": {
                 "profile": options.runtime.profile.as_str(),
                 "backend": options.runtime.backend_policy.as_str(),
@@ -1509,6 +1518,7 @@ fn run_benchmark_json(
             run_options.seed = options.seed.wrapping_add(run as u64);
         }
 
+        runner.clear_shared_prefix_cache();
         let wall_start = Instant::now();
         let mut loaded_skills = HashSet::new();
         let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
@@ -1522,6 +1532,7 @@ fn run_benchmark_json(
             "run": run + 1,
             "prompt_tokens": result.stats.prompt_tokens,
             "generated_tokens": result.stats.generated_tokens,
+            "cached_tokens": result.stats.cached_tokens,
             "prefill_ms": result.stats.prefill_time.as_millis(),
             "decode_ms": result.stats.decode_time.as_millis(),
             "total_ms": result.stats.total_time.as_millis(),
@@ -1577,6 +1588,9 @@ fn run_benchmark_json(
             "ultra_attention_min_tokens": metal::ultra_attention_min_metal_tokens(),
         },
         "runs": runs,
+        "measurement": {
+            "shared_prefix_cache": "cleared_before_each_run",
+        },
         "prompt": prompt,
         "options": {
             "max_tokens": options.max_tokens,
