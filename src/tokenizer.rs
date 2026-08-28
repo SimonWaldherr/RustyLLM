@@ -6,6 +6,67 @@
 use crate::gguf::MetaValue;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::ops::Range;
+
+/// Multiplicative hasher (the FxHash construction, as used by `rustc-hash`)
+/// for the tokenizer's lookup tables. `token_to_id` and friends are probed
+/// once per byte/char/window during encoding, and `HashMap`'s default SipHash
+/// pays a DoS-resistance cost that is pure waste here: every key comes from
+/// the fixed GGUF vocabulary at load time, never from untrusted input.
+#[derive(Default)]
+struct FxHasher(u64);
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some(chunk) = bytes.get(..8) {
+            self.mix(u64::from_ne_bytes(chunk.try_into().unwrap()));
+            bytes = &bytes[8..];
+        }
+        if let Some(chunk) = bytes.get(..4) {
+            self.mix(u32::from_ne_bytes(chunk.try_into().unwrap()) as u64);
+            bytes = &bytes[4..];
+        }
+        if let Some(chunk) = bytes.get(..2) {
+            self.mix(u16::from_ne_bytes(chunk.try_into().unwrap()) as u64);
+            bytes = &bytes[2..];
+        }
+        if let Some(&byte) = bytes.first() {
+            self.mix(byte as u64);
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.mix(i as u64);
+    }
+    fn write_u16(&mut self, i: u16) {
+        self.mix(i as u64);
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.mix(i as u64);
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.mix(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TokenizerMode {
@@ -22,14 +83,28 @@ enum TokenizerMode {
 pub struct Tokenizer {
     vocab: Vec<String>,
     scores: Vec<f32>,
-    token_to_id: HashMap<String, u32>,
-    bpe_merges: HashMap<(u32, u32), (usize, u32)>,
+    token_to_id: HashMap<String, u32, FxBuildHasher>,
+    bpe_merges: HashMap<(u32, u32), (usize, u32), FxBuildHasher>,
     /// Text-keyed merges for Gemma 4, nested left-then-right so a pair can be
     /// looked up from two `&str` without building an owned key for each probe.
-    bpe_text_merges: HashMap<String, HashMap<String, (usize, u32)>>,
+    bpe_text_merges: HashMap<String, HashMap<String, (usize, u32), FxBuildHasher>, FxBuildHasher>,
     byte_encoder: [char; 256],
-    byte_decoder: HashMap<char, u8>,
+    byte_decoder: HashMap<char, u8, FxBuildHasher>,
     byte_token_ids: [Option<u32>; 256],
+    /// Vocab id of each byte's own remapped single character, i.e. the common
+    /// hit case of `encode_piece` precomputed as a table. `encode_gpt2_bpe`
+    /// probes this once per input byte, so an array index instead of a
+    /// hashmap lookup there is the difference between O(1) and paying a hash
+    /// on every byte of every prompt.
+    single_byte_ids: [Option<u32>; 256],
+    /// Vocab id of each single ASCII character, for the SentencePiece symbol
+    /// list. That list starts as one symbol per character of the *whole*
+    /// prompt, so this turns the build from a hash lookup per character into
+    /// an array index. `None` falls back to `encode_piece`'s byte fallback.
+    spm_ascii_ids: [Option<u32>; 128],
+    /// Vocab id of the SentencePiece word-start marker `\u{2581}`, which the
+    /// symbol list emits once per space plus once at the front.
+    spm_space_id: Option<u32>,
     mode: TokenizerMode,
     /// Mistral's Tekken pre-tokenizer: same byte-level vocabulary as GPT-2, but
     /// a different split and a whole-word vocabulary shortcut before merges.
@@ -62,13 +137,18 @@ impl Tokenizer {
             .and_then(|v| v.as_f32_array())
             .unwrap_or_else(|| vec![0.0; vocab.len()]);
 
-        let mut token_to_id = HashMap::with_capacity(vocab.len());
+        let mut token_to_id =
+            HashMap::with_capacity_and_hasher(vocab.len(), FxBuildHasher::default());
         for (i, tok) in vocab.iter().enumerate() {
             token_to_id.insert(tok.clone(), i as u32);
         }
 
-        let mut bpe_merges = HashMap::new();
-        let mut bpe_text_merges: HashMap<String, HashMap<String, (usize, u32)>> = HashMap::new();
+        let mut bpe_merges: HashMap<(u32, u32), (usize, u32), FxBuildHasher> = HashMap::default();
+        let mut bpe_text_merges: HashMap<
+            String,
+            HashMap<String, (usize, u32), FxBuildHasher>,
+            FxBuildHasher,
+        > = HashMap::default();
         if let Some(merges) = metadata
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_string_array())
@@ -125,10 +205,24 @@ impl Tokenizer {
 
         let (byte_encoder, byte_decoder) = build_byte_maps();
         let mut byte_token_ids = [None; 256];
+        let mut single_byte_ids = [None; 256];
         for byte in 0u16..=255 {
             let byte_tok = format!("<0x{:02X}>", byte);
             byte_token_ids[byte as usize] = token_to_id.get(&byte_tok).copied();
+
+            let ch = byte_encoder[byte as usize];
+            let mut buf = [0u8; 4];
+            let symbol = ch.encode_utf8(&mut buf);
+            single_byte_ids[byte as usize] = token_to_id.get(symbol).copied();
         }
+
+        let mut spm_ascii_ids = [None; 128];
+        for (code, slot) in spm_ascii_ids.iter_mut().enumerate() {
+            let mut buf = [0u8; 4];
+            let symbol = (code as u8 as char).encode_utf8(&mut buf);
+            *slot = token_to_id.get(symbol).copied();
+        }
+        let spm_space_id = token_to_id.get("\u{2581}").copied();
 
         let bos_id = metadata
             .get("tokenizer.ggml.bos_token_id")
@@ -174,6 +268,9 @@ impl Tokenizer {
             byte_encoder,
             byte_decoder,
             byte_token_ids,
+            single_byte_ids,
+            spm_ascii_ids,
+            spm_space_id,
             mode,
             tekken,
             qwen35,
@@ -305,14 +402,30 @@ impl Tokenizer {
         // SentencePiece models encode word starts with U+2581, so we inject a
         // leading space before splitting to preserve first-token behavior.
         let mut current_tokens = Vec::with_capacity(text.len() + 1);
-        self.encode_piece("\u{2581}", &mut current_tokens);
-        for ch in text.chars() {
+        // `push_spm_char` resolves the overwhelmingly common cases — an ASCII
+        // character, or the word-start marker — from a precomputed table, and
+        // only falls back to the hashing path for the rest.
+        let push_spm_char = |ch: char, out: &mut Vec<u32>| {
             if ch == ' ' {
-                self.encode_piece("\u{2581}", &mut current_tokens);
-            } else {
-                let mut buf = [0u8; 4];
-                self.encode_piece(ch.encode_utf8(&mut buf), &mut current_tokens);
+                match self.spm_space_id {
+                    Some(id) => out.push(id),
+                    None => self.encode_piece("\u{2581}", out),
+                }
+                return;
             }
+            if ch.is_ascii()
+                && let Some(id) = self.spm_ascii_ids[ch as usize]
+            {
+                out.push(id);
+                return;
+            }
+            let mut buf = [0u8; 4];
+            self.encode_piece(ch.encode_utf8(&mut buf), out);
+        };
+
+        push_spm_char(' ', &mut current_tokens);
+        for ch in text.chars() {
+            push_spm_char(ch, &mut current_tokens);
         }
 
         // Iterative BPE merge: repeatedly take the highest-scoring adjacent
@@ -372,12 +485,12 @@ impl Tokenizer {
             symbols.clear();
             symbols.reserve(piece.len());
             for &byte in piece.as_bytes() {
-                let ch = self.byte_encoder[byte as usize];
-                let mut buf = [0u8; 4];
-                let symbol = ch.encode_utf8(&mut buf);
-                if let Some(&id) = self.token_to_id.get(symbol) {
+                if let Some(id) = self.single_byte_ids[byte as usize] {
                     symbols.push(id);
                 } else {
+                    let ch = self.byte_encoder[byte as usize];
+                    let mut buf = [0u8; 4];
+                    let symbol = ch.encode_utf8(&mut buf);
                     self.encode_piece(symbol, &mut symbols);
                 }
             }
@@ -447,24 +560,52 @@ impl Tokenizer {
     /// with a position that fails to match becomes a single `[UNK]`.
     fn encode_wordpiece(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
-        for word in wordpiece_split(text) {
-            self.encode_wordpiece_word(&word, &mut out);
+        // Every buffer here is reused for the whole text. The straightforward
+        // version costs three allocations per word — the word itself, its
+        // phantom-space copy, and its offset table — which for an embedding
+        // input of a few hundred words is most of the work this path does.
+        let mut normalized = String::new();
+        let mut words = Vec::new();
+        wordpiece_split_into(text, &mut normalized, &mut words);
+
+        let mut prefixed = String::new();
+        let mut offsets = Vec::new();
+        for word in &words {
+            self.encode_wordpiece_word(
+                &normalized[word.clone()],
+                &mut out,
+                &mut prefixed,
+                &mut offsets,
+            );
         }
         out
     }
 
     /// Greedily segments one normalized word into WordPiece token ids.
-    fn encode_wordpiece_word(&self, word: &str, out: &mut Vec<u32>) {
+    ///
+    /// `prefixed` and `offsets` are caller-owned scratch; their contents on
+    /// entry are irrelevant and they exist only so the allocation is not
+    /// repeated per word.
+    fn encode_wordpiece_word(
+        &self,
+        word: &str,
+        out: &mut Vec<u32>,
+        prefixed: &mut String,
+        offsets: &mut Vec<usize>,
+    ) {
         if word.is_empty() {
             return;
         }
         // Phantom-space form: a leading `\u{2581}` marks the word start, and
         // continuation pieces are stored without the `##` prefix.
-        let prefixed = format!("\u{2581}{word}");
+        prefixed.clear();
+        prefixed.push('\u{2581}');
+        prefixed.push_str(word);
         // Char-start byte offsets let every candidate window be a borrowed
         // slice; collecting the chars instead would rebuild a `String` for each
         // of the (up to `max_wp_token_chars`) windows tried per position.
-        let mut offsets: Vec<usize> = prefixed.char_indices().map(|(at, _)| at).collect();
+        offsets.clear();
+        offsets.extend(prefixed.char_indices().map(|(at, _)| at));
         offsets.push(prefixed.len());
         let n = offsets.len() - 1;
 
@@ -969,6 +1110,14 @@ fn is_qwen35_word_char(ch: char) -> bool {
 /// base word, rather than becoming punctuation-only BPE pieces.
 #[inline]
 fn is_combining_mark(ch: char) -> bool {
+    // No combining block starts below U+0300, so ASCII and Latin-1 — the bulk
+    // of real input, and every space, digit and punctuation mark in it — can
+    // skip the range chain below outright. `is_qwen35_word_char` reaches this
+    // for every non-alphabetic character of every Qwen prompt, so the early
+    // exit is the difference between one comparison and ~200.
+    if (ch as u32) < 0x0300 {
+        return false;
+    }
     matches!(
         ch as u32,
         0x0300..=0x036F
@@ -1476,12 +1625,21 @@ fn split_gemma4_pieces(text: &str) -> Vec<&str> {
 /// Applies llama.cpp's WPM preprocessing: lowercase, strip accents, drop
 /// control / replacement characters, split on Unicode whitespace, and emit
 /// each punctuation char, ASCII symbol, or CJK char as its own word.
-fn wordpiece_split(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let flush = |current: &mut String, words: &mut Vec<String>| {
-        if !current.is_empty() {
-            words.push(std::mem::take(current));
+///
+/// All words are appended to `buffer` and reported as byte ranges into it, so
+/// a text of n words costs one growing allocation rather than n separate
+/// `String`s. Both arguments are cleared on entry.
+fn wordpiece_split_into(text: &str, buffer: &mut String, words: &mut Vec<Range<usize>>) {
+    buffer.clear();
+    words.clear();
+    // Start of the word currently being accumulated at the end of `buffer`.
+    let mut start = 0usize;
+    // A word is only emitted once it has content, which also covers a
+    // character that normalizes away to nothing.
+    let flush = |buffer: &String, words: &mut Vec<Range<usize>>, start: &mut usize| {
+        if buffer.len() > *start {
+            words.push(*start..buffer.len());
+            *start = buffer.len();
         }
     };
 
@@ -1491,25 +1649,29 @@ fn wordpiece_split(text: &str) -> Vec<String> {
             continue;
         }
         if ch.is_whitespace() {
-            flush(&mut current, &mut words);
+            flush(buffer, words, &mut start);
             continue;
         }
         if is_wordpiece_standalone(ch) {
-            flush(&mut current, &mut words);
-            words.push(strip_accents_lower(ch));
+            flush(buffer, words, &mut start);
+            push_accent_stripped_lower(ch, buffer);
+            flush(buffer, words, &mut start);
             continue;
         }
-        current.push_str(&strip_accents_lower(ch));
+        push_accent_stripped_lower(ch, buffer);
     }
-    flush(&mut current, &mut words);
-    words
+    flush(buffer, words, &mut start);
 }
 
 /// Reports whether a character is tokenized as its own WordPiece word
 /// (punctuation, ASCII symbols, or CJK ideographs).
 fn is_wordpiece_standalone(ch: char) -> bool {
-    if ch.is_ascii_punctuation() {
-        return true;
+    // Every range below sits above U+7F, and the trailing clause is itself
+    // gated on `cp > 0x7F`, so for ASCII the whole function reduces to the
+    // punctuation test. Answering it here keeps ASCII input — the common case
+    // for embedding inputs — off the range chain.
+    if ch.is_ascii() {
+        return ch.is_ascii_punctuation();
     }
     let cp = ch as u32;
     // ASCII symbols that are not is_ascii_punctuation (none extra) plus the
@@ -1541,16 +1703,26 @@ fn is_unicode_punct_or_symbol(ch: char) -> bool {
 }
 
 /// Lowercases a character and strips diacritics for the Latin ranges (the
-/// common case for nomic-embed inputs). Combining marks are dropped; other
-/// scripts pass through lowercased. Full Unicode NFD parity is out of scope —
-/// rare non-Latin accents may diverge from llama.cpp.
-fn strip_accents_lower(ch: char) -> String {
+/// common case for nomic-embed inputs), appending straight into `out`. Every
+/// character of the input passes through here, so writing in place instead of
+/// returning a `String` avoids a heap allocation per character. Combining
+/// marks are dropped; other scripts pass through lowercased. Full Unicode NFD
+/// parity is out of scope — rare non-Latin accents may diverge from
+/// llama.cpp.
+fn push_accent_stripped_lower(ch: char, out: &mut String) {
+    // ASCII has no combining marks and no decomposition in `latin_deaccent`
+    // (whose arms are all non-ASCII), so it reduces to an ASCII lowercase —
+    // without walking the deaccent match or `to_lowercase`'s Unicode tables.
+    if ch.is_ascii() {
+        out.push(ch.to_ascii_lowercase());
+        return;
+    }
     // Drop combining diacritical marks outright.
     if ('\u{0300}'..='\u{036F}').contains(&ch) {
-        return String::new();
+        return;
     }
     let base = latin_deaccent(ch).unwrap_or(ch);
-    base.to_lowercase().collect()
+    out.extend(base.to_lowercase());
 }
 
 /// Maps accented Latin-1 Supplement / Latin Extended-A letters to their base
@@ -1621,7 +1793,7 @@ fn latin_deaccent(ch: char) -> Option<char> {
 }
 
 /// Builds reversible GPT-2 byte encoder and decoder tables.
-fn build_byte_maps() -> ([char; 256], HashMap<char, u8>) {
+fn build_byte_maps() -> ([char; 256], HashMap<char, u8, FxBuildHasher>) {
     // Mirrors GPT-2's bytes_to_unicode table so arbitrary byte sequences can
     // flow through BPE merges without losing reversibility.
     let mut bs: Vec<u32> = (b'!'..=b'~').map(|b| b as u32).collect();
@@ -1639,7 +1811,7 @@ fn build_byte_maps() -> ([char; 256], HashMap<char, u8>) {
     }
 
     let mut enc = ['\0'; 256];
-    let mut dec = HashMap::with_capacity(256);
+    let mut dec = HashMap::with_capacity_and_hasher(256, FxBuildHasher::default());
     for (b, c) in bs.into_iter().zip(cs.into_iter()) {
         if let Some(ch) = char::from_u32(c) {
             enc[b as usize] = ch;
@@ -2055,12 +2227,48 @@ mod tests {
         assert_eq!(tok.encode_without_bos("Café"), vec![9]);
     }
 
+    /// The normalization helpers short-circuit ASCII before consulting their
+    /// Unicode range chains. A misplaced cutoff would not fail loudly — it
+    /// would just retokenize ordinary text differently — so the boundaries are
+    /// pinned here.
+    #[test]
+    fn ascii_fast_paths_match_general_logic() {
+        // The cutoff must sit exactly on the first combining block.
+        assert!(!is_combining_mark('\u{02FF}'));
+        assert!(is_combining_mark('\u{0300}'));
+        assert!(is_combining_mark('\u{036F}'));
+
+        // Non-ASCII standalone characters must still be recognised past the
+        // ASCII early return.
+        assert!(is_wordpiece_standalone('\u{4E00}')); // CJK ideograph
+        assert!(is_wordpiece_standalone('\u{2014}')); // em dash
+        assert!(!is_wordpiece_standalone('\u{00E9}')); // é is a word character
+
+        for code in 0u8..=0x7F {
+            let ch = code as char;
+            assert!(!is_combining_mark(ch), "U+{code:04X}");
+            assert_eq!(
+                is_wordpiece_standalone(ch),
+                ch.is_ascii_punctuation(),
+                "U+{code:04X}"
+            );
+
+            // The ASCII branch must produce what the deaccent + Unicode
+            // lowercase path it skips would have produced.
+            let mut fast = String::new();
+            push_accent_stripped_lower(ch, &mut fast);
+            let general: String = latin_deaccent(ch).unwrap_or(ch).to_lowercase().collect();
+            assert_eq!(fast, general, "U+{code:04X}");
+        }
+    }
+
     #[test]
     fn wordpiece_split_normalizes() {
-        assert_eq!(
-            wordpiece_split("Hello, WORLD!"),
-            vec!["hello", ",", "world", "!"]
-        );
+        let mut buffer = String::new();
+        let mut words = Vec::new();
+        wordpiece_split_into("Hello, WORLD!", &mut buffer, &mut words);
+        let split: Vec<&str> = words.iter().map(|word| &buffer[word.clone()]).collect();
+        assert_eq!(split, vec!["hello", ",", "world", "!"]);
     }
 
     /// Builds a SentencePiece tokenizer whose vocabulary is harvested from a
