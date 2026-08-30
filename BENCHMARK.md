@@ -1,8 +1,28 @@
 # RustyLLM Benchmark Results
 
-Updated: **2026-07-16 22:52 CEST**
+Updated: **2026-08-30 18:15 CEST**
 
 This report compares the CPU path with the optional Apple Metal GPU path. Metal here means GPU acceleration through RustyLLM's Metal kernels; it is not a CoreML, ANE, or NPU backend.
+
+## Metal Decode Supplement — 2026-08-30
+
+The resident Q4_K and Q6_K kernels now process four quant blocks concurrently,
+reuse activation slices across two output rows, and combine compatible Q4_K
+matrix pairs in one grid. Q6_K decoding reconstructs four values at once with
+vector operations. Resident attention splits the timeline across four SIMD
+groups per query head and merges stable online-softmax states at the end.
+
+Direct scalar-dequantization parity tests cover odd row and block tails. The
+attention path also has CPU and serial-GPU parity coverage with grouped query
+attention and non-trivial cache strides.
+
+The reproducible three-model, fresh-process comparison is kept separately in
+[BENCHMARK_REFERENCE.md](BENCHMARK_REFERENCE.md). Its harness is
+[bench_reference.sh](bench_reference.sh); the reference executable is supplied
+by the caller, so repository code and documentation stay implementation-neutral.
+
+The full multi-model matrix below is the earlier 2026-07-16 run and has not yet
+been regenerated with the new kernels or attention path.
 
 ## Run Configuration
 

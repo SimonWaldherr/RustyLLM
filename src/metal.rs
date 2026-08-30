@@ -297,6 +297,25 @@ mod ffi {
             scale: f32,
             use_sink: i32,
         ) -> i32;
+        #[cfg(test)]
+        /// Test-only shim for the serial and temporally parallel resident attention kernels.
+        pub fn rusty_metal_test_resident_attention(
+            query: *const f32,
+            keys: *const f32,
+            values: *const f32,
+            out: *mut f32,
+            heads: u32,
+            kv_mul: u32,
+            head_dim: u32,
+            value_dim: u32,
+            key_stride: u32,
+            value_stride: u32,
+            slot_count: u32,
+            start_t: u32,
+            end_t: u32,
+            scale: f32,
+            parallel: i32,
+        ) -> i32;
 
         /// Configures the GPU-resident decoder (allocates resident buffers).
         pub fn rusty_metal_resident_configure(
@@ -1658,6 +1677,289 @@ fn q8_0_matvec_raw(
 #[cfg(test)]
 mod tests {
     use super::parse_env_flag;
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    /// Checks the lane-striped Metal Q4_K implementation against the native
+    /// CPU implementation, including incomplete output and block-group tails.
+    fn q4k_metal_matches_cpu_for_odd_shapes() {
+        if !super::available() {
+            return;
+        }
+
+        let rows = 5;
+        let cols = 3 * 256;
+        let blocks_per_row = cols / 256;
+        let mut weights = vec![0u8; rows * blocks_per_row * 144];
+        for block_index in 0..rows * blocks_per_row {
+            let block = &mut weights[block_index * 144..(block_index + 1) * 144];
+            // IEEE-754 binary16: d=0.5 and dmin=0.125.
+            block[0..2].copy_from_slice(&0x3800u16.to_le_bytes());
+            block[2..4].copy_from_slice(&0x3000u16.to_le_bytes());
+            for (i, byte) in block[4..16].iter_mut().enumerate() {
+                *byte = ((block_index * 29 + i * 17 + 11) & 0xff) as u8;
+            }
+            for (i, byte) in block[16..].iter_mut().enumerate() {
+                *byte = ((block_index * 37 + i * 13 + 7) & 0xff) as u8;
+            }
+        }
+        let x = (0..cols)
+            .map(|i| ((i * 19 % 257) as f32 - 128.0) / 128.0)
+            .collect::<Vec<_>>();
+        let scale_min = |j: usize, scales: &[u8]| -> (u8, u8) {
+            if j < 4 {
+                (scales[j] & 63, scales[j + 4] & 63)
+            } else {
+                (
+                    (scales[j + 4] & 15) | ((scales[j - 4] >> 6) << 4),
+                    (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4),
+                )
+            }
+        };
+        let mut expected = vec![0.0f32; rows];
+        for (row, expected_row) in expected.iter_mut().enumerate() {
+            let row_base = row * blocks_per_row * 144;
+            for block_index in 0..blocks_per_row {
+                let block_start = row_base + block_index * 144;
+                let block = &weights[block_start..block_start + 144];
+                let d = crate::simd::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                let dmin = crate::simd::f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+                let scales = &block[4..16];
+                let quants = &block[16..144];
+                for chunk in 0..4 {
+                    let (scale_lo, min_lo) = scale_min(chunk * 2, scales);
+                    let (scale_hi, min_hi) = scale_min(chunk * 2 + 1, scales);
+                    let x_lo = block_index * 256 + chunk * 64;
+                    let q = &quants[chunk * 32..chunk * 32 + 32];
+                    for i in 0..32 {
+                        *expected_row += (d * f32::from(scale_lo) * f32::from(q[i] & 15)
+                            - dmin * f32::from(min_lo))
+                            * x[x_lo + i];
+                        *expected_row += (d * f32::from(scale_hi) * f32::from(q[i] >> 4)
+                            - dmin * f32::from(min_hi))
+                            * x[x_lo + 32 + i];
+                    }
+                }
+            }
+        }
+        let mut actual = vec![0.0f32; rows];
+        assert!(super::q4k_matvec_raw(&weights, &x, rows, cols, &mut actual));
+
+        for (row, (&cpu, &metal)) in expected.iter().zip(&actual).enumerate() {
+            let tolerance = 5.0e-5 * cpu.abs().max(1.0);
+            assert!(
+                (cpu - metal).abs() <= tolerance,
+                "row {row}: CPU={cpu}, Metal={metal}, tolerance={tolerance}"
+            );
+        }
+
+        let rows_b = 3;
+        let mut paired_a = vec![0.0f32; rows];
+        let mut paired_b = vec![0.0f32; rows_b];
+        assert!(super::q4k_matvec2_raw(
+            &weights,
+            rows,
+            &weights[..rows_b * blocks_per_row * 144],
+            rows_b,
+            &x,
+            cols,
+            &mut paired_a,
+            &mut paired_b,
+        ));
+        for (row, (&cpu, &metal)) in expected.iter().zip(&paired_a).enumerate() {
+            let tolerance = 5.0e-5 * cpu.abs().max(1.0);
+            assert!(
+                (cpu - metal).abs() <= tolerance,
+                "paired A row {row}: CPU={cpu}, Metal={metal}, tolerance={tolerance}"
+            );
+        }
+        for (row, (&cpu, &metal)) in expected[..rows_b].iter().zip(&paired_b).enumerate() {
+            let tolerance = 5.0e-5 * cpu.abs().max(1.0);
+            assert!(
+                (cpu - metal).abs() <= tolerance,
+                "paired B row {row}: CPU={cpu}, Metal={metal}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    /// Checks the lane-striped Metal Q6_K implementation against direct scalar
+    /// dequantization, including incomplete output and block-group tails.
+    fn q6k_metal_matches_scalar_for_odd_shapes() {
+        if !super::available() {
+            return;
+        }
+
+        let rows = 5;
+        let cols = 3 * 256;
+        let blocks_per_row = cols / 256;
+        let mut weights = vec![0u8; rows * blocks_per_row * 210];
+        for block_index in 0..rows * blocks_per_row {
+            let block = &mut weights[block_index * 210..(block_index + 1) * 210];
+            for (i, byte) in block[..192].iter_mut().enumerate() {
+                *byte = ((block_index * 41 + i * 23 + 5) & 0xff) as u8;
+            }
+            for (i, byte) in block[192..208].iter_mut().enumerate() {
+                *byte = ((block_index * 11 + i * 7 + 109) & 0xff) as u8;
+            }
+            block[208..210].copy_from_slice(&0x3400u16.to_le_bytes()); // d=0.25
+        }
+        let x = (0..cols)
+            .map(|i| ((i * 31 % 263) as f32 - 131.0) / 131.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; rows];
+        for (row, expected_row) in expected.iter_mut().enumerate() {
+            let row_base = row * blocks_per_row * 210;
+            for block_index in 0..blocks_per_row {
+                let block_start = row_base + block_index * 210;
+                let block = &weights[block_start..block_start + 210];
+                let ql = &block[..128];
+                let qh = &block[128..192];
+                let scales = &block[192..208];
+                let d = crate::simd::f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                for step in 0..2 {
+                    for l in 0..32 {
+                        let low = ql[step * 64 + l];
+                        let high = ql[step * 64 + 32 + l];
+                        let high_bits = qh[step * 32 + l];
+                        let scale_group = step * 8 + usize::from(l >= 16);
+                        let signed_scale = |offset: usize| -> f32 {
+                            f32::from(scales[scale_group + offset] as i8)
+                        };
+                        let x_base = block_index * 256 + step * 128 + l;
+                        *expected_row += d
+                            * signed_scale(0)
+                            * (((low & 15) | ((high_bits & 3) << 4)) as f32 - 32.0)
+                            * x[x_base];
+                        *expected_row += d
+                            * signed_scale(2)
+                            * (((high & 15) | (((high_bits >> 2) & 3) << 4)) as f32 - 32.0)
+                            * x[x_base + 32];
+                        *expected_row += d
+                            * signed_scale(4)
+                            * (((low >> 4) | (((high_bits >> 4) & 3) << 4)) as f32 - 32.0)
+                            * x[x_base + 64];
+                        *expected_row += d
+                            * signed_scale(6)
+                            * (((high >> 4) | (((high_bits >> 6) & 3) << 4)) as f32 - 32.0)
+                            * x[x_base + 96];
+                    }
+                }
+            }
+        }
+        let mut actual = vec![0.0f32; rows];
+        assert!(super::q6k_matvec_raw(&weights, &x, rows, cols, &mut actual));
+
+        for (row, (&scalar, &metal)) in expected.iter().zip(&actual).enumerate() {
+            let tolerance = 5.0e-5 * scalar.abs().max(1.0);
+            assert!(
+                (scalar - metal).abs() <= tolerance,
+                "row {row}: scalar={scalar}, Metal={metal}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    /// Checks the four-way temporal softmax merge against both the serial Metal
+    /// kernel and a direct CPU softmax for GQA with non-trivial cache strides.
+    fn parallel_resident_attention_matches_serial_and_cpu() {
+        if !super::available() {
+            return;
+        }
+
+        let heads = 4usize;
+        let kv_mul = 2usize;
+        let head_dim = 64usize;
+        let value_dim = 48usize;
+        let kv_heads = heads / kv_mul;
+        let key_stride = kv_heads * head_dim;
+        let value_stride = kv_heads * value_dim;
+        let slot_count = 9usize;
+        let start_t = 1usize;
+        let end_t = 7usize;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let query = (0..heads * head_dim)
+            .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+            .collect::<Vec<_>>();
+        let keys = (0..slot_count * key_stride)
+            .map(|i| ((i * 29 % 127) as f32 - 63.0) / 43.0)
+            .collect::<Vec<_>>();
+        let values = (0..slot_count * value_stride)
+            .map(|i| ((i * 31 % 137) as f32 - 68.0) / 47.0)
+            .collect::<Vec<_>>();
+
+        let run_metal = |parallel: bool| {
+            let mut out = vec![0.0f32; heads * value_dim];
+            let ok = unsafe {
+                super::ffi::rusty_metal_test_resident_attention(
+                    query.as_ptr(),
+                    keys.as_ptr(),
+                    values.as_ptr(),
+                    out.as_mut_ptr(),
+                    heads as u32,
+                    kv_mul as u32,
+                    head_dim as u32,
+                    value_dim as u32,
+                    key_stride as u32,
+                    value_stride as u32,
+                    slot_count as u32,
+                    start_t as u32,
+                    end_t as u32,
+                    scale,
+                    i32::from(parallel),
+                ) != 0
+            };
+            assert!(ok);
+            out
+        };
+        let serial = run_metal(false);
+        let parallel = run_metal(true);
+
+        let mut expected = vec![0.0f32; heads * value_dim];
+        for head in 0..heads {
+            let kv_head = head / kv_mul;
+            let q = &query[head * head_dim..(head + 1) * head_dim];
+            let mut scores = Vec::with_capacity(end_t - start_t + 1);
+            for t in start_t..=end_t {
+                let k = &keys[t * key_stride + kv_head * head_dim
+                    ..t * key_stride + (kv_head + 1) * head_dim];
+                scores.push(q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale);
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights = scores
+                .iter()
+                .map(|score| (score - max).exp())
+                .collect::<Vec<_>>();
+            let denom = weights.iter().sum::<f32>();
+            for (offset, &weight) in weights.iter().enumerate() {
+                let t = start_t + offset;
+                let v = &values[t * value_stride + kv_head * value_dim
+                    ..t * value_stride + (kv_head + 1) * value_dim];
+                for (dst, &value) in expected[head * value_dim..(head + 1) * value_dim]
+                    .iter_mut()
+                    .zip(v)
+                {
+                    *dst += weight * value / denom;
+                }
+            }
+        }
+
+        for (index, ((&cpu, &serial_value), &parallel_value)) in
+            expected.iter().zip(&serial).zip(&parallel).enumerate()
+        {
+            let tolerance = 8.0e-5 * cpu.abs().max(1.0);
+            assert!(
+                (cpu - serial_value).abs() <= tolerance,
+                "index {index}: CPU={cpu}, serial={serial_value}, tolerance={tolerance}"
+            );
+            assert!(
+                (cpu - parallel_value).abs() <= tolerance,
+                "index {index}: CPU={cpu}, parallel={parallel_value}, tolerance={tolerance}"
+            );
+        }
+    }
 
     #[test]
     /// Verifies truthy environment values accepted by the Metal flag parser.

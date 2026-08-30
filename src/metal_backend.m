@@ -14,6 +14,15 @@ typedef struct {
     uint32_t rows_per_group;
 } RustyQ4KParams;
 
+typedef struct {
+    uint32_t rows_a;
+    uint32_t rows_b;
+    uint32_t cols;
+    uint32_t row_bytes;
+    uint32_t n_blocks;
+    uint32_t rows_per_group;
+} RustyQ4KPairParams;
+
 enum {
     RUSTY_MATVEC_ROWS_PER_GROUP = 4,
     RUSTY_MATVEC_THREADS_PER_GROUP = 32 * RUSTY_MATVEC_ROWS_PER_GROUP,
@@ -80,11 +89,13 @@ enum {
 static id<MTLDevice> gDevice;
 static id<MTLCommandQueue> gQueue;
 static id<MTLComputePipelineState> gQ4KPipeline;
+static id<MTLComputePipelineState> gQ4KPairPipeline;
 static id<MTLComputePipelineState> gQ6KPipeline;
 static id<MTLComputePipelineState> gQ4_0Pipeline;
 static id<MTLComputePipelineState> gQ8_0Pipeline;
 static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gResidentAttentionPipeline;
+static id<MTLComputePipelineState> gResidentParallelAttentionPipeline;
 static id<MTLComputePipelineState> gResidentGroupedAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
 static id<MTLComputePipelineState> gGeluMulPipeline;
@@ -130,8 +141,8 @@ static NSString *const kQ4KSource =
 "    if (j < 4) return uchar2(q[j] & 63, q[j + 4] & 63);\n"
 "    return uchar2((q[j + 4] & 15) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));\n"
 "}\n"
-"// Simdgroup-reduced Q4_K matvec using simdgroup reduction.\n"
-"// 32 threads collaborate on each output row; each lane owns ceil(n_blocks/32) blocks.\n"
+"// Four independent eight-lane teams process four quant blocks at once.\n"
+"// A lane loads four adjacent activations and reuses them for two rows.\n"
 "kernel void q4k_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                       device const float* x [[buffer(1)]],\n"
 "                       device float* out [[buffer(2)]],\n"
@@ -139,53 +150,140 @@ static NSString *const kQ4KSource =
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row_half = lane >> 4;\n"
-"    uint sublane = lane & 15;\n"
-"    uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
-"    if (row >= p.rows) return;\n"
-"    const device uchar* row_base = weights + row * p.row_bytes;\n"
-"    float sum = 0.0f;\n"
-"    for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
-"        const device uchar* block = row_base + b * 144;\n"
-"        ushort db = ushort(block[0]) | (ushort(block[1]) << 8);\n"
-"        ushort dmb = ushort(block[2]) | (ushort(block[3]) << 8);\n"
-"        float d = float(as_type<half>(db));\n"
-"        float dmin = float(as_type<half>(dmb));\n"
-"        const device uchar* scales = block + 4;\n"
-"        const device uchar* q = block + 16;\n"
-"        uint xoff = b * 256;\n"
-"        uint is = 0;\n"
+"    uint first_row = group * p.rows_per_group + sg * 2;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float2 lane_sum = float2(0.0f);\n"
+"    for (uint b = block_team; b < p.n_blocks; b += 4) {\n"
+"        float4 inputs_lo[4];\n"
+"        float4 inputs_hi[4];\n"
 "        #pragma unroll\n"
-"        for (uint chunk = 0; chunk < 4; ++chunk) {\n"
-"            uchar2 sm1 = scale_min_k4(is, scales);\n"
-"            uchar2 sm2 = scale_min_k4(is + 1, scales);\n"
-"            float d1 = d * float(sm1.x);\n"
-"            float min1 = dmin * float(sm1.y);\n"
-"            float d2 = d * float(sm2.x);\n"
-"            float min2 = dmin * float(sm2.y);\n"
-"            const device uchar* qchunk = q + chunk * 32;\n"
-"            uint x1 = xoff + chunk * 64;\n"
-"            uint x2 = x1 + 32;\n"
-"            #pragma unroll(32)\n"
-"            for (uint i = 0; i < 32; ++i) {\n"
-"                uchar byte = qchunk[i];\n"
-"                sum += (d1 * float(byte & 15) - min1) * x[x1 + i];\n"
-"                sum += (d2 * float(byte >> 4) - min2) * x[x2 + i];\n"
+"        for (uint segment = 0; segment < 4; ++segment) {\n"
+"            uint input_base = b * 256 + segment * 64 + value_base;\n"
+"            inputs_lo[segment] = *reinterpret_cast<const device float4*>(x + input_base);\n"
+"            inputs_hi[segment] = *reinterpret_cast<const device float4*>(x + input_base + 32);\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= p.rows) continue;\n"
+"            const device uchar* block = weights + row * p.row_bytes + b * 144;\n"
+"            const device half* multipliers = reinterpret_cast<const device half*>(block);\n"
+"            const device uchar* packed_scales = block + 4;\n"
+"            const device uchar* quants = block + 16;\n"
+"            float weighted = 0.0f;\n"
+"            float offsets = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint segment = 0; segment < 4; ++segment) {\n"
+"                uint low_group = segment * 2;\n"
+"                uint quant_base = segment * 32 + value_base;\n"
+"                ushort2 packed = *reinterpret_cast<const device ushort2*>(quants + quant_base);\n"
+"                uchar2 sm_lo = scale_min_k4(low_group, packed_scales);\n"
+"                uchar2 sm_hi = scale_min_k4(low_group + 1, packed_scales);\n"
+"                float4 lo = inputs_lo[segment];\n"
+"                float4 hi = inputs_hi[segment];\n"
+"                float dot_lo = lo.x * float(packed.x & 0x000f) +\n"
+"                               lo.y * float(packed.x & 0x0f00) * (1.0f / 256.0f) +\n"
+"                               lo.z * float(packed.y & 0x000f) +\n"
+"                               lo.w * float(packed.y & 0x0f00) * (1.0f / 256.0f);\n"
+"                float dot_hi = hi.x * float(packed.x & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.y * float(packed.x & 0xf000) * (1.0f / 4096.0f) +\n"
+"                               hi.z * float(packed.y & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.w * float(packed.y & 0xf000) * (1.0f / 4096.0f);\n"
+"                weighted += float(sm_lo.x) * dot_lo + float(sm_hi.x) * dot_hi;\n"
+"                offsets += float(sm_lo.y) * (lo.x + lo.y + lo.z + lo.w) +\n"
+"                           float(sm_hi.y) * (hi.x + hi.y + hi.z + hi.w);\n"
 "            }\n"
-"            is += 2;\n"
+"            lane_sum[row_slot] += float(multipliers[0]) * weighted -\n"
+"                                  float(multipliers[1]) * offsets;\n"
 "        }\n"
 "    }\n"
-"    for (ushort offset = 8; offset > 0; offset >>= 1)\n"
-"        sum += simd_shuffle_xor(sum, offset);\n"
-"    if (sublane == 0) out[row] = sum;\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < p.rows) out[row] = total;\n"
+"    }\n"
+"}\n"
+"struct PairParams { uint rows_a; uint rows_b; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"// A single grid covers two matrices that share one activation vector.\n"
+"kernel void q4k_matvec_pair(device const uchar* weights_a [[buffer(0)]],\n"
+"                            device const uchar* weights_b [[buffer(1)]],\n"
+"                            device const float* x [[buffer(2)]],\n"
+"                            device float* out_a [[buffer(3)]],\n"
+"                            device float* out_b [[buffer(4)]],\n"
+"                            constant PairParams& pp [[buffer(5)]],\n"
+"                            uint group [[threadgroup_position_in_grid]],\n"
+"                            uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                            uint lane [[thread_index_in_simdgroup]]) {\n"
+"    uint groups_a = (pp.rows_a + pp.rows_per_group - 1) / pp.rows_per_group;\n"
+"    bool second = group >= groups_a;\n"
+"    uint local_group = second ? group - groups_a : group;\n"
+"    uint rows = second ? pp.rows_b : pp.rows_a;\n"
+"    const device uchar* weights = second ? weights_b : weights_a;\n"
+"    device float* out = second ? out_b : out_a;\n"
+"    uint first_row = local_group * pp.rows_per_group + sg * 2;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float2 lane_sum = float2(0.0f);\n"
+"    for (uint b = block_team; b < pp.n_blocks; b += 4) {\n"
+"        float4 inputs_lo[4];\n"
+"        float4 inputs_hi[4];\n"
+"        #pragma unroll\n"
+"        for (uint segment = 0; segment < 4; ++segment) {\n"
+"            uint input_base = b * 256 + segment * 64 + value_base;\n"
+"            inputs_lo[segment] = *reinterpret_cast<const device float4*>(x + input_base);\n"
+"            inputs_hi[segment] = *reinterpret_cast<const device float4*>(x + input_base + 32);\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= rows) continue;\n"
+"            const device uchar* block = weights + row * pp.row_bytes + b * 144;\n"
+"            const device half* multipliers = reinterpret_cast<const device half*>(block);\n"
+"            const device uchar* packed_scales = block + 4;\n"
+"            const device uchar* quants = block + 16;\n"
+"            float weighted = 0.0f;\n"
+"            float offsets = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint segment = 0; segment < 4; ++segment) {\n"
+"                uint low_group = segment * 2;\n"
+"                uint quant_base = segment * 32 + value_base;\n"
+"                ushort2 packed = *reinterpret_cast<const device ushort2*>(quants + quant_base);\n"
+"                uchar2 sm_lo = scale_min_k4(low_group, packed_scales);\n"
+"                uchar2 sm_hi = scale_min_k4(low_group + 1, packed_scales);\n"
+"                float4 lo = inputs_lo[segment];\n"
+"                float4 hi = inputs_hi[segment];\n"
+"                float dot_lo = lo.x * float(packed.x & 0x000f) +\n"
+"                               lo.y * float(packed.x & 0x0f00) * (1.0f / 256.0f) +\n"
+"                               lo.z * float(packed.y & 0x000f) +\n"
+"                               lo.w * float(packed.y & 0x0f00) * (1.0f / 256.0f);\n"
+"                float dot_hi = hi.x * float(packed.x & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.y * float(packed.x & 0xf000) * (1.0f / 4096.0f) +\n"
+"                               hi.z * float(packed.y & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.w * float(packed.y & 0xf000) * (1.0f / 4096.0f);\n"
+"                weighted += float(sm_lo.x) * dot_lo + float(sm_hi.x) * dot_hi;\n"
+"                offsets += float(sm_lo.y) * (lo.x + lo.y + lo.z + lo.w) +\n"
+"                           float(sm_hi.y) * (hi.x + hi.y + hi.z + hi.w);\n"
+"            }\n"
+"            lane_sum[row_slot] += float(multipliers[0]) * weighted -\n"
+"                                  float(multipliers[1]) * offsets;\n"
+"        }\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < rows) out[row] = total;\n"
+"    }\n"
 "}\n";
 
 static NSString *const kQ6KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
-"inline int i8(uchar v) { return v < 128 ? int(v) : int(v) - 256; }\n"
-"// Simdgroup-reduced Q6_K matvec using simdgroup reduction.\n"
+"// Four independent eight-lane teams process four quant blocks at once.\n"
+"// Each lane rebuilds four adjacent values and applies them to two rows.\n"
 "kernel void q6k_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                       device const float* x [[buffer(1)]],\n"
 "                       device float* out [[buffer(2)]],\n"
@@ -193,59 +291,62 @@ static NSString *const kQ6KSource =
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint row_half = lane >> 4;\n"
-"    uint sublane = lane & 15;\n"
-"    uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
-"    if (row >= p.rows) return;\n"
-"    const device uchar* row_base = weights + row * p.row_bytes;\n"
-"    float sum = 0.0f;\n"
-"    for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
-"        const device uchar* block = row_base + b * 210;\n"
-"        const device uchar* ql = block;\n"
-"        const device uchar* qh = block + 128;\n"
-"        const device uchar* sc = block + 192;\n"
-"        ushort db = ushort(block[208]) | (ushort(block[209]) << 8);\n"
-"        float d = float(as_type<half>(db));\n"
-"        uint xoff = b * 256;\n"
+"    uint first_row = group * p.rows_per_group + sg * 2;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float2 lane_sum = float2(0.0f);\n"
+"    for (uint b = block_team; b < p.n_blocks; b += 4) {\n"
+"        float4 inputs[8];\n"
 "        #pragma unroll\n"
-"        for (uint step = 0; step < 2; ++step) {\n"
-"            const device uchar* ql_sub = ql + step * 64;\n"
-"            const device uchar* qh_sub = qh + step * 32;\n"
-"            const device uchar* sc_sub = sc + step * 8;\n"
-"            uint y = xoff + step * 128;\n"
-"            float dsc0 = d * float(i8(sc_sub[0]));\n"
-"            float dsc2 = d * float(i8(sc_sub[2]));\n"
-"            float dsc4 = d * float(i8(sc_sub[4]));\n"
-"            float dsc6 = d * float(i8(sc_sub[6]));\n"
-"            #pragma unroll(16)\n"
-"            for (uint l = 0; l < 16; ++l) {\n"
-"                uchar ql0 = ql_sub[l];\n"
-"                uchar ql32 = ql_sub[l + 32];\n"
-"                uchar qh0 = qh_sub[l];\n"
-"                sum += dsc0 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
-"                sum += dsc2 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
-"                sum += dsc4 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
-"                sum += dsc6 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
+"        for (uint quant_group = 0; quant_group < 8; ++quant_group) {\n"
+"            uint input_base = b * 256 + quant_group * 32 + value_base;\n"
+"            inputs[quant_group] = *reinterpret_cast<const device float4*>(x + input_base);\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= p.rows) continue;\n"
+"            const device uchar* block = weights + row * p.row_bytes + b * 210;\n"
+"            const device uchar* low_bits = block;\n"
+"            const device uchar* high_bits = block + 128;\n"
+"            const device char* scales = reinterpret_cast<const device char*>(block + 192);\n"
+"            float multiplier = float(*reinterpret_cast<const device half*>(block + 208));\n"
+"            float weighted = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint half_block = 0; half_block < 2; ++half_block) {\n"
+"                uint low_base = half_block * 64 + value_base;\n"
+"                uint high_base = half_block * 32 + value_base;\n"
+"                uint scale_base = half_block * 8 + uint(value_base >= 16);\n"
+"                uint input_group = half_block * 4;\n"
+"                float4 x0 = inputs[input_group];\n"
+"                float4 x1 = inputs[input_group + 1];\n"
+"                float4 x2 = inputs[input_group + 2];\n"
+"                float4 x3 = inputs[input_group + 3];\n"
+"                uchar4 low_a = *reinterpret_cast<const device uchar4*>(low_bits + low_base);\n"
+"                uchar4 low_b = *reinterpret_cast<const device uchar4*>(low_bits + low_base + 32);\n"
+"                uchar4 high = *reinterpret_cast<const device uchar4*>(high_bits + high_base);\n"
+"                int4 q0 = int4((low_a & 15) | ((high & 3) << 4)) - 32;\n"
+"                int4 q1 = int4((low_b & 15) | (((high >> 2) & 3) << 4)) - 32;\n"
+"                int4 q2 = int4((low_a >> 4) | (((high >> 4) & 3) << 4)) - 32;\n"
+"                int4 q3 = int4((low_b >> 4) | ((high >> 6) << 4)) - 32;\n"
+"                float dot0 = dot(float4(q0), x0);\n"
+"                float dot1 = dot(float4(q1), x1);\n"
+"                float dot2 = dot(float4(q2), x2);\n"
+"                float dot3 = dot(float4(q3), x3);\n"
+"                weighted += float(scales[scale_base]) * dot0 +\n"
+"                            float(scales[scale_base + 2]) * dot1 +\n"
+"                            float(scales[scale_base + 4]) * dot2 +\n"
+"                            float(scales[scale_base + 6]) * dot3;\n"
 "            }\n"
-"            float dsc1 = d * float(i8(sc_sub[1]));\n"
-"            float dsc3 = d * float(i8(sc_sub[3]));\n"
-"            float dsc5 = d * float(i8(sc_sub[5]));\n"
-"            float dsc7 = d * float(i8(sc_sub[7]));\n"
-"            #pragma unroll(16)\n"
-"            for (uint l = 16; l < 32; ++l) {\n"
-"                uchar ql0 = ql_sub[l];\n"
-"                uchar ql32 = ql_sub[l + 32];\n"
-"                uchar qh0 = qh_sub[l];\n"
-"                sum += dsc1 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
-"                sum += dsc3 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
-"                sum += dsc5 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
-"                sum += dsc7 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
-"            }\n"
+"            lane_sum[row_slot] += multiplier * weighted;\n"
 "        }\n"
 "    }\n"
-"    for (ushort offset = 8; offset > 0; offset >>= 1)\n"
-"        sum += simd_shuffle_xor(sum, offset);\n"
-"    if (sublane == 0) out[row] = sum;\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < p.rows) out[row] = total;\n"
+"    }\n"
 "}\n";
 
 static NSString *const kQ4_0Source =
@@ -536,6 +637,78 @@ static NSString *const kResidentAttnSource =
 "    for (uint i = lane; i < p.value_dim; i += 32) orow[i] = osh[i] * inv;\n"
 "}\n";
 
+// Short-context resident attention parallelized across four SIMD groups per
+// query head. Each SIMD group scans a disjoint subset of KV positions with an
+// online softmax; the four partial softmax states are merged exactly at the end.
+// This trades additional query-head KV reads for 4x more temporal parallelism,
+// which is profitable before the cache scan becomes memory-bandwidth bound.
+static NSString *const kResidentParallelAttnSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct AttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim;\n"
+"                    uint kv_k_dim; uint kv_v_dim; uint start_t; uint end_t; float scale; };\n"
+"kernel void resident_parallel_attention(device const float* q [[buffer(0)]],\n"
+"                                        device const float* k_cache [[buffer(1)]],\n"
+"                                        device const float* v_cache [[buffer(2)]],\n"
+"                                        device float* out [[buffer(3)]],\n"
+"                                        constant AttnParams& p [[buffer(4)]],\n"
+"                                        uint head [[threadgroup_position_in_grid]],\n"
+"                                        uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                                        uint lane [[thread_index_in_simdgroup]]) {\n"
+"    constexpr uint nsg = 4;\n"
+"    if (head >= p.n_heads) return;\n"
+"    threadgroup float qsh[256];\n"
+"    threadgroup float osh[nsg][256];\n"
+"    threadgroup float maxsh[nsg];\n"
+"    threadgroup float densh[nsg];\n"
+"    threadgroup float merged_max;\n"
+"    threadgroup float merged_den;\n"
+"    uint local = sg * 32 + lane;\n"
+"    const device float* qrow = q + head * p.head_dim;\n"
+"    uint kv_head = head / p.kv_mul;\n"
+"    for (uint i = local; i < p.head_dim; i += 128) qsh[i] = qrow[i];\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = 0.0f;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float maxs = -INFINITY;\n"
+"    float denom = 0.0f;\n"
+"    for (uint t = p.start_t + sg; t <= p.end_t; t += nsg) {\n"
+"        const device float* krow = k_cache + t * p.kv_k_dim + kv_head * p.head_dim;\n"
+"        float partial = 0.0f;\n"
+"        for (uint i = lane; i < p.head_dim; i += 32) partial += qsh[i] * krow[i];\n"
+"        float score = simd_sum(partial) * p.scale;\n"
+"        const device float* vrow = v_cache + t * p.kv_v_dim + kv_head * p.value_dim;\n"
+"        if (score > maxs) {\n"
+"            float r = isfinite(maxs) ? exp(maxs - score) : 0.0f;\n"
+"            denom = denom * r + 1.0f;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = osh[sg][i] * r + vrow[i];\n"
+"            maxs = score;\n"
+"        } else {\n"
+"            float w = exp(score - maxs);\n"
+"            denom += w;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] += w * vrow[i];\n"
+"        }\n"
+"    }\n"
+"    if (lane == 0) { maxsh[sg] = maxs; densh[sg] = denom; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (local == 0) {\n"
+"        float m = max(max(maxsh[0], maxsh[1]), max(maxsh[2], maxsh[3]));\n"
+"        float d = 0.0f;\n"
+"        for (uint j = 0; j < nsg; ++j) d += densh[j] * exp(maxsh[j] - m);\n"
+"        merged_max = m;\n"
+"        merged_den = d;\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        device float* orow = out + head * p.value_dim;\n"
+"        float inv = merged_den > 0.0f ? 1.0f / merged_den : 0.0f;\n"
+"        for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"            float total = 0.0f;\n"
+"            for (uint j = 0; j < nsg; ++j) total += osh[j][i] * exp(maxsh[j] - merged_max);\n"
+"            orow[i] = total * inv;\n"
+"        }\n"
+"    }\n"
+"}\n";
+
 // Four-head grouped-query attention for the resident decoder. Ministral 3
 // maps four query heads to each KV head, so loading the KV row once into
 // threadgroup memory avoids streaming the same keys and values four times.
@@ -618,6 +791,16 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q4k pipeline", error);
             return;
         }
+        id<MTLFunction> pair_function = [library newFunctionWithName:@"q4k_matvec_pair"];
+        if (!pair_function) {
+            rusty_metal_log_error("load q4k pair function", nil);
+            return;
+        }
+        gQ4KPairPipeline = [gDevice newComputePipelineStateWithFunction:pair_function error:&error];
+        if (!gQ4KPairPipeline) {
+            rusty_metal_log_error("create q4k pair pipeline", error);
+            return;
+        }
         id<MTLLibrary> q6_library = [gDevice newLibraryWithSource:kQ6KSource options:options error:&error];
         if (!q6_library) {
             rusty_metal_log_error("compile q6k library", error);
@@ -691,6 +874,21 @@ static BOOL rusty_metal_init(void) {
         gResidentAttentionPipeline = [gDevice newComputePipelineStateWithFunction:resident_attention_function error:&error];
         if (!gResidentAttentionPipeline) {
             rusty_metal_log_error("create resident attention pipeline", error);
+            return;
+        }
+        id<MTLLibrary> parallel_attention_library = [gDevice newLibraryWithSource:kResidentParallelAttnSource options:options error:&error];
+        if (!parallel_attention_library) {
+            rusty_metal_log_error("compile resident parallel attention library", error);
+            return;
+        }
+        id<MTLFunction> parallel_attention_function = [parallel_attention_library newFunctionWithName:@"resident_parallel_attention"];
+        if (!parallel_attention_function) {
+            rusty_metal_log_error("load resident parallel attention function", nil);
+            return;
+        }
+        gResidentParallelAttentionPipeline = [gDevice newComputePipelineStateWithFunction:parallel_attention_function error:&error];
+        if (!gResidentParallelAttentionPipeline) {
+            rusty_metal_log_error("create resident parallel attention pipeline", error);
             return;
         }
         id<MTLLibrary> grouped_attention_library = [gDevice newLibraryWithSource:kResidentGroupedAttnSource options:options error:&error];
@@ -925,6 +1123,19 @@ static void rusty_metal_profile_dump(void) {
             (unsigned long long)gMetalTemporaryAllocations);
 }
 
+static NSUInteger rusty_metal_q4k_rows_per_group(NSUInteger rows) {
+    const char *value = getenv("RUSTY_LLM_METAL_Q4K_ROWS_PER_GROUP");
+    if (value && *value) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(value, &end, 10);
+        if (end != value && parsed >= 2 && parsed <= 16 && (parsed % 2) == 0) {
+            return (NSUInteger)parsed;
+        }
+    }
+    (void)rows;
+    return 4;
+}
+
 static NSUInteger rusty_metal_q6k_rows_per_group(NSUInteger rows) {
     const char *value = getenv("RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP");
     if (value && *value) {
@@ -934,10 +1145,8 @@ static NSUInteger rusty_metal_q6k_rows_per_group(NSUInteger rows) {
             return (NSUInteger)parsed;
         }
     }
-    // Q6_K projections in Ministral-style Q4_K_M GGUFs are dominated by the
-    // large output and FFN-down matrices.  Two rows per threadgroup improves
-    // occupancy and reduces tail latency on Apple Silicon; callers can still
-    // override this with RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP for A/B testing.
+    // One simdgroup produces two rows; the smaller group wins for the wide
+    // value and down projections used during token-serial decode.
     (void)rows;
     return 2;
 }
@@ -1003,7 +1212,8 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLBuffer> out_buffer,
                                    uintptr_t rows,
                                    uintptr_t cols) {
-    const NSUInteger rows_per_group = 8;
+    // Two SIMD groups, each producing two rows.
+    const NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group((NSUInteger)rows);
     RustyQ4KParams params = {
         .rows = (uint32_t)rows,
         .cols = (uint32_t)cols,
@@ -1018,7 +1228,7 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
     [encoder setBuffer:out_buffer offset:0 atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-    MTLSize threads_per_group = MTLSizeMake(RUSTY_MATVEC_THREADS_PER_GROUP, 1, 1);
+    MTLSize threads_per_group = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
     MTLSize threadgroups = MTLSizeMake(
         ((NSUInteger)rows + rows_per_group - 1) / rows_per_group,
         1,
@@ -1026,6 +1236,39 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
     );
     gMetalDispatches += 1;
     [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+}
+
+static void rusty_metal_encode_q4k_pair(id<MTLComputeCommandEncoder> encoder,
+                                        id<MTLBuffer> weight_a,
+                                        id<MTLBuffer> weight_b,
+                                        id<MTLBuffer> x_buffer,
+                                        id<MTLBuffer> out_a,
+                                        id<MTLBuffer> out_b,
+                                        uintptr_t rows_a,
+                                        uintptr_t rows_b,
+                                        uintptr_t cols) {
+    const NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group((NSUInteger)(rows_a + rows_b));
+    RustyQ4KPairParams params = {
+        .rows_a = (uint32_t)rows_a,
+        .rows_b = (uint32_t)rows_b,
+        .cols = (uint32_t)cols,
+        .row_bytes = (uint32_t)((cols / 256) * 144),
+        .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [encoder setComputePipelineState:gQ4KPairPipeline];
+    [encoder setBuffer:weight_a offset:0 atIndex:0];
+    [encoder setBuffer:weight_b offset:0 atIndex:1];
+    [encoder setBuffer:x_buffer offset:0 atIndex:2];
+    [encoder setBuffer:out_a offset:0 atIndex:3];
+    [encoder setBuffer:out_b offset:0 atIndex:4];
+    [encoder setBytes:&params length:sizeof(params) atIndex:5];
+    NSUInteger groups_a = ((NSUInteger)rows_a + rows_per_group - 1) / rows_per_group;
+    NSUInteger groups_b = ((NSUInteger)rows_b + rows_per_group - 1) / rows_per_group;
+    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
+    gMetalDispatches += 1;
+    [encoder dispatchThreadgroups:MTLSizeMake(groups_a + groups_b, 1, 1)
+            threadsPerThreadgroup:threads];
 }
 
 static void rusty_metal_encode_q6k(id<MTLComputeCommandEncoder> encoder,
@@ -1299,8 +1542,10 @@ int rusty_metal_q4k_matvec2(const uint8_t *weights_a,
         double encode_start = rusty_metal_now_seconds();
         id<MTLCommandBuffer> command_buffer = [gQueue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        rusty_metal_encode_q4k(encoder, weight_a, x_metal, out_a_metal, rows_a, cols);
-        rusty_metal_encode_q4k(encoder, weight_b, x_metal, out_b_metal, rows_b, cols);
+        rusty_metal_encode_q4k_pair(
+            encoder, weight_a, weight_b, x_metal, out_a_metal, out_b_metal,
+            rows_a, rows_b, cols
+        );
         [encoder endEncoding];
         double encode_end = rusty_metal_now_seconds();
         [command_buffer commit];
@@ -1916,6 +2161,70 @@ int rusty_metal_attention(const float *query,
     }
 }
 
+// Test shim for comparing the resident serial and temporally parallel attention
+// pipelines without configuring a complete transformer. Kept out of the public
+// Rust API; the macOS parity test below is its only caller.
+int rusty_metal_test_resident_attention(const float *query,
+                                        const float *keys,
+                                        const float *values,
+                                        float *out,
+                                        uint32_t heads,
+                                        uint32_t kv_mul,
+                                        uint32_t head_dim,
+                                        uint32_t value_dim,
+                                        uint32_t key_stride,
+                                        uint32_t value_stride,
+                                        uint32_t slot_count,
+                                        uint32_t start_t,
+                                        uint32_t end_t,
+                                        float scale,
+                                        int parallel) {
+    if (!rusty_metal_init() || !query || !keys || !values || !out ||
+        heads == 0 || kv_mul == 0 || (heads % kv_mul) != 0 ||
+        head_dim == 0 || head_dim > 256 || value_dim == 0 || value_dim > 256 ||
+        slot_count == 0 || start_t > end_t || end_t >= slot_count) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        NSUInteger query_bytes = (NSUInteger)heads * head_dim * sizeof(float);
+        NSUInteger key_bytes = (NSUInteger)slot_count * key_stride * sizeof(float);
+        NSUInteger value_bytes = (NSUInteger)slot_count * value_stride * sizeof(float);
+        NSUInteger out_bytes = (NSUInteger)heads * value_dim * sizeof(float);
+        id<MTLBuffer> query_buffer = [gDevice newBufferWithBytes:query length:query_bytes
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> key_buffer = [gDevice newBufferWithBytes:keys length:key_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> value_buffer = [gDevice newBufferWithBytes:values length:value_bytes
+                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buffer = [gDevice newBufferWithLength:out_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (!query_buffer || !key_buffer || !value_buffer || !out_buffer) return 0;
+
+        RustyResidentAttentionParams p = {
+            .heads = heads, .kv_mul = kv_mul, .head_dim = head_dim, .value_dim = value_dim,
+            .key_stride = key_stride, .value_stride = value_stride,
+            .start_t = start_t, .end_t = end_t, .scale = scale,
+        };
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:parallel ? gResidentParallelAttentionPipeline : gResidentAttentionPipeline];
+        [enc setBuffer:query_buffer offset:0 atIndex:0];
+        [enc setBuffer:key_buffer offset:0 atIndex:1];
+        [enc setBuffer:value_buffer offset:0 atIndex:2];
+        [enc setBuffer:out_buffer offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(parallel ? 128 : 32, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
+        memcpy(out, [out_buffer contents], out_bytes);
+        return 1;
+    }
+}
+
 // ─── GPU-resident single-command-buffer decoder ─────────────────────────────
 //
 // Runs an entire token's forward pass (embedding → N layers → final norm →
@@ -1985,6 +2294,15 @@ static void resident_matvec(id<MTLComputeCommandEncoder> enc, uint32_t dt,
     } else {
         rusty_metal_encode_q4k(enc, w, x, out, rows, cols);
     }
+}
+
+static void resident_q4_pair(id<MTLComputeCommandEncoder> enc,
+                             id<MTLBuffer> weight_a, id<MTLBuffer> weight_b,
+                             id<MTLBuffer> x, id<MTLBuffer> out_a, id<MTLBuffer> out_b,
+                             uint32_t rows_a, uint32_t rows_b, uint32_t cols) {
+    rusty_metal_encode_q4k_pair(
+        enc, weight_a, weight_b, x, out_a, out_b, rows_a, rows_b, cols
+    );
 }
 
 static void resident_rms(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
@@ -2059,16 +2377,24 @@ static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
     // forcing an A/B comparison on other Apple GPUs.
     BOOL grouped_override_on = rusty_metal_env_enabled("RUSTY_LLM_METAL_GROUPED_GQA");
     BOOL grouped_override_off = rusty_metal_env_disabled("RUSTY_LLM_METAL_GROUPED_GQA");
+    BOOL parallel_override_on = rusty_metal_env_enabled("RUSTY_LLM_METAL_PARALLEL_ATTN");
+    BOOL parallel_override_off = rusty_metal_env_disabled("RUSTY_LLM_METAL_PARALLEL_ATTN");
     uint32_t context_tokens = end_t - start_t + 1;
-    BOOL use_grouped_gqa = kv_mul == 4 && gResidentGroupedAttentionPipeline != nil &&
+    BOOL use_parallel = gResidentParallelAttentionPipeline != nil &&
+                        (parallel_override_on ||
+                         (!parallel_override_off && context_tokens >= 16));
+    BOOL use_grouped_gqa = !use_parallel && kv_mul == 4 && gResidentGroupedAttentionPipeline != nil &&
                            (grouped_override_on || (!grouped_override_off && context_tokens >= 128));
-    [enc setComputePipelineState:use_grouped_gqa ? gResidentGroupedAttentionPipeline : gResidentAttentionPipeline];
+    [enc setComputePipelineState:use_parallel ? gResidentParallelAttentionPipeline :
+                                 (use_grouped_gqa ? gResidentGroupedAttentionPipeline : gResidentAttentionPipeline)];
     [enc setBuffer:gR_q offset:0 atIndex:0];
     [enc setBuffer:L->k_cache offset:0 atIndex:1];
     [enc setBuffer:L->v_cache offset:0 atIndex:2];
     [enc setBuffer:gR_attn offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
-    if (use_grouped_gqa) {
+    if (use_parallel) {
+        [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    } else if (use_grouped_gqa) {
         [enc dispatchThreadgroups:MTLSizeMake(gR_nkv, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else {
         [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -2179,8 +2505,15 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
             ResidentLayer *L = &gRLayers[l];
             id<MTLBuffer> resid = (l == 0) ? gR_zero : gR_proj;
             resident_rms(enc, gR_x, resid, L->attn_norm, gR_xn, gR_dim, gR_eps);
-            resident_matvec(enc, L->dt[0], L->w[0], gR_xn, gR_q, L->rows[0], L->cols[0]);
-            resident_matvec(enc, L->dt[1], L->w[1], gR_xn, gR_k, L->rows[1], L->cols[1]);
+            if (L->dt[0] == 0 && L->dt[1] == 0) {
+                resident_q4_pair(
+                    enc, L->w[0], L->w[1], gR_xn, gR_q, gR_k,
+                    L->rows[0], L->rows[1], L->cols[0]
+                );
+            } else {
+                resident_matvec(enc, L->dt[0], L->w[0], gR_xn, gR_q, L->rows[0], L->cols[0]);
+                resident_matvec(enc, L->dt[1], L->w[1], gR_xn, gR_k, L->rows[1], L->cols[1]);
+            }
             resident_matvec(enc, L->dt[2], L->w[2], gR_xn, gR_v, L->rows[2], L->cols[2]);
             if (L->bias_len[0]) resident_add(enc, gR_q, L->bias[0], L->bias_len[0]);
             if (L->bias_len[1]) resident_add(enc, gR_k, L->bias[1], L->bias_len[1]);
@@ -2189,8 +2522,15 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
             resident_attn(enc, L, start_t, pos, scale);
             resident_matvec(enc, L->dt[3], L->w[3], gR_attn, gR_proj, L->rows[3], L->cols[3]);
             resident_rms(enc, gR_x, gR_proj, L->ffn_norm, gR_xn, gR_dim, gR_eps);
-            resident_matvec(enc, L->dt[4], L->w[4], gR_xn, gR_gate, L->rows[4], L->cols[4]);
-            resident_matvec(enc, L->dt[5], L->w[5], gR_xn, gR_up, L->rows[5], L->cols[5]);
+            if (L->dt[4] == 0 && L->dt[5] == 0) {
+                resident_q4_pair(
+                    enc, L->w[4], L->w[5], gR_xn, gR_gate, gR_up,
+                    L->rows[4], L->rows[5], L->cols[4]
+                );
+            } else {
+                resident_matvec(enc, L->dt[4], L->w[4], gR_xn, gR_gate, L->rows[4], L->cols[4]);
+                resident_matvec(enc, L->dt[5], L->w[5], gR_xn, gR_up, L->rows[5], L->cols[5]);
+            }
             resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
             resident_matvec(enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj, L->rows[6], L->cols[6]);
         }

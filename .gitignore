@@ -3,6 +3,7 @@ Cargo.lock
 .DS_Store
 demo/wasm/pkg/*wasm
 .bench_raw
+BENCHMARK_REFERENCE.md.tmp
 model_benchmark_202*
 /models
 settings.local.json

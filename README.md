@@ -70,8 +70,9 @@ Additional documentation:
 - Quantized inference paths for `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K`, and `MXFP4`
   tensors.
 - SIMD kernels for Apple Silicon NEON and x86_64 AVX2/FMA, with scalar fallback.
-- Metal acceleration for Q4_K/Q6_K matrix-vector work on macOS, enabled by
-  default when the Objective-C shim builds and the GPU backend is available.
+- Metal acceleration for SIMD-wide Q4_K/Q6_K matrix-vector work and
+  four-way timeline-parallel resident attention on macOS, enabled by default
+  when the Objective-C shim builds and the GPU backend is available.
   Set `RUSTY_LLM_METAL=0` to force the CPU path.
 - One-shot generation, interactive REPL mode, benchmark mode, JSON benchmark
   output, and append-only chat history logging.
@@ -79,10 +80,12 @@ Additional documentation:
   de-duplication so long chats do not inject the same skill repeatedly.
 - OpenAI-compatible `/v1/models`, `/v1/completions`, `/v1/chat/completions`,
   `/v1/responses`, and `/v1/embeddings` routes.
+- Anthropic-compatible `/v1/messages` and `/v1/messages/count_tokens` routes,
+  including content blocks, tool round trips, and streaming events.
 - LM Studio-style `/api/v0/*` aliases and Ollama-style `/api/*` compatibility
   routes.
-- Server-Sent Events streaming for OpenAI-compatible completions and chat
-  completions, plus Responses API streaming and Ollama-style NDJSON streaming.
+- Server-Sent Events streaming for OpenAI- and Anthropic-compatible generation,
+  plus Responses API streaming and Ollama-style NDJSON streaming.
 - OpenAPI 3.1 document at `/openapi.json` with Swagger UI at `/docs`.
 - Model Context Protocol stdio mode with `generate`, `chat`, `embed`, and
   `models` tools.
@@ -653,6 +656,8 @@ Generation and embedding routes:
 - `POST /generate`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 - `POST /v1/responses`
 - `POST /v1/embeddings`
 - `POST /api/v0/completions`
@@ -761,6 +766,41 @@ data: [DONE]
 ```
 
 `max_completion_tokens` is accepted as an alias for `max_tokens`.
+
+### Anthropic-Compatible Messages
+
+The Messages API accepts Anthropic SDK request shapes, including top-level
+`system`, text content blocks, `tool_use`/`tool_result` round trips, sampling
+options, stop sequences, and usage counts:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'Anthropic-Version: 2023-06-01' \
+  -d '{
+    "model": "local-model",
+    "max_tokens": 64,
+    "system": "Be concise.",
+    "messages": [{"role": "user", "content": "What is GGUF?"}]
+  }'
+```
+
+Set `"stream": true` to receive Anthropic SSE events (`message_start`,
+`content_block_*`, `message_delta`, and `message_stop`). Tool-enabled streams
+buffer model output until tool markup can be separated safely, then emit
+protocol-compatible `tool_use` and `input_json_delta` blocks. The client remains
+responsible for executing tools and returning `tool_result` blocks.
+
+Count the exact locally rendered prompt before generation:
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/messages/count_tokens \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "local-model",
+    "messages": [{"role": "user", "content": "What is GGUF?"}]
+  }'
+```
 
 ### OpenAI-Compatible Completions
 
@@ -1006,6 +1046,20 @@ Benchmark output includes prompt tokens, generated tokens, prefill time, decode
 time, wall time, and aggregate throughput. Use the same model, prompt,
 temperature, seed, thread count, and build flags when comparing changes.
 
+For a fresh-process, same-GGUF comparison against an external reference across
+the local Ministral 3 3B, Meta Llama 3.1 8B, and Qwen2-family 7B models, run:
+
+```bash
+REFERENCE_BIN=/path/to/reference-cli make bench-reference
+```
+
+The harness alternates engine order, forces greedy sampling and GPU execution,
+writes raw logs below `.bench_raw/reference/`, and produces
+[`BENCHMARK_REFERENCE.md`](BENCHMARK_REFERENCE.md). Override model discovery
+with `MINISTRAL_MODEL`, `LLAMA_MODEL`, or `QWEN_MODEL`; use
+`REFERENCE_RUNS=5 REFERENCE_BIN=/path/to/reference-cli make bench-reference`
+for a longer comparison.
+
 Ollama and LM Studio are often faster on macOS because they use heavily tuned
 llama.cpp kernels and GPU paths. RustyLLM benchmark numbers are most useful for
 tracking RustyLLM changes against itself.
@@ -1131,14 +1185,20 @@ routing as `--profile mistral-ultra` while leaving the model profile explicit.
 For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with
 `RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS`, `RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS`, and
-`RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal
-Q6_K kernels use two rows per threadgroup by default, which improves current
-Ministral 3 Q4_K_M decode latency. Set `RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP` to
-`2`, `4`, `6`, or `8` for hardware-specific A/B tests. Metal
-resident decoding groups four GQA query heads once the attention window reaches
-128 tokens, reducing repeated KV-cache traffic during long Ministral 3
-generations. Set `RUSTY_LLM_METAL_GROUPED_GQA=0` to disable this route or `=1`
-to force it for an A/B check. Metal
+`RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal Q4_K
+and Q6_K kernels split each 256-value quant block across a full SIMD group
+and reuse each activation slice for two output rows. Q4_K uses four rows per
+threadgroup and Q6_K uses two by default. Set
+`RUSTY_LLM_METAL_Q4K_ROWS_PER_GROUP` or
+`RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP` to an even value in the supported range
+for hardware-specific A/B tests. Metal
+resident attention scans contexts of 16 or more tokens across four SIMD groups
+per query head and merges their stable online-softmax states. Set
+`RUSTY_LLM_METAL_PARALLEL_ATTN=0` to restore the serial timeline for A/B tests,
+or `=1` to force the parallel path even for very short contexts. The older
+shared-KV GQA kernel remains as a fallback when timeline parallelism is
+disabled; set `RUSTY_LLM_METAL_GROUPED_GQA=0` to disable it too or `=1` to
+force it. Metal
 matvec and attention calls use reusable copy buffers by default, which is faster
 on the current Ministral 3B Q4_K_M benchmark than Shared/NoCopy wrapping. Set
 `RUSTY_LLM_METAL_NOCOPY=1` only when benchmarking the no-copy path on your Mac.
@@ -1198,6 +1258,12 @@ No generated WASM binaries are written back to the repository branch.
   feature and the backend compiled and is available, Metal is used by default.
   Set `RUSTY_LLM_METAL=0` to force the CPU path; `RUSTY_LLM_METAL=1` keeps it
   explicit.
+- `RUSTY_LLM_METAL_PARALLEL_ATTN`: controls the four-SIMD-group temporal
+  resident-attention kernel. It is selected automatically from 16 context
+  tokens onward; set `0` for the serial-timeline A/B path or `1` to force it.
+- `RUSTY_LLM_METAL_GROUPED_GQA`: controls the older shared-KV grouped-GQA
+  fallback when temporal parallelism is disabled. Set `0` to keep the serial
+  fallback or `1` to force grouped GQA.
 - `RUSTY_LLM_BATCH_PREFILL`: batched CPU prompt prefill for dense standard-path
   and Qwen3.5/Qwen3.8 K-quant models (each weight matrix runs once per prompt
   chunk instead of once per token). On by default whenever Metal is disabled
@@ -1252,8 +1318,9 @@ cargo test runtime::tests
   and a configurable concurrency cap.
 - Some GGUF chat templates are mapped into internal prompt renderers;
   unsupported templates fall back to a plain `System/User/Assistant` transcript.
-- SSE responses do not include `Content-Length`; the stream ends with
-  `data: [DONE]` and the socket closes.
+- SSE responses do not include `Content-Length`. OpenAI streams end with
+  `data: [DONE]`; Anthropic streams end with `message_stop`; then the socket
+  closes.
 - Embeddings are mean-pooled over input token positions and L2-normalized.
 - Unknown model IDs sent to the API are accepted and mapped to the loaded model,
   which helps existing OpenAI, LM Studio, and RAG clients work without knowing

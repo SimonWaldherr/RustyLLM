@@ -262,6 +262,10 @@ the high-level runtime API.
 - `Runner::generate_stream` produces tokens and calls a callback as text
   becomes available.
 - `Runner::generate_chat_stream` streams a chat response.
+- `Runner::count_chat_tokens` counts the exact rendered chat prompt, including
+  system and tool-template tokens, without running inference.
+- `Runner::count_chat_tokens_with_skills` applies prompt-selected skills before
+  counting the rendered chat prompt.
 - `Runner::prefill_prompt_tokens` processes prompt tokens through the shared
   prefill chunk/thread/backend scheduler.
 - `Runner::forward_token_into` runs one token through the active model family.
@@ -317,14 +321,22 @@ the high-level runtime API.
 - `handle_connection` reads one request, routes it, and writes a response.
 - `chat_ui_route` maps UI paths to built-in UI assets.
 - `is_streaming_request` detects streaming completion/chat requests.
-- `route_streaming_request` writes Server-Sent Events for OpenAI-compatible
+- `route_streaming_request` dispatches OpenAI- and Anthropic-compatible
   streaming requests.
+- `route_anthropic_message_stream` writes Anthropic Messages SSE events and
+  protocol-shaped text/tool content blocks.
 - `route_request` dispatches non-streaming HTTP routes.
 - `generate_with_optional_session` runs chat generation with optional session
   reuse.
 - `route_generate`, `route_openai_completion`, `route_openai_chat`,
+  `route_anthropic_message`, `route_anthropic_count_tokens`,
   `route_embeddings`, `route_ollama_tags`, `route_ollama_generate`,
   `route_ollama_chat`, and `route_ollama_embeddings` implement API endpoints.
+- `parse_anthropic_messages`, `anthropic_content_text`, and
+  `parse_anthropic_system` normalize Anthropic request blocks.
+- `anthropic_tool_declarations`, `anthropic_response_content`, and
+  `write_anthropic_stream_content` translate tool schemas and tool events
+  between Anthropic and the runtime representation.
 - `apply_ollama_options` maps Ollama generation options to RustyLLM options.
 - `parse_ollama_messages` converts Ollama messages to runtime chat messages.
 - `dominant_quantization` reports the dominant loaded tensor format.

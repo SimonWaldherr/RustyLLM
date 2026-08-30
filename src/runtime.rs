@@ -4091,6 +4091,35 @@ impl Runner {
         self.render_plain_messages(messages, system_prompt)
     }
 
+    /// Counts the tokens in an exactly rendered chat prompt.
+    ///
+    /// This includes the selected model's chat template, the system prompt,
+    /// tool declarations, and the assistant-generation marker. It is useful
+    /// for compatibility APIs that expose a preflight token-count endpoint.
+    pub fn count_chat_tokens(
+        &self,
+        messages: &[ChatMessage],
+        system_prompt: &str,
+        tools: &[String],
+    ) -> Result<usize, String> {
+        if messages.is_empty() {
+            return Err(String::from("No prompt provided."));
+        }
+        Ok(self.render_messages(messages, system_prompt, tools).len())
+    }
+
+    /// Counts a generated chat prompt after applying prompt-selected skills.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn count_chat_tokens_with_skills(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+    ) -> Result<usize, String> {
+        let mut loaded_skills = HashSet::new();
+        let generation = self.options_with_skill_context(messages, options, &mut loaded_skills)?;
+        self.count_chat_tokens(messages, &generation.system_prompt, &generation.tools)
+    }
+
     /// Renders messages with a simple role-prefixed chat format.
     fn render_plain_messages(&self, messages: &[ChatMessage], system_prompt: &str) -> Vec<u32> {
         let mut prompt = String::new();

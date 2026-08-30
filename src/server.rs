@@ -335,6 +335,38 @@ struct ResponsesTextConfig {
     format: Option<serde_json::Value>,
 }
 
+/// Anthropic-compatible Messages API request.
+///
+/// Content stays as JSON until it is converted because Anthropic permits both
+/// shorthand strings and ordered content-block arrays containing text, images,
+/// tool calls, and tool results.
+#[derive(Deserialize)]
+struct AnthropicMessagesRequest {
+    model: Option<String>,
+    messages: Vec<AnthropicMessage>,
+    max_tokens: Option<usize>,
+    system: Option<serde_json::Value>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    stop_sequences: Option<Vec<String>>,
+    #[allow(dead_code)]
+    stream: Option<bool>,
+    tools: Option<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
+    tool_choice: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    thinking: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicMessage {
+    role: String,
+    content: serde_json::Value,
+}
+
 /// OpenAI-compatible `/v1/embeddings` request.
 #[derive(Deserialize)]
 struct EmbeddingsRequest {
@@ -1371,6 +1403,7 @@ fn is_streaming_request(request: &HttpRequest) -> bool {
         path,
         "/v1/chat/completions"
             | "/v1/completions"
+            | "/v1/messages"
             | "/v1/responses"
             | "/api/v0/chat/completions"
             | "/api/v0/completions"
@@ -1393,6 +1426,9 @@ fn route_streaming_request<W: Write>(
     runner: &Runner,
     options: &ServeOptions,
 ) -> io::Result<()> {
+    if request.path == "/v1/messages" {
+        return route_anthropic_message_stream(request, stream, runner, options);
+    }
     if request.path == "/v1/responses" {
         return route_openai_response_stream(request, stream, runner, options);
     }
@@ -1580,6 +1616,149 @@ fn route_streaming_request<W: Write>(
     };
     write!(stream, "data: {}\n\n", final_chunk)?;
     write!(stream, "data: [DONE]\n\n")?;
+    stream.flush()
+}
+
+/// Writes an Anthropic Messages API SSE stream.
+fn route_anthropic_message_stream<W: Write>(
+    request: &HttpRequest,
+    stream: &mut W,
+    runner: &Runner,
+    options: &ServeOptions,
+) -> io::Result<()> {
+    let model_ids = advertised_model_ids(runner);
+    let prepared = match prepare_anthropic_request(&request.body, options, &model_ids) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            write_http_response(stream, 400, &anthropic_error("invalid_request_error", &err))?;
+            return Ok(());
+        }
+    };
+    let input_tokens =
+        match runner.count_chat_tokens_with_skills(&prepared.messages, &prepared.generation) {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                write_http_response(stream, 400, &anthropic_error("invalid_request_error", &err))?;
+                return Ok(());
+            }
+        };
+    let message_id = format!("msg_rustyllm_{}", unique_timestamp());
+
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type,Authorization,X-Api-Key,Anthropic-Version,Anthropic-Beta\r\n\r\n"
+    )?;
+    let message_start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": prepared.model,
+            "stop_reason": serde_json::Value::Null,
+            "stop_sequence": serde_json::Value::Null,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+        }
+    });
+    write_anthropic_event(stream, "message_start", &message_start)?;
+    write_anthropic_event(stream, "ping", &serde_json::json!({"type": "ping"}))?;
+
+    // Tool-call markup can only be distinguished from visible text once the
+    // complete model response has been parsed. Plain text requests retain
+    // true token-by-token streaming; tool-enabled requests buffer the model
+    // output and then emit protocol-correct tool_use blocks.
+    let has_tools = !prepared.generation.tools.is_empty();
+    let result = if has_tools {
+        generate_with_optional_session(
+            runner,
+            options,
+            &prepared.messages,
+            &prepared.generation,
+            false,
+            None,
+            |_| {},
+        )
+    } else {
+        write_anthropic_event(
+            stream,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        )?;
+        generate_with_optional_session(
+            runner,
+            options,
+            &prepared.messages,
+            &prepared.generation,
+            false,
+            None,
+            |text| {
+                let event = serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text}
+                });
+                let _ = write_anthropic_event(stream, "content_block_delta", &event);
+            },
+        )
+    };
+
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => {
+            write_anthropic_event(
+                stream,
+                "error",
+                &serde_json::json!({
+                    "type": "error",
+                    "error": {"type": "api_error", "message": err}
+                }),
+            )?;
+            return stream.flush();
+        }
+    };
+    let _ = append_chat_history(
+        options,
+        "anthropic.message.stream",
+        &prepared.model,
+        &prepared.messages,
+        &result,
+    );
+
+    let (text, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+    if has_tools {
+        write_anthropic_stream_content(stream, &message_id, &text, &calls)?;
+    } else {
+        write_anthropic_event(
+            stream,
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": 0}),
+        )?;
+    }
+
+    let stop_reason = anthropic_stop_reason(
+        result.stats.generated_tokens,
+        prepared.max_tokens,
+        !calls.is_empty(),
+    );
+    write_anthropic_event(
+        stream,
+        "message_delta",
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": serde_json::Value::Null},
+            "usage": {"output_tokens": result.stats.generated_tokens}
+        }),
+    )?;
+    write_anthropic_event(
+        stream,
+        "message_stop",
+        &serde_json::json!({"type": "message_stop"}),
+    )?;
     stream.flush()
 }
 
@@ -1888,6 +2067,8 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                 "/generate"
                     | "/v1/completions"
                     | "/v1/chat/completions"
+                    | "/v1/messages"
+                    | "/v1/messages/count_tokens"
                     | "/v1/responses"
                     | "/v1/embeddings"
                     | "/api/v0/completions"
@@ -1917,6 +2098,12 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                 }
                 "/v1/chat/completions" | "/api/v0/chat/completions" => {
                     route_openai_chat(&request.body, runner, options, &model_ids)
+                }
+                "/v1/messages" => {
+                    route_anthropic_message(&request.body, runner, options, &model_ids)
+                }
+                "/v1/messages/count_tokens" => {
+                    route_anthropic_count_tokens(&request.body, runner, options)
                 }
                 "/v1/responses" => {
                     route_openai_response(&request.body, runner, options, &model_ids)
@@ -1952,12 +2139,13 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
         "info": {
             "title": "RustyLLM API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Local GGUF inference server with RustyLLM-native, OpenAI-compatible, LM Studio-compatible, Ollama-compatible, and explorer routes."
+            "description": "Local GGUF inference server with RustyLLM-native, OpenAI-compatible, Anthropic-compatible, LM Studio-compatible, Ollama-compatible, and explorer routes."
         },
         "servers": [{"url": "/"}],
         "tags": [
             {"name": "health"},
             {"name": "openai"},
+            {"name": "anthropic"},
             {"name": "ollama"},
             {"name": "native"},
             {"name": "explorer"}
@@ -2019,6 +2207,23 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                     "summary": "OpenAI-compatible chat completion",
                     "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OpenAIChatRequest" } } } },
                     "responses": { "200": { "description": "Chat completion, or SSE stream when stream=true" } }
+                }
+            },
+            "/v1/messages": {
+                "post": {
+                    "tags": ["anthropic"],
+                    "summary": "Anthropic-compatible message generation",
+                    "description": "Supports string and content-block messages, tool_use/tool_result round trips, system prompts, stop sequences, token usage, and Anthropic SSE events.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" } } } },
+                    "responses": { "200": { "description": "Anthropic Message object, or SSE stream when stream=true" } }
+                }
+            },
+            "/v1/messages/count_tokens": {
+                "post": {
+                    "tags": ["anthropic"],
+                    "summary": "Count rendered Anthropic message tokens",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AnthropicMessagesRequest" } } } },
+                    "responses": { "200": { "description": "Input token count" } }
                 }
             },
             "/v1/completions": {
@@ -2219,6 +2424,33 @@ fn route_openapi_document(runner: &Runner, model_ids: &[String]) -> (u16, String
                         "cache_prompt": { "type": "boolean" }
                     }
                 },
+                "AnthropicMessagesRequest": {
+                    "type": "object",
+                    "required": ["messages"],
+                    "properties": {
+                        "model": { "type": "string", "enum": model_ids },
+                        "messages": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["role", "content"],
+                                "properties": {
+                                    "role": { "type": "string", "enum": ["user", "assistant"] },
+                                    "content": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] }
+                                }
+                            }
+                        },
+                        "max_tokens": { "type": "integer", "minimum": 1 },
+                        "system": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "object" } }] },
+                        "temperature": { "type": "number" },
+                        "top_p": { "type": "number" },
+                        "top_k": { "type": "integer" },
+                        "stop_sequences": { "type": "array", "items": { "type": "string" } },
+                        "stream": { "type": "boolean" },
+                        "tools": { "type": "array", "items": { "type": "object" } },
+                        "tool_choice": { "type": "object" }
+                    }
+                },
                 "OpenAIResponsesRequest": {
                     "type": "object",
                     "required": ["input"],
@@ -2415,6 +2647,139 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
             }
         }
         Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+    }
+}
+
+struct PreparedAnthropicRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    generation: GenerationOptions,
+    max_tokens: usize,
+}
+
+/// Parses and normalizes one Anthropic request for both streaming and
+/// non-streaming handlers.
+fn prepare_anthropic_request(
+    body: &[u8],
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> Result<PreparedAnthropicRequest, String> {
+    let payload = serde_json::from_slice::<AnthropicMessagesRequest>(body)
+        .map_err(|err| format!("Invalid JSON: {}", err))?;
+    let max_tokens = payload
+        .max_tokens
+        .filter(|value| *value > 0)
+        .ok_or_else(|| String::from("'max_tokens' is required and must be greater than 0."))?;
+    let messages = parse_anthropic_messages(&payload.messages)?;
+    let system_prompt = parse_anthropic_system(payload.system.as_ref())?;
+    let mut generation = apply_generation_overrides(
+        &options.defaults,
+        Some(max_tokens),
+        payload.temperature,
+        payload.top_p,
+        payload.top_k,
+        None,
+        None,
+        None,
+        system_prompt,
+        payload.stop_sequences,
+        None,
+        None,
+        None,
+    );
+    generation.tools = anthropic_tool_declarations(payload.tools.as_deref());
+    Ok(PreparedAnthropicRequest {
+        model: resolve_model(payload.model.as_deref(), model_ids),
+        messages,
+        generation,
+        max_tokens,
+    })
+}
+
+/// Handles an Anthropic-compatible Messages API request.
+fn route_anthropic_message(
+    body: &[u8],
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
+    let prepared = match prepare_anthropic_request(body, options, model_ids) {
+        Ok(prepared) => prepared,
+        Err(err) => return (400, anthropic_error("invalid_request_error", &err)),
+    };
+    let result = match generate_with_optional_session(
+        runner,
+        options,
+        &prepared.messages,
+        &prepared.generation,
+        false,
+        None,
+        |_| {},
+    ) {
+        Ok(result) => result,
+        Err(err) => return (400, anthropic_error("invalid_request_error", &err)),
+    };
+    let _ = append_chat_history(
+        options,
+        "anthropic.message",
+        &prepared.model,
+        &prepared.messages,
+        &result,
+    );
+    let message_id = format!("msg_rustyllm_{}", unique_timestamp());
+    let (text, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+    let content = anthropic_response_content(&message_id, text, &calls);
+    let stop_reason = anthropic_stop_reason(
+        result.stats.generated_tokens,
+        prepared.max_tokens,
+        !calls.is_empty(),
+    );
+    json_response(serde_json::json!({
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": prepared.model,
+        "stop_reason": stop_reason,
+        "stop_sequence": serde_json::Value::Null,
+        "usage": {
+            "input_tokens": result.stats.prompt_tokens,
+            "output_tokens": result.stats.generated_tokens
+        }
+    }))
+}
+
+/// Handles Anthropic's token-count preflight using the exact local chat
+/// renderer, including system and tool blocks.
+fn route_anthropic_count_tokens(
+    body: &[u8],
+    runner: &Runner,
+    options: &ServeOptions,
+) -> (u16, String) {
+    let payload = match serde_json::from_slice::<AnthropicMessagesRequest>(body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return (
+                400,
+                anthropic_error("invalid_request_error", &format!("Invalid JSON: {}", err)),
+            );
+        }
+    };
+    let messages = match parse_anthropic_messages(&payload.messages) {
+        Ok(messages) => messages,
+        Err(err) => return (400, anthropic_error("invalid_request_error", &err)),
+    };
+    let system_prompt = match parse_anthropic_system(payload.system.as_ref()) {
+        Ok(Some(system)) => system,
+        Ok(None) => options.defaults.system_prompt.clone(),
+        Err(err) => return (400, anthropic_error("invalid_request_error", &err)),
+    };
+    let mut generation = options.defaults.clone();
+    generation.system_prompt = system_prompt;
+    generation.tools = anthropic_tool_declarations(payload.tools.as_deref());
+    match runner.count_chat_tokens_with_skills(&messages, &generation) {
+        Ok(input_tokens) => json_response(serde_json::json!({"input_tokens": input_tokens})),
+        Err(err) => (400, anthropic_error("invalid_request_error", &err)),
     }
 }
 
@@ -3376,6 +3741,146 @@ fn history_message_json(message: &ChatMessage) -> serde_json::Value {
     }
 }
 
+/// Builds Anthropic response content blocks from the runtime's text/tool-call
+/// representation.
+fn anthropic_response_content(
+    message_id: &str,
+    text: String,
+    calls: &[ToolCall],
+) -> Vec<serde_json::Value> {
+    let mut content = Vec::new();
+    if !text.is_empty() || calls.is_empty() {
+        content.push(serde_json::json!({"type": "text", "text": text}));
+    }
+    for (index, call) in calls.iter().enumerate() {
+        content.push(serde_json::json!({
+            "type": "tool_use",
+            "id": anthropic_tool_call_id(message_id, index, call),
+            "name": call.name,
+            "input": anthropic_tool_input(call)
+        }));
+    }
+    content
+}
+
+fn anthropic_tool_call_id(message_id: &str, index: usize, call: &ToolCall) -> String {
+    if call.id.is_empty() {
+        format!("toolu_{}_{}", message_id, index)
+    } else {
+        call.id.clone()
+    }
+}
+
+fn anthropic_tool_input(call: &ToolCall) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+        Ok(serde_json::Value::Object(input)) => serde_json::Value::Object(input),
+        Ok(value) => serde_json::json!({"value": value}),
+        Err(_) => serde_json::json!({"raw": call.arguments}),
+    }
+}
+
+fn anthropic_stop_reason(
+    generated_tokens: usize,
+    max_tokens: usize,
+    has_tool_calls: bool,
+) -> &'static str {
+    if has_tool_calls {
+        "tool_use"
+    } else if generated_tokens >= max_tokens {
+        "max_tokens"
+    } else {
+        "end_turn"
+    }
+}
+
+/// Emits complete Anthropic content blocks after a tool-enabled generation.
+fn write_anthropic_stream_content<W: Write>(
+    stream: &mut W,
+    message_id: &str,
+    text: &str,
+    calls: &[ToolCall],
+) -> io::Result<()> {
+    let mut index = 0usize;
+    if !text.is_empty() || calls.is_empty() {
+        write_anthropic_event(
+            stream,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        )?;
+        write_anthropic_event(
+            stream,
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        )?;
+        write_anthropic_event(
+            stream,
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": index}),
+        )?;
+        index += 1;
+    }
+    for (call_index, call) in calls.iter().enumerate() {
+        let tool_id = anthropic_tool_call_id(message_id, call_index, call);
+        let input = anthropic_tool_input(call);
+        write_anthropic_event(
+            stream,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {"type": "tool_use", "id": tool_id, "name": call.name, "input": {}}
+            }),
+        )?;
+        write_anthropic_event(
+            stream,
+            "content_block_delta",
+            &serde_json::json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": input.to_string()}
+            }),
+        )?;
+        write_anthropic_event(
+            stream,
+            "content_block_stop",
+            &serde_json::json!({"type": "content_block_stop", "index": index}),
+        )?;
+        index += 1;
+    }
+    Ok(())
+}
+
+fn anthropic_error(error_type: &str, message: &str) -> String {
+    serde_json::json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message}
+    })
+    .to_string()
+}
+
+fn unique_timestamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn write_anthropic_event<T: Serialize, W: Write>(
+    stream: &mut W,
+    event: &str,
+    data: &T,
+) -> io::Result<()> {
+    write_sse_event(stream, event, data)
+}
+
 /// Writes one named Server-Sent Event with a JSON body.
 fn write_sse_event<T: Serialize, W: Write>(
     stream: &mut W,
@@ -3687,6 +4192,222 @@ fn redact_data_image_url(url: &str) -> String {
     } else {
         url.to_string()
     }
+}
+
+/// Converts Anthropic message content blocks into runtime chat messages.
+fn parse_anthropic_messages(messages: &[AnthropicMessage]) -> Result<Vec<ChatMessage>, String> {
+    if messages.is_empty() {
+        return Err(String::from(
+            "'messages' must contain at least one message.",
+        ));
+    }
+
+    let mut parsed = Vec::new();
+    for message in messages {
+        match message.role.as_str() {
+            "user" => match &message.content {
+                serde_json::Value::String(text) => parsed.push(ChatMessage::user(text.clone())),
+                serde_json::Value::Array(blocks) => {
+                    // Tool results are separate runtime messages so model chat
+                    // templates can correlate them with the preceding call.
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                            continue;
+                        }
+                        let tool_use_id = block
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if tool_use_id.is_empty() {
+                            return Err(String::from(
+                                "Anthropic tool_result block is missing 'tool_use_id'.",
+                            ));
+                        }
+                        let content = block
+                            .get("content")
+                            .map(anthropic_content_text)
+                            .transpose()?
+                            .unwrap_or_default();
+                        parsed.push(ChatMessage::tool_result(tool_use_id, content));
+                    }
+
+                    let mut text_parts = Vec::new();
+                    for block in blocks {
+                        if block.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                            continue;
+                        }
+                        let text = anthropic_content_text(block)?;
+                        if !text.is_empty() {
+                            text_parts.push(text);
+                        }
+                    }
+                    if !text_parts.is_empty() {
+                        parsed.push(ChatMessage::user(text_parts.join("\n")));
+                    }
+                }
+                _ => {
+                    return Err(String::from(
+                        "Anthropic message content must be text or an array.",
+                    ));
+                }
+            },
+            "assistant" => {
+                let mut text_parts = Vec::new();
+                let mut tool_calls = Vec::new();
+                match &message.content {
+                    serde_json::Value::String(text) => text_parts.push(text.clone()),
+                    serde_json::Value::Array(blocks) => {
+                        for block in blocks {
+                            if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                                let name = block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                if name.is_empty() {
+                                    return Err(String::from(
+                                        "Anthropic tool_use block is missing 'name'.",
+                                    ));
+                                }
+                                tool_calls.push(ToolCall {
+                                    id: block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    name: name.to_string(),
+                                    arguments: block
+                                        .get("input")
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!({}))
+                                        .to_string(),
+                                });
+                            } else {
+                                let text = anthropic_content_text(block)?;
+                                if !text.is_empty() {
+                                    text_parts.push(text);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(String::from(
+                            "Anthropic message content must be text or an array.",
+                        ));
+                    }
+                }
+                let mut assistant = ChatMessage::assistant(text_parts.join("\n"));
+                assistant.tool_calls = tool_calls;
+                parsed.push(assistant);
+            }
+            other => {
+                return Err(format!(
+                    "Unsupported Anthropic message role '{}'; use user or assistant.",
+                    other
+                ));
+            }
+        }
+    }
+    if parsed.is_empty() {
+        Err(String::from(
+            "Anthropic messages did not contain usable content.",
+        ))
+    } else {
+        Ok(parsed)
+    }
+}
+
+/// Extracts the textual representation of one Anthropic content value.
+fn anthropic_content_text(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        serde_json::Value::Array(items) => {
+            let mut parts = Vec::new();
+            for item in items {
+                let text = anthropic_content_text(item)?;
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+            Ok(parts.join("\n"))
+        }
+        serde_json::Value::Object(block) => match block
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("text")
+        {
+            "text" | "thinking" => Ok(block
+                .get(if block.contains_key("text") {
+                    "text"
+                } else {
+                    "thinking"
+                })
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string()),
+            "image" => {
+                let source = block.get("source").and_then(|value| value.as_object());
+                let source_type = source
+                    .and_then(|value| value.get("type"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                if source_type == "base64" {
+                    Ok(String::from("[image: base64 data]"))
+                } else {
+                    let url = source
+                        .and_then(|value| value.get("url"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    Ok(format!("[image: {}]", redact_data_image_url(url)))
+                }
+            }
+            "document" => Ok(String::from("[document]")),
+            "tool_result" => block
+                .get("content")
+                .map(anthropic_content_text)
+                .transpose()
+                .map(|value| value.unwrap_or_default()),
+            "tool_use" | "redacted_thinking" => Ok(String::new()),
+            other => Err(format!(
+                "Unsupported Anthropic content block type: {}",
+                other
+            )),
+        },
+        serde_json::Value::Null => Ok(String::new()),
+        _ => Err(String::from(
+            "Anthropic content block has an invalid value.",
+        )),
+    }
+}
+
+/// Normalizes Anthropic's top-level system field into a plain system prompt.
+fn parse_anthropic_system(system: Option<&serde_json::Value>) -> Result<Option<String>, String> {
+    system.map(anthropic_content_text).transpose()
+}
+
+/// Translates Anthropic tools into the OpenAI function-tool shape understood
+/// by RustyLLM's model-specific chat renderers.
+fn anthropic_tool_declarations(tools: Option<&[serde_json::Value]>) -> Vec<String> {
+    tools
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?;
+            if name.is_empty() {
+                return None;
+            }
+            Some(
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.get("description").cloned().unwrap_or(serde_json::Value::Null),
+                        "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({"type": "object"}))
+                    }
+                })
+                .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// Converts OpenAI-compatible messages into runtime chat messages.
@@ -4067,7 +4788,7 @@ where
     };
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nX-Content-Type-Options: nosniff\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET,POST,OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type,Authorization,X-Api-Key,Anthropic-Version,Anthropic-Beta\r\nX-Content-Type-Options: nosniff\r\n\r\n{}",
         status,
         status_text,
         content_type,
@@ -4110,10 +4831,12 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<ServerConfig, Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BODY_BYTES, mcp_initialize_result, mcp_tools_list, parse_responses_input,
-        read_http_request, write_http_response,
+        AnthropicMessagesRequest, MAX_BODY_BYTES, anthropic_response_content,
+        anthropic_tool_declarations, mcp_initialize_result, mcp_tools_list,
+        parse_anthropic_messages, parse_responses_input, read_http_request,
+        write_anthropic_stream_content, write_http_response,
     };
-    use crate::runtime::ChatRole;
+    use crate::runtime::{ChatRole, ToolCall};
     use std::io::Cursor;
 
     #[test]
@@ -4160,7 +4883,78 @@ mod tests {
         let text = String::from_utf8(out).expect("valid UTF-8 response");
         assert!(text.contains("Access-Control-Allow-Origin: *"));
         assert!(text.contains("Access-Control-Allow-Methods: GET,POST,OPTIONS"));
+        assert!(text.contains("Anthropic-Version"));
+        assert!(text.contains("X-Api-Key"));
         assert!(text.contains("X-Content-Type-Options: nosniff"));
+    }
+
+    #[test]
+    /// Verifies Anthropic tool_use/tool_result blocks survive a conversation round trip.
+    fn parse_anthropic_messages_preserves_tool_round_trip() {
+        let payload = serde_json::from_value::<AnthropicMessagesRequest>(serde_json::json!({
+            "model": "local",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": "Check the weather."},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "I'll check."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "weather", "input": {"city": "Berlin"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "21 C"}]}
+                ]}
+            ]
+        }))
+        .expect("request should deserialize");
+        let messages = parse_anthropic_messages(&payload.messages).expect("messages should parse");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].name, "weather");
+        assert_eq!(role_name(&messages[2].role), "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(messages[2].content, "21 C");
+    }
+
+    #[test]
+    /// Verifies Anthropic tool schemas are translated for model chat templates.
+    fn anthropic_tools_translate_to_function_shape() {
+        let tools = serde_json::json!([{
+            "name": "weather",
+            "description": "Read the weather",
+            "input_schema": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }]);
+        let translated = anthropic_tool_declarations(tools.as_array().map(Vec::as_slice));
+        assert_eq!(translated.len(), 1);
+        let tool: serde_json::Value =
+            serde_json::from_str(&translated[0]).expect("translated tool is JSON");
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "weather");
+        assert_eq!(tool["function"]["parameters"]["required"][0], "city");
+    }
+
+    #[test]
+    /// Verifies non-streaming and streaming Anthropic tool blocks use object inputs.
+    fn anthropic_tool_responses_use_protocol_blocks() {
+        let calls = vec![ToolCall {
+            id: String::from("toolu_7"),
+            name: String::from("weather"),
+            arguments: String::from("{\"city\":\"Berlin\"}"),
+        }];
+        let content = anthropic_response_content("msg_1", String::new(), &calls);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["input"]["city"], "Berlin");
+
+        let mut stream = Vec::new();
+        write_anthropic_stream_content(&mut stream, "msg_1", "", &calls)
+            .expect("stream blocks should serialize");
+        let stream = String::from_utf8(stream).expect("SSE is UTF-8");
+        assert!(stream.contains("event: content_block_start"));
+        assert!(stream.contains("input_json_delta"));
+        assert!(stream.contains("toolu_7"));
     }
 
     #[test]
