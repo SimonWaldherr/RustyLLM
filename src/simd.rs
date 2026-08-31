@@ -60,18 +60,69 @@ fn has_avx2_fma() -> bool {
         .get_or_init(|| is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma"))
 }
 
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[inline]
+/// Detects whether the F16C hardware half-float conversion instructions are
+/// available on this CPU (Ivy Bridge+ / all AVX2 parts in practice).
+fn has_f16c() -> bool {
+    static HAS_F16C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS_F16C.get_or_init(|| is_x86_feature_detected!("f16c"))
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+#[target_feature(enable = "f16c")]
+/// Converts one half-precision bit pattern to `f32` via `VCVTPH2PS`.
+unsafe fn f16_to_f32_x86(h: u16) -> f32 {
+    use std::arch::x86_64::*;
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+/// Converts one half-precision bit pattern to `f32` via NEON `FCVT`. This
+/// widening conversion is baseline NEON (unlike full fp16 arithmetic), so no
+/// runtime feature detection is needed on aarch64.
+unsafe fn f16_to_f32_neon(h: u16) -> f32 {
+    use std::arch::aarch64::*;
+    let bits: [u16; 4] = [h, 0, 0, 0];
+    let hv: float16x4_t = std::mem::transmute(bits);
+    vgetq_lane_f32::<0>(vcvt_f32_f16(hv))
+}
+
 // ─── f16 ↔ f32 conversion ────────────────────────────────────────────────────
 
 #[inline(always)]
 /// Converts a half-precision bit pattern into `f32`.
+///
+/// Prefers the hardware conversion instruction (F16C on x86_64, baseline
+/// NEON `FCVT` on aarch64) over the 256 KiB lookup table built from
+/// [`f16_to_f32_soft`] — that table is exactly this CPU's L2 size and this
+/// function runs 2x per K-quant block in every hot kernel, so evicting it
+/// frees real cache footprint for the weight streams decode is bottlenecked
+/// on. Falls back to the table on x86_64 without F16C and on other targets.
 pub fn f16_to_f32(h: u16) -> f32 {
-    #[cfg(not(target_family = "wasm"))]
-    {
-        f16_lookup()[h as usize]
-    }
     #[cfg(target_family = "wasm")]
     {
         f16_to_f32_soft(h)
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_family = "wasm")))]
+    {
+        unsafe { f16_to_f32_neon(h) }
+    }
+    #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+    {
+        if has_f16c() {
+            unsafe { f16_to_f32_x86(h) }
+        } else {
+            f16_lookup()[h as usize]
+        }
+    }
+    #[cfg(not(any(
+        target_family = "wasm",
+        target_arch = "aarch64",
+        target_arch = "x86_64"
+    )))]
+    {
+        f16_lookup()[h as usize]
     }
 }
 
@@ -478,8 +529,9 @@ pub fn num_threads() -> usize {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-/// Returns the lazily initialized half-to-float lookup table.
+#[cfg(not(any(target_family = "wasm", target_arch = "aarch64")))]
+/// Returns the lazily initialized half-to-float lookup table. Unused on
+/// aarch64, where [`f16_to_f32`] always takes the NEON hardware path.
 fn f16_lookup() -> &'static [f32] {
     static F16_LOOKUP: OnceLock<Vec<f32>> = OnceLock::new();
     F16_LOOKUP.get_or_init(|| {
@@ -2013,8 +2065,11 @@ fn worker_pool() -> &'static WorkerPool {
     })
 }
 
+#[cfg(any(not(target_arch = "aarch64"), test))]
 #[inline(always)]
-/// Converts half precision to f32 using portable scalar code.
+/// Converts half precision to f32 using portable scalar code. Unused as a
+/// production path on aarch64 (kept for tests, which cross-check the NEON
+/// hardware path against it).
 fn f16_to_f32_soft(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -7770,6 +7825,85 @@ unsafe fn affine_add_bf16x4_f32_avx2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "manual microbenchmark, not a correctness check"]
+    /// Isolates the per-call cost of the three f16->f32 paths to settle
+    /// whether the F16C hardware path's un-inlined function-call boundary
+    /// (target_feature functions can't be inlined into a caller that
+    /// doesn't statically guarantee the feature) actually costs more than
+    /// it saves for a scalar, once-per-value call site. Uses an LCG-shuffled
+    /// index sequence so neither branch prediction nor a constant-folded
+    /// value can flatter either implementation, and a large table so the
+    /// lookup path pays a real (occasionally L2, sometimes L1) memory hit
+    /// like it would in production, not a hot single cache line.
+    fn f16_to_f32_microbench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 20_000_000;
+        // Full-period LCG over u16 space so every h value appears, in a
+        // decorrelated order (mod 65536 with a=75, c=74, m=2^16 is a known
+        // full-period generator).
+        let mut order = Vec::with_capacity(65536);
+        let mut x: u32 = 12345;
+        for _ in 0..65536 {
+            order.push(x as u16);
+            x = (x.wrapping_mul(75).wrapping_add(74)) & 0xFFFF;
+        }
+
+        let bench = |name: &str, f: &dyn Fn(u16) -> f32| {
+            let mut acc = 0.0f32;
+            let start = Instant::now();
+            for i in 0..N {
+                let h = order[i % order.len()];
+                acc += black_box(f(black_box(h)));
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "{name}: {:.2} ns/call (acc={acc}, {N} calls in {elapsed:?})",
+                elapsed.as_secs_f64() * 1e9 / N as f64
+            );
+        };
+
+        bench("soft (branchy scalar)", &f16_to_f32_soft);
+        bench("table (current fallback)", &|h| f16_lookup()[h as usize]);
+        #[cfg(all(target_arch = "x86_64", not(target_family = "wasm")))]
+        bench("f16c hw (unsafe fn call)", &|h| unsafe {
+            f16_to_f32_x86(h)
+        });
+        bench("dispatcher (f16_to_f32)", &f16_to_f32);
+    }
+
+    #[test]
+    /// The hardware f16→f32 path (F16C on x86_64, NEON `FCVT` on aarch64)
+    /// must agree bit-for-bit with the portable scalar reference across
+    /// every possible half-precision bit pattern — normals, subnormals,
+    /// both zeros, both infinities — except NaN payloads, where hardware
+    /// `VCVTPH2PS` quiets an input signaling NaN (sets the top mantissa
+    /// bit) per IEEE 754 while the bit-shift software path preserves the
+    /// payload verbatim. GGUF f16 scale/min values are never NaN, so only
+    /// "is it still NaN" is checked there, not the exact payload.
+    fn f16_to_f32_matches_soft_reference_exhaustively() {
+        for h in 0..=u16::MAX {
+            let hw = f16_to_f32(h);
+            let soft = f16_to_f32_soft(h);
+            if soft.is_nan() {
+                assert!(
+                    hw.is_nan(),
+                    "h=0x{h:04x}: soft was NaN but hw={hw:?} was not"
+                );
+                continue;
+            }
+            assert_eq!(
+                hw.to_bits(),
+                soft.to_bits(),
+                "mismatch for h=0x{h:04x}: hw={hw:?} (0x{:08x}) soft={soft:?} (0x{:08x})",
+                hw.to_bits(),
+                soft.to_bits(),
+            );
+        }
+    }
 
     /// Builds one Q4_0 block (18 bytes) with scale 1.0 and byte[i] = lo|(hi<<4),
     /// where lo = i and hi = 15 - i for i in 0..16.
