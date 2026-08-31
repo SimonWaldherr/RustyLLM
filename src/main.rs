@@ -21,7 +21,7 @@ use rusty_llm::metal;
 use rusty_llm::model::Config;
 use rusty_llm::runtime::{
     BackendPolicy, ChatMessage, GenerationOptions, KvCacheDType, LoadInfo, Runner, RuntimeProfile,
-    architecture_preparation_note, compatibility_report,
+    architecture_preparation_note, compatibility_report, decode_steps_per_second,
 };
 #[cfg(all(not(target_family = "wasm"), feature = "server"))]
 use rusty_llm::server::{self, McpServeOptions, ServeOptions};
@@ -90,7 +90,7 @@ fn print_usage(name: &str) {
     eprintln!("  --mlock                   Best-effort lock mapped model pages in RAM");
     eprintln!("  --backend <name>          Backend policy: auto, cpu, metal, metal-ultra");
     eprintln!("  --mtp-assistant <path>    Assistant GGUF for greedy speculative decoding");
-    eprintln!("  --mtp-tokens <N>          Max speculative draft tokens (default: 4)");
+    eprintln!("  --mtp-tokens <N>          Enable native drafting / set max draft tokens");
     eprintln!("  --mtp-min-accept-rate <F> Disable MTP below this accept rate (default: 0.5)");
     eprintln!("  --no-mtp-adaptive         Keep --mtp-tokens fixed instead of adapting it");
     eprintln!("  --no-speculative          Disable speculative decoding");
@@ -484,6 +484,7 @@ fn run() -> Result<(), String> {
             "--mtp-tokens" => {
                 options.speculative.max_draft_tokens =
                     parse_arg::<usize>(&args, &mut i, "--mtp-tokens")?;
+                options.speculative.native_head = true;
             }
             "--mtp-min-accept-rate" => {
                 options.speculative.min_accept_rate =
@@ -792,6 +793,29 @@ fn run() -> Result<(), String> {
         eprintln!("Model: {}", name);
     }
     eprintln!("Architecture: {}", runner.architecture());
+    // Qwen3.5/3.8 decode streams substantially larger projection rows than
+    // the smaller dense models used to choose the Apple default. Dynamic row
+    // stealing lets the efficiency cores contribute instead of setting a
+    // static-shard barrier; an M2 Max sweep measured all 12 physical cores
+    // ahead of the 8 performance-core default. Preserve every explicit
+    // `--threads` choice and leave Metal-only runs unchanged.
+    if threads_override.is_none()
+        && bench_threads.is_none()
+        && runner.architecture() == "qwen35"
+        && matches!(
+            options.runtime.backend_policy,
+            BackendPolicy::Auto | BackendPolicy::Cpu
+        )
+    {
+        let qwen_threads = simd::physical_threads();
+        if qwen_threads > simd::num_threads() {
+            simd::set_num_threads(qwen_threads);
+            eprintln!(
+                "Qwen worker threads: {} (auto, all physical cores)",
+                qwen_threads
+            );
+        }
+    }
     eprintln!(
         "Tokenizer: {} tokens, BOS={}, EOS={}",
         runner.tokenizer().vocab_size(),
@@ -1063,7 +1087,10 @@ fn run() -> Result<(), String> {
 
     eprintln!("\n\n─── Stats ───────────────────────────────");
     eprintln!("Prompt: {} tokens", result.stats.prompt_tokens);
-    eprintln!("Generated: {} tokens", result.stats.generated_tokens);
+    eprintln!(
+        "Generated: {} tokens ({} decode steps)",
+        result.stats.generated_tokens, result.stats.decode_steps
+    );
     eprintln!(
         "Prefill: {:.2}s ({:.1} tok/s)",
         result.stats.prefill_time.as_secs_f32(),
@@ -1072,14 +1099,17 @@ fn run() -> Result<(), String> {
     eprintln!(
         "Decode: {:.2}s ({:.2} tok/s)",
         result.stats.decode_time.as_secs_f32(),
-        result.stats.generated_tokens as f32 / result.stats.decode_time.as_secs_f32().max(0.001)
+        result.stats.decode_tok_s()
     );
     if let Some(spec) = &result.stats.speculative {
         eprintln!(
-            "MTP: accept_rate={:.2}, drafted={}, accepted={}, draft={:.2} tok/s, effective={:.2} tok/s{}{}",
+            "MTP: accept_rate={:.2}, drafted={}, accepted={}, verified={}/{} batches, verify={:.1}ms, draft={:.2} tok/s, effective={:.2} tok/s{}{}",
             spec.accept_rate(),
             spec.drafted_tokens,
             spec.accepted_tokens,
+            spec.verified_tokens,
+            spec.verification_batches,
+            spec.verification_time.as_secs_f64() * 1000.0,
             spec.draft_tok_s(),
             result.stats.generated_tokens as f32
                 / result.stats.decode_time.as_secs_f32().max(0.001),
@@ -1207,11 +1237,12 @@ fn run_benchmark(
     println!("shared_prefix_cache=cleared_before_each_run");
     println!();
     println!(
-        "run,prompt_tokens,generated_tokens,cached_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s,mtp_accept_rate,mtp_draft_tok_s"
+        "run,prompt_tokens,generated_tokens,decode_steps,cached_tokens,prefill_ms,decode_ms,total_ms,wall_ms,decode_tok_s,mtp_accept_rate,mtp_draft_tok_s"
     );
 
     let mut total_prompt_tokens = 0usize;
     let mut total_generated_tokens = 0usize;
+    let mut total_decode_steps = 0usize;
     let mut total_prefill = Duration::from_secs(0);
     let mut total_decode = Duration::from_secs(0);
     let mut total_model = Duration::from_secs(0);
@@ -1228,8 +1259,7 @@ fn run_benchmark(
         let mut loaded_skills = HashSet::new();
         let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
         let wall = wall_start.elapsed();
-        let decode_tok_s = result.stats.generated_tokens as f64
-            / result.stats.decode_time.as_secs_f64().max(0.001);
+        let decode_tok_s = result.stats.decode_tok_s();
 
         let mtp_accept_rate = result
             .stats
@@ -1245,10 +1275,11 @@ fn run_benchmark(
             .unwrap_or(0.0);
 
         println!(
-            "{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2}",
+            "{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2}",
             run + 1,
             result.stats.prompt_tokens,
             result.stats.generated_tokens,
+            result.stats.decode_steps,
             result.stats.cached_tokens,
             result.stats.prefill_time.as_millis(),
             result.stats.decode_time.as_millis(),
@@ -1264,6 +1295,7 @@ fn run_benchmark(
 
         total_prompt_tokens += result.stats.prompt_tokens;
         total_generated_tokens += result.stats.generated_tokens;
+        total_decode_steps += result.stats.decode_steps;
         total_prefill += result.stats.prefill_time;
         total_decode += result.stats.decode_time;
         total_model += result.stats.total_time;
@@ -1278,6 +1310,10 @@ fn run_benchmark(
     println!(
         "avg_generated_tokens={:.1}",
         total_generated_tokens as f64 / runs as f64
+    );
+    println!(
+        "avg_decode_steps={:.1}",
+        total_decode_steps as f64 / runs as f64
     );
     println!(
         "avg_prefill_ms={:.1}",
@@ -1297,7 +1333,7 @@ fn run_benchmark(
     );
     println!(
         "aggregate_decode_tok_s={:.2}",
-        total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001)
+        decode_steps_per_second(total_decode_steps, total_decode)
     );
 
     Ok(())
@@ -1338,7 +1374,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
         println!("shared_prefix_cache=cleared_before_each_run");
         println!();
         println!(
-            "threads,avg_prompt_tokens,avg_generated_tokens,avg_prefill_ms,avg_decode_ms,avg_total_ms,avg_wall_ms,aggregate_prefill_tok_s,aggregate_decode_tok_s"
+            "threads,avg_prompt_tokens,avg_generated_tokens,avg_decode_steps,avg_prefill_ms,avg_decode_ms,avg_total_ms,avg_wall_ms,aggregate_prefill_tok_s,aggregate_decode_tok_s"
         );
     }
 
@@ -1350,6 +1386,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
 
         let mut total_prompt_tokens = 0usize;
         let mut total_generated_tokens = 0usize;
+        let mut total_decode_steps = 0usize;
         let mut total_prefill = Duration::from_secs(0);
         let mut total_decode = Duration::from_secs(0);
         let mut total_model = Duration::from_secs(0);
@@ -1370,14 +1407,14 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
             let wall = wall_start.elapsed();
 
             if json {
-                let decode_tok_s = result.stats.generated_tokens as f64
-                    / result.stats.decode_time.as_secs_f64().max(0.001);
+                let decode_tok_s = result.stats.decode_tok_s();
                 let prefill_tok_s = result.stats.prompt_tokens as f64
                     / result.stats.prefill_time.as_secs_f64().max(0.001);
                 let mut run_value = serde_json::json!({
                     "run": run + 1,
                     "prompt_tokens": result.stats.prompt_tokens,
                     "generated_tokens": result.stats.generated_tokens,
+                    "decode_steps": result.stats.decode_steps,
                     "cached_tokens": result.stats.cached_tokens,
                     "prefill_ms": result.stats.prefill_time.as_millis(),
                     "decode_ms": result.stats.decode_time.as_millis(),
@@ -1401,6 +1438,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
 
             total_prompt_tokens += result.stats.prompt_tokens;
             total_generated_tokens += result.stats.generated_tokens;
+            total_decode_steps += result.stats.decode_steps;
             total_prefill += result.stats.prefill_time;
             total_decode += result.stats.decode_time;
             total_model += result.stats.total_time;
@@ -1408,7 +1446,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
         }
 
         let prefill_tok_s = total_prompt_tokens as f64 / total_prefill.as_secs_f64().max(0.001);
-        let decode_tok_s = total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001);
+        let decode_tok_s = decode_steps_per_second(total_decode_steps, total_decode);
         if decode_tok_s > best_decode_tok_s {
             best_decode_tok_s = decode_tok_s;
             best_threads = threads;
@@ -1419,6 +1457,7 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
             "runs": runs,
             "avg_prompt_tokens": total_prompt_tokens as f64 / runs as f64,
             "avg_generated_tokens": total_generated_tokens as f64 / runs as f64,
+            "avg_decode_steps": total_decode_steps as f64 / runs as f64,
             "avg_prefill_ms": total_prefill.as_secs_f64() * 1000.0 / runs as f64,
             "avg_decode_ms": total_decode.as_secs_f64() * 1000.0 / runs as f64,
             "avg_total_ms": total_model.as_secs_f64() * 1000.0 / runs as f64,
@@ -1430,10 +1469,11 @@ fn run_benchmark_thread_sweep(config: BenchmarkThreadSweep<'_>) -> Result<(), St
 
         if !json {
             println!(
-                "{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
+                "{},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.2},{:.2}",
                 threads,
                 total_prompt_tokens as f64 / runs as f64,
                 total_generated_tokens as f64 / runs as f64,
+                total_decode_steps as f64 / runs as f64,
                 total_prefill.as_secs_f64() * 1000.0 / runs as f64,
                 total_decode.as_secs_f64() * 1000.0 / runs as f64,
                 total_model.as_secs_f64() * 1000.0 / runs as f64,
@@ -1506,6 +1546,7 @@ fn run_benchmark_json(
     };
     let mut total_prompt_tokens = 0usize;
     let mut total_generated_tokens = 0usize;
+    let mut total_decode_steps = 0usize;
     let mut total_prefill = Duration::from_secs(0);
     let mut total_decode = Duration::from_secs(0);
     let mut total_model = Duration::from_secs(0);
@@ -1523,8 +1564,12 @@ fn run_benchmark_json(
         let mut loaded_skills = HashSet::new();
         let result = runner.generate_with_skill_memory(prompt, &run_options, &mut loaded_skills)?;
         let wall = wall_start.elapsed();
-        let decode_tok_s = result.stats.generated_tokens as f64
-            / result.stats.decode_time.as_secs_f64().max(0.001);
+        let decode_tok_s = result.stats.decode_tok_s();
+        let effective_tok_s = if result.stats.decode_time.is_zero() {
+            0.0
+        } else {
+            result.stats.generated_tokens as f64 / result.stats.decode_time.as_secs_f64()
+        };
         let prefill_tok_s =
             result.stats.prompt_tokens as f64 / result.stats.prefill_time.as_secs_f64().max(0.001);
 
@@ -1532,6 +1577,7 @@ fn run_benchmark_json(
             "run": run + 1,
             "prompt_tokens": result.stats.prompt_tokens,
             "generated_tokens": result.stats.generated_tokens,
+            "decode_steps": result.stats.decode_steps,
             "cached_tokens": result.stats.cached_tokens,
             "prefill_ms": result.stats.prefill_time.as_millis(),
             "decode_ms": result.stats.decode_time.as_millis(),
@@ -1547,8 +1593,14 @@ fn run_benchmark_json(
                 "rejected_tokens": spec.rejected_tokens,
                 "accept_rate": spec.accept_rate(),
                 "draft_ms": spec.draft_time.as_millis(),
+                "verification_ms": spec.verification_time.as_millis(),
+                "verified_tokens": spec.verified_tokens,
+                "verification_batches": spec.verification_batches,
+                "recovery_ms": spec.recovery_time.as_millis(),
+                "recovered_target_steps": spec.recovered_target_steps,
+                "output_tokens": spec.output_tokens,
                 "draft_tok_s": spec.draft_tok_s(),
-                "effective_tok_s": decode_tok_s,
+                "effective_tok_s": effective_tok_s,
                 "disabled": spec.disabled,
             });
         }
@@ -1559,6 +1611,7 @@ fn run_benchmark_json(
 
         total_prompt_tokens += result.stats.prompt_tokens;
         total_generated_tokens += result.stats.generated_tokens;
+        total_decode_steps += result.stats.decode_steps;
         total_prefill += result.stats.prefill_time;
         total_decode += result.stats.decode_time;
         total_model += result.stats.total_time;
@@ -1602,7 +1655,10 @@ fn run_benchmark_json(
             "seed": options.seed,
             "stop_sequences": options.stop_sequences,
             "speculative": {
-                "enabled": options.speculative.enabled && runner.has_speculative_assistant(),
+                "enabled": options.speculative.enabled
+                    && (runner.has_speculative_assistant()
+                        || (options.speculative.native_head && runner.has_native_mtp())),
+                "native_head": options.speculative.native_head,
                 "assistant": options.speculative.assistant_path.as_deref(),
                 "max_draft_tokens": options.speculative.max_draft_tokens,
                 "adaptive": options.speculative.adaptive,
@@ -1627,12 +1683,13 @@ fn run_benchmark_json(
         "summary": {
             "avg_prompt_tokens": total_prompt_tokens as f64 / runs as f64,
             "avg_generated_tokens": total_generated_tokens as f64 / runs as f64,
+            "avg_decode_steps": total_decode_steps as f64 / runs as f64,
             "avg_prefill_ms": total_prefill.as_secs_f64() * 1000.0 / runs as f64,
             "avg_decode_ms": total_decode.as_secs_f64() * 1000.0 / runs as f64,
             "avg_total_ms": total_model.as_secs_f64() * 1000.0 / runs as f64,
             "avg_wall_ms": total_wall.as_secs_f64() * 1000.0 / runs as f64,
             "aggregate_prefill_tok_s": total_prompt_tokens as f64 / total_prefill.as_secs_f64().max(0.001),
-            "aggregate_decode_tok_s": total_generated_tokens as f64 / total_decode.as_secs_f64().max(0.001),
+            "aggregate_decode_tok_s": decode_steps_per_second(total_decode_steps, total_decode),
         }
     });
     let body = serde_json::to_string_pretty(&response)

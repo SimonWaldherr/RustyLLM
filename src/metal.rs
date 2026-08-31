@@ -316,6 +316,15 @@ mod ffi {
             scale: f32,
             parallel: i32,
         ) -> i32;
+        #[cfg(test)]
+        pub fn rusty_metal_test_greedy_argmax(
+            logits: *const f32,
+            vocab: u32,
+            recent: *const u32,
+            recent_len: u32,
+            repeat_penalty: f32,
+            token_out: *mut u32,
+        ) -> i32;
 
         /// Configures the GPU-resident decoder (allocates resident buffers).
         pub fn rusty_metal_resident_configure(
@@ -352,8 +361,57 @@ mod ffi {
             x_embed: *const f32,
             pos: u32,
             start_t: u32,
-            want_logits: i32,
+            output_mode: i32,
             logits_out: *mut f32,
+            recent: *const u32,
+            recent_len: u32,
+            repeat_penalty: f32,
+            token_out: *mut u32,
+        ) -> i32;
+
+        /// Configures the Qwen3.5/Qwen3.8 GPU-resident hybrid decoder.
+        pub fn rusty_metal_qwen_resident_configure(
+            n_layers: u32,
+            dim: u32,
+            hidden_dim: u32,
+            vocab: u32,
+            storage_len: u32,
+            eps: f32,
+            n_heads: u32,
+            n_kv_heads: u32,
+            head_dim: u32,
+            rotary_dim: u32,
+            value_heads: u32,
+            key_heads: u32,
+            state_dim: u32,
+            d_conv: u32,
+        ) -> i32;
+        /// Registers one recurrent or full-attention Qwen hybrid layer.
+        pub fn rusty_metal_qwen_resident_set_layer(
+            l: u32,
+            desc: *const super::QwenResidentLayerDesc,
+        ) -> i32;
+        /// Registers Qwen's final norm, vocabulary projection, and RoPE table.
+        pub fn rusty_metal_qwen_resident_set_output(
+            output_norm: *const f32,
+            output_w: *const u8,
+            output_w_len: usize,
+            output_rows: u32,
+            output_dt: u32,
+            inv_freq: *const f32,
+            inv_freq_len: u32,
+        ) -> i32;
+        /// Runs one complete Qwen hybrid token in a single command buffer.
+        pub fn rusty_metal_qwen_resident_decode(
+            x_embed: *const f32,
+            pos: u32,
+            start_t: u32,
+            output_mode: i32,
+            logits_out: *mut f32,
+            recent: *const u32,
+            recent_len: u32,
+            repeat_penalty: f32,
+            token_out: *mut u32,
         ) -> i32;
     }
 }
@@ -376,6 +434,45 @@ pub struct ResidentLayerDesc {
     pub bk_len: u32,
     pub bv: *const f32,
     pub bv_len: u32,
+}
+
+/// Qwen resident-layer tag for a Gated DeltaNet recurrent block.
+pub(crate) const QWEN_RESIDENT_LAYER_LINEAR: u32 = 0;
+/// Qwen resident-layer tag for a gated full-attention block.
+pub(crate) const QWEN_RESIDENT_LAYER_ATTENTION: u32 = 1;
+
+/// C-compatible descriptor for one Qwen3.5/Qwen3.8 hybrid layer.
+///
+/// Field order and types must match `RustyQwenResidentLayerDesc` in
+/// `metal_backend.m`. The eight weight slots are interpreted according to
+/// `layer_type`: recurrent layers use qkv, gate, alpha, beta, mixer-output,
+/// FFN-gate, FFN-up, FFN-down; attention layers use q+gate, K, V,
+/// attention-output, FFN-gate, FFN-up, FFN-down, unused. An unused slot has a
+/// null pointer and zero dimensions. Every `w_dt` is 0 for Q4_K or 1 for Q6_K.
+#[repr(C)]
+pub struct QwenResidentLayerDesc {
+    pub layer_type: u32,
+    pub w: [*const u8; 8],
+    pub w_len: [usize; 8],
+    pub w_rows: [u32; 8],
+    pub w_cols: [u32; 8],
+    pub w_dt: [u32; 8],
+    pub attn_norm: *const f32,
+    pub attn_norm_len: u32,
+    pub post_norm: *const f32,
+    pub post_norm_len: u32,
+    pub conv_w: *const f32,
+    pub conv_w_len: u32,
+    pub a: *const f32,
+    pub a_len: u32,
+    pub dt_bias: *const f32,
+    pub dt_bias_len: u32,
+    pub norm: *const f32,
+    pub norm_len: u32,
+    pub q_norm: *const f32,
+    pub q_norm_len: u32,
+    pub k_norm: *const f32,
+    pub k_norm_len: u32,
 }
 
 static AUTO_RESIDENT_ALLOWED: std::sync::atomic::AtomicBool =
@@ -401,11 +498,14 @@ pub fn disable_auto_resident_for_server() {
 /// time. An explicit `RUSTY_LLM_METAL_RESIDENT=0|1` always wins; otherwise it
 /// auto-enables unless the process called `disable_auto_resident_for_server`.
 pub fn resident_enabled() -> bool {
-    static RESIDENT_ENABLED: OnceLock<bool> = OnceLock::new();
-    *RESIDENT_ENABLED.get_or_init(|| match env_flag("RUSTY_LLM_METAL_RESIDENT") {
+    // Cache only the environment override. The server safety flag may be set
+    // after startup diagnostics queried this function, so its Atomic value
+    // must remain live until every automatic-policy decision.
+    static EXPLICIT_RESIDENT: OnceLock<Option<bool>> = OnceLock::new();
+    match *EXPLICIT_RESIDENT.get_or_init(|| env_flag("RUSTY_LLM_METAL_RESIDENT")) {
         Some(explicit) => explicit,
         None => AUTO_RESIDENT_ALLOWED.load(std::sync::atomic::Ordering::Relaxed),
-    })
+    }
 }
 
 /// One transformer layer's weights, borrowed just long enough to register
@@ -419,6 +519,25 @@ pub struct ResidentLayerInput<'a> {
     pub bq: &'a [f32],
     pub bk: &'a [f32],
     pub bv: &'a [f32],
+}
+
+/// Borrowed inputs used to register one Qwen hybrid layer with the resident
+/// decoder. Empty slices represent fields that do not apply to the selected
+/// `layer_type` and are passed to the Objective-C backend as null pointers.
+pub(crate) struct QwenResidentLayerInput<'a> {
+    pub layer_type: u32,
+    pub w: [&'a [u8]; 8],
+    pub w_rows: [u32; 8],
+    pub w_cols: [u32; 8],
+    pub w_dt: [u32; 8],
+    pub attn_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub conv_w: &'a [f32],
+    pub a: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub norm: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
@@ -553,8 +672,17 @@ pub fn resident_decode_into(
 ) -> bool {
     logits.resize(vocab, 0.0);
     unsafe {
-        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, 1, logits.as_mut_ptr())
-            != 0
+        ffi::rusty_metal_resident_decode(
+            x_embed.as_ptr(),
+            pos as u32,
+            0,
+            1,
+            logits.as_mut_ptr(),
+            std::ptr::null(),
+            0,
+            1.0,
+            std::ptr::null_mut(),
+        ) != 0
     }
 }
 
@@ -569,19 +697,409 @@ pub fn resident_decode_into(
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
+/// Runs one resident forward pass and returns the exact greedy token after the
+/// configured repetition penalty, without copying the vocabulary to the CPU.
+pub fn resident_decode_greedy(
+    x_embed: &[f32],
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+) -> Option<u32> {
+    if recent.len() > 64 {
+        return None;
+    }
+    let mut token = 0u32;
+    let ok = unsafe {
+        ffi::rusty_metal_resident_decode(
+            x_embed.as_ptr(),
+            pos as u32,
+            0,
+            2,
+            std::ptr::null_mut(),
+            recent.as_ptr(),
+            recent.len() as u32,
+            repeat_penalty,
+            &mut token,
+        ) != 0
+    };
+    ok.then_some(token)
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub fn resident_decode_greedy(
+    _x_embed: &[f32],
+    _pos: usize,
+    _recent: &[u32],
+    _repeat_penalty: f32,
+) -> Option<u32> {
+    None
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
 /// Runs one prompt token through the GPU-resident decoder for its KV-cache
 /// writes alone, skipping the vocabulary projection whose result prefill throws
 /// away. Saves the largest weight read in the model plus a full-vocabulary
 /// device-to-host copy on every prefilled position.
 pub fn resident_prefill(x_embed: &[f32], pos: usize) -> bool {
     unsafe {
-        ffi::rusty_metal_resident_decode(x_embed.as_ptr(), pos as u32, 0, 0, std::ptr::null_mut())
-            != 0
+        ffi::rusty_metal_resident_decode(
+            x_embed.as_ptr(),
+            pos as u32,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            1.0,
+            std::ptr::null_mut(),
+        ) != 0
     }
 }
 
 #[cfg(not(all(target_os = "macos", rusty_metal)))]
 pub fn resident_prefill(_x_embed: &[f32], _pos: usize) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+/// Allocates the persistent buffers and recurrent state for a Qwen3.5/Qwen3.8
+/// hybrid decoder. Full-attention KV storage is allocated only for the tagged
+/// attention layers registered after this call.
+pub(crate) fn qwen_resident_configure(
+    n_layers: usize,
+    dim: usize,
+    hidden_dim: usize,
+    vocab: usize,
+    storage_len: usize,
+    eps: f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    value_heads: usize,
+    key_heads: usize,
+    state_dim: usize,
+    d_conv: usize,
+) -> bool {
+    let (
+        Ok(n_layers),
+        Ok(dim),
+        Ok(hidden_dim),
+        Ok(vocab),
+        Ok(storage_len),
+        Ok(n_heads),
+        Ok(n_kv_heads),
+        Ok(head_dim),
+        Ok(rotary_dim),
+        Ok(value_heads),
+        Ok(key_heads),
+        Ok(state_dim),
+        Ok(d_conv),
+    ) = (
+        u32::try_from(n_layers),
+        u32::try_from(dim),
+        u32::try_from(hidden_dim),
+        u32::try_from(vocab),
+        u32::try_from(storage_len),
+        u32::try_from(n_heads),
+        u32::try_from(n_kv_heads),
+        u32::try_from(head_dim),
+        u32::try_from(rotary_dim),
+        u32::try_from(value_heads),
+        u32::try_from(key_heads),
+        u32::try_from(state_dim),
+        u32::try_from(d_conv),
+    )
+    else {
+        return false;
+    };
+    unsafe {
+        ffi::rusty_metal_qwen_resident_configure(
+            n_layers,
+            dim,
+            hidden_dim,
+            vocab,
+            storage_len,
+            eps,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rotary_dim,
+            value_heads,
+            key_heads,
+            state_dim,
+            d_conv,
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_resident_configure(
+    _n_layers: usize,
+    _dim: usize,
+    _hidden_dim: usize,
+    _vocab: usize,
+    _storage_len: usize,
+    _eps: f32,
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _rotary_dim: usize,
+    _value_heads: usize,
+    _key_heads: usize,
+    _state_dim: usize,
+    _d_conv: usize,
+) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Registers one tagged Qwen recurrent or full-attention layer. The backend
+/// retains its own Metal buffer objects before the borrowed slices expire.
+pub(crate) fn qwen_resident_set_layer(l: usize, input: &QwenResidentLayerInput<'_>) -> bool {
+    if !matches!(
+        input.layer_type,
+        QWEN_RESIDENT_LAYER_LINEAR | QWEN_RESIDENT_LAYER_ATTENTION
+    ) {
+        return false;
+    }
+    if input
+        .w
+        .iter()
+        .zip(input.w_dt)
+        .any(|(weight, dtype)| !weight.is_empty() && dtype > 1)
+    {
+        return false;
+    }
+    let (
+        Ok(l),
+        Ok(attn_norm_len),
+        Ok(post_norm_len),
+        Ok(conv_w_len),
+        Ok(a_len),
+        Ok(dt_bias_len),
+        Ok(norm_len),
+        Ok(q_norm_len),
+        Ok(k_norm_len),
+    ) = (
+        u32::try_from(l),
+        u32::try_from(input.attn_norm.len()),
+        u32::try_from(input.post_norm.len()),
+        u32::try_from(input.conv_w.len()),
+        u32::try_from(input.a.len()),
+        u32::try_from(input.dt_bias.len()),
+        u32::try_from(input.norm.len()),
+        u32::try_from(input.q_norm.len()),
+        u32::try_from(input.k_norm.len()),
+    )
+    else {
+        return false;
+    };
+    let float_ptr = |values: &[f32]| {
+        if values.is_empty() {
+            std::ptr::null()
+        } else {
+            values.as_ptr()
+        }
+    };
+    let desc = QwenResidentLayerDesc {
+        layer_type: input.layer_type,
+        w: std::array::from_fn(|i| {
+            if input.w[i].is_empty() {
+                std::ptr::null()
+            } else {
+                input.w[i].as_ptr()
+            }
+        }),
+        w_len: std::array::from_fn(|i| input.w[i].len()),
+        w_rows: input.w_rows,
+        w_cols: input.w_cols,
+        w_dt: input.w_dt,
+        attn_norm: float_ptr(input.attn_norm),
+        attn_norm_len,
+        post_norm: float_ptr(input.post_norm),
+        post_norm_len,
+        conv_w: float_ptr(input.conv_w),
+        conv_w_len,
+        a: float_ptr(input.a),
+        a_len,
+        dt_bias: float_ptr(input.dt_bias),
+        dt_bias_len,
+        norm: float_ptr(input.norm),
+        norm_len,
+        q_norm: float_ptr(input.q_norm),
+        q_norm_len,
+        k_norm: float_ptr(input.k_norm),
+        k_norm_len,
+    };
+    unsafe { ffi::rusty_metal_qwen_resident_set_layer(l, &desc) != 0 }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub(crate) fn qwen_resident_set_layer(_l: usize, _input: &QwenResidentLayerInput<'_>) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Registers Qwen's final RMSNorm, vocabulary projection, and partial-RoPE
+/// frequency table with the resident decoder.
+pub(crate) fn qwen_resident_set_output(
+    output_norm: &[f32],
+    output_w: &[u8],
+    output_rows: usize,
+    output_dt: u32,
+    inv_freq: &[f32],
+) -> bool {
+    if output_norm.is_empty() || output_w.is_empty() || inv_freq.is_empty() || output_dt > 1 {
+        return false;
+    }
+    let (Ok(output_rows), Ok(inv_freq_len)) = (
+        u32::try_from(output_rows),
+        u32::try_from(inv_freq.len()),
+    ) else {
+        return false;
+    };
+    unsafe {
+        ffi::rusty_metal_qwen_resident_set_output(
+            output_norm.as_ptr(),
+            output_w.as_ptr(),
+            output_w.len(),
+            output_rows,
+            output_dt,
+            inv_freq.as_ptr(),
+            inv_freq_len,
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub(crate) fn qwen_resident_set_output(
+    _output_norm: &[f32],
+    _output_w: &[u8],
+    _output_rows: usize,
+    _output_dt: u32,
+    _inv_freq: &[f32],
+) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Runs one Qwen token through the resident decoder and copies vocabulary
+/// logits back to the caller.
+pub(crate) fn qwen_resident_decode_into(
+    x_embed: &[f32],
+    pos: usize,
+    vocab: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    if x_embed.is_empty() || u32::try_from(vocab).is_err() {
+        return false;
+    }
+    let Ok(pos) = u32::try_from(pos) else {
+        return false;
+    };
+    logits.resize(vocab, 0.0);
+    unsafe {
+        ffi::rusty_metal_qwen_resident_decode(
+            x_embed.as_ptr(),
+            pos,
+            0,
+            1,
+            logits.as_mut_ptr(),
+            std::ptr::null(),
+            0,
+            1.0,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub(crate) fn qwen_resident_decode_into(
+    _x_embed: &[f32],
+    _pos: usize,
+    _vocab: usize,
+    _logits: &mut Vec<f32>,
+) -> bool {
+    false
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Runs one resident Qwen forward pass and returns its exact greedy token
+/// without copying the full vocabulary to the CPU.
+pub(crate) fn qwen_resident_greedy(
+    x_embed: &[f32],
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+) -> Option<u32> {
+    if x_embed.is_empty() || recent.len() > 64 {
+        return None;
+    }
+    let (Ok(pos), Ok(recent_len)) = (u32::try_from(pos), u32::try_from(recent.len())) else {
+        return None;
+    };
+    let recent_ptr = if recent.is_empty() {
+        std::ptr::null()
+    } else {
+        recent.as_ptr()
+    };
+    let mut token = 0u32;
+    let ok = unsafe {
+        ffi::rusty_metal_qwen_resident_decode(
+            x_embed.as_ptr(),
+            pos,
+            0,
+            2,
+            std::ptr::null_mut(),
+            recent_ptr,
+            recent_len,
+            repeat_penalty,
+            &mut token,
+        ) != 0
+    };
+    ok.then_some(token)
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub(crate) fn qwen_resident_greedy(
+    _x_embed: &[f32],
+    _pos: usize,
+    _recent: &[u32],
+    _repeat_penalty: f32,
+) -> Option<u32> {
+    None
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+/// Advances Qwen's resident recurrent and KV state for one prompt token while
+/// skipping the final vocabulary projection.
+pub(crate) fn qwen_resident_prefill(x_embed: &[f32], pos: usize) -> bool {
+    if x_embed.is_empty() {
+        return false;
+    }
+    let Ok(pos) = u32::try_from(pos) else {
+        return false;
+    };
+    unsafe {
+        ffi::rusty_metal_qwen_resident_decode(
+            x_embed.as_ptr(),
+            pos,
+            0,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            0,
+            1.0,
+            std::ptr::null_mut(),
+        ) != 0
+    }
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+pub(crate) fn qwen_resident_prefill(_x_embed: &[f32], _pos: usize) -> bool {
     false
 }
 
@@ -1858,6 +2376,35 @@ mod tests {
                 "row {row}: scalar={scalar}, Metal={metal}, tolerance={tolerance}"
             );
         }
+    }
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    fn greedy_argmax_matches_repeat_penalty_and_tie_breaking() {
+        if !super::available() {
+            return;
+        }
+        let mut logits = (0..777)
+            .map(|index| -20.0 + (index % 17) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        logits[42] = 10.0;
+        logits[300] = 9.0;
+        logits[301] = 9.0;
+        logits[500] = f32::NAN;
+        let recent = [42u32, 42];
+        let mut selected = u32::MAX;
+        let ok = unsafe {
+            super::ffi::rusty_metal_test_greedy_argmax(
+                logits.as_ptr(),
+                logits.len() as u32,
+                recent.as_ptr(),
+                recent.len() as u32,
+                2.0,
+                &mut selected,
+            ) != 0
+        };
+        assert!(ok);
+        assert_eq!(selected, 300);
     }
 
     #[cfg(all(target_os = "macos", rusty_metal))]

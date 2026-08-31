@@ -107,14 +107,32 @@ impl ServeOptions {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentPart {
     Text { text: String },
+    InputText { text: String },
+    OutputText { text: String },
     ImageUrl { image_url: ImageUrl },
+    InputImage { image_url: serde_json::Value },
+    Refusal { refusal: String },
+    #[serde(other)]
+    Unsupported,
 }
 
 #[derive(Deserialize)]
-struct ImageUrl {
-    url: String,
-    #[allow(dead_code)]
-    detail: Option<String>,
+#[serde(untagged)]
+enum ImageUrl {
+    Url(String),
+    Object {
+        url: String,
+        #[allow(dead_code)]
+        detail: Option<String>,
+    },
+}
+
+impl ImageUrl {
+    fn url(&self) -> &str {
+        match self {
+            Self::Url(url) | Self::Object { url, .. } => url,
+        }
+    }
 }
 
 /// The `content` field of an API message can be either a plain string or an
@@ -124,6 +142,7 @@ struct ImageUrl {
 enum ApiMessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    Null,
 }
 
 impl Default for ApiMessageContent {
@@ -138,11 +157,15 @@ impl ApiMessageContent {
     fn into_text(self) -> String {
         match self {
             ApiMessageContent::Text(s) => s,
+            ApiMessageContent::Null => String::new(),
             ApiMessageContent::Parts(parts) => {
                 let mut out = String::new();
                 for part in parts {
                     match part {
-                        ContentPart::Text { text } => {
+                        ContentPart::Text { text }
+                        | ContentPart::InputText { text }
+                        | ContentPart::OutputText { text }
+                        | ContentPart::Refusal { refusal: text } => {
                             if !out.is_empty() {
                                 out.push('\n');
                             }
@@ -155,13 +178,31 @@ impl ApiMessageContent {
                             // Describe the image with its URL for context; a
                             // vision encoder would process it in a full
                             // multimodal pipeline.
-                            let url = &image_url.url;
+                            let url = image_url.url();
                             if url.starts_with("data:image/") {
                                 out.push_str("[image: base64 data]");
                             } else {
                                 out.push_str(&format!("[image: {}]", url));
                             }
                         }
+                        ContentPart::InputImage { image_url } => {
+                            let url = image_url
+                                .as_str()
+                                .or_else(|| image_url.get("url").and_then(|value| value.as_str()))
+                                .unwrap_or("unknown");
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(&format!(
+                                "[image: {}]",
+                                if url.starts_with("data:image/") {
+                                    "base64 data"
+                                } else {
+                                    url
+                                }
+                            ));
+                        }
+                        ContentPart::Unsupported => {}
                     }
                 }
                 out
@@ -196,8 +237,12 @@ impl StopSpec {
 #[derive(Deserialize)]
 struct GenerateRequest {
     prompt: Option<String>,
+    content: Option<String>,
+    /// Alternate single-prompt field used by common inference clients.
+    inputs: Option<String>,
     messages: Option<Vec<ApiMessage>>,
     max_tokens: Option<usize>,
+    n_predict: Option<usize>,
     temp: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
@@ -213,6 +258,28 @@ struct GenerateRequest {
     conversation_id: Option<String>,
     /// When `true` (and `conversation_id` is set), use the persistent session.
     cache_prompt: Option<bool>,
+    parameters: Option<GenerateParameters>,
+}
+
+#[derive(Deserialize, Default)]
+struct GenerateParameters {
+    max_new_tokens: Option<usize>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<usize>,
+    repetition_penalty: Option<f32>,
+    seed: Option<u64>,
+    stop: Option<Vec<String>>,
+    #[allow(dead_code)]
+    do_sample: Option<bool>,
+    return_full_text: Option<bool>,
+    details: Option<bool>,
+    #[allow(dead_code)]
+    decoder_input_details: Option<bool>,
+    #[allow(dead_code)]
+    watermark: Option<bool>,
+    #[allow(dead_code)]
+    truncate: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -222,8 +289,12 @@ struct ApiMessage {
     content: ApiMessageContent,
     /// Set on `role: "tool"` messages to identify the call being answered.
     tool_call_id: Option<String>,
+    /// Legacy function-result messages identify the function by name.
+    name: Option<String>,
     /// Set on assistant turns replaying tool calls the model previously made.
     tool_calls: Option<Vec<serde_json::Value>>,
+    /// Legacy Chat Completions function call.
+    function_call: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -241,6 +312,7 @@ struct OpenAiCompletionsRequest {
     seed: Option<u64>,
     #[allow(dead_code)]
     stream: Option<bool>,
+    stream_options: Option<OpenAiStreamOptions>,
     system_prompt: Option<String>,
     thinking: Option<bool>,
     thinking_prompt: Option<String>,
@@ -278,20 +350,25 @@ struct OpenAiChatCompletionsRequest {
     seed: Option<u64>,
     #[allow(dead_code)]
     stream: Option<bool>,
+    stream_options: Option<OpenAiStreamOptions>,
     system_prompt: Option<String>,
     thinking: Option<bool>,
     thinking_prompt: Option<String>,
     thinking_max_tokens: Option<usize>,
     stop: Option<StopSpec>,
     response_format: Option<serde_json::Value>,
-    #[allow(dead_code)]
     tools: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
     /// Optional conversation ID for persistent KV-cache sessions.
     conversation_id: Option<String>,
     /// When `true` (and `conversation_id` is set), use the persistent session.
     cache_prompt: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAiStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 #[derive(Deserialize)]
@@ -316,9 +393,7 @@ struct OpenAiResponsesRequest {
     stop: Option<StopSpec>,
     text: Option<ResponsesTextConfig>,
     response_format: Option<serde_json::Value>,
-    #[allow(dead_code)]
     tools: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
     tool_choice: Option<serde_json::Value>,
     #[allow(dead_code)]
     previous_response_id: Option<String>,
@@ -372,10 +447,11 @@ struct AnthropicMessage {
 struct EmbeddingsRequest {
     model: Option<String>,
     input: EmbeddingsInput,
-    /// Ignored — always returns float embeddings.
     #[serde(default)]
-    #[allow(dead_code)]
     encoding_format: Option<String>,
+    dimensions: Option<usize>,
+    #[allow(dead_code)]
+    user: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +459,8 @@ struct EmbeddingsRequest {
 enum EmbeddingsInput {
     Single(String),
     Batch(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenBatches(Vec<Vec<u32>>),
 }
 
 #[derive(Deserialize)]
@@ -393,10 +471,16 @@ struct OllamaGenerateRequest {
     thinking: Option<bool>,
     thinking_prompt: Option<String>,
     thinking_max_tokens: Option<usize>,
+    think: Option<BoolOrString>,
     #[allow(dead_code)]
     stream: Option<bool>,
     options: Option<OllamaOptions>,
     stop: Option<StopSpec>,
+    format: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    raw: Option<bool>,
+    #[allow(dead_code)]
+    keep_alive: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -406,15 +490,42 @@ struct OllamaChatRequest {
     thinking: Option<bool>,
     thinking_prompt: Option<String>,
     thinking_max_tokens: Option<usize>,
+    think: Option<BoolOrString>,
     #[allow(dead_code)]
     stream: Option<bool>,
     options: Option<OllamaOptions>,
+    tools: Option<Vec<serde_json::Value>>,
+    format: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    keep_alive: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct OllamaMessage {
     role: String,
+    #[serde(default)]
     content: String,
+    #[serde(default)]
+    tool_calls: Vec<serde_json::Value>,
+    tool_name: Option<String>,
+    #[allow(dead_code)]
+    images: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BoolOrString {
+    Bool(bool),
+    Level(String),
+}
+
+impl BoolOrString {
+    fn enabled(&self) -> bool {
+        match self {
+            Self::Bool(value) => *value,
+            Self::Level(level) => !matches!(level.as_str(), "" | "false" | "off" | "none"),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -434,12 +545,37 @@ struct OllamaEmbeddingRequest {
     model: Option<String>,
     prompt: Option<String>,
     input: Option<EmbeddingsInput>,
+    truncate: Option<bool>,
+    dimensions: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelRequest {
+    #[serde(alias = "name")]
+    model: Option<String>,
+    #[allow(dead_code)]
+    verbose: Option<bool>,
 }
 
 #[derive(Deserialize)]
 struct ExplorerTokenizeRequest {
     input: String,
     add_bos: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CompatTokenizeRequest {
+    content: Option<String>,
+    text: Option<String>,
+    input: Option<String>,
+    add_bos: Option<bool>,
+    #[allow(dead_code)]
+    add_special: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct CompatDetokenizeRequest {
+    tokens: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -570,7 +706,7 @@ struct OpenAiUsage {
 #[derive(Serialize)]
 struct OpenAiChatMessage {
     role: &'static str,
-    content: String,
+    content: Option<String>,
     /// Omitted entirely unless the model requested tools, so ordinary replies
     /// keep the exact response shape clients already parse.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -661,29 +797,13 @@ struct OpenAiResponsesUsage {
 }
 
 #[derive(Serialize)]
-struct OpenAiResponsesOutputText {
-    r#type: &'static str,
-    text: String,
-    annotations: Vec<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct OpenAiResponsesOutputMessage {
-    r#type: &'static str,
-    id: String,
-    status: &'static str,
-    role: &'static str,
-    content: Vec<OpenAiResponsesOutputText>,
-}
-
-#[derive(Serialize)]
 struct OpenAiResponsesResponse {
     id: String,
     object: &'static str,
     created_at: u64,
     status: &'static str,
     model: String,
-    output: Vec<OpenAiResponsesOutputMessage>,
+    output: Vec<serde_json::Value>,
     output_text: String,
     usage: OpenAiResponsesUsage,
     error: Option<serde_json::Value>,
@@ -1392,29 +1512,105 @@ fn chat_ui_route(path: &str) -> Option<ChatUiRoute> {
     }
 }
 
+/// Returns the URL path without its query string. Several official SDKs add
+/// version or transport query parameters even when the route itself is fixed.
+fn path_only(path: &str) -> &str {
+    path.split_once('?').map(|(path, _)| path).unwrap_or(path)
+}
+
+fn is_openai_chat_path(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/chat/completions"
+            | "/chat/completions"
+            | "/openai/v1/chat/completions"
+            | "/api/v0/chat/completions"
+            | "/api/v1/chat/completions"
+    ) || (path_only(path).starts_with("/openai/deployments/")
+        && path_only(path).ends_with("/chat/completions"))
+}
+
+fn is_openai_completion_path(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/completions"
+            | "/completions"
+            | "/openai/v1/completions"
+            | "/api/v0/completions"
+            | "/api/v1/completions"
+    ) || (path_only(path).starts_with("/openai/deployments/")
+        && path_only(path).ends_with("/completions")
+        && !path_only(path).ends_with("/chat/completions"))
+}
+
+fn is_openai_response_path(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/responses" | "/responses" | "/openai/v1/responses"
+    )
+}
+
+fn is_openai_embedding_path(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/embeddings"
+            | "/embeddings"
+            | "/openai/v1/embeddings"
+            | "/api/v0/embeddings"
+            | "/api/v1/embeddings"
+    ) || (path_only(path).starts_with("/openai/deployments/")
+        && path_only(path).ends_with("/embeddings"))
+}
+
+fn is_openai_models_path(path: &str) -> bool {
+    matches!(
+        path_only(path),
+        "/v1/models"
+            | "/models"
+            | "/openai/v1/models"
+            | "/api/v0/models"
+            | "/api/v1/models"
+    )
+}
+
+fn openai_model_id(path: &str) -> Option<&str> {
+    let path = path_only(path);
+    [
+        "/v1/models/",
+        "/models/",
+        "/openai/v1/models/",
+        "/api/v0/models/",
+        "/api/v1/models/",
+    ]
+    .into_iter()
+    .find_map(|prefix| path.strip_prefix(prefix))
+    .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// Returns true when the request body asks for SSE streaming.
 fn is_streaming_request(request: &HttpRequest) -> bool {
     let method = request.method.as_str();
-    let path = request.path.as_str();
+    let path = path_only(&request.path);
     if method != "POST" {
         return false;
     }
-    if !matches!(
-        path,
-        "/v1/chat/completions"
-            | "/v1/completions"
-            | "/v1/messages"
-            | "/v1/responses"
-            | "/api/v0/chat/completions"
-            | "/api/v0/completions"
-            | "/api/generate"
-            | "/api/chat"
-    ) {
+    let supported = is_openai_chat_path(path)
+        || is_openai_completion_path(path)
+        || is_openai_response_path(path)
+        || matches!(
+            path,
+            "/v1/messages" | "/api/generate" | "/api/chat" | "/generate_stream"
+        );
+    if !supported {
         return false;
+    }
+    if path == "/generate_stream" {
+        return true;
     }
     // Quick JSON field scan — avoid full deserialisation just for the flag.
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&request.body) {
-        return v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
+        let requested = v.get("stream").and_then(|s| s.as_bool());
+        return requested.unwrap_or(matches!(path, "/api/generate" | "/api/chat"));
     }
     false
 }
@@ -1426,44 +1622,47 @@ fn route_streaming_request<W: Write>(
     runner: &Runner,
     options: &ServeOptions,
 ) -> io::Result<()> {
-    if request.path == "/v1/messages" {
+    let path = path_only(&request.path);
+    if path == "/v1/messages" {
         return route_anthropic_message_stream(request, stream, runner, options);
     }
-    if request.path == "/v1/responses" {
+    if is_openai_response_path(path) {
         return route_openai_response_stream(request, stream, runner, options);
     }
-    if request.path == "/api/generate" {
+    if path == "/api/generate" {
         return route_ollama_generate_stream(request, stream, runner, options);
     }
-    if request.path == "/api/chat" {
+    if path == "/api/chat" {
         return route_ollama_chat_stream(request, stream, runner, options);
+    }
+    if path == "/generate_stream" {
+        return route_text_generation_stream(request, stream, runner, options);
     }
 
     let model_ids = advertised_model_ids(runner);
     let created = unix_timestamp();
     let comp_id = format!(
         "{}rustyllm-{}",
-        if request.path == "/v1/chat/completions" || request.path == "/api/v0/chat/completions" {
+        if is_openai_chat_path(path) {
             "chatcmpl-"
         } else {
             "cmpl-"
         },
         created
     );
-    let is_chat =
-        request.path == "/v1/chat/completions" || request.path == "/api/v0/chat/completions";
+    let is_chat = is_openai_chat_path(path);
     let model_name = model_ids
         .first()
         .cloned()
         .unwrap_or_else(|| runner.architecture().to_string());
 
-    let (messages, generation, use_session, conv_id) = if is_chat {
+    let (messages, generation, use_session, conv_id, include_usage, has_tools) = if is_chat {
         match serde_json::from_slice::<OpenAiChatCompletionsRequest>(&request.body) {
             Ok(payload) => {
                 let messages = match parse_api_messages(payload.messages) {
                     Ok(m) => m,
                     Err(err) => {
-                        write_http_response(stream, 400, &json_error(&err))?;
+                        write_http_response(stream, 400, &openai_error(&err))?;
                         return Ok(());
                     }
                 };
@@ -1487,12 +1686,26 @@ fn route_streaming_request<W: Write>(
                     &mut generation_options,
                     payload.response_format.as_ref(),
                 );
+                generation_options.tools = tool_declarations(payload.tools.as_deref());
+                apply_tool_choice(&mut generation_options, payload.tool_choice.as_ref());
                 let use_session = payload.cache_prompt.unwrap_or(false);
                 let conv_id = payload.conversation_id;
-                (messages, generation_options, use_session, conv_id)
+                let include_usage = payload
+                    .stream_options
+                    .as_ref()
+                    .is_some_and(|options| options.include_usage);
+                let has_tools = !generation_options.tools.is_empty();
+                (
+                    messages,
+                    generation_options,
+                    use_session,
+                    conv_id,
+                    include_usage,
+                    has_tools,
+                )
             }
             Err(err) => {
-                write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+                write_http_response(stream, 400, &openai_error(&format!("Invalid JSON: {}", err)))?;
                 return Ok(());
             }
         }
@@ -1506,7 +1719,7 @@ fn route_streaming_request<W: Write>(
                             write_http_response(
                                 stream,
                                 400,
-                                &json_error("Prompt array must not be empty."),
+                                &openai_error("Prompt array must not be empty."),
                             )?;
                             return Ok(());
                         }
@@ -1533,15 +1746,21 @@ fn route_streaming_request<W: Write>(
                     &mut generation_options,
                     payload.response_format.as_ref(),
                 );
+                let include_usage = payload
+                    .stream_options
+                    .as_ref()
+                    .is_some_and(|options| options.include_usage);
                 (
                     vec![ChatMessage::user(prompt)],
                     generation_options,
                     false,
                     None,
+                    include_usage,
+                    false,
                 )
             }
             Err(err) => {
-                write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+                write_http_response(stream, 400, &openai_error(&format!("Invalid JSON: {}", err)))?;
                 return Ok(());
             }
         }
@@ -1553,50 +1772,123 @@ fn route_streaming_request<W: Write>(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
     )?;
 
-    // Stream each token as a Server-Sent Event chunk.
-    let result = generate_with_optional_session(
-        runner,
-        options,
-        &messages,
-        &generation,
-        use_session,
-        conv_id.as_deref(),
-        |text| {
-            let chunk = if is_chat {
-                serde_json::json!({
-                    "id": comp_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": text},
-                        "finish_reason": null
-                    }]
-                })
-            } else {
-                serde_json::json!({
-                    "id": comp_id,
-                    "object": "text_completion",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "text": text,
-                        "finish_reason": null
-                    }]
-                })
-            };
-            let line = format!("data: {}\n\n", chunk);
-            let _ = stream.write_all(line.as_bytes());
-        },
-    );
+    if is_chat {
+        let initial_chunk = serde_json::json!({
+            "id": comp_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        write!(stream, "data: {}\n\n", initial_chunk)?;
+    }
+
+    // Tool markup can only be separated safely once the response is complete.
+    // Plain-text requests retain token-level streaming.
+    let result = if has_tools {
+        generate_with_optional_session(
+            runner,
+            options,
+            &messages,
+            &generation,
+            use_session,
+            conv_id.as_deref(),
+            |_| {},
+        )
+    } else {
+        generate_with_optional_session(
+            runner,
+            options,
+            &messages,
+            &generation,
+            use_session,
+            conv_id.as_deref(),
+            |text| {
+                let chunk = if is_chat {
+                    serde_json::json!({
+                        "id": comp_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": text},
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": comp_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "text": text,
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    })
+                };
+                let line = format!("data: {}\n\n", chunk);
+                let _ = stream.write_all(line.as_bytes());
+            },
+        )
+    };
     if let Ok(result) = &result {
         let _ = append_chat_history(options, "openai.stream", &model_name, &messages, result);
     }
 
-    // Send final chunk with finish_reason and [DONE].
-    let finish_reason = if result.is_ok() { "stop" } else { "error" };
+    let mut streamed_tool_calls = false;
+    if has_tools && let Ok(result) = &result {
+        let (content, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+        if !content.is_empty() {
+            let chunk = serde_json::json!({
+                "id": comp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": serde_json::Value::Null}]
+            });
+            write!(stream, "data: {}\n\n", chunk)?;
+        }
+        if !calls.is_empty() {
+            streamed_tool_calls = true;
+            let calls = calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    let call = OpenAiToolCall::from_runtime(index, call);
+                    serde_json::json!({
+                        "index": index,
+                        "id": call.id,
+                        "type": call.call_type,
+                        "function": {"name": call.function.name, "arguments": call.function.arguments}
+                    })
+                })
+                .collect::<Vec<_>>();
+            let chunk = serde_json::json!({
+                "id": comp_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": serde_json::Value::Null}]
+            });
+            write!(stream, "data: {}\n\n", chunk)?;
+        }
+    }
+
+    // Send final chunk with finish_reason, optional usage, and [DONE].
+    let finish_reason = if result.is_err() {
+        "error"
+    } else if streamed_tool_calls {
+        "tool_calls"
+    } else {
+        "stop"
+    };
     let final_chunk = if is_chat {
         serde_json::json!({
             "id": comp_id,
@@ -1615,6 +1907,21 @@ fn route_streaming_request<W: Write>(
         })
     };
     write!(stream, "data: {}\n\n", final_chunk)?;
+    if include_usage && let Ok(result) = &result {
+        let usage_chunk = serde_json::json!({
+            "id": comp_id,
+            "object": if is_chat { "chat.completion.chunk" } else { "text_completion" },
+            "created": created,
+            "model": model_name,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": result.stats.prompt_tokens,
+                "completion_tokens": result.stats.generated_tokens,
+                "total_tokens": result.stats.prompt_tokens + result.stats.generated_tokens
+            }
+        });
+        write!(stream, "data: {}\n\n", usage_chunk)?;
+    }
     write!(stream, "data: [DONE]\n\n")?;
     stream.flush()
 }
@@ -1773,7 +2080,7 @@ fn route_openai_response_stream<W: Write>(
     let payload = match serde_json::from_slice::<OpenAiResponsesRequest>(&request.body) {
         Ok(payload) => payload,
         Err(err) => {
-            write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+            write_http_response(stream, 400, &openai_error(&format!("Invalid JSON: {}", err)))?;
             return Ok(());
         }
     };
@@ -1781,7 +2088,7 @@ fn route_openai_response_stream<W: Write>(
     let messages = match parse_responses_input(payload.input.as_ref()) {
         Ok(messages) => messages,
         Err(err) => {
-            write_http_response(stream, 400, &json_error(&err))?;
+            write_http_response(stream, 400, &openai_error(&err))?;
             return Ok(());
         }
     };
@@ -1807,6 +2114,8 @@ fn route_openai_response_stream<W: Write>(
         .and_then(|text| text.format.as_ref())
         .or(payload.response_format.as_ref());
     apply_response_format_hint(&mut generation, format_hint);
+    generation.tools = tool_declarations(payload.tools.as_deref());
+    apply_tool_choice(&mut generation, payload.tool_choice.as_ref());
 
     let created = unix_timestamp();
     let response_id = format!("resp-rustyllm-{}", created);
@@ -1826,26 +2135,47 @@ fn route_openai_response_stream<W: Write>(
         }
     });
     write_sse_event(stream, "response.created", &created_event)?;
+    write_sse_event(
+        stream,
+        "response.in_progress",
+        &serde_json::json!({"type": "response.in_progress", "response": created_event["response"]}),
+    )?;
 
-    let result = generate_with_optional_session(
-        runner,
-        options,
-        &messages,
-        &generation,
-        false,
-        None,
-        |text| {
-            let chunk = serde_json::json!({
-                "type": "response.output_text.delta",
-                "response_id": response_id,
-                "item_id": message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "delta": text,
-            });
-            let _ = write_sse_event(stream, "response.output_text.delta", &chunk);
-        },
-    );
+    let has_tools = !generation.tools.is_empty();
+    if !has_tools {
+        write_responses_text_start(stream, &response_id, &message_id, 0)?;
+    }
+    let result = if has_tools {
+        generate_with_optional_session(
+            runner,
+            options,
+            &messages,
+            &generation,
+            false,
+            None,
+            |_| {},
+        )
+    } else {
+        generate_with_optional_session(
+            runner,
+            options,
+            &messages,
+            &generation,
+            false,
+            None,
+            |text| {
+                let chunk = serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "response_id": response_id,
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": text,
+                });
+                let _ = write_sse_event(stream, "response.output_text.delta", &chunk);
+            },
+        )
+    };
 
     match result {
         Ok(result) => {
@@ -1856,6 +2186,106 @@ fn route_openai_response_stream<W: Write>(
                 &messages,
                 &result,
             );
+            let (text, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+            let mut output_index = 0usize;
+            if has_tools && (!text.is_empty() || calls.is_empty()) {
+                write_responses_text_start(stream, &response_id, &message_id, output_index)?;
+                write_sse_event(
+                    stream,
+                    "response.output_text.delta",
+                    &serde_json::json!({
+                        "type": "response.output_text.delta",
+                        "response_id": response_id,
+                        "item_id": message_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": text,
+                    }),
+                )?;
+                write_responses_text_done(
+                    stream,
+                    &response_id,
+                    &message_id,
+                    output_index,
+                    &text,
+                )?;
+                output_index += 1;
+            } else if !has_tools {
+                write_responses_text_done(
+                    stream,
+                    &response_id,
+                    &message_id,
+                    output_index,
+                    &text,
+                )?;
+                output_index += 1;
+            }
+            for (index, call) in calls.iter().enumerate() {
+                let call_id = if call.id.is_empty() {
+                    format!("call_{:08}", index)
+                } else {
+                    call.id.clone()
+                };
+                let item_id = format!("fc-rustyllm-{}-{}", created, index);
+                let item = serde_json::json!({
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": call.name,
+                    "arguments": "",
+                    "status": "in_progress"
+                });
+                write_sse_event(
+                    stream,
+                    "response.output_item.added",
+                    &serde_json::json!({
+                        "type": "response.output_item.added",
+                        "response_id": response_id,
+                        "output_index": output_index,
+                        "item": item,
+                    }),
+                )?;
+                write_sse_event(
+                    stream,
+                    "response.function_call_arguments.delta",
+                    &serde_json::json!({
+                        "type": "response.function_call_arguments.delta",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": call.arguments,
+                    }),
+                )?;
+                write_sse_event(
+                    stream,
+                    "response.function_call_arguments.done",
+                    &serde_json::json!({
+                        "type": "response.function_call_arguments.done",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": call.arguments,
+                    }),
+                )?;
+                write_sse_event(
+                    stream,
+                    "response.output_item.done",
+                    &serde_json::json!({
+                        "type": "response.output_item.done",
+                        "response_id": response_id,
+                        "output_index": output_index,
+                        "item": {
+                            "type": "function_call",
+                            "id": item_id,
+                            "call_id": call_id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                            "status": "completed"
+                        }
+                    }),
+                )?;
+                output_index += 1;
+            }
             let completed = serde_json::json!({
                 "type": "response.completed",
                 "response": make_openai_response(&model, result),
@@ -1878,6 +2308,95 @@ fn route_openai_response_stream<W: Write>(
         }
     }
     write!(stream, "data: [DONE]\n\n")?;
+    stream.flush()
+}
+
+/// Writes the simple token-event stream used by text-generation clients.
+fn route_text_generation_stream<W: Write>(
+    request: &HttpRequest,
+    stream: &mut W,
+    runner: &Runner,
+    options: &ServeOptions,
+) -> io::Result<()> {
+    let payload = match serde_json::from_slice::<GenerateRequest>(&request.body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            write_http_response(stream, 400, &json_error(&format!("Invalid JSON: {}", err)))?;
+            return Ok(());
+        }
+    };
+    let parameters = payload.parameters.unwrap_or_default();
+    let Some(prompt) = payload.inputs.or(payload.prompt) else {
+        write_http_response(stream, 400, &json_error("Missing inputs."))?;
+        return Ok(());
+    };
+    let stop_sequences = payload
+        .stop
+        .map(StopSpec::into_vec)
+        .or(parameters.stop);
+    let generation = apply_generation_overrides(
+        &options.defaults,
+        payload.max_tokens.or(parameters.max_new_tokens),
+        payload.temp.or(parameters.temperature),
+        payload.top_p.or(parameters.top_p),
+        payload.top_k.or(parameters.top_k),
+        payload.min_p,
+        payload.repeat_penalty.or(parameters.repetition_penalty),
+        payload.seed.or(parameters.seed),
+        payload.system_prompt,
+        stop_sequences,
+        payload.thinking,
+        payload.thinking_prompt,
+        payload.thinking_max_tokens,
+    );
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+    )?;
+    let mut index = 0usize;
+    let mut loaded_skills = HashSet::new();
+    let result = runner.generate_stream_with_skill_memory(
+        &prompt,
+        &generation,
+        &mut loaded_skills,
+        |text| {
+            let event = serde_json::json!({
+                "index": index,
+                "token": {"id": 0, "text": text, "logprob": serde_json::Value::Null, "special": false},
+                "generated_text": serde_json::Value::Null,
+                "details": serde_json::Value::Null,
+            });
+            index += 1;
+            let _ = writeln!(stream, "data: {}\n", event);
+            let _ = stream.flush();
+        },
+    );
+    match result {
+        Ok(result) => {
+            let messages = [ChatMessage::user(prompt)];
+            let _ = append_chat_history(
+                options,
+                "text-generation.stream",
+                runner.model_name().unwrap_or(runner.architecture()),
+                &messages,
+                &result,
+            );
+            let event = serde_json::json!({
+                "index": index,
+                "token": {"id": 0, "text": "", "logprob": 0.0, "special": true},
+                "generated_text": result.text,
+                "details": {
+                    "finish_reason": "eos_token",
+                    "generated_tokens": result.stats.generated_tokens,
+                    "seed": generation.seed,
+                }
+            });
+            writeln!(stream, "data: {}\n", event)?;
+        }
+        Err(err) => {
+            writeln!(stream, "data: {}\n", serde_json::json!({"error": err}))?;
+        }
+    }
     stream.flush()
 }
 
@@ -1908,6 +2427,18 @@ fn route_ollama_generate_stream<W: Write>(
     if let Some(stop) = payload.stop {
         generation.stop_sequences = stop.into_vec();
     }
+    let thinking = payload
+        .think
+        .as_ref()
+        .map(BoolOrString::enabled)
+        .or(payload.thinking);
+    apply_thinking_overrides(
+        &mut generation,
+        thinking,
+        payload.thinking_prompt,
+        payload.thinking_max_tokens,
+    );
+    apply_ollama_format_hint(&mut generation, payload.format.as_ref());
     let started = Instant::now();
     write_ndjson_response_header(stream)?;
     let mut loaded_skills = HashSet::new();
@@ -1940,6 +2471,7 @@ fn route_ollama_generate_stream<W: Write>(
                 "created_at": iso_timestamp(),
                 "response": "",
                 "done": true,
+                "done_reason": "stop",
                 "context": [],
                 "total_duration": started.elapsed().as_nanos(),
                 "load_duration": 0,
@@ -1980,32 +2512,72 @@ fn route_ollama_chat_stream<W: Write>(
             return Ok(());
         }
     };
-    let generation = apply_ollama_options(&options.defaults, payload.options);
+    let mut generation = apply_ollama_options(&options.defaults, payload.options);
+    let thinking = payload
+        .think
+        .as_ref()
+        .map(BoolOrString::enabled)
+        .or(payload.thinking);
+    apply_thinking_overrides(
+        &mut generation,
+        thinking,
+        payload.thinking_prompt,
+        payload.thinking_max_tokens,
+    );
+    apply_ollama_format_hint(&mut generation, payload.format.as_ref());
+    generation.tools = tool_declarations(payload.tools.as_deref());
+    let has_tools = !generation.tools.is_empty();
     let started = Instant::now();
     write_ndjson_response_header(stream)?;
     let mut loaded_skills = HashSet::new();
-    let result = runner.generate_chat_stream_with_skill_memory(
-        &messages,
-        &generation,
-        &mut loaded_skills,
-        |text| {
-            let chunk = serde_json::json!({
-                "model": model,
-                "created_at": iso_timestamp(),
-                "message": {"role": "assistant", "content": text},
-                "done": false,
-            });
-            let _ = write_json_line(stream, &chunk);
-        },
-    );
+    let result = if has_tools {
+        runner.generate_chat_stream_with_skill_memory(
+            &messages,
+            &generation,
+            &mut loaded_skills,
+            |_| {},
+        )
+    } else {
+        runner.generate_chat_stream_with_skill_memory(
+            &messages,
+            &generation,
+            &mut loaded_skills,
+            |text| {
+                let chunk = serde_json::json!({
+                    "model": model,
+                    "created_at": iso_timestamp(),
+                    "message": {"role": "assistant", "content": text},
+                    "done": false,
+                });
+                let _ = write_json_line(stream, &chunk);
+            },
+        )
+    };
     match result {
         Ok(result) => {
             let _ = append_chat_history(options, "ollama.chat.stream", &model, &messages, &result);
+            if has_tools {
+                let (content, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+                let mut message = serde_json::json!({"role": "assistant", "content": content});
+                if !calls.is_empty() {
+                    message["tool_calls"] = serde_json::Value::Array(ollama_tool_calls(&calls));
+                }
+                write_json_line(
+                    stream,
+                    &serde_json::json!({
+                        "model": model,
+                        "created_at": iso_timestamp(),
+                        "message": message,
+                        "done": false,
+                    }),
+                )?;
+            }
             let final_chunk = serde_json::json!({
                 "model": model,
                 "created_at": iso_timestamp(),
                 "message": {"role": "assistant", "content": ""},
                 "done": true,
+                "done_reason": "stop",
                 "total_duration": started.elapsed().as_nanos(),
                 "load_duration": 0,
                 "prompt_eval_count": result.stats.prompt_tokens,
@@ -2029,10 +2601,14 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
     }
 
     let model_ids = advertised_model_ids(runner);
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") | ("GET", "/ready") => {
+    let path = path_only(&request.path);
+    match (request.method.as_str(), path) {
+        ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") | ("GET", "/ready")
+        | ("GET", "/v1/health") => {
             (200, String::from("{\"status\":\"ok\"}"))
         }
+        ("HEAD", "/") | ("HEAD", "/health") | ("HEAD", "/healthz")
+        | ("HEAD", "/ready") => (200, String::new()),
         ("GET", "/api/version") => (
             200,
             format!(
@@ -2041,16 +2617,25 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
             ),
         ),
         ("GET", "/api/explorer/model") => route_explorer_model(runner, options),
+        ("GET", "/props") => route_server_properties(runner, options),
+        ("GET", "/info") => route_inference_info(runner, options),
+        ("GET", "/slots") => json_response(serde_json::json!([{
+            "id": 0,
+            "is_processing": false,
+            "n_ctx": runner.config().max_seq_len,
+        }])),
         ("GET", "/openapi.json") | ("GET", "/swagger.json") => {
             route_openapi_document(runner, &model_ids)
         }
-        ("GET", "/api/tags") => route_ollama_tags(runner, &model_ids),
-        ("GET", "/v1/models") | ("GET", "/api/v0/models") => {
+        ("GET", "/api/tags") => route_ollama_tags(runner, options, &model_ids),
+        ("GET", "/api/ps") => route_ollama_ps(runner, options, &model_ids),
+        ("GET", path) if is_openai_models_path(path) => {
             let created = unix_timestamp();
             let response = OpenAiModelListResponse {
                 object: "list",
                 data: model_ids
-                    .into_iter()
+                    .iter()
+                    .cloned()
                     .map(|id| OpenAiModelInfo {
                         id,
                         object: "model",
@@ -2061,27 +2646,37 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
             };
             json_response(response)
         }
+        ("GET", path) if let Some(id) = openai_model_id(path) => {
+            json_response(OpenAiModelInfo {
+                id: resolve_model(Some(id), &model_ids),
+                object: "model",
+                created: unix_timestamp(),
+                owned_by: "rusty-llm",
+            })
+        }
         ("POST", path)
-            if matches!(
-                path,
-                "/generate"
-                    | "/v1/completions"
-                    | "/v1/chat/completions"
-                    | "/v1/messages"
-                    | "/v1/messages/count_tokens"
-                    | "/v1/responses"
-                    | "/v1/embeddings"
-                    | "/api/v0/completions"
-                    | "/api/v0/chat/completions"
-                    | "/api/v0/embeddings"
-                    | "/api/generate"
-                    | "/api/chat"
-                    | "/api/embeddings"
-                    | "/api/embed"
-                    | "/api/explorer/tokenize"
-                    | "/api/explorer/vector"
-                    | "/api/explorer/neighbors"
-            ) =>
+            if is_openai_completion_path(path)
+                || is_openai_chat_path(path)
+                || is_openai_response_path(path)
+                || is_openai_embedding_path(path)
+                || matches!(
+                    path,
+                    "/generate"
+                        | "/v1/messages"
+                        | "/v1/messages/count_tokens"
+                        | "/api/generate"
+                        | "/api/chat"
+                        | "/api/embeddings"
+                        | "/api/embed"
+                        | "/api/show"
+                        | "/tokenize"
+                        | "/detokenize"
+                        | "/v1/tokenize"
+                        | "/v1/detokenize"
+                        | "/api/explorer/tokenize"
+                        | "/api/explorer/vector"
+                        | "/api/explorer/neighbors"
+                ) =>
         {
             if !request
                 .content_type
@@ -2089,42 +2684,59 @@ fn route_request(request: &HttpRequest, runner: &Runner, options: &ServeOptions)
                 .map(is_json_content_type)
                 .unwrap_or(false)
             {
-                return (415, json_error("Content-Type must be application/json."));
+                let body = if is_openai_completion_path(path)
+                    || is_openai_chat_path(path)
+                    || is_openai_response_path(path)
+                    || is_openai_embedding_path(path)
+                {
+                    openai_error("Content-Type must be application/json.")
+                } else {
+                    json_error("Content-Type must be application/json.")
+                };
+                return (415, body);
             }
-            match path {
+            if is_openai_completion_path(path) {
+                route_openai_completion(&request.body, runner, options, &model_ids)
+            } else if is_openai_chat_path(path) {
+                route_openai_chat(&request.body, runner, options, &model_ids)
+            } else if is_openai_response_path(path) {
+                route_openai_response(&request.body, runner, options, &model_ids)
+            } else if is_openai_embedding_path(path) {
+                route_embeddings(&request.body, runner, &model_ids)
+            } else {
+                match path {
                 "/generate" => route_generate(&request.body, runner, options),
-                "/v1/completions" | "/api/v0/completions" => {
-                    route_openai_completion(&request.body, runner, options, &model_ids)
-                }
-                "/v1/chat/completions" | "/api/v0/chat/completions" => {
-                    route_openai_chat(&request.body, runner, options, &model_ids)
-                }
                 "/v1/messages" => {
                     route_anthropic_message(&request.body, runner, options, &model_ids)
                 }
                 "/v1/messages/count_tokens" => {
                     route_anthropic_count_tokens(&request.body, runner, options)
                 }
-                "/v1/responses" => {
-                    route_openai_response(&request.body, runner, options, &model_ids)
-                }
-                "/v1/embeddings" | "/api/v0/embeddings" => {
-                    route_embeddings(&request.body, runner, &model_ids)
-                }
                 "/api/generate" => {
                     route_ollama_generate(&request.body, runner, options, &model_ids)
                 }
                 "/api/chat" => route_ollama_chat(&request.body, runner, options, &model_ids),
-                "/api/embeddings" | "/api/embed" => {
-                    route_ollama_embeddings(&request.body, runner, &model_ids)
+                "/api/embeddings" => {
+                    route_ollama_embeddings(&request.body, runner, &model_ids, false)
+                }
+                "/api/embed" => {
+                    route_ollama_embeddings(&request.body, runner, &model_ids, true)
+                }
+                "/api/show" => route_ollama_show(&request.body, runner, options, &model_ids),
+                "/tokenize" | "/v1/tokenize" => {
+                    route_compat_tokenize(&request.body, runner)
+                }
+                "/detokenize" | "/v1/detokenize" => {
+                    route_compat_detokenize(&request.body, runner)
                 }
                 "/api/explorer/tokenize" => route_explorer_tokenize(&request.body, runner),
                 "/api/explorer/vector" => route_explorer_vector(&request.body, runner),
                 "/api/explorer/neighbors" => route_explorer_neighbors(&request.body, runner),
                 _ => (404, json_error("Not found")),
+                }
             }
         }
-        ("GET", _) | ("POST", _) => (404, json_error("Not found")),
+        ("GET", _) | ("HEAD", _) | ("POST", _) => (404, json_error("Not found")),
         _ => (405, json_error("Method not allowed.")),
     }
 }
@@ -2570,17 +3182,29 @@ where
 fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16, String) {
     match serde_json::from_slice::<GenerateRequest>(body) {
         Ok(payload) => {
+            let is_text_generation = payload.inputs.is_some();
+            let is_compat_completion = payload.content.is_some();
+            let parameters = payload.parameters.unwrap_or_default();
+            let return_full_text = parameters.return_full_text.unwrap_or(false);
+            let include_details = parameters.details.unwrap_or(false);
+            let stop_sequences = payload
+                .stop
+                .map(|stop| stop.into_vec())
+                .or(parameters.stop);
             let generation = apply_generation_overrides(
                 &options.defaults,
-                payload.max_tokens,
-                payload.temp,
-                payload.top_p,
-                payload.top_k,
+                payload
+                    .max_tokens
+                    .or(payload.n_predict)
+                    .or(parameters.max_new_tokens),
+                payload.temp.or(parameters.temperature),
+                payload.top_p.or(parameters.top_p),
+                payload.top_k.or(parameters.top_k),
                 payload.min_p,
-                payload.repeat_penalty,
-                payload.seed,
+                payload.repeat_penalty.or(parameters.repetition_penalty),
+                payload.seed.or(parameters.seed),
                 payload.system_prompt,
-                payload.stop.map(|s| s.into_vec()),
+                stop_sequences,
                 payload.thinking,
                 payload.thinking_prompt,
                 payload.thinking_max_tokens,
@@ -2590,6 +3214,8 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
             let conv_id = payload.conversation_id.clone();
 
             let mut history_messages = Vec::new();
+            let requested_prompt = payload.prompt.or(payload.inputs).or(payload.content);
+            let original_prompt = requested_prompt.clone().unwrap_or_default();
             let result = if let Some(messages) = payload.messages {
                 match parse_api_messages(messages) {
                     Ok(messages) => generate_with_optional_session(
@@ -2606,7 +3232,7 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                     }),
                     Err(err) => Err(err),
                 }
-            } else if let Some(prompt) = payload.prompt {
+            } else if let Some(prompt) = requested_prompt {
                 history_messages = vec![ChatMessage::user(prompt.clone())];
                 generate_with_optional_session(
                     runner,
@@ -2633,15 +3259,58 @@ fn route_generate(body: &[u8], runner: &Runner, options: &ServeOptions) -> (u16,
                     );
                     let cache_stats =
                         make_cache_stats(&result.stats, use_session, conv_id.as_deref());
-                    json_response(GenerateResponse {
-                        text: &result.text,
-                        prompt_tokens: result.stats.prompt_tokens,
-                        generated_tokens: result.stats.generated_tokens,
-                        prefill_ms: result.stats.prefill_time.as_millis(),
-                        decode_ms: result.stats.decode_time.as_millis(),
-                        total_ms: result.stats.total_time.as_millis(),
-                        cache_stats,
-                    })
+                    if is_text_generation {
+                        let generated_text = if return_full_text {
+                            format!("{}{}", original_prompt, result.text)
+                        } else {
+                            result.text.clone()
+                        };
+                        let details = include_details.then(|| {
+                            serde_json::json!({
+                                "finish_reason": "eos_token",
+                                "generated_tokens": result.stats.generated_tokens,
+                                "seed": generation.seed,
+                            })
+                        });
+                        json_response(serde_json::json!({
+                            "generated_text": generated_text,
+                            "details": details,
+                        }))
+                    } else if is_compat_completion {
+                        json_response(serde_json::json!({
+                            "content": result.text,
+                            "stop": true,
+                            "stopped_eos": true,
+                            "stopped_word": false,
+                            "stopped_limit": false,
+                            "stopping_word": "",
+                            "tokens_cached": result.stats.cached_tokens,
+                            "tokens_evaluated": result.stats.prompt_tokens,
+                            "tokens_predicted": result.stats.generated_tokens,
+                            "decode_steps": result.stats.decode_steps,
+                            "generation_settings": {
+                                "n_predict": generation.max_tokens,
+                                "temperature": generation.sampler.temperature,
+                                "top_k": generation.sampler.top_k,
+                                "top_p": generation.sampler.top_p,
+                            },
+                            "timings": {
+                                "prompt_ms": result.stats.prefill_time.as_secs_f64() * 1000.0,
+                                "predicted_ms": result.stats.decode_time.as_secs_f64() * 1000.0,
+                                "predicted_per_second": result.stats.decode_tok_s(),
+                            }
+                        }))
+                    } else {
+                        json_response(GenerateResponse {
+                            text: &result.text,
+                            prompt_tokens: result.stats.prompt_tokens,
+                            generated_tokens: result.stats.generated_tokens,
+                            prefill_ms: result.stats.prefill_time.as_millis(),
+                            decode_ms: result.stats.decode_time.as_millis(),
+                            total_ms: result.stats.total_time.as_millis(),
+                            cache_stats,
+                        })
+                    }
                 }
                 Err(err) => (400, json_error(&err)),
             }
@@ -2797,7 +3466,7 @@ fn route_openai_completion(
                 OpenAiPrompt::Single(prompt) => prompt,
                 OpenAiPrompt::Batch(mut prompts) => {
                     if prompts.is_empty() {
-                        return (400, json_error("Prompt array must not be empty."));
+                        return (400, openai_error("Prompt array must not be empty."));
                     }
                     prompts.remove(0)
                 }
@@ -2849,10 +3518,10 @@ fn route_openai_completion(
                         usage,
                     })
                 }
-                Err(err) => (400, json_error(&err)),
+                Err(err) => (400, openai_error(&err)),
             }
         }
-        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+        Err(err) => (400, openai_error(&format!("Invalid JSON: {}", err))),
     }
 }
 
@@ -2868,7 +3537,7 @@ fn route_openai_chat(
             let model = resolve_model(payload.model.as_deref(), model_ids);
             let messages = match parse_api_messages(payload.messages) {
                 Ok(messages) => messages,
-                Err(err) => return (400, json_error(&err)),
+                Err(err) => return (400, openai_error(&err)),
             };
             let max_tokens = payload.max_completion_tokens.or(payload.max_tokens);
             let mut generation = apply_generation_overrides(
@@ -2888,6 +3557,7 @@ fn route_openai_chat(
             );
             apply_response_format_hint(&mut generation, payload.response_format.as_ref());
             generation.tools = tool_declarations(payload.tools.as_deref());
+            apply_tool_choice(&mut generation, payload.tool_choice.as_ref());
             let use_session = payload.cache_prompt.unwrap_or(false);
             let conv_id = payload.conversation_id.clone();
             let result = generate_with_optional_session(
@@ -2933,7 +3603,11 @@ fn route_openai_chat(
                             index: 0,
                             message: OpenAiChatMessage {
                                 role: "assistant",
-                                content,
+                                content: if content.is_empty() && !tool_calls.is_empty() {
+                                    None
+                                } else {
+                                    Some(content)
+                                },
                                 tool_calls,
                             },
                             finish_reason,
@@ -2942,10 +3616,10 @@ fn route_openai_chat(
                         cache_stats,
                     })
                 }
-                Err(err) => (400, json_error(&err)),
+                Err(err) => (400, openai_error(&err)),
             }
         }
-        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+        Err(err) => (400, openai_error(&format!("Invalid JSON: {}", err))),
     }
 }
 
@@ -2961,7 +3635,7 @@ fn route_openai_response(
             let model = resolve_model(payload.model.as_deref(), model_ids);
             let messages = match parse_responses_input(payload.input.as_ref()) {
                 Ok(messages) => messages,
-                Err(err) => return (400, json_error(&err)),
+                Err(err) => return (400, openai_error(&err)),
             };
             let max_tokens = payload.max_output_tokens.or(payload.max_completion_tokens);
             let mut generation = apply_generation_overrides(
@@ -2985,6 +3659,8 @@ fn route_openai_response(
                 .and_then(|text| text.format.as_ref())
                 .or(payload.response_format.as_ref());
             apply_response_format_hint(&mut generation, format_hint);
+            generation.tools = tool_declarations(payload.tools.as_deref());
+            apply_tool_choice(&mut generation, payload.tool_choice.as_ref());
 
             match generate_with_optional_session(
                 runner,
@@ -3000,10 +3676,10 @@ fn route_openai_response(
                         append_chat_history(options, "openai.response", &model, &messages, &result);
                     json_response(make_openai_response(&model, result))
                 }
-                Err(err) => (400, json_error(&err)),
+                Err(err) => (400, openai_error(&err)),
             }
         }
-        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+        Err(err) => (400, openai_error(&format!("Invalid JSON: {}", err))),
     }
 }
 
@@ -3012,18 +3688,23 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
     match serde_json::from_slice::<EmbeddingsRequest>(body) {
         Ok(payload) => {
             let model = resolve_model(payload.model.as_deref(), model_ids);
-            let inputs = match payload.input {
-                EmbeddingsInput::Single(input) => vec![input],
-                EmbeddingsInput::Batch(inputs) => inputs,
+            let dimensions = payload.dimensions;
+            let encoding_format = payload.encoding_format.as_deref().unwrap_or("float");
+            if !matches!(encoding_format, "float" | "base64") {
+                return (400, openai_error("encoding_format must be 'float' or 'base64'."));
+            }
+            let inputs = match embedding_input_texts(payload.input, runner) {
+                Ok(inputs) => inputs,
+                Err(err) => return (400, openai_error(&err)),
             };
             if inputs.is_empty() {
-                return (400, json_error("input must not be empty."));
+                return (400, openai_error("input must not be empty."));
             }
 
             let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
             let results = match runner.embed_batch(&input_refs) {
                 Ok(results) => results,
-                Err(err) => return (400, json_error(&err)),
+                Err(err) => return (400, openai_error(&err)),
             };
             let total_tokens = results
                 .iter()
@@ -3033,13 +3714,26 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
                 .into_iter()
                 .enumerate()
                 .map(|(index, result)| {
-                    serde_json::json!({
+                    let embedding = match resized_embedding(result.embedding, dimensions) {
+                        Ok(embedding) => embedding,
+                        Err(err) => return Err(err),
+                    };
+                    let embedding = if encoding_format == "base64" {
+                        serde_json::Value::String(base64_f32_embedding(&embedding))
+                    } else {
+                        serde_json::json!(embedding)
+                    };
+                    Ok(serde_json::json!({
                         "object": "embedding",
-                        "embedding": result.embedding,
+                        "embedding": embedding,
                         "index": index,
-                    })
+                    }))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, String>>();
+            let data = match data {
+                Ok(data) => data,
+                Err(err) => return (400, openai_error(&err)),
+            };
             let response = serde_json::json!({
                 "object": "list",
                 "data": data,
@@ -3051,10 +3745,10 @@ fn route_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16,
             });
             match serde_json::to_string(&response) {
                 Ok(body) => (200, body),
-                Err(err) => (500, json_error(&format!("Serialize error: {}", err))),
+                Err(err) => (500, openai_error(&format!("Serialize error: {}", err))),
             }
         }
-        Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
+        Err(err) => (400, openai_error(&format!("Invalid JSON: {}", err))),
     }
 }
 
@@ -3183,6 +3877,74 @@ fn route_explorer_tokenize(body: &[u8], runner: &Runner) -> (u16, String) {
         }
         Err(err) => (400, json_error(&format!("Invalid JSON: {}", err))),
     }
+}
+
+fn route_compat_tokenize(body: &[u8], runner: &Runner) -> (u16, String) {
+    let payload = match serde_json::from_slice::<CompatTokenizeRequest>(body) {
+        Ok(payload) => payload,
+        Err(err) => return (400, json_error(&format!("Invalid JSON: {}", err))),
+    };
+    let Some(content) = payload.content.or(payload.text).or(payload.input) else {
+        return (400, json_error("Missing content, text, or input."));
+    };
+    let tokens = if payload.add_bos.unwrap_or(false) {
+        runner.tokenizer().encode(&content)
+    } else {
+        runner.tokenizer().encode_without_bos(&content)
+    };
+    json_response(serde_json::json!({
+        "tokens": tokens,
+        "count": tokens.len(),
+        "max_model_len": runner.config().max_seq_len,
+    }))
+}
+
+fn route_compat_detokenize(body: &[u8], runner: &Runner) -> (u16, String) {
+    let payload = match serde_json::from_slice::<CompatDetokenizeRequest>(body) {
+        Ok(payload) => payload,
+        Err(err) => return (400, json_error(&format!("Invalid JSON: {}", err))),
+    };
+    match decode_embedding_tokens(&payload.tokens, runner) {
+        Ok(content) => json_response(serde_json::json!({"content": content, "text": content})),
+        Err(err) => (400, json_error(&err)),
+    }
+}
+
+fn route_server_properties(runner: &Runner, options: &ServeOptions) -> (u16, String) {
+    json_response(serde_json::json!({
+        "model_name": runner.model_name().unwrap_or(runner.architecture()),
+        "model_alias": runner.architecture(),
+        "model_path": options.model_catalog.as_ref().map(|catalog| catalog.loaded_model_path.as_str()).unwrap_or(""),
+        "total_slots": options.max_concurrent_connections.max(1),
+        "chat_template": runner.gguf().get_str("tokenizer.chat_template").unwrap_or(""),
+        "default_generation_settings": {
+            "n_ctx": runner.config().max_seq_len,
+            "n_predict": options.defaults.max_tokens,
+            "temperature": options.defaults.sampler.temperature,
+            "top_k": options.defaults.sampler.top_k,
+            "top_p": options.defaults.sampler.top_p,
+            "min_p": options.defaults.sampler.min_p,
+            "repeat_penalty": options.defaults.sampler.repeat_penalty,
+        }
+    }))
+}
+
+fn route_inference_info(runner: &Runner, options: &ServeOptions) -> (u16, String) {
+    json_response(serde_json::json!({
+        "model_id": runner.model_name().unwrap_or(runner.architecture()),
+        "model_sha": ollama_digest(runner),
+        "model_dtype": dominant_quantization(runner),
+        "model_device_type": if cfg!(target_os = "macos") { "metal" } else { "cpu" },
+        "model_pipeline_tag": "text-generation",
+        "max_concurrent_requests": options.max_concurrent_connections.max(1),
+        "max_best_of": 1,
+        "max_stop_sequences": 64,
+        "max_input_tokens": runner.config().max_seq_len,
+        "max_total_tokens": runner.config().max_seq_len,
+        "validation_workers": 1,
+        "waiting_served_ratio": 0.0,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 fn route_explorer_vector(body: &[u8], runner: &Runner) -> (u16, String) {
@@ -3430,10 +4192,48 @@ fn meta_value_json(value: &MetaValue) -> serde_json::Value {
     }
 }
 
+fn loaded_model_size(options: &ServeOptions) -> u64 {
+    options
+        .model_catalog
+        .as_ref()
+        .and_then(|catalog| {
+            catalog
+                .entries
+                .iter()
+                .find(|entry| entry.path == catalog.loaded_model_path)
+                .map(|entry| entry.size_bytes)
+                .or_else(|| fs::metadata(&catalog.loaded_model_path).ok().map(|meta| meta.len()))
+        })
+        .unwrap_or(0)
+}
+
+fn ollama_model_details(runner: &Runner) -> serde_json::Value {
+    let parameter_size = runner
+        .gguf()
+        .get_str("general.size_label")
+        .unwrap_or("unknown");
+    serde_json::json!({
+        "parent_model": "",
+        "format": "gguf",
+        "family": runner.architecture(),
+        "families": [runner.architecture()],
+        "parameter_size": parameter_size,
+        "quantization_level": dominant_quantization(runner),
+    })
+}
+
+fn ollama_digest(runner: &Runner) -> String {
+    format!("rustyllm-{}-{}", runner.architecture(), dominant_quantization(runner))
+}
+
 /// Handles the Ollama-compatible model listing route.
-fn route_ollama_tags(runner: &Runner, model_ids: &[String]) -> (u16, String) {
+fn route_ollama_tags(
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
     let modified_at = iso_timestamp();
-    let size = runner.gguf().tensors.len();
+    let size = loaded_model_size(options);
     let models = model_ids
         .iter()
         .map(|id| {
@@ -3442,18 +4242,88 @@ fn route_ollama_tags(runner: &Runner, model_ids: &[String]) -> (u16, String) {
                 "model": id,
                 "modified_at": modified_at,
                 "size": size,
-                "digest": format!("rusty-llm-{}", runner.architecture()),
-                "details": {
-                    "format": "gguf",
-                    "family": runner.architecture(),
-                    "families": [runner.architecture()],
-                    "parameter_size": "unknown",
-                    "quantization_level": dominant_quantization(runner),
-                }
+                "digest": ollama_digest(runner),
+                "details": ollama_model_details(runner),
             })
         })
         .collect::<Vec<_>>();
     json_response(serde_json::json!({ "models": models }))
+}
+
+fn route_ollama_ps(
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
+    let size = loaded_model_size(options);
+    let models = model_ids
+        .first()
+        .into_iter()
+        .map(|id| {
+            serde_json::json!({
+                "name": id,
+                "model": id,
+                "size": size,
+                "digest": ollama_digest(runner),
+                "details": ollama_model_details(runner),
+                "expires_at": iso_timestamp(),
+                "size_vram": 0,
+                "context_length": runner.config().max_seq_len,
+            })
+        })
+        .collect::<Vec<_>>();
+    json_response(serde_json::json!({"models": models}))
+}
+
+fn route_ollama_show(
+    body: &[u8],
+    runner: &Runner,
+    options: &ServeOptions,
+    model_ids: &[String],
+) -> (u16, String) {
+    let payload = match serde_json::from_slice::<OllamaModelRequest>(body) {
+        Ok(payload) => payload,
+        Err(err) => return (400, json_error(&format!("Invalid JSON: {}", err))),
+    };
+    let model = resolve_model(payload.model.as_deref(), model_ids);
+    let mut model_info = serde_json::Map::new();
+    let mut metadata = runner.gguf().metadata.iter().collect::<Vec<_>>();
+    metadata.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (key, value) in metadata {
+        let include = payload.verbose.unwrap_or(false)
+            || key.starts_with("general.")
+            || key.starts_with(&format!("{}.", runner.architecture()));
+        if include {
+            model_info.insert(key.clone(), meta_value_json(value));
+        }
+    }
+    let template = runner
+        .gguf()
+        .get_str("tokenizer.chat_template")
+        .unwrap_or("");
+    let license = runner.gguf().get_str("general.license").unwrap_or("");
+    let mut capabilities = vec!["embedding"];
+    if !matches!(runner.architecture(), "nomic-bert" | "nomic-embed") {
+        capabilities.insert(0, "completion");
+        capabilities.push("tools");
+    }
+    json_response(serde_json::json!({
+        "model": model,
+        "modified_at": iso_timestamp(),
+        "template": template,
+        "modelfile": "",
+        "license": license,
+        "details": ollama_model_details(runner),
+        "model_info": model_info,
+        "capabilities": capabilities,
+        "size": loaded_model_size(options),
+        "digest": ollama_digest(runner),
+        "parameters": format!(
+            "num_ctx {}\nnum_batch {}",
+            runner.config().max_seq_len,
+            options.defaults.max_tokens
+        ),
+    }))
 }
 
 /// Handles the Ollama-compatible generate route.
@@ -3476,12 +4346,18 @@ fn route_ollama_generate(
             if let Some(stop) = payload.stop {
                 generation.stop_sequences = stop.into_vec();
             }
+            let thinking = payload
+                .think
+                .as_ref()
+                .map(BoolOrString::enabled)
+                .or(payload.thinking);
             apply_thinking_overrides(
                 &mut generation,
-                payload.thinking,
+                thinking,
                 payload.thinking_prompt,
                 payload.thinking_max_tokens,
             );
+            apply_ollama_format_hint(&mut generation, payload.format.as_ref());
             let started = Instant::now();
             let mut loaded_skills = HashSet::new();
             match runner.generate_with_skill_memory(&prompt, &generation, &mut loaded_skills) {
@@ -3494,6 +4370,7 @@ fn route_ollama_generate(
                         "created_at": iso_timestamp(),
                         "response": result.text,
                         "done": true,
+                        "done_reason": "stop",
                         "context": [],
                         "total_duration": started.elapsed().as_nanos(),
                         "load_duration": 0,
@@ -3525,26 +4402,39 @@ fn route_ollama_chat(
                 Err(err) => return (400, json_error(&err)),
             };
             let mut generation = apply_ollama_options(&options.defaults, payload.options);
+            let thinking = payload
+                .think
+                .as_ref()
+                .map(BoolOrString::enabled)
+                .or(payload.thinking);
             apply_thinking_overrides(
                 &mut generation,
-                payload.thinking,
+                thinking,
                 payload.thinking_prompt,
                 payload.thinking_max_tokens,
             );
+            apply_ollama_format_hint(&mut generation, payload.format.as_ref());
+            generation.tools = tool_declarations(payload.tools.as_deref());
             let started = Instant::now();
             let mut loaded_skills = HashSet::new();
             match runner.generate_chat_with_skill_memory(&messages, &generation, &mut loaded_skills)
             {
                 Ok(result) => {
                     let _ = append_chat_history(options, "ollama.chat", &model, &messages, &result);
+                    let (content, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+                    let mut message = serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                    });
+                    if !calls.is_empty() {
+                        message["tool_calls"] = serde_json::Value::Array(ollama_tool_calls(&calls));
+                    }
                     json_response(serde_json::json!({
                         "model": model,
                         "created_at": iso_timestamp(),
-                        "message": {
-                            "role": "assistant",
-                            "content": result.text,
-                        },
+                        "message": message,
                         "done": true,
+                        "done_reason": "stop",
                         "total_duration": started.elapsed().as_nanos(),
                         "load_duration": 0,
                         "prompt_eval_count": result.stats.prompt_tokens,
@@ -3560,15 +4450,23 @@ fn route_ollama_chat(
     }
 }
 
-/// Handles the Ollama-compatible embedding routes.
-fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -> (u16, String) {
+/// Handles the Ollama-compatible embedding routes. The modern endpoint always
+/// returns a batch, while the legacy endpoint returns one flat vector.
+fn route_ollama_embeddings(
+    body: &[u8],
+    runner: &Runner,
+    model_ids: &[String],
+    modern: bool,
+) -> (u16, String) {
     match serde_json::from_slice::<OllamaEmbeddingRequest>(body) {
         Ok(payload) => {
+            let started = Instant::now();
             let model = resolve_model(payload.model.as_deref(), model_ids);
+            let dimensions = payload.dimensions;
             let inputs = if let Some(input) = payload.input {
-                match input {
-                    EmbeddingsInput::Single(text) => vec![text],
-                    EmbeddingsInput::Batch(texts) => texts,
+                match embedding_input_texts(input, runner) {
+                    Ok(inputs) => inputs,
+                    Err(err) => return (400, json_error(&err)),
                 }
             } else if let Some(prompt) = payload.prompt {
                 vec![prompt]
@@ -3578,23 +4476,44 @@ fn route_ollama_embeddings(body: &[u8], runner: &Runner, model_ids: &[String]) -
             if inputs.is_empty() {
                 return (400, json_error("input must not be empty."));
             }
+            if payload.truncate == Some(false) {
+                let max_tokens = runner.config().max_seq_len;
+                if inputs
+                    .iter()
+                    .any(|input| runner.tokenizer().encode_without_bos(input).len() > max_tokens)
+                {
+                    return (400, json_error("input exceeds the model context length."));
+                }
+            }
             let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
-            let mut embeddings = match runner.embed_batch(&input_refs) {
-                Ok(results) => results
-                    .into_iter()
-                    .map(|result| result.embedding)
-                    .collect::<Vec<_>>(),
+            let results = match runner.embed_batch(&input_refs) {
+                Ok(results) => results,
                 Err(err) => return (400, json_error(&err)),
             };
-            if embeddings.len() == 1 {
-                json_response(serde_json::json!({
-                    "model": model,
-                    "embedding": embeddings.remove(0),
-                }))
-            } else {
+            let prompt_eval_count = results.iter().map(|result| result.token_count).sum::<usize>();
+            let embeddings = match results
+                .into_iter()
+                .map(|result| resized_embedding(result.embedding, dimensions))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(embeddings) => embeddings,
+                Err(err) => return (400, json_error(&err)),
+            };
+            if modern {
                 json_response(serde_json::json!({
                     "model": model,
                     "embeddings": embeddings,
+                    "total_duration": started.elapsed().as_nanos(),
+                    "load_duration": 0,
+                    "prompt_eval_count": prompt_eval_count,
+                }))
+            } else {
+                let Some(embedding) = embeddings.into_iter().next() else {
+                    return (400, json_error("input must not be empty."));
+                };
+                json_response(serde_json::json!({
+                    "model": model,
+                    "embedding": embedding,
                 }))
             }
         }
@@ -3631,11 +4550,63 @@ fn apply_ollama_options(
 fn parse_ollama_messages(messages: Vec<OllamaMessage>) -> Result<Vec<ChatMessage>, String> {
     messages
         .into_iter()
-        .map(|message| match message.role.as_str() {
-            "system" => Ok(ChatMessage::new(ChatRole::System, message.content)),
-            "user" => Ok(ChatMessage::user(message.content)),
-            "assistant" => Ok(ChatMessage::assistant(message.content)),
-            other => Err(format!("Unsupported role: {}", other)),
+        .map(|message| {
+            let role = message.role;
+            match role.as_str() {
+                "system" => Ok(ChatMessage::new(ChatRole::System, message.content)),
+                "user" => Ok(ChatMessage::user(message.content)),
+                "assistant" => {
+                    let mut assistant = ChatMessage::assistant(message.content);
+                    assistant.tool_calls = message
+                        .tool_calls
+                        .iter()
+                        .filter_map(parse_api_tool_call)
+                        .collect();
+                    Ok(assistant)
+                }
+                "tool" => Ok(ChatMessage::tool_result(
+                    message.tool_name.unwrap_or_default(),
+                    message.content,
+                )),
+                other => Err(format!("Unsupported role: {}", other)),
+            }
+        })
+        .collect()
+}
+
+fn apply_ollama_format_hint(
+    generation: &mut GenerationOptions,
+    format: Option<&serde_json::Value>,
+) {
+    let Some(format) = format else {
+        return;
+    };
+    if format.as_str() == Some("json") {
+        apply_response_format_hint(generation, Some(&serde_json::json!({"type": "json_object"})));
+    } else if format.is_object() {
+        if format.get("type").is_some() {
+            apply_response_format_hint(generation, Some(format));
+        } else {
+            apply_response_format_hint(
+                generation,
+                Some(&serde_json::json!({"type": "json_schema", "schema": format})),
+            );
+        }
+    }
+}
+
+fn ollama_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .map(|call| {
+            let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({"value": call.arguments}));
+            serde_json::json!({
+                "function": {
+                    "name": call.name,
+                    "arguments": arguments
+                }
+            })
         })
         .collect()
 }
@@ -3893,6 +4864,92 @@ fn write_sse_event<T: Serialize, W: Write>(
     stream.flush()
 }
 
+fn write_responses_text_start<W: Write>(
+    stream: &mut W,
+    response_id: &str,
+    item_id: &str,
+    output_index: usize,
+) -> io::Result<()> {
+    write_sse_event(
+        stream,
+        "response.output_item.added",
+        &serde_json::json!({
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": item_id,
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        }),
+    )?;
+    write_sse_event(
+        stream,
+        "response.content_part.added",
+        &serde_json::json!({
+            "type": "response.content_part.added",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        }),
+    )
+}
+
+fn write_responses_text_done<W: Write>(
+    stream: &mut W,
+    response_id: &str,
+    item_id: &str,
+    output_index: usize,
+    text: &str,
+) -> io::Result<()> {
+    write_sse_event(
+        stream,
+        "response.output_text.done",
+        &serde_json::json!({
+            "type": "response.output_text.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text,
+        }),
+    )?;
+    let part = serde_json::json!({"type": "output_text", "text": text, "annotations": []});
+    write_sse_event(
+        stream,
+        "response.content_part.done",
+        &serde_json::json!({
+            "type": "response.content_part.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": 0,
+            "part": part,
+        }),
+    )?;
+    write_sse_event(
+        stream,
+        "response.output_item.done",
+        &serde_json::json!({
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": {
+                "type": "message",
+                "id": item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [part]
+            }
+        }),
+    )
+}
+
 /// Writes HTTP headers for an Ollama-style NDJSON stream.
 fn write_ndjson_response_header<W: Write>(stream: &mut W) -> io::Result<()> {
     write!(
@@ -4042,24 +5099,44 @@ fn make_openai_response(
     result: crate::runtime::GenerationResult,
 ) -> OpenAiResponsesResponse {
     let created = unix_timestamp();
-    let text = result.text;
+    let (text, calls) = crate::runtime::parse_mistral_tool_calls(&result.text);
+    let response_id = unique_timestamp();
+    let mut output = Vec::new();
+    if !text.is_empty() || calls.is_empty() {
+        output.push(serde_json::json!({
+            "type": "message",
+            "id": format!("msg-rustyllm-{}", response_id),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }]
+        }));
+    }
+    for (index, call) in calls.iter().enumerate() {
+        let call_id = if call.id.is_empty() {
+            format!("call_{:08}", index)
+        } else {
+            call.id.clone()
+        };
+        output.push(serde_json::json!({
+            "type": "function_call",
+            "id": format!("fc-rustyllm-{}-{}", response_id, index),
+            "call_id": call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "status": "completed"
+        }));
+    }
     OpenAiResponsesResponse {
         id: format!("resp-rustyllm-{}", created),
         object: "response",
         created_at: created,
         status: "completed",
         model: model.to_string(),
-        output: vec![OpenAiResponsesOutputMessage {
-            r#type: "message",
-            id: format!("msg-rustyllm-{}", created),
-            status: "completed",
-            role: "assistant",
-            content: vec![OpenAiResponsesOutputText {
-                r#type: "output_text",
-                text: text.clone(),
-                annotations: Vec::new(),
-            }],
-        }],
+        output,
         output_text: text,
         usage: OpenAiResponsesUsage {
             input_tokens: result.stats.prompt_tokens,
@@ -4068,8 +5145,100 @@ fn make_openai_response(
         },
         error: None,
         incomplete_details: None,
-        parallel_tool_calls: false,
+        parallel_tool_calls: calls.len() > 1,
     }
+}
+
+/// Converts all embedding input variants into text understood by the local
+/// encoder. Token-id arrays are decoded as one byte stream so split UTF-8
+/// characters survive the round trip.
+fn embedding_input_texts(
+    input: EmbeddingsInput,
+    runner: &Runner,
+) -> Result<Vec<String>, String> {
+    match input {
+        EmbeddingsInput::Single(text) => Ok(vec![text]),
+        EmbeddingsInput::Batch(texts) => Ok(texts),
+        EmbeddingsInput::Tokens(tokens) => Ok(vec![decode_embedding_tokens(&tokens, runner)?]),
+        EmbeddingsInput::TokenBatches(batches) => batches
+            .iter()
+            .map(|tokens| decode_embedding_tokens(tokens, runner))
+            .collect(),
+    }
+}
+
+fn decode_embedding_tokens(tokens: &[u32], runner: &Runner) -> Result<String, String> {
+    let vocab_size = runner.tokenizer().vocab_size();
+    let mut bytes = Vec::new();
+    for &token in tokens {
+        if token as usize >= vocab_size {
+            return Err(format!(
+                "input contains token id {} outside vocabulary size {}.",
+                token, vocab_size
+            ));
+        }
+        bytes.extend_from_slice(&runner.tokenizer().decode_token_bytes(token));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn resized_embedding(
+    mut embedding: Vec<f32>,
+    dimensions: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    let Some(dimensions) = dimensions else {
+        return Ok(embedding);
+    };
+    if dimensions == 0 || dimensions > embedding.len() {
+        return Err(format!(
+            "dimensions must be between 1 and {}.",
+            embedding.len()
+        ));
+    }
+    embedding.truncate(dimensions);
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut embedding {
+            *value /= norm;
+        }
+    }
+    Ok(embedding)
+}
+
+fn base64_f32_embedding(embedding: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(embedding.len() * std::mem::size_of::<f32>());
+    for value in embedding {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    base64_bytes(&bytes)
+}
+
+fn base64_bytes(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(TABLE[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 /// Converts the flexible Responses API `input` field into runtime messages.
@@ -4415,13 +5584,15 @@ fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, Str
     messages
         .into_iter()
         .map(|message| {
-            let role = message.role.clone();
-            let tool_call_id = message.tool_call_id.clone();
-            let tool_calls = message
+            let role = message.role;
+            let mut tool_calls: Vec<ToolCall> = message
                 .tool_calls
                 .as_ref()
                 .map(|calls| calls.iter().filter_map(parse_api_tool_call).collect())
                 .unwrap_or_default();
+            if let Some(call) = message.function_call.as_ref().and_then(parse_api_tool_call) {
+                tool_calls.push(call);
+            }
             let content = message.content.into_text();
             match role.as_str() {
                 "system" | "developer" => Ok(ChatMessage::new(ChatRole::System, content)),
@@ -4432,7 +5603,14 @@ fn parse_api_messages(messages: Vec<ApiMessage>) -> Result<Vec<ChatMessage>, Str
                     Ok(assistant)
                 }
                 "tool" => Ok(ChatMessage::tool_result(
-                    tool_call_id.unwrap_or_default(),
+                    message
+                        .tool_call_id
+                        .or(message.name)
+                        .unwrap_or_default(),
+                    content,
+                )),
+                "function" => Ok(ChatMessage::tool_result(
+                    message.name.unwrap_or_default(),
                     content,
                 )),
                 other => Err(format!("Unsupported role: {}", other)),
@@ -4452,6 +5630,43 @@ fn tool_declarations(tools: Option<&[serde_json::Value]>) -> Vec<String> {
         .iter()
         .map(|tool| tool.to_string())
         .collect()
+}
+
+fn apply_tool_choice(generation: &mut GenerationOptions, choice: Option<&serde_json::Value>) {
+    let Some(choice) = choice else {
+        return;
+    };
+    if choice.as_str() == Some("none") {
+        generation.tools.clear();
+        return;
+    }
+
+    let selected_name = choice
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .or_else(|| choice.get("name"))
+        .and_then(|name| name.as_str());
+    if let Some(selected_name) = selected_name {
+        generation.tools.retain(|tool| {
+            serde_json::from_str::<serde_json::Value>(tool)
+                .ok()
+                .and_then(|tool| {
+                    tool.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(|name| name.as_str())
+                        .map(|name| name == selected_name)
+                })
+                .unwrap_or(false)
+        });
+    }
+    if choice.as_str() == Some("required") || selected_name.is_some() {
+        if !generation.system_prompt.ends_with(' ') {
+            generation.system_prompt.push(' ');
+        }
+        generation
+            .system_prompt
+            .push_str("Use one of the available functions in this response.");
+    }
 }
 
 /// Converts one OpenAI `tool_calls` entry into a runtime [`ToolCall`].
@@ -4572,12 +5787,50 @@ fn unix_timestamp() -> u64 {
 
 /// Formats the current timestamp for lightweight logs.
 fn iso_timestamp() -> String {
-    format!("{}Z", unix_timestamp())
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = duration.as_secs();
+    let days = (seconds / 86_400) as i64;
+    let seconds_of_day = seconds % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    // Convert days since the Unix epoch to the proleptic Gregorian calendar.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096)
+            / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = month_index + if month_index < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z",
+        nanos = duration.subsec_nanos()
+    )
 }
 
 /// Formats an error message as a JSON object.
 fn json_error(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
+}
+
+fn openai_error(message: &str) -> String {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "param": serde_json::Value::Null,
+            "code": serde_json::Value::Null
+        }
+    })
+    .to_string()
 }
 
 #[derive(Debug)]

@@ -70,6 +70,7 @@ impl Session {
         if let Some(ssm) = &mut self.kv_cache.ssm {
             ssm.reset();
         }
+        self.kv_cache.reset_resident_stream();
         self.cached_tokens_served = 0;
         self.evaluated_tokens = 0;
     }

@@ -234,8 +234,12 @@ numeric code points and combining marks retained with their words). Normal chat
 generation also opens Qwen's default `<think>` turn. Its 24-query/4-KV-head
 attention uses a six-head grouped SIMD path, including the BF16-KV variant.
 
-This path currently covers text generation only. Vision/MMProj inputs and the
-MTP head are intentionally not advertised as supported.
+This path currently covers text generation only. When the GGUF contains the
+single embedded draft block, `--mtp-tokens 2` activates a native two-token
+speculative path with exact batched target verification on the CPU path. It
+automatically returns to ordinary decoding when measured acceptance or timing
+does not pay for the probe; without the explicit option there is no probe
+overhead. Vision/MMProj inputs remain outside this path.
 
 ### Soofi S Isar / Nemotron-H
 
@@ -559,9 +563,11 @@ Generation options:
   Q4_K/Q6_K projections and attention scans, with native SIMD fallback for
   kernels that still run on CPU. With `RUSTY_LLM_METAL=1`, `auto` enables this
   backend for Ministral 3 models.
-- `--mtp-assistant <path>` loads a smaller assistant GGUF for greedy
-  speculative decoding.
-- `--mtp-tokens <N>` sets the maximum speculative draft tokens.
+- `--mtp-assistant <path>` optionally loads a smaller assistant GGUF for greedy
+  speculative decoding. A compatible embedded Qwen draft head is discovered
+  automatically when no external assistant is attached.
+- `--mtp-tokens <N>` enables an embedded draft head when present and sets the
+  maximum speculative draft tokens.
 - `--mtp-min-accept-rate <F>` disables MTP when the acceptance rate drops below
   this threshold. The default is `0.5`.
 - `--no-mtp-adaptive` keeps the MTP draft length fixed instead of adapting it.
@@ -1186,9 +1192,10 @@ For repeatable checks, use `make bench-model-ultra MODEL=...` or
 `make kernel-bench-ultra MODEL=...`. Tune the aggressive routing thresholds with
 `RUSTY_LLM_METAL_ULTRA_Q4K_MIN_ROWS`, `RUSTY_LLM_METAL_ULTRA_Q6K_MIN_ROWS`, and
 `RUSTY_LLM_METAL_ULTRA_ATTENTION_MIN_TOKENS`; all default to `512`. Metal Q4_K
-and Q6_K kernels split each 256-value quant block across a full SIMD group
-and reuse each activation slice for two output rows. Q4_K uses four rows per
-threadgroup and Q6_K uses two by default. Set
+and Q6_K kernels split each 256-value quant block across a full SIMD group.
+The decode-tuned Q4_K kernel reuses each activation slice across eight output
+rows per SIMD group and uses two SIMD groups (16 rows) per threadgroup; Q6_K
+reuses each activation slice for two rows. Set
 `RUSTY_LLM_METAL_Q4K_ROWS_PER_GROUP` or
 `RUSTY_LLM_METAL_Q6K_ROWS_PER_GROUP` to an even value in the supported range
 for hardware-specific A/B tests. Metal

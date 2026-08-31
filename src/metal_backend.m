@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include "rusty_metallib.h"
 
 typedef struct {
     uint32_t rows;
@@ -47,6 +49,7 @@ typedef struct {
     uint32_t kv_mul;
     uint32_t head_dim;
     uint32_t value_dim;
+    uint32_t apply_gate;
     uint32_t key_stride;
     uint32_t value_stride;
     uint32_t start_t;
@@ -77,6 +80,13 @@ typedef struct {
 } RustyResidualNormParams;
 
 typedef struct {
+    uint32_t vocab;
+    uint32_t recent_len;
+    uint32_t groups;
+    float repeat_penalty;
+} RustyArgmaxParams;
+
+typedef struct {
     const void *key;
     uintptr_t len;
     __strong id<MTLBuffer> buffer;
@@ -84,6 +94,7 @@ typedef struct {
 
 enum {
     RUSTY_WEIGHT_CACHE_SIZE = 8192,
+    RUSTY_ARGMAX_GROUPS = 128,
 };
 
 static id<MTLDevice> gDevice;
@@ -102,6 +113,15 @@ static id<MTLComputePipelineState> gGeluMulPipeline;
 static id<MTLComputePipelineState> gResidualRmsPipeline;
 static id<MTLComputePipelineState> gResidualAddPipeline;
 static id<MTLComputePipelineState> gRopeStorePipeline;
+static id<MTLComputePipelineState> gGreedyArgmaxPipeline;
+static id<MTLComputePipelineState> gGreedyArgmaxStage1Pipeline;
+static id<MTLComputePipelineState> gGreedyArgmaxStage2Pipeline;
+static id<MTLComputePipelineState> gQwenConvSiluPipeline;
+static id<MTLComputePipelineState> gQwenL2NormPipeline;
+static id<MTLComputePipelineState> gQwenDeltaPipeline;
+static id<MTLComputePipelineState> gQwenDeltaNormGatePipeline;
+static id<MTLComputePipelineState> gQwenAttentionNormSplitPipeline;
+static id<MTLComputePipelineState> gQwenSigmoidGatePipeline;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gWeightBuffers;
 static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *gSharedBuffers;
 static RustyWeightCacheEntry gWeightCache[RUSTY_WEIGHT_CACHE_SIZE];
@@ -136,24 +156,27 @@ static void rusty_metal_log_error(const char *step, NSError *error) {
 static NSString *const kQ4KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Q4KParams { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "inline uchar2 scale_min_k4(uint j, const device uchar* q) {\n"
 "    if (j < 4) return uchar2(q[j] & 63, q[j + 4] & 63);\n"
 "    return uchar2((q[j + 4] & 15) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4));\n"
 "}\n"
 "// Four independent eight-lane teams process four quant blocks at once.\n"
-"// A lane loads four adjacent activations and reuses them for two rows.\n"
+"// Match ggml's decode geometry: every SIMD group reuses its activation\n"
+"// registers across eight rows, and two SIMD groups cover 16 rows.\n"
 "kernel void q4k_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                       device const float* x [[buffer(1)]],\n"
 "                       device float* out [[buffer(2)]],\n"
-"                       constant Params& p [[buffer(3)]],\n"
+"                       constant Q4KParams& p [[buffer(3)]],\n"
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
-"    uint first_row = group * p.rows_per_group + sg * 2;\n"
+"    constexpr uint rows_per_simdgroup = 8;\n"
+"    uint first_row = group * p.rows_per_group + sg * rows_per_simdgroup;\n"
 "    uint block_team = lane >> 3;\n"
 "    uint value_base = (lane & 7) * 4;\n"
-"    float2 lane_sum = float2(0.0f);\n"
+"    float lane_sum[rows_per_simdgroup] = { 0.0f, 0.0f, 0.0f, 0.0f,\n"
+"                                                0.0f, 0.0f, 0.0f, 0.0f };\n"
 "    for (uint b = block_team; b < p.n_blocks; b += 4) {\n"
 "        float4 inputs_lo[4];\n"
 "        float4 inputs_hi[4];\n"
@@ -164,7 +187,7 @@ static NSString *const kQ4KSource =
 "            inputs_hi[segment] = *reinterpret_cast<const device float4*>(x + input_base + 32);\n"
 "        }\n"
 "        #pragma unroll\n"
-"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
 "            uint row = first_row + row_slot;\n"
 "            if (row >= p.rows) continue;\n"
 "            const device uchar* block = weights + row * p.row_bytes + b * 144;\n"
@@ -199,7 +222,7 @@ static NSString *const kQ4KSource =
 "        }\n"
 "    }\n"
 "    #pragma unroll\n"
-"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"    for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
 "        float total = simd_sum(lane_sum[row_slot]);\n"
 "        uint row = first_row + row_slot;\n"
 "        if (lane == 0 && row < p.rows) out[row] = total;\n"
@@ -222,10 +245,12 @@ static NSString *const kQ4KSource =
 "    uint rows = second ? pp.rows_b : pp.rows_a;\n"
 "    const device uchar* weights = second ? weights_b : weights_a;\n"
 "    device float* out = second ? out_b : out_a;\n"
-"    uint first_row = local_group * pp.rows_per_group + sg * 2;\n"
+"    constexpr uint rows_per_simdgroup = 8;\n"
+"    uint first_row = local_group * pp.rows_per_group + sg * rows_per_simdgroup;\n"
 "    uint block_team = lane >> 3;\n"
 "    uint value_base = (lane & 7) * 4;\n"
-"    float2 lane_sum = float2(0.0f);\n"
+"    float lane_sum[rows_per_simdgroup] = { 0.0f, 0.0f, 0.0f, 0.0f,\n"
+"                                                0.0f, 0.0f, 0.0f, 0.0f };\n"
 "    for (uint b = block_team; b < pp.n_blocks; b += 4) {\n"
 "        float4 inputs_lo[4];\n"
 "        float4 inputs_hi[4];\n"
@@ -236,7 +261,7 @@ static NSString *const kQ4KSource =
 "            inputs_hi[segment] = *reinterpret_cast<const device float4*>(x + input_base + 32);\n"
 "        }\n"
 "        #pragma unroll\n"
-"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
 "            uint row = first_row + row_slot;\n"
 "            if (row >= rows) continue;\n"
 "            const device uchar* block = weights + row * pp.row_bytes + b * 144;\n"
@@ -271,7 +296,7 @@ static NSString *const kQ4KSource =
 "        }\n"
 "    }\n"
 "    #pragma unroll\n"
-"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"    for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
 "        float total = simd_sum(lane_sum[row_slot]);\n"
 "        uint row = first_row + row_slot;\n"
 "        if (lane == 0 && row < rows) out[row] = total;\n"
@@ -281,13 +306,13 @@ static NSString *const kQ4KSource =
 static NSString *const kQ6KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Q6KParams { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "// Four independent eight-lane teams process four quant blocks at once.\n"
 "// Each lane rebuilds four adjacent values and applies them to two rows.\n"
 "kernel void q6k_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                       device const float* x [[buffer(1)]],\n"
 "                       device float* out [[buffer(2)]],\n"
-"                       constant Params& p [[buffer(3)]],\n"
+"                       constant Q6KParams& p [[buffer(3)]],\n"
 "                       uint group [[threadgroup_position_in_grid]],\n"
 "                       uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                       uint lane [[thread_index_in_simdgroup]]) {\n"
@@ -352,11 +377,11 @@ static NSString *const kQ6KSource =
 static NSString *const kQ4_0Source =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Q40Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "kernel void q4_0_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                        device const float* x [[buffer(1)]],\n"
 "                        device float* out [[buffer(2)]],\n"
-"                        constant Params& p [[buffer(3)]],\n"
+"                        constant Q40Params& p [[buffer(3)]],\n"
 "                        uint group [[threadgroup_position_in_grid]],\n"
 "                        uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                        uint lane [[thread_index_in_simdgroup]]) {\n"
@@ -387,11 +412,11 @@ static NSString *const kQ4_0Source =
 static NSString *const kQ8_0Source =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Q80Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "kernel void q8_0_matvec(device const uchar* weights [[buffer(0)]],\n"
 "                        device const float* x [[buffer(1)]],\n"
 "                        device float* out [[buffer(2)]],\n"
-"                        constant Params& p [[buffer(3)]],\n"
+"                        constant Q80Params& p [[buffer(3)]],\n"
 "                        uint group [[threadgroup_position_in_grid]],\n"
 "                        uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                        uint lane [[thread_index_in_simdgroup]]) {\n"
@@ -418,13 +443,13 @@ static NSString *const kQ8_0Source =
 static NSString *const kAttentionSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint heads; uint kv_mul; uint head_dim; uint value_dim; uint key_stride; uint value_stride; uint slot_count; uint start_t; uint end_t; uint use_sink; float scale; };\n"
+"struct ScanParams { uint heads; uint kv_mul; uint head_dim; uint value_dim; uint key_stride; uint value_stride; uint slot_count; uint start_t; uint end_t; uint use_sink; float scale; };\n"
 "kernel void attention_scan(device const float* query [[buffer(0)]],\n"
 "                           device const float* keys [[buffer(1)]],\n"
 "                           device const float* values [[buffer(2)]],\n"
 "                           device float* out [[buffer(3)]],\n"
 "                           device const float* sinks [[buffer(4)]],\n"
-"                           constant Params& p [[buffer(5)]],\n"
+"                           constant ScanParams& p [[buffer(5)]],\n"
 "                           uint head [[threadgroup_position_in_grid]],\n"
 "                           uint lane [[thread_index_in_simdgroup]]) {\n"
 "    constexpr uint MAX_LANE_VALUES = 8;\n"
@@ -494,11 +519,11 @@ static NSString *const kAttentionSource =
 static NSString *const kSiluMulSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint len; };\n"
+"struct ActivationParams { uint len; };\n"
 "kernel void silu_mul(device const float* gate [[buffer(0)]],\n"
 "                     device const float* up [[buffer(1)]],\n"
 "                     device float* out [[buffer(2)]],\n"
-"                     constant Params& p [[buffer(3)]],\n"
+"                     constant ActivationParams& p [[buffer(3)]],\n"
 "                     uint gid [[thread_position_in_grid]]) {\n"
 "    if (gid >= p.len) return;\n"
 "    float g = gate[gid];\n"
@@ -516,19 +541,24 @@ static NSString *const kResidualSource =
 "                         device float* out [[buffer(3)]],\n"
 "                         constant NormParams& p [[buffer(4)]],\n"
 "                         uint tid [[thread_index_in_threadgroup]]) {\n"
-"    threadgroup float partial[256];\n"
+"    threadgroup float partial[8];\n"
+"    uint lane = tid & 31;\n"
+"    uint sg = tid >> 5;\n"
 "    float sum = 0.0f;\n"
 "    for (uint i = tid; i < p.len; i += 256) {\n"
 "        float v = x[i] + residual[i];\n"
 "        x[i] = v;\n"
 "        sum += v * v;\n"
 "    }\n"
-"    partial[tid] = sum;\n"
+"    sum = simd_sum(sum);\n"
+"    if (lane == 0) partial[sg] = sum;\n"
 "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"    for (uint stride = 128; stride > 0; stride >>= 1) {\n"
-"        if (tid < stride) partial[tid] += partial[tid + stride];\n"
-"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        float total = lane < 8 ? partial[lane] : 0.0f;\n"
+"        total = simd_sum(total);\n"
+"        if (lane == 0) partial[0] = total;\n"
 "    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "    float scale = rsqrt(partial[0] / float(p.len) + p.eps);\n"
 "    for (uint i = tid; i < p.len; i += 256) out[i] = x[i] * weight[i] * scale;\n"
 "}\n"
@@ -583,6 +613,18 @@ static NSString *const kRopeStoreSource =
 "            k_cache[p.slot * p.kv_k_dim + i1] = r1;\n"
 "        }\n"
 "    }\n"
+"    // Partial RoPE leaves the remainder of every K head unchanged.  Those\n"
+"    // values still belong in the cache; copying only the rotated prefix\n"
+"    // makes attention incorrect from the second token onward.\n"
+"    uint rotated_dim = 2 * p.half_dim;\n"
+"    uint tail_dim = p.head_dim - rotated_dim;\n"
+"    uint tail_total = p.n_kv_heads * tail_dim;\n"
+"    if (gid < tail_total) {\n"
+"        uint h = gid / tail_dim;\n"
+"        uint d = rotated_dim + gid % tail_dim;\n"
+"        uint off = h * p.head_dim + d;\n"
+"        k_cache[p.slot * p.kv_k_dim + off] = k[off];\n"
+"    }\n"
 "    // Copy V (unrotated) into the cache slot; one thread per element.\n"
 "    if (gid < p.kv_v_dim) {\n"
 "        v_cache[p.slot * p.kv_v_dim + gid] = v[gid];\n"
@@ -595,13 +637,14 @@ static NSString *const kRopeStoreSource =
 static NSString *const kResidentAttnSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct AttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim;\n"
+"struct ResidentAttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim; uint apply_gate;\n"
 "                    uint kv_k_dim; uint kv_v_dim; uint start_t; uint end_t; float scale; };\n"
 "kernel void resident_attention(device const float* q [[buffer(0)]],\n"
 "                               device const float* k_cache [[buffer(1)]],\n"
 "                               device const float* v_cache [[buffer(2)]],\n"
 "                               device float* out [[buffer(3)]],\n"
-"                               constant AttnParams& p [[buffer(4)]],\n"
+"                               constant ResidentAttnParams& p [[buffer(4)]],\n"
+"                               device const float* gate [[buffer(5)]],\n"
 "                               uint head [[threadgroup_position_in_grid]],\n"
 "                               uint lane [[thread_index_in_simdgroup]]) {\n"
 "    if (head >= p.n_heads) return;\n"
@@ -634,7 +677,11 @@ static NSString *const kResidentAttnSource =
 "    }\n"
 "    float inv = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
 "    device float* orow = out + head * p.value_dim;\n"
-"    for (uint i = lane; i < p.value_dim; i += 32) orow[i] = osh[i] * inv;\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"        float value = osh[i] * inv;\n"
+"        if (p.apply_gate != 0) { float z = gate[head * p.value_dim + i]; value *= 1.0f / (1.0f + exp(-z)); }\n"
+"        orow[i] = value;\n"
+"    }\n"
 "}\n";
 
 // Short-context resident attention parallelized across four SIMD groups per
@@ -645,13 +692,14 @@ static NSString *const kResidentAttnSource =
 static NSString *const kResidentParallelAttnSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct AttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim;\n"
+"struct ParallelAttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim; uint apply_gate;\n"
 "                    uint kv_k_dim; uint kv_v_dim; uint start_t; uint end_t; float scale; };\n"
 "kernel void resident_parallel_attention(device const float* q [[buffer(0)]],\n"
 "                                        device const float* k_cache [[buffer(1)]],\n"
 "                                        device const float* v_cache [[buffer(2)]],\n"
 "                                        device float* out [[buffer(3)]],\n"
-"                                        constant AttnParams& p [[buffer(4)]],\n"
+"                                        constant ParallelAttnParams& p [[buffer(4)]],\n"
+"                                        device const float* gate [[buffer(5)]],\n"
 "                                        uint head [[threadgroup_position_in_grid]],\n"
 "                                        uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                                        uint lane [[thread_index_in_simdgroup]]) {\n"
@@ -704,7 +752,9 @@ static NSString *const kResidentParallelAttnSource =
 "        for (uint i = lane; i < p.value_dim; i += 32) {\n"
 "            float total = 0.0f;\n"
 "            for (uint j = 0; j < nsg; ++j) total += osh[j][i] * exp(maxsh[j] - merged_max);\n"
-"            orow[i] = total * inv;\n"
+"            float value = total * inv;\n"
+"            if (p.apply_gate != 0) { float z = gate[head * p.value_dim + i]; value *= 1.0f / (1.0f + exp(-z)); }\n"
+"            orow[i] = value;\n"
 "        }\n"
 "    }\n"
 "}\n";
@@ -715,13 +765,13 @@ static NSString *const kResidentParallelAttnSource =
 static NSString *const kResidentGroupedAttnSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct AttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim;\n"
+"struct GroupedAttnParams { uint n_heads; uint kv_mul; uint head_dim; uint value_dim; uint apply_gate;\n"
 "                    uint kv_k_dim; uint kv_v_dim; uint start_t; uint end_t; float scale; };\n"
 "kernel void resident_gqa4_attention(device const float* q [[buffer(0)]],\n"
 "                                    device const float* k_cache [[buffer(1)]],\n"
 "                                    device const float* v_cache [[buffer(2)]],\n"
 "                                    device float* out [[buffer(3)]],\n"
-"                                    constant AttnParams& p [[buffer(4)]],\n"
+"                                    constant GroupedAttnParams& p [[buffer(4)]],\n"
 "                                    uint kv_head [[threadgroup_position_in_grid]],\n"
 "                                    uint sg [[simdgroup_index_in_threadgroup]],\n"
 "                                    uint lane [[thread_index_in_simdgroup]]) {\n"
@@ -764,6 +814,289 @@ static NSString *const kResidentGroupedAttnSource =
 "    for (uint i = lane; i < p.value_dim; i += 32) orow[i] = osh[sg][i] * inv;\n"
 "}\n";
 
+// Applies the exact greedy repetition penalty and reduces the vocabulary to a
+// single token on-device. Equal logits select the lower token id.
+static NSString *const kGreedyArgmaxSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct GreedyParams { uint vocab; uint recent_len; uint groups; float repeat_penalty; };\n"
+"kernel void greedy_argmax(device const float* logits [[buffer(0)]],\n"
+"                          device const uint* recent [[buffer(1)]],\n"
+"                          device uint* selected [[buffer(2)]],\n"
+"                          constant GreedyParams& p [[buffer(3)]],\n"
+"                          uint tid [[thread_index_in_threadgroup]],\n"
+"                          uint lane [[thread_index_in_simdgroup]],\n"
+"                          uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+"    float best = -INFINITY;\n"
+"    uint best_id = 0;\n"
+"    for (uint token = tid; token < p.vocab; token += 256) {\n"
+"        float value = logits[token];\n"
+"        if (!isfinite(value)) value = -INFINITY;\n"
+"        if (p.repeat_penalty != 1.0f) {\n"
+"            for (uint r = 0; r < p.recent_len; ++r) {\n"
+"                if (recent[r] == token) {\n"
+"                    value = value > 0.0f ? value / p.repeat_penalty : value * p.repeat_penalty;\n"
+"                }\n"
+"            }\n"
+"        }\n"
+"        if (value > best || (value == best && token < best_id)) { best = value; best_id = token; }\n"
+"    }\n"
+"    for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"        float other = simd_shuffle_down(best, delta);\n"
+"        uint other_id = simd_shuffle_down(best_id, delta);\n"
+"        if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"    }\n"
+"    threadgroup float group_value[8];\n"
+"    threadgroup uint group_id[8];\n"
+"    if (lane == 0) { group_value[sg] = best; group_id[sg] = best_id; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        best = lane < 8 ? group_value[lane] : -INFINITY;\n"
+"        best_id = lane < 8 ? group_id[lane] : 0xffffffffu;\n"
+"        for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"            float other = simd_shuffle_down(best, delta);\n"
+"            uint other_id = simd_shuffle_down(best_id, delta);\n"
+"            if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"        }\n"
+"        if (lane == 0) selected[0] = best_id;\n"
+"    }\n"
+"}\n"
+"kernel void greedy_argmax_stage1(device const float* logits [[buffer(0)]],\n"
+"                                 device const uint* recent [[buffer(1)]],\n"
+"                                 device float* partial_value [[buffer(2)]],\n"
+"                                 device uint* partial_id [[buffer(3)]],\n"
+"                                 constant GreedyParams& p [[buffer(4)]],\n"
+"                                 uint group [[threadgroup_position_in_grid]],\n"
+"                                 uint tid [[thread_index_in_threadgroup]],\n"
+"                                 uint lane [[thread_index_in_simdgroup]],\n"
+"                                 uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+"    float best = -INFINITY;\n"
+"    uint best_id = 0xffffffffu;\n"
+"    uint stride = p.groups * 256;\n"
+"    for (uint token = group * 256 + tid; token < p.vocab; token += stride) {\n"
+"        float value = logits[token];\n"
+"        if (!isfinite(value)) value = -INFINITY;\n"
+"        if (p.repeat_penalty != 1.0f) {\n"
+"            for (uint r = 0; r < p.recent_len; ++r) {\n"
+"                if (recent[r] == token) value = value > 0.0f ? value / p.repeat_penalty : value * p.repeat_penalty;\n"
+"            }\n"
+"        }\n"
+"        if (value > best || (value == best && token < best_id)) { best = value; best_id = token; }\n"
+"    }\n"
+"    for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"        float other = simd_shuffle_down(best, delta);\n"
+"        uint other_id = simd_shuffle_down(best_id, delta);\n"
+"        if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"    }\n"
+"    threadgroup float group_value[8];\n"
+"    threadgroup uint group_id[8];\n"
+"    if (lane == 0) { group_value[sg] = best; group_id[sg] = best_id; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        best = lane < 8 ? group_value[lane] : -INFINITY;\n"
+"        best_id = lane < 8 ? group_id[lane] : 0xffffffffu;\n"
+"        for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"            float other = simd_shuffle_down(best, delta);\n"
+"            uint other_id = simd_shuffle_down(best_id, delta);\n"
+"            if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"        }\n"
+"        if (lane == 0) { partial_value[group] = best; partial_id[group] = best_id; }\n"
+"    }\n"
+"}\n"
+"kernel void greedy_argmax_stage2(device const float* partial_value [[buffer(0)]],\n"
+"                                 device const uint* partial_id [[buffer(1)]],\n"
+"                                 device uint* selected [[buffer(2)]],\n"
+"                                 constant GreedyParams& p [[buffer(3)]],\n"
+"                                 uint tid [[thread_index_in_threadgroup]],\n"
+"                                 uint lane [[thread_index_in_simdgroup]],\n"
+"                                 uint sg [[simdgroup_index_in_threadgroup]]) {\n"
+"    float best = -INFINITY;\n"
+"    uint best_id = 0xffffffffu;\n"
+"    for (uint i = tid; i < p.groups; i += 256) {\n"
+"        float value = partial_value[i];\n"
+"        uint token = partial_id[i];\n"
+"        if (value > best || (value == best && token < best_id)) { best = value; best_id = token; }\n"
+"    }\n"
+"    for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"        float other = simd_shuffle_down(best, delta);\n"
+"        uint other_id = simd_shuffle_down(best_id, delta);\n"
+"        if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"    }\n"
+"    threadgroup float group_value[8];\n"
+"    threadgroup uint group_id[8];\n"
+"    if (lane == 0) { group_value[sg] = best; group_id[sg] = best_id; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        best = lane < 8 ? group_value[lane] : -INFINITY;\n"
+"        best_id = lane < 8 ? group_id[lane] : 0xffffffffu;\n"
+"        for (ushort delta = 16; delta > 0; delta >>= 1) {\n"
+"            float other = simd_shuffle_down(best, delta);\n"
+"            uint other_id = simd_shuffle_down(best_id, delta);\n"
+"            if (other > best || (other == best && other_id < best_id)) { best = other; best_id = other_id; }\n"
+"        }\n"
+"        if (lane == 0) selected[0] = best_id;\n"
+"    }\n"
+"}\n";
+
+// Qwen3.5/Qwen3.8 resident-only elementwise and recurrent kernels.  All large
+// projections continue to use the shared Q4_K/Q6_K kernels above; these small
+// kernels keep the hybrid block's activations and recurrent state on-device so
+// the complete 64-layer graph can be encoded in one command buffer.
+static NSString *const kQwenResidentSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct QwenConvParams { uint conv_dim; uint d_conv; uint value_heads; uint key_heads; uint head_dim; float eps; };\n"
+"struct QwenNormParams { uint heads; uint head_dim; float eps; };\n"
+"struct QwenDeltaParams { uint value_heads; uint key_heads; uint head_dim; };\n"
+"struct QwenAttentionNormParams { uint query_heads; uint key_heads; uint head_dim; float eps; };\n"
+"struct QwenUnaryParams { uint len; };\n"
+"kernel void qwen_conv_silu(device float* qkv [[buffer(0)]],\n"
+"                            device const float* conv_w [[buffer(1)]],\n"
+"                            device float* history [[buffer(2)]],\n"
+"                            constant QwenConvParams& p [[buffer(3)]],\n"
+"                            device float* alpha [[buffer(4)]],\n"
+"                            device float* beta [[buffer(5)]],\n"
+"                            device const float* a [[buffer(6)]],\n"
+"                            device const float* dt_bias [[buffer(7)]],\n"
+"                            uint group [[threadgroup_position_in_grid]],\n"
+"                            uint lane [[thread_index_in_simdgroup]]) {\n"
+"    uint head_count = 2 * p.key_heads + p.value_heads;\n"
+"    if (group >= head_count || p.head_dim != 128 || p.d_conv < 2) return;\n"
+"    uint history_len = p.d_conv - 1;\n"
+"    float values[4];\n"
+"    float sum = 0.0f;\n"
+"    #pragma unroll\n"
+"    for (uint j = 0; j < 4; ++j) {\n"
+"        uint gid = group * p.head_dim + lane + j * 32;\n"
+"        uint hbase = gid * history_len;\n"
+"        uint wbase = gid * p.d_conv;\n"
+"        float current = qkv[gid];\n"
+"        float value = current * conv_w[wbase + history_len];\n"
+"        for (uint i = 0; i < history_len; ++i) value += history[hbase + i] * conv_w[wbase + i];\n"
+"        for (uint i = 1; i < history_len; ++i) history[hbase + i - 1] = history[hbase + i];\n"
+"        history[hbase + history_len - 1] = current;\n"
+"        value = value / (1.0f + exp(-value));\n"
+"        values[j] = value;\n"
+"        sum += value * value;\n"
+"    }\n"
+"    float denom = group < 2 * p.key_heads ? max(sqrt(simd_sum(sum)), p.eps) : 1.0f;\n"
+"    #pragma unroll\n"
+"    for (uint j = 0; j < 4; ++j) qkv[group * p.head_dim + lane + j * 32] = values[j] / denom;\n"
+"    if (lane == 0 && group < p.value_heads) {\n"
+"        float raw_alpha = alpha[group] + dt_bias[group];\n"
+"        float step = raw_alpha > 20.0f ? raw_alpha : log(1.0f + exp(raw_alpha));\n"
+"        alpha[group] = exp(a[group] * step);\n"
+"        beta[group] = 1.0f / (1.0f + exp(-beta[group]));\n"
+"    }\n"
+"}\n"
+"kernel void qwen_l2_norm_qk(device float* qkv [[buffer(0)]],\n"
+"                            constant QwenNormParams& p [[buffer(1)]],\n"
+"                            uint group [[threadgroup_position_in_grid]],\n"
+"                            uint tid [[thread_index_in_threadgroup]]) {\n"
+"    if (group >= 2 * p.heads) return;\n"
+"    uint head = group % p.heads;\n"
+"    uint base = head * p.head_dim + (group >= p.heads ? p.heads * p.head_dim : 0);\n"
+"    float sum = 0.0f;\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) { float v = qkv[base + i]; sum += v * v; }\n"
+"    float denom = max(sqrt(simd_sum(sum)), p.eps);\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) qkv[base + i] /= denom;\n"
+"}\n"
+"kernel void qwen_delta_step(device const float* qkv [[buffer(0)]],\n"
+"                            device const float* alpha_in [[buffer(1)]],\n"
+"                            device const float* beta_in [[buffer(2)]],\n"
+"                            device float* state [[buffer(3)]],\n"
+"                            device float* out [[buffer(4)]],\n"
+"                            constant QwenDeltaParams& p [[buffer(5)]],\n"
+"                            uint2 group [[threadgroup_position_in_grid]],\n"
+"                            uint2 tid [[thread_position_in_threadgroup]]) {\n"
+"    uint value_head = group.y;\n"
+"    if (value_head >= p.value_heads) return;\n"
+"    constexpr uint values_per_lane = 4;\n"
+"    uint lane = tid.x;\n"
+"    uint row = group.x * 4 + tid.y;\n"
+"    if (row >= p.head_dim) return;\n"
+"    uint key_head = value_head % p.key_heads;\n"
+"    uint key_dim = p.key_heads * p.head_dim;\n"
+"    const device float* q = qkv + key_head * p.head_dim;\n"
+"    const device float* k = qkv + key_dim + key_head * p.head_dim;\n"
+"    const device float* v = qkv + 2 * key_dim + value_head * p.head_dim;\n"
+"    float decay = alpha_in[value_head];\n"
+"    float beta = beta_in[value_head];\n"
+"    float qscale = rsqrt(float(p.head_dim));\n"
+"    uint state_base = (value_head * p.head_dim + row) * p.head_dim;\n"
+"    uint col_base = lane * values_per_lane;\n"
+"    float values[values_per_lane];\n"
+"    float predicted_part = 0.0f;\n"
+"    #pragma unroll\n"
+"    for (uint j = 0; j < values_per_lane; ++j) {\n"
+"        uint col = col_base + j;\n"
+"        values[j] = state[state_base + col] * decay;\n"
+"        predicted_part += values[j] * k[col];\n"
+"    }\n"
+"    float predicted = simd_sum(predicted_part);\n"
+"    float delta = (v[row] - predicted) * beta;\n"
+"    float projected_part = 0.0f;\n"
+"    #pragma unroll\n"
+"    for (uint j = 0; j < values_per_lane; ++j) {\n"
+"        uint col = col_base + j;\n"
+"        float updated = values[j] + delta * k[col];\n"
+"        state[state_base + col] = updated;\n"
+"        projected_part += updated * q[col];\n"
+"    }\n"
+"    float projected = simd_sum(projected_part) * qscale;\n"
+"    if (lane == 0) out[value_head * p.head_dim + row] = projected;\n"
+"}\n"
+"kernel void qwen_delta_norm_gate(device const float* values [[buffer(0)]],\n"
+"                                 device const float* gate [[buffer(1)]],\n"
+"                                 device const float* norm [[buffer(2)]],\n"
+"                                 device float* out [[buffer(3)]],\n"
+"                                 constant QwenNormParams& p [[buffer(4)]],\n"
+"                                 uint head [[threadgroup_position_in_grid]],\n"
+"                                 uint tid [[thread_index_in_threadgroup]]) {\n"
+"    if (head >= p.heads) return;\n"
+"    uint base = head * p.head_dim;\n"
+"    float sum = 0.0f;\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) { float v = values[base + i]; sum += v * v; }\n"
+"    float scale = rsqrt(simd_sum(sum) / float(p.head_dim) + p.eps);\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) {\n"
+"        float z = gate[base + i];\n"
+"        out[base + i] = values[base + i] * scale * norm[i] * (z / (1.0f + exp(-z)));\n"
+"    }\n"
+"}\n"
+"kernel void qwen_attention_norm_split(device const float* joint [[buffer(0)]],\n"
+"                                      device float* keys [[buffer(1)]],\n"
+"                                      device const float* q_norm [[buffer(2)]],\n"
+"                                      device const float* k_norm [[buffer(3)]],\n"
+"                                      device float* queries [[buffer(4)]],\n"
+"                                      device float* gates [[buffer(5)]],\n"
+"                                      constant QwenAttentionNormParams& p [[buffer(6)]],\n"
+"                                      uint group [[threadgroup_position_in_grid]],\n"
+"                                      uint tid [[thread_index_in_threadgroup]]) {\n"
+"    if (group >= p.query_heads + p.key_heads) return;\n"
+"    bool is_query = group < p.query_heads;\n"
+"    uint head = is_query ? group : group - p.query_heads;\n"
+"    uint base = head * p.head_dim;\n"
+"    const device float* src = is_query ? joint + head * 2 * p.head_dim : keys + base;\n"
+"    float sum = 0.0f;\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) { float v = src[i]; sum += v * v; }\n"
+"    float scale = rsqrt(simd_sum(sum) / float(p.head_dim) + p.eps);\n"
+"    for (uint i = tid; i < p.head_dim; i += 32) {\n"
+"        if (is_query) {\n"
+"            queries[base + i] = src[i] * scale * q_norm[i];\n"
+"            gates[base + i] = src[p.head_dim + i];\n"
+"        } else {\n"
+"            keys[base + i] = src[i] * scale * k_norm[i];\n"
+"        }\n"
+"    }\n"
+"}\n"
+"kernel void qwen_sigmoid_gate(device float* values [[buffer(0)]],\n"
+"                              device const float* gate [[buffer(1)]],\n"
+"                              constant QwenUnaryParams& p [[buffer(2)]],\n"
+"                              uint gid [[thread_position_in_grid]]) {\n"
+"    if (gid >= p.len) return;\n"
+"    values[gid] *= 1.0f / (1.0f + exp(-gate[gid]));\n"
+"}\n";
+
 static BOOL rusty_metal_init(void) {
     static dispatch_once_t once;
     static BOOL ok = NO;
@@ -776,9 +1109,45 @@ static BOOL rusty_metal_init(void) {
         NSError *error = nil;
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         options.fastMathEnabled = YES;
-        id<MTLLibrary> library = [gDevice newLibraryWithSource:kQ4KSource options:options error:&error];
+        NSArray<NSString *> *sources = @[
+            kQ4KSource,
+            kQ6KSource,
+            kQ4_0Source,
+            kQ8_0Source,
+            kAttentionSource,
+            kSiluMulSource,
+            kResidualSource,
+            kRopeStoreSource,
+            kResidentAttnSource,
+            kResidentParallelAttnSource,
+            kResidentGroupedAttnSource,
+            kGreedyArgmaxSource,
+            kQwenResidentSource,
+        ];
+        NSMutableString *combined_source = [[NSMutableString alloc] init];
+        for (NSString *source in sources) {
+            [combined_source appendString:source];
+            [combined_source appendString:@"\n"];
+        }
+        id<MTLLibrary> library = nil;
+        if (rusty_precompiled_metallib_len > 0) {
+            dispatch_data_t library_data = dispatch_data_create(
+                rusty_precompiled_metallib,
+                rusty_precompiled_metallib_len,
+                dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                ^{}
+            );
+            library = [gDevice newLibraryWithData:library_data error:&error];
+            if (!library) {
+                rusty_metal_log_error("load precompiled kernel library", error);
+                error = nil;
+            }
+        }
         if (!library) {
-            rusty_metal_log_error("compile q4k library", error);
+            library = [gDevice newLibraryWithSource:combined_source options:options error:&error];
+        }
+        if (!library) {
+            rusty_metal_log_error("compile combined kernel library", error);
             return;
         }
         id<MTLFunction> function = [library newFunctionWithName:@"q4k_matvec"];
@@ -801,12 +1170,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q4k pair pipeline", error);
             return;
         }
-        id<MTLLibrary> q6_library = [gDevice newLibraryWithSource:kQ6KSource options:options error:&error];
-        if (!q6_library) {
-            rusty_metal_log_error("compile q6k library", error);
-            return;
-        }
-        id<MTLFunction> q6_function = [q6_library newFunctionWithName:@"q6k_matvec"];
+        id<MTLFunction> q6_function = [library newFunctionWithName:@"q6k_matvec"];
         if (!q6_function) {
             rusty_metal_log_error("load q6k function", nil);
             return;
@@ -816,12 +1180,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q6k pipeline", error);
             return;
         }
-        id<MTLLibrary> q4_0_library = [gDevice newLibraryWithSource:kQ4_0Source options:options error:&error];
-        if (!q4_0_library) {
-            rusty_metal_log_error("compile q4_0 library", error);
-            return;
-        }
-        id<MTLFunction> q4_0_function = [q4_0_library newFunctionWithName:@"q4_0_matvec"];
+        id<MTLFunction> q4_0_function = [library newFunctionWithName:@"q4_0_matvec"];
         if (!q4_0_function) {
             rusty_metal_log_error("load q4_0 function", nil);
             return;
@@ -831,12 +1190,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q4_0 pipeline", error);
             return;
         }
-        id<MTLLibrary> q8_0_library = [gDevice newLibraryWithSource:kQ8_0Source options:options error:&error];
-        if (!q8_0_library) {
-            rusty_metal_log_error("compile q8_0 library", error);
-            return;
-        }
-        id<MTLFunction> q8_0_function = [q8_0_library newFunctionWithName:@"q8_0_matvec"];
+        id<MTLFunction> q8_0_function = [library newFunctionWithName:@"q8_0_matvec"];
         if (!q8_0_function) {
             rusty_metal_log_error("load q8_0 function", nil);
             return;
@@ -846,12 +1200,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q8_0 pipeline", error);
             return;
         }
-        id<MTLLibrary> attention_library = [gDevice newLibraryWithSource:kAttentionSource options:options error:&error];
-        if (!attention_library) {
-            rusty_metal_log_error("compile attention library", error);
-            return;
-        }
-        id<MTLFunction> attention_function = [attention_library newFunctionWithName:@"attention_scan"];
+        id<MTLFunction> attention_function = [library newFunctionWithName:@"attention_scan"];
         if (!attention_function) {
             rusty_metal_log_error("load attention function", nil);
             return;
@@ -861,12 +1210,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create attention pipeline", error);
             return;
         }
-        id<MTLLibrary> resident_attention_library = [gDevice newLibraryWithSource:kResidentAttnSource options:options error:&error];
-        if (!resident_attention_library) {
-            rusty_metal_log_error("compile resident attention library", error);
-            return;
-        }
-        id<MTLFunction> resident_attention_function = [resident_attention_library newFunctionWithName:@"resident_attention"];
+        id<MTLFunction> resident_attention_function = [library newFunctionWithName:@"resident_attention"];
         if (!resident_attention_function) {
             rusty_metal_log_error("load resident attention function", nil);
             return;
@@ -876,12 +1220,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create resident attention pipeline", error);
             return;
         }
-        id<MTLLibrary> parallel_attention_library = [gDevice newLibraryWithSource:kResidentParallelAttnSource options:options error:&error];
-        if (!parallel_attention_library) {
-            rusty_metal_log_error("compile resident parallel attention library", error);
-            return;
-        }
-        id<MTLFunction> parallel_attention_function = [parallel_attention_library newFunctionWithName:@"resident_parallel_attention"];
+        id<MTLFunction> parallel_attention_function = [library newFunctionWithName:@"resident_parallel_attention"];
         if (!parallel_attention_function) {
             rusty_metal_log_error("load resident parallel attention function", nil);
             return;
@@ -891,12 +1230,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create resident parallel attention pipeline", error);
             return;
         }
-        id<MTLLibrary> grouped_attention_library = [gDevice newLibraryWithSource:kResidentGroupedAttnSource options:options error:&error];
-        if (!grouped_attention_library) {
-            rusty_metal_log_error("compile resident grouped attention library", error);
-            return;
-        }
-        id<MTLFunction> grouped_attention_function = [grouped_attention_library newFunctionWithName:@"resident_gqa4_attention"];
+        id<MTLFunction> grouped_attention_function = [library newFunctionWithName:@"resident_gqa4_attention"];
         if (!grouped_attention_function) {
             rusty_metal_log_error("load resident grouped attention function", nil);
             return;
@@ -906,12 +1240,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create resident grouped attention pipeline", error);
             return;
         }
-        id<MTLLibrary> silu_library = [gDevice newLibraryWithSource:kSiluMulSource options:options error:&error];
-        if (!silu_library) {
-            rusty_metal_log_error("compile silu_mul library", error);
-            return;
-        }
-        id<MTLFunction> silu_function = [silu_library newFunctionWithName:@"silu_mul"];
+        id<MTLFunction> silu_function = [library newFunctionWithName:@"silu_mul"];
         if (!silu_function) {
             rusty_metal_log_error("load silu_mul function", nil);
             return;
@@ -921,12 +1250,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create silu_mul pipeline", error);
             return;
         }
-        id<MTLLibrary> residual_library = [gDevice newLibraryWithSource:kResidualSource options:options error:&error];
-        if (!residual_library) {
-            rusty_metal_log_error("compile residual kernels", error);
-            return;
-        }
-        id<MTLFunction> residual_rms_function = [residual_library newFunctionWithName:@"residual_rms"];
+        id<MTLFunction> residual_rms_function = [library newFunctionWithName:@"residual_rms"];
         if (!residual_rms_function) {
             rusty_metal_log_error("load residual_rms function", nil);
             return;
@@ -936,7 +1260,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create residual_rms pipeline", error);
             return;
         }
-        id<MTLFunction> residual_add_function = [residual_library newFunctionWithName:@"residual_add"];
+        id<MTLFunction> residual_add_function = [library newFunctionWithName:@"residual_add"];
         if (!residual_add_function) {
             rusty_metal_log_error("load residual_add function", nil);
             return;
@@ -946,12 +1270,7 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create residual_add pipeline", error);
             return;
         }
-        id<MTLLibrary> rope_library = [gDevice newLibraryWithSource:kRopeStoreSource options:nil error:&error];
-        if (!rope_library) {
-            rusty_metal_log_error("compile rope_store library", error);
-            return;
-        }
-        id<MTLFunction> rope_function = [rope_library newFunctionWithName:@"rope_store"];
+        id<MTLFunction> rope_function = [library newFunctionWithName:@"rope_store"];
         if (!rope_function) {
             rusty_metal_log_error("load rope_store function", nil);
             return;
@@ -959,6 +1278,70 @@ static BOOL rusty_metal_init(void) {
         gRopeStorePipeline = [gDevice newComputePipelineStateWithFunction:rope_function error:&error];
         if (!gRopeStorePipeline) {
             rusty_metal_log_error("create rope_store pipeline", error);
+            return;
+        }
+        id<MTLFunction> greedy_function = [library newFunctionWithName:@"greedy_argmax"];
+        if (!greedy_function) {
+            rusty_metal_log_error("load greedy_argmax function", nil);
+            return;
+        }
+        gGreedyArgmaxPipeline = [gDevice newComputePipelineStateWithFunction:greedy_function error:&error];
+        if (!gGreedyArgmaxPipeline) {
+            rusty_metal_log_error("create greedy_argmax pipeline", error);
+            return;
+        }
+        id<MTLFunction> greedy_stage1_function = [library newFunctionWithName:@"greedy_argmax_stage1"];
+        id<MTLFunction> greedy_stage2_function = [library newFunctionWithName:@"greedy_argmax_stage2"];
+        if (!greedy_stage1_function || !greedy_stage2_function) {
+            rusty_metal_log_error("load parallel greedy argmax functions", nil);
+            return;
+        }
+        gGreedyArgmaxStage1Pipeline = [gDevice newComputePipelineStateWithFunction:greedy_stage1_function error:&error];
+        gGreedyArgmaxStage2Pipeline = [gDevice newComputePipelineStateWithFunction:greedy_stage2_function error:&error];
+        if (!gGreedyArgmaxStage1Pipeline || !gGreedyArgmaxStage2Pipeline) {
+            rusty_metal_log_error("create parallel greedy argmax pipelines", error);
+            return;
+        }
+        id<MTLFunction> qwen_conv_function = [library newFunctionWithName:@"qwen_conv_silu"];
+        id<MTLFunction> qwen_l2_function = [library newFunctionWithName:@"qwen_l2_norm_qk"];
+        id<MTLFunction> qwen_delta_function = [library newFunctionWithName:@"qwen_delta_step"];
+        id<MTLFunction> qwen_delta_norm_function = [library newFunctionWithName:@"qwen_delta_norm_gate"];
+        id<MTLFunction> qwen_attention_norm_function = [library newFunctionWithName:@"qwen_attention_norm_split"];
+        id<MTLFunction> qwen_sigmoid_function = [library newFunctionWithName:@"qwen_sigmoid_gate"];
+        if (!qwen_conv_function || !qwen_l2_function || !qwen_delta_function ||
+            !qwen_delta_norm_function || !qwen_attention_norm_function || !qwen_sigmoid_function) {
+            // An installed precompiled metallib may predate these optional
+            // Qwen kernels. Compile just this small source at runtime while
+            // retaining the precompiled pipelines for the common operators.
+            NSError *qwen_error = nil;
+            id<MTLLibrary> qwen_library = [gDevice newLibraryWithSource:kQwenResidentSource
+                                                               options:options
+                                                                 error:&qwen_error];
+            if (!qwen_library) {
+                rusty_metal_log_error("compile qwen resident library", qwen_error);
+                return;
+            }
+            qwen_conv_function = [qwen_library newFunctionWithName:@"qwen_conv_silu"];
+            qwen_l2_function = [qwen_library newFunctionWithName:@"qwen_l2_norm_qk"];
+            qwen_delta_function = [qwen_library newFunctionWithName:@"qwen_delta_step"];
+            qwen_delta_norm_function = [qwen_library newFunctionWithName:@"qwen_delta_norm_gate"];
+            qwen_attention_norm_function = [qwen_library newFunctionWithName:@"qwen_attention_norm_split"];
+            qwen_sigmoid_function = [qwen_library newFunctionWithName:@"qwen_sigmoid_gate"];
+            if (!qwen_conv_function || !qwen_l2_function || !qwen_delta_function ||
+                !qwen_delta_norm_function || !qwen_attention_norm_function || !qwen_sigmoid_function) {
+                rusty_metal_log_error("load qwen resident functions", nil);
+                return;
+            }
+        }
+        gQwenConvSiluPipeline = [gDevice newComputePipelineStateWithFunction:qwen_conv_function error:&error];
+        gQwenL2NormPipeline = [gDevice newComputePipelineStateWithFunction:qwen_l2_function error:&error];
+        gQwenDeltaPipeline = [gDevice newComputePipelineStateWithFunction:qwen_delta_function error:&error];
+        gQwenDeltaNormGatePipeline = [gDevice newComputePipelineStateWithFunction:qwen_delta_norm_function error:&error];
+        gQwenAttentionNormSplitPipeline = [gDevice newComputePipelineStateWithFunction:qwen_attention_norm_function error:&error];
+        gQwenSigmoidGatePipeline = [gDevice newComputePipelineStateWithFunction:qwen_sigmoid_function error:&error];
+        if (!gQwenConvSiluPipeline || !gQwenL2NormPipeline || !gQwenDeltaPipeline ||
+            !gQwenDeltaNormGatePipeline || !gQwenAttentionNormSplitPipeline || !gQwenSigmoidGatePipeline) {
+            rusty_metal_log_error("create qwen resident pipelines", error);
             return;
         }
         gQueue = [gDevice newCommandQueue];
@@ -1128,12 +1511,15 @@ static NSUInteger rusty_metal_q4k_rows_per_group(NSUInteger rows) {
     if (value && *value) {
         char *end = NULL;
         unsigned long parsed = strtoul(value, &end, 10);
-        if (end != value && parsed >= 2 && parsed <= 16 && (parsed % 2) == 0) {
+        if (end != value && parsed >= 8 && parsed <= 16 && (parsed % 8) == 0) {
             return (NSUInteger)parsed;
         }
     }
     (void)rows;
-    return 4;
+    // ggml's current Apple decode tuning processes eight rows in each of two
+    // SIMD groups. This both cuts the number of groups and amortizes every
+    // activation load across four times as many weight rows.
+    return 16;
 }
 
 static NSUInteger rusty_metal_q6k_rows_per_group(NSUInteger rows) {
@@ -1212,7 +1598,7 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLBuffer> out_buffer,
                                    uintptr_t rows,
                                    uintptr_t cols) {
-    // Two SIMD groups, each producing two rows.
+    // Two SIMD groups, each producing eight rows.
     const NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group((NSUInteger)rows);
     RustyQ4KParams params = {
         .rows = (uint32_t)rows,
@@ -1228,7 +1614,7 @@ static void rusty_metal_encode_q4k(id<MTLComputeCommandEncoder> encoder,
     [encoder setBuffer:out_buffer offset:0 atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-    MTLSize threads_per_group = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
+    MTLSize threads_per_group = MTLSizeMake(32 * (rows_per_group / 8), 1, 1);
     MTLSize threadgroups = MTLSizeMake(
         ((NSUInteger)rows + rows_per_group - 1) / rows_per_group,
         1,
@@ -1265,7 +1651,7 @@ static void rusty_metal_encode_q4k_pair(id<MTLComputeCommandEncoder> encoder,
     [encoder setBytes:&params length:sizeof(params) atIndex:5];
     NSUInteger groups_a = ((NSUInteger)rows_a + rows_per_group - 1) / rows_per_group;
     NSUInteger groups_b = ((NSUInteger)rows_b + rows_per_group - 1) / rows_per_group;
-    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
+    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 8), 1, 1);
     gMetalDispatches += 1;
     [encoder dispatchThreadgroups:MTLSizeMake(groups_a + groups_b, 1, 1)
             threadsPerThreadgroup:threads];
@@ -2203,6 +2589,7 @@ int rusty_metal_test_resident_attention(const float *query,
 
         RustyResidentAttentionParams p = {
             .heads = heads, .kv_mul = kv_mul, .head_dim = head_dim, .value_dim = value_dim,
+            .apply_gate = 0,
             .key_stride = key_stride, .value_stride = value_stride,
             .start_t = start_t, .end_t = end_t, .scale = scale,
         };
@@ -2214,6 +2601,7 @@ int rusty_metal_test_resident_attention(const float *query,
         [enc setBuffer:value_buffer offset:0 atIndex:2];
         [enc setBuffer:out_buffer offset:0 atIndex:3];
         [enc setBytes:&p length:sizeof(p) atIndex:4];
+        [enc setBuffer:gAttentionZeroBuffer offset:0 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(parallel ? 128 : 32, 1, 1)];
         [enc endEncoding];
@@ -2221,6 +2609,59 @@ int rusty_metal_test_resident_attention(const float *query,
         [cb waitUntilCompleted];
         if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
         memcpy(out, [out_buffer contents], out_bytes);
+        return 1;
+    }
+}
+
+int rusty_metal_test_greedy_argmax(const float *logits, uint32_t vocab,
+                                   const uint32_t *recent, uint32_t recent_len,
+                                   float repeat_penalty, uint32_t *token_out) {
+    if (!rusty_metal_init() || !logits || vocab == 0 || recent_len > 64 ||
+        (recent_len > 0 && !recent) || !token_out) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> logits_buffer = [gDevice newBufferWithBytes:logits
+            length:(NSUInteger)vocab * sizeof(float)
+            options:MTLResourceStorageModeShared];
+        uint32_t zero = 0;
+        id<MTLBuffer> recent_buffer = [gDevice newBufferWithBytes:(recent_len ? recent : &zero)
+            length:(NSUInteger)(recent_len ? recent_len : 1) * sizeof(uint32_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> token_buffer = [gDevice newBufferWithLength:sizeof(uint32_t)
+            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> partial_value = [gDevice newBufferWithLength:RUSTY_ARGMAX_GROUPS * sizeof(float)
+            options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> partial_id = [gDevice newBufferWithLength:RUSTY_ARGMAX_GROUPS * sizeof(uint32_t)
+            options:MTLResourceStorageModePrivate];
+        if (!logits_buffer || !recent_buffer || !token_buffer || !partial_value || !partial_id) return 0;
+        uint32_t groups = MIN((vocab + 255) / 256, RUSTY_ARGMAX_GROUPS);
+        RustyArgmaxParams p = {
+            .vocab = vocab,
+            .recent_len = recent_len,
+            .groups = groups,
+            .repeat_penalty = repeat_penalty,
+        };
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:gGreedyArgmaxStage1Pipeline];
+        [enc setBuffer:logits_buffer offset:0 atIndex:0];
+        [enc setBuffer:recent_buffer offset:0 atIndex:1];
+        [enc setBuffer:partial_value offset:0 atIndex:2];
+        [enc setBuffer:partial_id offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc setComputePipelineState:gGreedyArgmaxStage2Pipeline];
+        [enc setBuffer:partial_value offset:0 atIndex:0];
+        [enc setBuffer:partial_id offset:0 atIndex:1];
+        [enc setBuffer:token_buffer offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
+        *token_out = *(const uint32_t *)[token_buffer contents];
         return 1;
     }
 }
@@ -2271,6 +2712,7 @@ static ResidentLayer gRLayers[RUSTY_MAX_RESIDENT_LAYERS];
 static __strong id<MTLBuffer> gR_x, gR_xn, gR_q, gR_k, gR_v, gR_attn;
 static __strong id<MTLBuffer> gR_gate, gR_up, gR_hiddenbuf, gR_proj, gR_logits;
 static __strong id<MTLBuffer> gR_zero, gR_invfreq, gR_outnorm, gR_outw;
+static __strong id<MTLBuffer> gR_recent, gR_selected;
 
 static id<MTLBuffer> resident_alloc_shared(NSUInteger bytes) {
     return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -2341,6 +2783,23 @@ static void resident_silu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate,
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
+static void resident_greedy_argmax(id<MTLComputeCommandEncoder> enc,
+                                   uint32_t recent_len, float repeat_penalty) {
+    RustyArgmaxParams p = {
+        .vocab = gR_vocab,
+        .recent_len = recent_len,
+        .groups = 1,
+        .repeat_penalty = repeat_penalty,
+    };
+    [enc setComputePipelineState:gGreedyArgmaxPipeline];
+    [enc setBuffer:gR_logits offset:0 atIndex:0];
+    [enc setBuffer:gR_recent offset:0 atIndex:1];
+    [enc setBuffer:gR_selected offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 static void resident_rope(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
                           uint32_t pos, uint32_t slot) {
     RustyRopeParams p = {
@@ -2367,7 +2826,8 @@ static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
     uint32_t kv_mul = gR_nheads / gR_nkv;
     RustyResidentAttentionParams p = {
         .heads = gR_nheads, .kv_mul = kv_mul, .head_dim = gR_headdim,
-        .value_dim = gR_valuedim, .key_stride = gR_kdim, .value_stride = gR_vdim,
+        .value_dim = gR_valuedim, .apply_gate = 0,
+        .key_stride = gR_kdim, .value_stride = gR_vdim,
         .start_t = start_t, .end_t = end_t, .scale = scale,
     };
     // At short contexts the extra threadgroup barriers cost more than the KV
@@ -2392,6 +2852,7 @@ static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
     [enc setBuffer:L->v_cache offset:0 atIndex:2];
     [enc setBuffer:gR_attn offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc setBuffer:gAttentionZeroBuffer offset:0 atIndex:5];
     if (use_parallel) {
         [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     } else if (use_grouped_gqa) {
@@ -2429,8 +2890,10 @@ int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_h
     gR_proj = resident_alloc_private((NSUInteger)dim * sizeof(float));
     gR_logits = resident_alloc_shared((NSUInteger)vocab * sizeof(float));
     gR_zero = resident_alloc_shared((NSUInteger)dim * sizeof(float));
+    gR_recent = resident_alloc_shared(64 * sizeof(uint32_t));
+    gR_selected = resident_alloc_shared(sizeof(uint32_t));
     if (!gR_x || !gR_xn || !gR_q || !gR_k || !gR_v || !gR_attn || !gR_gate || !gR_up ||
-        !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_zero) {
+        !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_zero || !gR_recent || !gR_selected) {
         return 0;
     }
     memset([gR_zero contents], 0, (NSUInteger)dim * sizeof(float));
@@ -2482,7 +2945,7 @@ int rusty_metal_resident_set_output(const float *output_norm, const uint8_t *out
     return 1;
 }
 
-// `want_logits` == 0 runs the layer stack for its KV-cache side effects only and
+// `output_mode` == 0 runs the layer stack for its KV-cache side effects only and
 // skips the final norm plus the vocabulary projection. Prompt tokens need the
 // cache filled but throw their logits away, and that projection is the single
 // largest weight read in the model (330 MiB for a 131072-entry Q6_K vocabulary),
@@ -2491,11 +2954,18 @@ int rusty_metal_resident_set_output(const float *output_norm, const uint8_t *out
 // caller's embedding, so nothing carries over from the tail of the graph; only
 // the in-layer RoPE/attention KV writes have to happen.
 int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t start_t,
-                                int want_logits, float *logits_out) {
+                                int output_mode, float *logits_out,
+                                const uint32_t *recent, uint32_t recent_len,
+                                float repeat_penalty, uint32_t *token_out) {
     if (!gResidentReady || !x_embed || pos >= gR_storage) return 0;
-    if (want_logits && !logits_out) return 0;
+    if (output_mode == 1 && !logits_out) return 0;
+    if (output_mode == 2 && (!token_out || recent_len > 64 || (recent_len > 0 && !recent))) return 0;
+    if (output_mode < 0 || output_mode > 2) return 0;
     @autoreleasepool {
         memcpy([gR_x contents], x_embed, (NSUInteger)gR_dim * sizeof(float));
+        if (output_mode == 2 && recent_len > 0) {
+            memcpy([gR_recent contents], recent, (NSUInteger)recent_len * sizeof(uint32_t));
+        }
         uint32_t slot = pos;
         float scale = 1.0f / sqrt((float)gR_headdim);
         double encode_start = rusty_metal_now_seconds();
@@ -2534,9 +3004,12 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
             resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
             resident_matvec(enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj, L->rows[6], L->cols[6]);
         }
-        if (want_logits) {
+        if (output_mode != 0) {
             resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
             resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
+            if (output_mode == 2) {
+                resident_greedy_argmax(enc, recent_len, repeat_penalty);
+            }
         }
         [enc endEncoding];
         double encode_end = rusty_metal_now_seconds();
@@ -2544,8 +3017,587 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
         [cb waitUntilCompleted];
         rusty_metal_profile_command_buffer(cb, encode_start, encode_end);
         if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
-        if (want_logits) {
+        if (output_mode == 1) {
             memcpy(logits_out, [gR_logits contents], (NSUInteger)gR_vocab * sizeof(float));
+        } else if (output_mode == 2) {
+            *token_out = *(const uint32_t *)[gR_selected contents];
+        }
+        return 1;
+    }
+}
+
+// ─── Qwen3.5/Qwen3.8 GPU-resident hybrid decoder ───────────────────────────
+
+typedef struct {
+    uint32_t layer_type;
+    const uint8_t *w[8];
+    uintptr_t w_len[8];
+    uint32_t w_rows[8];
+    uint32_t w_cols[8];
+    uint32_t w_dt[8];
+    const float *attn_norm; uint32_t attn_norm_len;
+    const float *post_norm; uint32_t post_norm_len;
+    const float *conv_w; uint32_t conv_w_len;
+    const float *a; uint32_t a_len;
+    const float *dt_bias; uint32_t dt_bias_len;
+    const float *norm; uint32_t norm_len;
+    const float *q_norm; uint32_t q_norm_len;
+    const float *k_norm; uint32_t k_norm_len;
+} RustyQwenResidentLayerDesc;
+
+typedef struct {
+    uint32_t conv_dim, d_conv, value_heads, key_heads, head_dim;
+    float eps;
+} RustyQwenConvParams;
+typedef struct { uint32_t heads, head_dim; float eps; } RustyQwenNormParams;
+typedef struct { uint32_t value_heads, key_heads, head_dim; } RustyQwenDeltaParams;
+typedef struct { uint32_t query_heads, key_heads, head_dim; float eps; } RustyQwenAttentionNormParams;
+
+typedef struct {
+    uint32_t type;
+    __strong id<MTLBuffer> w[8];
+    NSUInteger w_offset[8];
+    uint32_t rows[8], cols[8], dt[8];
+    __strong id<MTLBuffer> attn_norm;
+    __strong id<MTLBuffer> post_norm;
+    __strong id<MTLBuffer> conv_w;
+    __strong id<MTLBuffer> a;
+    __strong id<MTLBuffer> dt_bias;
+    __strong id<MTLBuffer> norm;
+    __strong id<MTLBuffer> q_norm;
+    __strong id<MTLBuffer> k_norm;
+    __strong id<MTLBuffer> conv_state;
+    __strong id<MTLBuffer> delta_state;
+    __strong id<MTLBuffer> k_cache;
+    __strong id<MTLBuffer> v_cache;
+} QwenResidentLayer;
+
+static BOOL gQwenResidentReady;
+static uint32_t gQ_nlayers, gQ_dim, gQ_hidden, gQ_vocab, gQ_storage;
+static uint32_t gQ_nheads, gQ_nkv, gQ_headdim, gQ_rotarydim;
+static uint32_t gQ_valueheads, gQ_keyheads, gQ_statedim, gQ_dconv;
+static uint32_t gQ_qdim, gQ_kdim, gQ_vdim, gQ_attndim, gQ_conv_dim;
+static uint32_t gQ_outrows, gQ_outdt, gQ_registered_layers;
+static float gQ_eps;
+static QwenResidentLayer gQLayers[RUSTY_MAX_RESIDENT_LAYERS];
+static __strong id<MTLBuffer> gQ_x, gQ_xn, gQ_joint, gQ_q, gQ_k, gQ_v;
+static __strong id<MTLBuffer> gQ_attn, gQ_gate, gQ_up, gQ_hiddenbuf, gQ_proj;
+static __strong id<MTLBuffer> gQ_alpha, gQ_beta, gQ_logits, gQ_zero;
+static __strong id<MTLBuffer> gQ_recent, gQ_selected, gQ_argmax_value, gQ_argmax_id;
+static __strong id<MTLBuffer> gQ_invfreq, gQ_outnorm, gQ_outw;
+static NSUInteger gQ_outw_offset;
+
+// GGUF tensors are slices of a process-lifetime read-only mmap.  Wrapping the
+// encompassing VM pages avoids duplicating roughly 16 GiB of Qwen weights on
+// a 32-GiB Mac.  The returned offset points from the page-aligned Metal buffer
+// to the actual tensor start.  Fall back to the ordinary copied cache on a
+// platform that rejects a read-only no-copy mapping.
+static id<MTLBuffer> qwen_resident_weight_buffer(const uint8_t *bytes,
+                                                 uintptr_t bytes_len,
+                                                 NSUInteger *offset_out) {
+    if (!bytes || bytes_len == 0 || !offset_out) return nil;
+    if (rusty_metal_env_enabled("RUSTY_LLM_METAL_QWEN_COPY_WEIGHTS")) {
+        *offset_out = 0;
+        return rusty_metal_weight_buffer(bytes, bytes_len);
+    }
+    uintptr_t page_size = (uintptr_t)getpagesize();
+    uintptr_t address = (uintptr_t)bytes;
+    uintptr_t base = address - (address % page_size);
+    uintptr_t offset = address - base;
+    if (bytes_len > UINTPTR_MAX - offset - (page_size - 1)) return nil;
+    uintptr_t mapped_len = (offset + bytes_len + page_size - 1) / page_size * page_size;
+    id<MTLBuffer> buffer = [gDevice newBufferWithBytesNoCopy:(void *)base
+                                                     length:(NSUInteger)mapped_len
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+    if (buffer) {
+        *offset_out = (NSUInteger)offset;
+        gMetalBufferAllocations += 1;
+        return buffer;
+    }
+    buffer = rusty_metal_weight_buffer(bytes, bytes_len);
+    *offset_out = 0;
+    return buffer;
+}
+
+static void qwen_encode_matvec(id<MTLComputeCommandEncoder> enc, uint32_t dt,
+                               id<MTLBuffer> weight, NSUInteger weight_offset,
+                               id<MTLBuffer> x, id<MTLBuffer> out,
+                               uint32_t rows, uint32_t cols) {
+    NSUInteger rows_per_group = dt == 1
+        ? rusty_metal_q6k_rows_per_group(rows)
+        : rusty_metal_q4k_rows_per_group(rows);
+    RustyQ4KParams params = {
+        .rows = rows,
+        .cols = cols,
+        .row_bytes = (uint32_t)((cols / 256) * (dt == 1 ? 210 : 144)),
+        .n_blocks = cols / 256,
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [enc setComputePipelineState:dt == 1 ? gQ6KPipeline : gQ4KPipeline];
+    [enc setBuffer:weight offset:weight_offset atIndex:0];
+    [enc setBuffer:x offset:0 atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    [enc setBytes:&params length:sizeof(params) atIndex:3];
+    NSUInteger rows_per_simd = dt == 1 ? 2 : 8;
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows + rows_per_group - 1) / rows_per_group, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32 * (rows_per_group / rows_per_simd), 1, 1)];
+}
+
+static void qwen_encode_q4_pair(id<MTLComputeCommandEncoder> enc,
+                                id<MTLBuffer> weight_a, NSUInteger offset_a,
+                                id<MTLBuffer> weight_b, NSUInteger offset_b,
+                                id<MTLBuffer> x, id<MTLBuffer> out_a, id<MTLBuffer> out_b,
+                                uint32_t rows_a, uint32_t rows_b, uint32_t cols) {
+    NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group(rows_a + rows_b);
+    RustyQ4KPairParams params = {
+        .rows_a = rows_a, .rows_b = rows_b, .cols = cols,
+        .row_bytes = (uint32_t)((cols / 256) * 144), .n_blocks = cols / 256,
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [enc setComputePipelineState:gQ4KPairPipeline];
+    [enc setBuffer:weight_a offset:offset_a atIndex:0];
+    [enc setBuffer:weight_b offset:offset_b atIndex:1];
+    [enc setBuffer:x offset:0 atIndex:2];
+    [enc setBuffer:out_a offset:0 atIndex:3];
+    [enc setBuffer:out_b offset:0 atIndex:4];
+    [enc setBytes:&params length:sizeof(params) atIndex:5];
+    NSUInteger groups_a = ((NSUInteger)rows_a + rows_per_group - 1) / rows_per_group;
+    NSUInteger groups_b = ((NSUInteger)rows_b + rows_per_group - 1) / rows_per_group;
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(groups_a + groups_b, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32 * (rows_per_group / 8), 1, 1)];
+}
+
+static void qwen_encode_conv(id<MTLComputeCommandEncoder> enc, QwenResidentLayer *L) {
+    RustyQwenConvParams p = {
+        .conv_dim = gQ_conv_dim, .d_conv = gQ_dconv, .value_heads = gQ_valueheads,
+        .key_heads = gQ_keyheads, .head_dim = gQ_statedim, .eps = gQ_eps,
+    };
+    [enc setComputePipelineState:gQwenConvSiluPipeline];
+    [enc setBuffer:gQ_joint offset:0 atIndex:0];
+    [enc setBuffer:L->conv_w offset:0 atIndex:1];
+    [enc setBuffer:L->conv_state offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc setBuffer:gQ_alpha offset:0 atIndex:4];
+    [enc setBuffer:gQ_beta offset:0 atIndex:5];
+    [enc setBuffer:L->a offset:0 atIndex:6];
+    [enc setBuffer:L->dt_bias offset:0 atIndex:7];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(2 * gQ_keyheads + gQ_valueheads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void qwen_encode_l2(id<MTLComputeCommandEncoder> enc) {
+    RustyQwenNormParams p = { .heads = gQ_keyheads, .head_dim = gQ_statedim, .eps = gQ_eps };
+    [enc setComputePipelineState:gQwenL2NormPipeline];
+    [enc setBuffer:gQ_joint offset:0 atIndex:0];
+    [enc setBytes:&p length:sizeof(p) atIndex:1];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(2 * gQ_keyheads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void qwen_encode_delta(id<MTLComputeCommandEncoder> enc, QwenResidentLayer *L) {
+    RustyQwenDeltaParams p = {
+        .value_heads = gQ_valueheads, .key_heads = gQ_keyheads, .head_dim = gQ_statedim,
+    };
+    [enc setComputePipelineState:gQwenDeltaPipeline];
+    [enc setBuffer:gQ_joint offset:0 atIndex:0];
+    [enc setBuffer:gQ_alpha offset:0 atIndex:1];
+    [enc setBuffer:gQ_beta offset:0 atIndex:2];
+    [enc setBuffer:L->delta_state offset:0 atIndex:3];
+    [enc setBuffer:gQ_attn offset:0 atIndex:4];
+    [enc setBytes:&p length:sizeof(p) atIndex:5];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake((gQ_statedim + 3) / 4, gQ_valueheads, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+}
+
+static void qwen_encode_delta_norm_gate(id<MTLComputeCommandEncoder> enc,
+                                         QwenResidentLayer *L) {
+    RustyQwenNormParams p = { .heads = gQ_valueheads, .head_dim = gQ_statedim, .eps = gQ_eps };
+    [enc setComputePipelineState:gQwenDeltaNormGatePipeline];
+    [enc setBuffer:gQ_attn offset:0 atIndex:0];
+    [enc setBuffer:gQ_gate offset:0 atIndex:1];
+    [enc setBuffer:L->norm offset:0 atIndex:2];
+    [enc setBuffer:gQ_hiddenbuf offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(gQ_valueheads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void qwen_encode_attention_norm(id<MTLComputeCommandEncoder> enc,
+                                        QwenResidentLayer *L) {
+    RustyQwenAttentionNormParams p = {
+        .query_heads = gQ_nheads, .key_heads = gQ_nkv, .head_dim = gQ_headdim, .eps = gQ_eps,
+    };
+    [enc setComputePipelineState:gQwenAttentionNormSplitPipeline];
+    [enc setBuffer:gQ_joint offset:0 atIndex:0];
+    [enc setBuffer:gQ_k offset:0 atIndex:1];
+    [enc setBuffer:L->q_norm offset:0 atIndex:2];
+    [enc setBuffer:L->k_norm offset:0 atIndex:3];
+    [enc setBuffer:gQ_q offset:0 atIndex:4];
+    [enc setBuffer:gQ_gate offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(gQ_nheads + gQ_nkv, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+}
+
+static void qwen_encode_rope_store(id<MTLComputeCommandEncoder> enc,
+                                    QwenResidentLayer *L, uint32_t pos) {
+    RustyRopeParams p = {
+        .pos = pos, .head_dim = gQ_headdim, .half_dim = gQ_rotarydim / 2,
+        .n_heads = gQ_nheads, .n_kv_heads = gQ_nkv, .value_dim = gQ_headdim,
+        .kv_k_dim = gQ_kdim, .kv_v_dim = gQ_vdim, .slot = pos, .neox = 1,
+    };
+    [enc setComputePipelineState:gRopeStorePipeline];
+    [enc setBuffer:gQ_q offset:0 atIndex:0];
+    [enc setBuffer:gQ_k offset:0 atIndex:1];
+    [enc setBuffer:gQ_v offset:0 atIndex:2];
+    [enc setBuffer:gQ_invfreq offset:0 atIndex:3];
+    [enc setBuffer:L->k_cache offset:0 atIndex:4];
+    [enc setBuffer:L->v_cache offset:0 atIndex:5];
+    [enc setBytes:&p length:sizeof(p) atIndex:6];
+    uint32_t work = gQ_nheads * (gQ_rotarydim / 2);
+    if (gQ_vdim > work) work = gQ_vdim;
+    gMetalDispatches += 1;
+    [enc dispatchThreads:MTLSizeMake(work, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void qwen_encode_attention(id<MTLComputeCommandEncoder> enc,
+                                   QwenResidentLayer *L, uint32_t start_t, uint32_t end_t) {
+    RustyResidentAttentionParams p = {
+        .heads = gQ_nheads, .kv_mul = gQ_nheads / gQ_nkv,
+        .head_dim = gQ_headdim, .value_dim = gQ_headdim, .apply_gate = 1,
+        .key_stride = gQ_kdim, .value_stride = gQ_vdim,
+        .start_t = start_t, .end_t = end_t,
+        .scale = 1.0f / sqrt((float)gQ_headdim),
+    };
+    uint32_t context_tokens = end_t - start_t + 1;
+    BOOL use_parallel = gResidentParallelAttentionPipeline != nil && context_tokens >= 16;
+    [enc setComputePipelineState:use_parallel ? gResidentParallelAttentionPipeline : gResidentAttentionPipeline];
+    [enc setBuffer:gQ_q offset:0 atIndex:0];
+    [enc setBuffer:L->k_cache offset:0 atIndex:1];
+    [enc setBuffer:L->v_cache offset:0 atIndex:2];
+    [enc setBuffer:gQ_attn offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc setBuffer:gQ_gate offset:0 atIndex:5];
+    gMetalDispatches += 1;
+    [enc dispatchThreadgroups:MTLSizeMake(gQ_nheads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(use_parallel ? 128 : 32, 1, 1)];
+}
+
+static void qwen_encode_sigmoid_gate(id<MTLComputeCommandEncoder> enc) {
+    RustyUnaryParams p = { .len = gQ_attndim };
+    [enc setComputePipelineState:gQwenSigmoidGatePipeline];
+    [enc setBuffer:gQ_attn offset:0 atIndex:0];
+    [enc setBuffer:gQ_gate offset:0 atIndex:1];
+    [enc setBytes:&p length:sizeof(p) atIndex:2];
+    gMetalDispatches += 1;
+    [enc dispatchThreads:MTLSizeMake(gQ_attndim, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void qwen_encode_greedy(id<MTLComputeCommandEncoder> enc,
+                                uint32_t recent_len, float repeat_penalty) {
+    if (rusty_metal_env_enabled("RUSTY_LLM_METAL_QWEN_LEGACY_ARGMAX")) {
+        RustyArgmaxParams legacy = {
+            .vocab = gQ_vocab, .recent_len = recent_len, .groups = 1,
+            .repeat_penalty = repeat_penalty,
+        };
+        [enc setComputePipelineState:gGreedyArgmaxPipeline];
+        [enc setBuffer:gQ_logits offset:0 atIndex:0];
+        [enc setBuffer:gQ_recent offset:0 atIndex:1];
+        [enc setBuffer:gQ_selected offset:0 atIndex:2];
+        [enc setBytes:&legacy length:sizeof(legacy) atIndex:3];
+        gMetalDispatches += 1;
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+    }
+    uint32_t groups = MIN((gQ_vocab + 255) / 256, RUSTY_ARGMAX_GROUPS);
+    RustyArgmaxParams p = {
+        .vocab = gQ_vocab, .recent_len = recent_len, .groups = groups,
+        .repeat_penalty = repeat_penalty,
+    };
+    [enc setComputePipelineState:gGreedyArgmaxStage1Pipeline];
+    [enc setBuffer:gQ_logits offset:0 atIndex:0];
+    [enc setBuffer:gQ_recent offset:0 atIndex:1];
+    [enc setBuffer:gQ_argmax_value offset:0 atIndex:2];
+    [enc setBuffer:gQ_argmax_id offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc setComputePipelineState:gGreedyArgmaxStage2Pipeline];
+    [enc setBuffer:gQ_argmax_value offset:0 atIndex:0];
+    [enc setBuffer:gQ_argmax_id offset:0 atIndex:1];
+    [enc setBuffer:gQ_selected offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    gMetalDispatches += 2;
+}
+
+int rusty_metal_qwen_resident_configure(uint32_t n_layers, uint32_t dim,
+                                        uint32_t hidden_dim, uint32_t vocab,
+                                        uint32_t storage_len, float eps,
+                                        uint32_t n_heads, uint32_t n_kv_heads,
+                                        uint32_t head_dim, uint32_t rotary_dim,
+                                        uint32_t value_heads, uint32_t key_heads,
+                                        uint32_t state_dim, uint32_t d_conv) {
+    if (!rusty_metal_init()) return 0;
+    if (n_layers == 0 || n_layers > RUSTY_MAX_RESIDENT_LAYERS || dim == 0 || hidden_dim == 0 ||
+        vocab == 0 || storage_len == 0 || n_heads == 0 || n_kv_heads == 0 ||
+        n_heads % n_kv_heads != 0 || head_dim == 0 || head_dim > 256 ||
+        rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 ||
+        value_heads == 0 || key_heads == 0 || value_heads % key_heads != 0 ||
+        state_dim != 128 || d_conv < 2 ||
+        (dim % 256) != 0 || (hidden_dim % 256) != 0) return 0;
+    uint64_t qdim64 = (uint64_t)n_heads * head_dim;
+    uint64_t kdim64 = (uint64_t)n_kv_heads * head_dim;
+    uint64_t value_dim64 = (uint64_t)value_heads * state_dim;
+    uint64_t conv_dim64 = ((uint64_t)2 * key_heads + value_heads) * state_dim;
+    if (qdim64 > UINT32_MAX / 2 || kdim64 > UINT32_MAX ||
+        value_dim64 > UINT32_MAX || conv_dim64 > UINT32_MAX) return 0;
+
+    gQwenResidentReady = NO;
+    gQ_registered_layers = 0;
+    gQ_nlayers = n_layers; gQ_dim = dim; gQ_hidden = hidden_dim; gQ_vocab = vocab;
+    gQ_storage = storage_len; gQ_eps = eps; gQ_nheads = n_heads; gQ_nkv = n_kv_heads;
+    gQ_headdim = head_dim; gQ_rotarydim = rotary_dim; gQ_valueheads = value_heads;
+    gQ_keyheads = key_heads; gQ_statedim = state_dim; gQ_dconv = d_conv;
+    gQ_qdim = (uint32_t)qdim64; gQ_kdim = (uint32_t)kdim64;
+    gQ_vdim = (uint32_t)kdim64; gQ_attndim = (uint32_t)qdim64;
+    gQ_conv_dim = (uint32_t)conv_dim64;
+    uint32_t joint_len = MAX(gQ_conv_dim, 2 * gQ_qdim);
+    uint32_t value_dim = (uint32_t)value_dim64;
+
+    gQ_x = resident_alloc_shared((NSUInteger)dim * sizeof(float));
+    gQ_xn = resident_alloc_private((NSUInteger)dim * sizeof(float));
+    gQ_joint = resident_alloc_private((NSUInteger)joint_len * sizeof(float));
+    gQ_q = resident_alloc_private((NSUInteger)gQ_qdim * sizeof(float));
+    gQ_k = resident_alloc_private((NSUInteger)gQ_kdim * sizeof(float));
+    gQ_v = resident_alloc_private((NSUInteger)gQ_vdim * sizeof(float));
+    gQ_attn = resident_alloc_private((NSUInteger)MAX(gQ_attndim, value_dim) * sizeof(float));
+    gQ_gate = resident_alloc_private((NSUInteger)MAX(MAX(hidden_dim, gQ_attndim), value_dim) * sizeof(float));
+    gQ_up = resident_alloc_private((NSUInteger)hidden_dim * sizeof(float));
+    gQ_hiddenbuf = resident_alloc_private((NSUInteger)MAX(hidden_dim, value_dim) * sizeof(float));
+    gQ_proj = resident_alloc_private((NSUInteger)dim * sizeof(float));
+    gQ_alpha = resident_alloc_private((NSUInteger)value_heads * sizeof(float));
+    gQ_beta = resident_alloc_private((NSUInteger)value_heads * sizeof(float));
+    gQ_logits = resident_alloc_shared((NSUInteger)vocab * sizeof(float));
+    gQ_zero = resident_alloc_shared((NSUInteger)dim * sizeof(float));
+    gQ_recent = resident_alloc_shared(64 * sizeof(uint32_t));
+    gQ_selected = resident_alloc_shared(sizeof(uint32_t));
+    gQ_argmax_value = resident_alloc_private(RUSTY_ARGMAX_GROUPS * sizeof(float));
+    gQ_argmax_id = resident_alloc_private(RUSTY_ARGMAX_GROUPS * sizeof(uint32_t));
+    if (!gQ_x || !gQ_xn || !gQ_joint || !gQ_q || !gQ_k || !gQ_v || !gQ_attn ||
+        !gQ_gate || !gQ_up || !gQ_hiddenbuf || !gQ_proj || !gQ_alpha || !gQ_beta ||
+        !gQ_logits || !gQ_zero || !gQ_recent || !gQ_selected ||
+        !gQ_argmax_value || !gQ_argmax_id) return 0;
+    memset([gQ_zero contents], 0, (NSUInteger)dim * sizeof(float));
+    return 1;
+}
+
+int rusty_metal_qwen_resident_set_layer(uint32_t l,
+                                        const RustyQwenResidentLayerDesc *d) {
+    if (!gDevice || !d || l >= gQ_nlayers || d->layer_type > 1 ||
+        !d->attn_norm || d->attn_norm_len != gQ_dim ||
+        !d->post_norm || d->post_norm_len != gQ_dim) return 0;
+    QwenResidentLayer *L = &gQLayers[l];
+    L->type = d->layer_type;
+    uint32_t required = d->layer_type == 0 ? 8 : 7;
+    uint32_t value_dim = gQ_valueheads * gQ_statedim;
+    uint32_t expected_rows[8] = {0};
+    uint32_t expected_cols[8] = {0};
+    if (d->layer_type == 0) {
+        uint32_t rows[8] = {
+            gQ_conv_dim, value_dim, gQ_valueheads, gQ_valueheads,
+            gQ_dim, gQ_hidden, gQ_hidden, gQ_dim,
+        };
+        uint32_t cols[8] = {
+            gQ_dim, gQ_dim, gQ_dim, gQ_dim,
+            value_dim, gQ_dim, gQ_dim, gQ_hidden,
+        };
+        memcpy(expected_rows, rows, sizeof(rows));
+        memcpy(expected_cols, cols, sizeof(cols));
+    } else {
+        uint32_t rows[8] = {
+            2 * gQ_qdim, gQ_kdim, gQ_vdim, gQ_dim,
+            gQ_hidden, gQ_hidden, gQ_dim, 0,
+        };
+        uint32_t cols[8] = {
+            gQ_dim, gQ_dim, gQ_dim, gQ_attndim,
+            gQ_dim, gQ_dim, gQ_hidden, 0,
+        };
+        memcpy(expected_rows, rows, sizeof(rows));
+        memcpy(expected_cols, cols, sizeof(cols));
+    }
+    for (uint32_t i = 0; i < required; ++i) {
+        if (!d->w[i] || d->w_len[i] == 0 || d->w_rows[i] == 0 || d->w_cols[i] == 0 ||
+            d->w_dt[i] > 1 || (d->w_cols[i] % 256) != 0 ||
+            d->w_rows[i] != expected_rows[i] || d->w_cols[i] != expected_cols[i]) return 0;
+        uint64_t expected_len = (uint64_t)d->w_rows[i] * (d->w_cols[i] / 256) *
+                                (d->w_dt[i] == 1 ? 210u : 144u);
+        if (expected_len != d->w_len[i]) return 0;
+        // These slots share the Q4_K pair kernel rather than selecting a
+        // pipeline from their dtype at dispatch time.
+        if ((d->layer_type == 0 && (i == 2 || i == 3 || i == 5 || i == 6) && d->w_dt[i] != 0) ||
+            (d->layer_type == 1 && (i == 4 || i == 5) && d->w_dt[i] != 0)) return 0;
+        L->w[i] = qwen_resident_weight_buffer(d->w[i], d->w_len[i], &L->w_offset[i]);
+        if (!L->w[i]) return 0;
+        L->rows[i] = d->w_rows[i]; L->cols[i] = d->w_cols[i]; L->dt[i] = d->w_dt[i];
+    }
+    L->attn_norm = resident_floats(d->attn_norm, d->attn_norm_len);
+    L->post_norm = resident_floats(d->post_norm, d->post_norm_len);
+    if (!L->attn_norm || !L->post_norm) return 0;
+
+    if (d->layer_type == 0) {
+        uint32_t conv_w_len = gQ_conv_dim * gQ_dconv;
+        if (!d->conv_w || d->conv_w_len != conv_w_len || !d->a || d->a_len != gQ_valueheads ||
+            !d->dt_bias || d->dt_bias_len != gQ_valueheads ||
+            !d->norm || d->norm_len != gQ_statedim) return 0;
+        L->conv_w = resident_floats(d->conv_w, d->conv_w_len);
+        L->a = resident_floats(d->a, d->a_len);
+        L->dt_bias = resident_floats(d->dt_bias, d->dt_bias_len);
+        L->norm = resident_floats(d->norm, d->norm_len);
+        NSUInteger conv_state_len = (NSUInteger)gQ_conv_dim * (gQ_dconv - 1);
+        NSUInteger delta_state_len = (NSUInteger)gQ_valueheads * gQ_statedim * gQ_statedim;
+        L->conv_state = resident_alloc_shared(conv_state_len * sizeof(float));
+        L->delta_state = resident_alloc_shared(delta_state_len * sizeof(float));
+        if (!L->conv_w || !L->a || !L->dt_bias || !L->norm ||
+            !L->conv_state || !L->delta_state) return 0;
+        memset([L->conv_state contents], 0, conv_state_len * sizeof(float));
+        memset([L->delta_state contents], 0, delta_state_len * sizeof(float));
+    } else {
+        if (!d->q_norm || d->q_norm_len != gQ_headdim ||
+            !d->k_norm || d->k_norm_len != gQ_headdim) return 0;
+        L->q_norm = resident_floats(d->q_norm, d->q_norm_len);
+        L->k_norm = resident_floats(d->k_norm, d->k_norm_len);
+        L->k_cache = resident_alloc_private((NSUInteger)gQ_storage * gQ_kdim * sizeof(float));
+        L->v_cache = resident_alloc_private((NSUInteger)gQ_storage * gQ_vdim * sizeof(float));
+        if (!L->q_norm || !L->k_norm || !L->k_cache || !L->v_cache) return 0;
+    }
+    gQ_registered_layers += 1;
+    return 1;
+}
+
+int rusty_metal_qwen_resident_set_output(const float *output_norm,
+                                         const uint8_t *output_w,
+                                         uintptr_t output_w_len,
+                                         uint32_t output_rows,
+                                         uint32_t output_dt,
+                                         const float *inv_freq,
+                                         uint32_t inv_freq_len) {
+    if (!gDevice || !output_norm || !output_w || !inv_freq || output_dt > 1 ||
+        output_rows != gQ_vocab || inv_freq_len < gQ_rotarydim / 2 ||
+        gQ_registered_layers != gQ_nlayers) return 0;
+    uint64_t expected_output_len = (uint64_t)output_rows * (gQ_dim / 256) *
+                                   (output_dt == 1 ? 210u : 144u);
+    if (expected_output_len != output_w_len) return 0;
+    gQ_outnorm = resident_floats(output_norm, gQ_dim);
+    gQ_invfreq = resident_floats(inv_freq, inv_freq_len);
+    gQ_outw = qwen_resident_weight_buffer(output_w, output_w_len, &gQ_outw_offset);
+    gQ_outrows = output_rows; gQ_outdt = output_dt;
+    if (!gQ_outnorm || !gQ_invfreq || !gQ_outw) return 0;
+    gQwenResidentReady = YES;
+    return 1;
+}
+
+int rusty_metal_qwen_resident_decode(const float *x_embed, uint32_t pos,
+                                     uint32_t start_t, int output_mode,
+                                     float *logits_out, const uint32_t *recent,
+                                     uint32_t recent_len, float repeat_penalty,
+                                     uint32_t *token_out) {
+    if (!gQwenResidentReady || !x_embed || pos >= gQ_storage || start_t > pos) return 0;
+    if (output_mode == 1 && !logits_out) return 0;
+    if (output_mode == 2 && (!token_out || recent_len > 64 || (recent_len && !recent))) return 0;
+    if (output_mode < 0 || output_mode > 2) return 0;
+    @autoreleasepool {
+        if (pos == 0) {
+            for (uint32_t l = 0; l < gQ_nlayers; ++l) {
+                QwenResidentLayer *L = &gQLayers[l];
+                if (L->type == 0) {
+                    memset([L->conv_state contents], 0,
+                           (NSUInteger)gQ_conv_dim * (gQ_dconv - 1) * sizeof(float));
+                    memset([L->delta_state contents], 0,
+                           (NSUInteger)gQ_valueheads * gQ_statedim * gQ_statedim * sizeof(float));
+                }
+            }
+        }
+        memcpy([gQ_x contents], x_embed, (NSUInteger)gQ_dim * sizeof(float));
+        if (output_mode == 2 && recent_len) {
+            memcpy([gQ_recent contents], recent, (NSUInteger)recent_len * sizeof(uint32_t));
+        }
+        double encode_start = rusty_metal_now_seconds();
+        id<MTLCommandBuffer> cb = [gQueue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        for (uint32_t l = 0; l < gQ_nlayers; ++l) {
+            QwenResidentLayer *L = &gQLayers[l];
+            id<MTLBuffer> residual = l == 0 ? gQ_zero : gQ_proj;
+            resident_rms(enc, gQ_x, residual, L->attn_norm, gQ_xn, gQ_dim, gQ_eps);
+            if (L->type == 0) {
+                qwen_encode_matvec(enc, L->dt[0], L->w[0], L->w_offset[0],
+                                   gQ_xn, gQ_joint, L->rows[0], L->cols[0]);
+                qwen_encode_matvec(enc, L->dt[1], L->w[1], L->w_offset[1],
+                                   gQ_xn, gQ_gate, L->rows[1], L->cols[1]);
+                qwen_encode_q4_pair(enc, L->w[2], L->w_offset[2], L->w[3], L->w_offset[3],
+                                    gQ_xn, gQ_alpha, gQ_beta,
+                                    L->rows[2], L->rows[3], L->cols[2]);
+                qwen_encode_conv(enc, L);
+                qwen_encode_delta(enc, L);
+                qwen_encode_delta_norm_gate(enc, L);
+                qwen_encode_matvec(enc, L->dt[4], L->w[4], L->w_offset[4],
+                                   gQ_hiddenbuf, gQ_proj, L->rows[4], L->cols[4]);
+                resident_rms(enc, gQ_x, gQ_proj, L->post_norm, gQ_xn, gQ_dim, gQ_eps);
+                qwen_encode_q4_pair(enc, L->w[5], L->w_offset[5], L->w[6], L->w_offset[6],
+                                    gQ_xn, gQ_gate, gQ_up,
+                                    L->rows[5], L->rows[6], L->cols[5]);
+                resident_silu(enc, gQ_gate, gQ_up, gQ_hiddenbuf, gQ_hidden);
+                qwen_encode_matvec(enc, L->dt[7], L->w[7], L->w_offset[7],
+                                   gQ_hiddenbuf, gQ_proj, L->rows[7], L->cols[7]);
+            } else {
+                qwen_encode_matvec(enc, L->dt[0], L->w[0], L->w_offset[0],
+                                   gQ_xn, gQ_joint, L->rows[0], L->cols[0]);
+                qwen_encode_matvec(enc, L->dt[1], L->w[1], L->w_offset[1],
+                                   gQ_xn, gQ_k, L->rows[1], L->cols[1]);
+                qwen_encode_matvec(enc, L->dt[2], L->w[2], L->w_offset[2],
+                                   gQ_xn, gQ_v, L->rows[2], L->cols[2]);
+                qwen_encode_attention_norm(enc, L);
+                qwen_encode_rope_store(enc, L, pos);
+                qwen_encode_attention(enc, L, start_t, pos);
+                qwen_encode_matvec(enc, L->dt[3], L->w[3], L->w_offset[3],
+                                   gQ_attn, gQ_proj, L->rows[3], L->cols[3]);
+                resident_rms(enc, gQ_x, gQ_proj, L->post_norm, gQ_xn, gQ_dim, gQ_eps);
+                qwen_encode_q4_pair(enc, L->w[4], L->w_offset[4], L->w[5], L->w_offset[5],
+                                    gQ_xn, gQ_gate, gQ_up,
+                                    L->rows[4], L->rows[5], L->cols[4]);
+                resident_silu(enc, gQ_gate, gQ_up, gQ_hiddenbuf, gQ_hidden);
+                qwen_encode_matvec(enc, L->dt[6], L->w[6], L->w_offset[6],
+                                   gQ_hiddenbuf, gQ_proj, L->rows[6], L->cols[6]);
+            }
+        }
+        if (output_mode != 0) {
+            resident_rms(enc, gQ_x, gQ_proj, gQ_outnorm, gQ_xn, gQ_dim, gQ_eps);
+            qwen_encode_matvec(enc, gQ_outdt, gQ_outw, gQ_outw_offset,
+                               gQ_xn, gQ_logits, gQ_outrows, gQ_dim);
+            if (output_mode == 2) qwen_encode_greedy(enc, recent_len, repeat_penalty);
+        }
+        [enc endEncoding];
+        double encode_end = rusty_metal_now_seconds();
+        [cb commit];
+        [cb waitUntilCompleted];
+        rusty_metal_profile_command_buffer(cb, encode_start, encode_end);
+        if ([cb status] != MTLCommandBufferStatusCompleted) return 0;
+        if (output_mode == 1) {
+            memcpy(logits_out, [gQ_logits contents], (NSUInteger)gQ_vocab * sizeof(float));
+        } else if (output_mode == 2) {
+            *token_out = *(const uint32_t *)[gQ_selected contents];
         }
         return 1;
     }

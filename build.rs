@@ -3,6 +3,121 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+fn decode_c_string(text: &str) -> Option<String> {
+    let mut decoded = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        decoded.push(match chars.next()? {
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            '\\' => '\\',
+            '"' => '"',
+            other => other,
+        });
+    }
+    Some(decoded)
+}
+
+/// Extracts the embedded kernel strings into one normal source file. The
+/// Objective-C fallback and the build-time compiler therefore consume the
+/// exact same independently maintained kernels.
+fn extract_metal_source(objective_c: &str) -> Option<String> {
+    let mut source = String::new();
+    let mut in_kernel = false;
+    for line in objective_c.lines() {
+        if line.starts_with("static NSString *const k") && line.contains("Source") {
+            in_kernel = true;
+            continue;
+        }
+        if !in_kernel {
+            continue;
+        }
+        let ends_kernel = line.trim_end_matches('\r').trim_end().ends_with(';');
+        let start = line.find('"')?;
+        let end = line.rfind('"')?;
+        if end <= start {
+            return None;
+        }
+        source.push_str(&decode_c_string(&line[start + 1..end])?);
+        if ends_kernel {
+            in_kernel = false;
+            source.push('\n');
+        }
+    }
+    (!source.is_empty()).then_some(source)
+}
+
+fn write_metallib_header(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut header = String::from(
+        "#pragma once\n#include <stddef.h>\nstatic const unsigned char rusty_precompiled_metallib[] = {\n",
+    );
+    if bytes.is_empty() {
+        header.push_str("0\n");
+    } else {
+        for chunk in bytes.chunks(16) {
+            for byte in chunk {
+                header.push_str(&format!("0x{byte:02x},"));
+            }
+            header.push('\n');
+        }
+    }
+    header.push_str(&format!(
+        "}};\nstatic const size_t rusty_precompiled_metallib_len = {};\n",
+        bytes.len()
+    ));
+    fs::write(path, header)
+}
+
+fn precompile_metal_library(out_dir: &Path, tmp_dir: &Path) -> Vec<u8> {
+    let Ok(objective_c) = fs::read_to_string("src/metal_backend.m") else {
+        return Vec::new();
+    };
+    let Some(source) = extract_metal_source(&objective_c) else {
+        return Vec::new();
+    };
+    let source_path = out_dir.join("rusty_kernels.metal");
+    let air_path = out_dir.join("rusty_kernels.air");
+    let library_path = out_dir.join("rusty_kernels.metallib");
+    if fs::write(&source_path, source).is_err() {
+        return Vec::new();
+    }
+
+    let compile = Command::new("xcrun")
+        .env("TMPDIR", tmp_dir)
+        .env("TMP", tmp_dir)
+        .env("TEMP", tmp_dir)
+        .args(["-sdk", "macosx", "metal", "-ffast-math", "-c"])
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&air_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !matches!(compile, Ok(status) if status.success()) {
+        return Vec::new();
+    }
+    let link = Command::new("xcrun")
+        .env("TMPDIR", tmp_dir)
+        .env("TMP", tmp_dir)
+        .env("TEMP", tmp_dir)
+        .args(["-sdk", "macosx", "metallib"])
+        .arg(&air_path)
+        .arg("-o")
+        .arg(&library_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !matches!(link, Ok(status) if status.success()) {
+        return Vec::new();
+    }
+    fs::read(library_path).unwrap_or_default()
+}
+
 fn macos_sdk_candidates() -> impl Iterator<Item = PathBuf> {
     let mut candidates = Vec::new();
 
@@ -67,6 +182,12 @@ fn main() {
     let lib = out_dir.join("librusty_metal_backend.a");
     let tmp_dir = out_dir.join("xcrun-tmp");
     let _ = fs::create_dir_all(&tmp_dir);
+    let metallib = precompile_metal_library(&out_dir, &tmp_dir);
+    let metallib_header = out_dir.join("rusty_metallib.h");
+    if write_metallib_header(&metallib_header, &metallib).is_err() {
+        println!("cargo:warning=Metal backend disabled: could not generate kernel header");
+        return;
+    }
 
     let mut clang = Command::new(find_macos_clang());
     clang
@@ -74,6 +195,8 @@ fn main() {
         .env("TMP", &tmp_dir)
         .env("TEMP", &tmp_dir)
         .stderr(Stdio::piped())
+        .arg("-I")
+        .arg(&out_dir)
         .args(["-x", "objective-c", "-fobjc-arc", "-O3"]);
     if let Some(sdk) = find_macos_sdk() {
         clang.arg("-isysroot").arg(sdk);

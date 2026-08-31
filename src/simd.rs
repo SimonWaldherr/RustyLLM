@@ -625,6 +625,15 @@ impl QuantMatvecKind {
         };
         blocks.checked_mul(bytes)
     }
+
+    #[inline]
+    fn from_kquant(kind: KQuantMatvecKind) -> Self {
+        match kind {
+            KQuantMatvecKind::Q4K => Self::Q4K,
+            KQuantMatvecKind::Q5K => Self::Q5K,
+            KQuantMatvecKind::Q6K => Self::Q6K,
+        }
+    }
 }
 
 #[inline]
@@ -2335,6 +2344,45 @@ pub fn affine_add_f32x4(
     }
 }
 
+/// Applies four independent affine updates and returns their dot products
+/// against one shared vector. Combining both operations keeps every updated
+/// output lane in a register for the dot product instead of reading the four
+/// vectors from memory again.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn affine_add_dot_f32x4(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+    dot: &[f32],
+) -> [f32; 4] {
+    debug_assert_eq!(out0.len(), x.len());
+    debug_assert_eq!(out1.len(), x.len());
+    debug_assert_eq!(out2.len(), x.len());
+    debug_assert_eq!(out3.len(), x.len());
+    debug_assert_eq!(dot.len(), x.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { affine_add_dot_f32x4_neon(out0, out1, out2, out3, multiplier, alpha, x, dot) }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_fma() {
+            unsafe { affine_add_dot_f32x4_avx2(out0, out1, out2, out3, multiplier, alpha, x, dot) }
+        } else {
+            affine_add_dot_f32x4_scalar(out0, out1, out2, out3, multiplier, alpha, x, dot)
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        affine_add_dot_f32x4_scalar(out0, out1, out2, out3, multiplier, alpha, x, dot)
+    }
+}
+
 /// Computes `out[i] = silu(gate[i]) * up[i]` — the SwiGLU elementwise combine
 /// between the fused gate/up projections and the down projection. The scalar
 /// `expf` loop this replaces costs ~0.8 ms per layer at Ministral's
@@ -3480,18 +3528,102 @@ pub fn matvec_kquant3_batch_into(
     let (kind_a, weights_a, rows_a, cols_a) = a;
     let (kind_b, weights_b, rows_b, cols_b) = b;
     let (kind_c, weights_c, rows_c, cols_c) = c;
-    if cols_a == 0
-        || cols_a % 256 != 0
-        || cols_a != cols_b
-        || cols_a != cols_c
-        || inputs.len() % cols_a != 0
-    {
+    matvec_quant3_batch_into(
+        (
+            QuantMatvecKind::from_kquant(kind_a),
+            weights_a,
+            rows_a,
+            cols_a,
+        ),
+        (
+            QuantMatvecKind::from_kquant(kind_b),
+            weights_b,
+            rows_b,
+            cols_b,
+        ),
+        (
+            QuantMatvecKind::from_kquant(kind_c),
+            weights_c,
+            rows_c,
+            cols_c,
+        ),
+        inputs,
+        out_a,
+        out_b,
+        out_c,
+    )
+}
+
+/// Runs one quantized matrix against a row-major activation batch. Unlike the
+/// narrower K-quant entry point, this also accepts the 32-value block formats
+/// used by hybrid and fallback quantizations.
+pub fn matvec_quant_batch_into(
+    a: (QuantMatvecKind, &[u8], usize, usize),
+    inputs: &[f32],
+    out: &mut Vec<f32>,
+) -> bool {
+    let (_, _, _, cols) = a;
+    let mut unused_b = Vec::new();
+    let mut unused_c = Vec::new();
+    matvec_quant3_batch_into(
+        a,
+        (a.0, &[], 0, cols),
+        (a.0, &[], 0, cols),
+        inputs,
+        out,
+        &mut unused_b,
+        &mut unused_c,
+    )
+}
+
+/// Runs two quantized matrices against the same row-major activation batch.
+pub fn matvec_quant2_batch_into(
+    a: (QuantMatvecKind, &[u8], usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize),
+    inputs: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let mut unused_c = Vec::new();
+    matvec_quant3_batch_into(
+        a,
+        b,
+        (a.0, &[], 0, a.3),
+        inputs,
+        out_a,
+        out_b,
+        &mut unused_c,
+    )
+}
+
+/// Runs three quantized matrices against a row-major activation batch while
+/// keeping each owned weight row hot across up to four activation rows.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_quant3_batch_into(
+    a: (QuantMatvecKind, &[u8], usize, usize),
+    b: (QuantMatvecKind, &[u8], usize, usize),
+    c: (QuantMatvecKind, &[u8], usize, usize),
+    inputs: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (kind_a, weights_a, rows_a, cols_a) = a;
+    let (kind_b, weights_b, rows_b, cols_b) = b;
+    let (kind_c, weights_c, rows_c, cols_c) = c;
+    if cols_a == 0 || cols_a != cols_b || cols_a != cols_c || inputs.len() % cols_a != 0 {
         return false;
     }
 
-    let row_bytes_a = kind_a.row_bytes(cols_a);
-    let row_bytes_b = kind_b.row_bytes(cols_b);
-    let row_bytes_c = kind_c.row_bytes(cols_c);
+    let Some(row_bytes_a) = kind_a.row_bytes(cols_a) else {
+        return false;
+    };
+    let Some(row_bytes_b) = kind_b.row_bytes(cols_b) else {
+        return false;
+    };
+    let Some(row_bytes_c) = kind_c.row_bytes(cols_c) else {
+        return false;
+    };
     let needed_a = match row_bytes_a.checked_mul(rows_a) {
         Some(v) => v,
         None => return false,
@@ -3535,7 +3667,7 @@ pub fn matvec_kquant3_batch_into(
         let mut row_c = Vec::new();
         for token in 0..tokens {
             let input = &inputs[token * cols_a..(token + 1) * cols_a];
-            if !matvec_kquant3_into(a, b, c, input, &mut row_a, &mut row_b, &mut row_c) {
+            if !matvec_quant3_into(a, b, c, input, &mut row_a, &mut row_b, &mut row_c) {
                 return false;
             }
             out_a[token * rows_a..(token + 1) * rows_a].copy_from_slice(&row_a);
@@ -4361,6 +4493,31 @@ fn affine_add_f32x4_scalar(
         out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
         out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
     }
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn affine_add_dot_f32x4_scalar(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+    dot: &[f32],
+) -> [f32; 4] {
+    let mut sums = [0.0f32; 4];
+    for i in 0..x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+        sums[0] += out0[i] * dot[i];
+        sums[1] += out1[i] * dot[i];
+        sums[2] += out2[i] * dot[i];
+        sums[3] += out3[i] * dot[i];
+    }
+    sums
 }
 
 #[allow(dead_code)]
@@ -6137,6 +6294,87 @@ unsafe fn affine_add_f32x4_neon(
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn affine_add_dot_f32x4_neon(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+    dot: &[f32],
+) -> [f32; 4] {
+    use std::arch::aarch64::*;
+    let mul = [
+        vdupq_n_f32(multiplier[0]),
+        vdupq_n_f32(multiplier[1]),
+        vdupq_n_f32(multiplier[2]),
+        vdupq_n_f32(multiplier[3]),
+    ];
+    let add = [
+        vdupq_n_f32(alpha[0]),
+        vdupq_n_f32(alpha[1]),
+        vdupq_n_f32(alpha[2]),
+        vdupq_n_f32(alpha[3]),
+    ];
+    let mut sums = [vdupq_n_f32(0.0); 4];
+    let mut i = 0usize;
+    while i + 4 <= x.len() {
+        let value = vld1q_f32(x.as_ptr().add(i));
+        let projection = vld1q_f32(dot.as_ptr().add(i));
+        let updated0 = vmlaq_f32(
+            vmulq_f32(vld1q_f32(out0.as_ptr().add(i)), mul[0]),
+            value,
+            add[0],
+        );
+        let updated1 = vmlaq_f32(
+            vmulq_f32(vld1q_f32(out1.as_ptr().add(i)), mul[1]),
+            value,
+            add[1],
+        );
+        let updated2 = vmlaq_f32(
+            vmulq_f32(vld1q_f32(out2.as_ptr().add(i)), mul[2]),
+            value,
+            add[2],
+        );
+        let updated3 = vmlaq_f32(
+            vmulq_f32(vld1q_f32(out3.as_ptr().add(i)), mul[3]),
+            value,
+            add[3],
+        );
+        vst1q_f32(out0.as_mut_ptr().add(i), updated0);
+        vst1q_f32(out1.as_mut_ptr().add(i), updated1);
+        vst1q_f32(out2.as_mut_ptr().add(i), updated2);
+        vst1q_f32(out3.as_mut_ptr().add(i), updated3);
+        sums[0] = vmlaq_f32(sums[0], updated0, projection);
+        sums[1] = vmlaq_f32(sums[1], updated1, projection);
+        sums[2] = vmlaq_f32(sums[2], updated2, projection);
+        sums[3] = vmlaq_f32(sums[3], updated3, projection);
+        i += 4;
+    }
+    let mut result = [
+        vaddvq_f32(sums[0]),
+        vaddvq_f32(sums[1]),
+        vaddvq_f32(sums[2]),
+        vaddvq_f32(sums[3]),
+    ];
+    while i < x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+        result[0] += out0[i] * dot[i];
+        result[1] += out1[i] * dot[i];
+        result[2] += out2[i] * dot[i];
+        result[3] += out3[i] * dot[i];
+        i += 1;
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
 unsafe fn dot_q8_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
@@ -6674,6 +6912,87 @@ unsafe fn affine_add_f32x4_avx2(
         out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
         i += 1;
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn affine_add_dot_f32x4_avx2(
+    out0: &mut [f32],
+    out1: &mut [f32],
+    out2: &mut [f32],
+    out3: &mut [f32],
+    multiplier: [f32; 4],
+    alpha: [f32; 4],
+    x: &[f32],
+    dot: &[f32],
+) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let mul = [
+        _mm256_set1_ps(multiplier[0]),
+        _mm256_set1_ps(multiplier[1]),
+        _mm256_set1_ps(multiplier[2]),
+        _mm256_set1_ps(multiplier[3]),
+    ];
+    let add = [
+        _mm256_set1_ps(alpha[0]),
+        _mm256_set1_ps(alpha[1]),
+        _mm256_set1_ps(alpha[2]),
+        _mm256_set1_ps(alpha[3]),
+    ];
+    let mut sums = [_mm256_setzero_ps(); 4];
+    let mut i = 0usize;
+    while i + 8 <= x.len() {
+        let value = _mm256_loadu_ps(x.as_ptr().add(i));
+        let projection = _mm256_loadu_ps(dot.as_ptr().add(i));
+        let updated0 = _mm256_fmadd_ps(
+            value,
+            add[0],
+            _mm256_mul_ps(_mm256_loadu_ps(out0.as_ptr().add(i)), mul[0]),
+        );
+        let updated1 = _mm256_fmadd_ps(
+            value,
+            add[1],
+            _mm256_mul_ps(_mm256_loadu_ps(out1.as_ptr().add(i)), mul[1]),
+        );
+        let updated2 = _mm256_fmadd_ps(
+            value,
+            add[2],
+            _mm256_mul_ps(_mm256_loadu_ps(out2.as_ptr().add(i)), mul[2]),
+        );
+        let updated3 = _mm256_fmadd_ps(
+            value,
+            add[3],
+            _mm256_mul_ps(_mm256_loadu_ps(out3.as_ptr().add(i)), mul[3]),
+        );
+        _mm256_storeu_ps(out0.as_mut_ptr().add(i), updated0);
+        _mm256_storeu_ps(out1.as_mut_ptr().add(i), updated1);
+        _mm256_storeu_ps(out2.as_mut_ptr().add(i), updated2);
+        _mm256_storeu_ps(out3.as_mut_ptr().add(i), updated3);
+        sums[0] = _mm256_fmadd_ps(updated0, projection, sums[0]);
+        sums[1] = _mm256_fmadd_ps(updated1, projection, sums[1]);
+        sums[2] = _mm256_fmadd_ps(updated2, projection, sums[2]);
+        sums[3] = _mm256_fmadd_ps(updated3, projection, sums[3]);
+        i += 8;
+    }
+    let mut result = [
+        hsum_avx(sums[0]),
+        hsum_avx(sums[1]),
+        hsum_avx(sums[2]),
+        hsum_avx(sums[3]),
+    ];
+    while i < x.len() {
+        out0[i] = out0[i] * multiplier[0] + alpha[0] * x[i];
+        out1[i] = out1[i] * multiplier[1] + alpha[1] * x[i];
+        out2[i] = out2[i] * multiplier[2] + alpha[2] * x[i];
+        out3[i] = out3[i] * multiplier[3] + alpha[3] * x[i];
+        result[0] += out0[i] * dot[i];
+        result[1] += out1[i] * dot[i];
+        result[2] += out2[i] * dot[i];
+        result[3] += out3[i] * dot[i];
+        i += 1;
+    }
+    result
 }
 
 #[cfg(target_arch = "x86_64")]

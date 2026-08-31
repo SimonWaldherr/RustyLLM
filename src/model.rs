@@ -8,7 +8,47 @@
 use crate::gguf::{GGMLType, GGUFFile};
 use crate::simd;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Qwen35Profile {
+    pub tokens: usize,
+    pub recurrent: Duration,
+    pub attention: Duration,
+    pub ffn: Duration,
+    pub output: Duration,
+}
+
+pub fn qwen35_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("RUSTY_LLM_QWEN_PROFILE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        )
+    })
+}
+
+fn qwen35_profile_store() -> &'static Mutex<Qwen35Profile> {
+    static PROFILE: OnceLock<Mutex<Qwen35Profile>> = OnceLock::new();
+    PROFILE.get_or_init(|| Mutex::new(Qwen35Profile::default()))
+}
+
+pub fn qwen35_profile_reset() {
+    if qwen35_profile_enabled()
+        && let Ok(mut profile) = qwen35_profile_store().lock()
+    {
+        *profile = Qwen35Profile::default();
+    }
+}
+
+pub fn qwen35_profile_snapshot() -> Qwen35Profile {
+    qwen35_profile_store()
+        .lock()
+        .map(|profile| *profile)
+        .unwrap_or_default()
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -670,12 +710,37 @@ fn kquant_weight_parts(
     Some((kind, data, *rows, *cols))
 }
 
+/// Returns the borrowed row layout for every quantized matrix format handled
+/// by the CPU batch worker. This covers models whose dimensions force a
+/// 32-value block format instead of a K-quant layout.
+#[cfg(not(target_family = "wasm"))]
+fn quant_weight_parts(
+    weight: &Weight,
+) -> Option<(crate::simd::QuantMatvecKind, &[u8], usize, usize)> {
+    let Weight::Quantized {
+        data,
+        dtype,
+        rows,
+        cols,
+    } = weight
+    else {
+        return None;
+    };
+    let kind = quant_matvec_kind(*dtype)?;
+    let bytes = quantized_row_bytes(*dtype, *cols)?.checked_mul(*rows)?;
+    let data = data.as_slice();
+    if data.len() < bytes {
+        return None;
+    }
+    Some((kind, data, *rows, *cols))
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn try_kquant_matvec_batch_into(weight: &Weight, inputs: &[f32], out: &mut Vec<f32>) -> bool {
-    let Some(parts) = kquant_weight_parts(weight) else {
+    let Some(parts) = quant_weight_parts(weight) else {
         return false;
     };
-    crate::simd::matvec_kquant_batch_into(parts, inputs, out)
+    crate::simd::matvec_quant_batch_into(parts, inputs, out)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -686,10 +751,10 @@ fn try_kquant_matvec2_batch_into(
     out_a: &mut Vec<f32>,
     out_b: &mut Vec<f32>,
 ) -> bool {
-    let (Some(a), Some(b)) = (kquant_weight_parts(a), kquant_weight_parts(b)) else {
+    let (Some(a), Some(b)) = (quant_weight_parts(a), quant_weight_parts(b)) else {
         return false;
     };
-    crate::simd::matvec_kquant2_batch_into(a, b, inputs, out_a, out_b)
+    crate::simd::matvec_quant2_batch_into(a, b, inputs, out_a, out_b)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -703,13 +768,13 @@ fn try_kquant_matvec3_batch_into(
     out_c: &mut Vec<f32>,
 ) -> bool {
     let (Some(a), Some(b), Some(c)) = (
-        kquant_weight_parts(a),
-        kquant_weight_parts(b),
-        kquant_weight_parts(c),
+        quant_weight_parts(a),
+        quant_weight_parts(b),
+        quant_weight_parts(c),
     ) else {
         return false;
     };
-    crate::simd::matvec_kquant3_batch_into(a, b, c, inputs, out_a, out_b, out_c)
+    crate::simd::matvec_quant3_batch_into(a, b, c, inputs, out_a, out_b, out_c)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1260,10 +1325,26 @@ pub struct Qwen35LayerWeights {
     pub ffn_down: Weight,
 }
 
+/// Single-token draft head embedded after a Qwen hybrid trunk. It combines
+/// the trunk residual with the embedding of the just-selected token, then
+/// predicts one additional token through its own gated-attention block.
+pub struct Qwen35MtpWeights {
+    pub eh_proj: Weight,
+    pub embedding_norm: Vec<f32>,
+    pub hidden_norm: Vec<f32>,
+    pub attn_norm: Vec<f32>,
+    pub post_attn_norm: Vec<f32>,
+    pub attention: Qwen35AttentionWeights,
+    pub ffn_gate: Weight,
+    pub ffn_up: Weight,
+    pub ffn_down: Weight,
+    pub head_norm: Vec<f32>,
+    pub token_embd: Option<Weight>,
+    pub output: Option<Weight>,
+}
+
 /// Text decoder portion of a Qwen3.5/Qwen3.8 GGUF.
 ///
-/// The optional final MTP/NextN block is intentionally not represented here:
-/// it is a speculative draft head, not part of the normal decoder trunk.
 pub struct Qwen35Weights {
     pub token_embd: Weight,
     pub output_norm: Vec<f32>,
@@ -1278,11 +1359,15 @@ pub struct Qwen35Weights {
     pub rotary_dim: usize,
     /// Text uses the same scalar position on all MRoPE axes.
     pub rope_inv_freq: Vec<f32>,
+    /// Optional embedded one-step draft head. It is kept separate from the
+    /// trunk layer list and therefore never consumes trunk cache slots.
+    pub mtp: Option<Box<Qwen35MtpWeights>>,
 }
 
 /// Per-layer recurrent state for Mamba-2 blocks — the state-space equivalent of
 /// a KV cache. Unlike keys and values this does not grow with position: each
 /// token overwrites it in place, so a rewind requires a replay from the start.
+#[derive(Clone)]
 pub struct SsmState {
     /// Per recurrent layer, a `conv_dim * (d_conv - 1)` shift register holding
     /// the previous convolution inputs, oldest first within each channel.
@@ -1342,6 +1427,10 @@ pub struct KVCache {
     pub max_len: usize,
     pub storage_len: usize,
     pub sliding_window: Option<usize>,
+    /// Once a Qwen stream has entered the GPU-resident graph, falling back to
+    /// the CPU mid-stream would use an empty CPU recurrent/KV prefix. Track
+    /// that invariant so a backend failure cannot silently corrupt output.
+    qwen_resident_active: bool,
     /// Recurrent state for hybrid Mamba-2 architectures. `None` for every
     /// attention-only model. It lives here rather than on `Session` so that the
     /// stateless one-shot generate path carries it too.
@@ -1349,6 +1438,13 @@ pub struct KVCache {
 }
 
 impl KVCache {
+    /// Marks the next token as the start of a fresh resident Qwen stream. The
+    /// Metal backend clears its recurrent state when that token is encoded at
+    /// position zero.
+    pub(crate) fn reset_resident_stream(&mut self) {
+        self.qwen_resident_active = false;
+    }
+
     /// Allocates per-layer key and value cache buffers for autoregressive decode reuse.
     pub fn new(
         n_layers: usize,
@@ -1380,6 +1476,7 @@ impl KVCache {
             max_len,
             storage_len,
             sliding_window,
+            qwen_resident_active: false,
             ssm: None,
         }
     }
@@ -2747,6 +2844,7 @@ mod tests {
             .map(|i| ((i * 13 % 71) as f32 - 35.0) * 0.0007)
             .collect();
         let mut reference_state = initial.clone();
+        let mut split_simd_state = initial.clone();
         let mut optimized_state = initial;
         let mut out = vec![0.0f32; width];
         let decay = 0.93f32;
@@ -2775,21 +2873,57 @@ mod tests {
         let started = Instant::now();
         for _ in 0..rounds {
             for head in 0..heads {
+                let state = &mut split_simd_state[head * width * width..(head + 1) * width * width];
+                for value_row in (0..width).step_by(4) {
+                    let rows = &mut state[value_row * width..(value_row + 4) * width];
+                    let (row0, rows) = rows.split_at_mut(width);
+                    let (row1, rows) = rows.split_at_mut(width);
+                    let (row2, row3) = rows.split_at_mut(width);
+                    let mut predicted = crate::simd::dot_f32x4(row0, row1, row2, row3, &k);
+                    for score in &mut predicted {
+                        *score *= decay;
+                    }
+                    let delta = [
+                        (v[value_row] - predicted[0]) * beta,
+                        (v[value_row + 1] - predicted[1]) * beta,
+                        (v[value_row + 2] - predicted[2]) * beta,
+                        (v[value_row + 3] - predicted[3]) * beta,
+                    ];
+                    crate::simd::affine_add_f32x4(row0, row1, row2, row3, [decay; 4], delta, &k);
+                    let projected = crate::simd::dot_f32x4(row0, row1, row2, row3, &q);
+                    for lane in 0..4 {
+                        out[value_row + lane] = projected[lane] * q_scale;
+                    }
+                }
+                black_box(&out);
+            }
+        }
+        let split_simd_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for head in 0..heads {
                 let state = &mut optimized_state[head * width * width..(head + 1) * width * width];
                 super::qwen35_delta_head_step(&q, &k, &v, decay, beta, state, &mut out);
                 black_box(&out);
             }
         }
         let optimized_elapsed = started.elapsed();
-        black_box((&reference_state, &optimized_state));
+        black_box((&reference_state, &split_simd_state, &optimized_state));
 
         let speedup = reference_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64();
+        let fusion_speedup = split_simd_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64();
         eprintln!(
-            "Qwen35 DeltaNet x4: scalar={:.3} ms, x4={:.3} ms, speedup={speedup:.2}x",
+            "Qwen35 DeltaNet x4: scalar={:.3} ms, split={:.3} ms, fused={:.3} ms, scalar_speedup={speedup:.2}x, fusion_speedup={fusion_speedup:.2}x",
             reference_elapsed.as_secs_f64() * 1e3,
+            split_simd_elapsed.as_secs_f64() * 1e3,
             optimized_elapsed.as_secs_f64() * 1e3,
         );
         assert!(speedup > 1.05, "x4 recurrence unexpectedly regressed");
+        assert!(
+            fusion_speedup > 1.05,
+            "fused recurrence unexpectedly regressed"
+        );
     }
 
     #[test]
@@ -3111,6 +3245,101 @@ mod tests {
             attn_layer_count: 1,
             rotary_dim: head_dim,
             rope_inv_freq: super::build_rope_inv_freq(10_000.0, head_dim, 1.0),
+            mtp: None,
+        };
+        (config, weights)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn tiny_nemotron_h_model() -> (super::Config, super::NemotronHWeights) {
+        let dim = 256usize;
+        let hidden = 256usize;
+        let ssm = super::SsmDims {
+            d_conv: 2,
+            d_inner: 256,
+            d_state: 64,
+            n_head: 1,
+            n_group: 1,
+        };
+        let config = super::Config {
+            arch: "nemotron_h_moe".to_string(),
+            dim,
+            hidden_dim: hidden,
+            n_layers: 4,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: 32,
+            max_seq_len: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+            head_dim: dim,
+            kv_dim: dim,
+            kv_mul: 1,
+            value_dim: dim,
+            sliding_window: 0,
+            expert_count: 2,
+            expert_used_count: 1,
+            rope_scaling_factor: 1.0,
+            rope_original_context_length: 0,
+        };
+        let token_embd = tiny_q4k_weight(config.vocab_size, dim, 9);
+        let mamba = super::NemotronHLayerWeights {
+            attn_norm: vec![1.0; dim],
+            mixer: super::NemotronMixer::Mamba2(Box::new(super::Mamba2LayerWeights {
+                in_proj: tiny_q4k_weight(ssm.d_in_proj(), dim, 17),
+                conv_w: (0..ssm.conv_dim())
+                    .flat_map(|index| [0.01 + (index % 5) as f32 * 0.002, 0.07])
+                    .collect(),
+                conv_b: vec![0.0; ssm.conv_dim()],
+                dt_bias: vec![0.0; ssm.n_head],
+                a: vec![-0.02; ssm.n_head],
+                d: vec![0.1; ssm.n_head],
+                norm: vec![1.0; ssm.d_inner],
+                out_proj: tiny_q4k_weight(dim, ssm.d_inner, 23),
+            })),
+        };
+        let attention = super::NemotronHLayerWeights {
+            attn_norm: vec![1.0; dim],
+            mixer: super::NemotronMixer::Attention(Box::new(super::NemotronAttnWeights {
+                wq: tiny_q4k_weight(dim, dim, 31),
+                wk: tiny_q4k_weight(dim, dim, 37),
+                wv: tiny_q4k_weight(dim, dim, 41),
+                wo: tiny_q4k_weight(dim, dim, 43),
+                bo: vec![0.0; dim],
+                n_heads: 1,
+                n_kv_heads: 1,
+                kv_slot: 0,
+            })),
+        };
+        let moe = super::NemotronHLayerWeights {
+            attn_norm: vec![1.0; dim],
+            mixer: super::NemotronMixer::Moe(Box::new(super::NemotronMoeWeights {
+                router: tiny_q4k_weight(config.expert_count, dim, 47),
+                router_bias: vec![0.0; config.expert_count],
+                up_experts: tiny_q4k_expert_weight(config.expert_count, hidden, dim, 53),
+                down_experts: tiny_q4k_expert_weight(config.expert_count, dim, hidden, 59),
+                shared_up: tiny_q4k_weight(hidden, dim, 61),
+                shared_down: tiny_q4k_weight(dim, hidden, 67),
+            })),
+        };
+        let dense = super::NemotronHLayerWeights {
+            attn_norm: vec![1.0; dim],
+            mixer: super::NemotronMixer::DenseFfn(Box::new(super::NemotronDenseFfnWeights {
+                up: tiny_q4k_weight(hidden, dim, 71),
+                up_bias: vec![0.0; hidden],
+                down: tiny_q4k_weight(dim, hidden, 73),
+                down_bias: vec![0.0; dim],
+            })),
+        };
+        let weights = super::NemotronHWeights {
+            token_embd: token_embd.clone(),
+            output_norm: vec![1.0; dim],
+            output: token_embd,
+            layers: vec![mamba, attention, moe, dense],
+            ssm,
+            attn_layer_count: 1,
+            router_normalize_weights: true,
+            routed_scaling_factor: 1.0,
         };
         (config, weights)
     }
@@ -3190,6 +3419,212 @@ mod tests {
             assert!(
                 (seq - batch).abs() <= tolerance,
                 "logits[{index}] sequential={seq} batched={batch}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn qwen35_batched_verification_matches_sequential_rows() {
+        let (config, weights) = tiny_qwen35_model();
+        let draft = [4u32, 9, 17];
+        let mut sequential = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut seq_buf = super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        let mut expected_logits = Vec::new();
+        let mut row_logits = Vec::new();
+        let mut expected_hidden = Vec::new();
+        for (pos, &token) in draft.iter().enumerate() {
+            super::forward_qwen35_into(
+                &config,
+                &weights,
+                &mut sequential,
+                &mut seq_buf,
+                token,
+                pos,
+                &mut row_logits,
+            );
+            expected_logits.extend_from_slice(&row_logits);
+            expected_hidden.extend_from_slice(&seq_buf.x);
+        }
+
+        let mut batched = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        let mut hidden = Vec::new();
+        let mut logits = Vec::new();
+        assert!(super::forward_verify_batch_qwen35(
+            &config,
+            &weights,
+            &mut batched,
+            &mut batch_buf,
+            &draft,
+            0,
+            &mut hidden,
+            &mut logits,
+        ));
+        for (index, (&expected, &actual)) in expected_logits.iter().zip(&logits).enumerate() {
+            let tolerance = 2e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "qwen verification logits[{index}] sequential={expected} batched={actual}"
+            );
+        }
+        for (index, (&expected, &actual)) in expected_hidden.iter().zip(&hidden).enumerate() {
+            let tolerance = 2e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "qwen verification hidden[{index}] sequential={expected} batched={actual}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn standard_batched_verification_matches_sequential_rows() {
+        let (config, weights) = tiny_standard_model(0);
+        let draft = [2u32, 11, 19];
+        let mut sequential = super::KVCache::new(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+        );
+        let mut seq_buf = super::DecodeBuffer::new(
+            &config,
+            config.head_dim,
+            config.n_kv_heads,
+            config.value_dim,
+        );
+        let mut expected_logits = Vec::new();
+        let mut expected_hidden = Vec::new();
+        let mut row_logits = Vec::new();
+        for (pos, &token) in draft.iter().enumerate() {
+            super::forward_into(
+                &config,
+                &weights,
+                &mut sequential,
+                &mut seq_buf,
+                token,
+                pos,
+                &mut row_logits,
+            );
+            expected_logits.extend_from_slice(&row_logits);
+            expected_hidden.extend_from_slice(&seq_buf.x);
+        }
+
+        let mut batched = super::KVCache::new(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        let mut hidden = Vec::new();
+        let mut logits = Vec::new();
+        assert!(super::forward_verify_batch(
+            &config,
+            &weights,
+            &mut batched,
+            &mut batch_buf,
+            &draft,
+            0,
+            &mut hidden,
+            &mut logits,
+        ));
+        for (index, (&expected, &actual)) in expected_logits.iter().zip(&logits).enumerate() {
+            let tolerance = 2e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "standard verification logits[{index}] sequential={expected} batched={actual}"
+            );
+        }
+        for (index, (&expected, &actual)) in expected_hidden.iter().zip(&hidden).enumerate() {
+            let tolerance = 2e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "standard verification hidden[{index}] sequential={expected} batched={actual}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    fn nemotron_h_batched_verification_matches_sequential_rows() {
+        let (config, weights) = tiny_nemotron_h_model();
+        let draft = [5u32, 12, 27];
+        assert!(super::nemotron_h_verify_batchable(&weights));
+        let mut sequential = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut seq_buf = super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        let mut expected_logits = Vec::new();
+        let mut expected_hidden = Vec::new();
+        let mut row_logits = Vec::new();
+        for (pos, &token) in draft.iter().enumerate() {
+            super::forward_nemotron_h_into(
+                &config,
+                &weights,
+                &mut sequential,
+                &mut seq_buf,
+                token,
+                pos,
+                &mut row_logits,
+            );
+            expected_logits.extend_from_slice(&row_logits);
+            expected_hidden.extend_from_slice(&seq_buf.x);
+        }
+
+        let mut batched = super::KVCache::with_recurrent_state(
+            1,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+            1,
+            weights.ssm,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        let mut hidden = Vec::new();
+        let mut logits = Vec::new();
+        assert!(super::forward_verify_batch_nemotron_h(
+            &config,
+            &weights,
+            &mut batched,
+            &mut batch_buf,
+            &draft,
+            0,
+            &mut hidden,
+            &mut logits,
+        ));
+        for (index, (&expected, &actual)) in expected_logits.iter().zip(&logits).enumerate() {
+            let tolerance = 3e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "hybrid verification logits[{index}] sequential={expected} batched={actual}"
+            );
+        }
+        for (index, (&expected, &actual)) in expected_hidden.iter().zip(&hidden).enumerate() {
+            let tolerance = 3e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "hybrid verification hidden[{index}] sequential={expected} batched={actual}"
             );
         }
     }
@@ -5137,9 +5572,9 @@ pub fn load_qwen35_model(
         0,
         "qwen35 value-head count must be divisible by its key-head count"
     );
-    // The GGUF/reference kernel represents every per-value-head memory as a
-    // square `[value_dim, key_dim]` matrix. Current qwen35 dense models keep
-    // both dimensions equal; reject a future incompatible variant explicitly.
+    // Every per-value-head memory is stored as a square
+    // `[value_dim, key_dim]` matrix. Current qwen35 dense models keep both
+    // dimensions equal; reject a future incompatible variant explicitly.
     assert_eq!(
         ssm.head_dim(),
         ssm.d_state,
@@ -5522,6 +5957,139 @@ pub fn load_qwen35_model(
         "qwen35 trunk must contain both Gated DeltaNet and full-attention blocks"
     );
 
+    let mtp = if nextn == 1 {
+        let mtp_prefix = format!("blk.{}.nextn", trunk_layers);
+        let plain_prefix = format!("blk.{}", trunk_layers);
+        let find_name = |suffix: &str, global: Option<&str>| -> Option<String> {
+            let scoped = format!("{}.{}", mtp_prefix, suffix);
+            if tensor_idx.contains_key(&scoped) {
+                return Some(scoped);
+            }
+            let plain = format!("{}.{}", plain_prefix, suffix);
+            if tensor_idx.contains_key(&plain) {
+                return Some(plain);
+            }
+            global
+                .filter(|name| tensor_idx.contains_key(*name))
+                .map(str::to_string)
+        };
+        let loaded = (|| -> Option<Qwen35MtpWeights> {
+            let load_required_weight = |suffix: &str| -> Option<(String, Weight)> {
+                let name = find_name(suffix, None)?;
+                let weight = load_weight(
+                    mmap_data,
+                    data_offset,
+                    &name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                );
+                Some((name, weight))
+            };
+            let load_required_vec = |suffix: &str, global: Option<&str>| -> Option<Vec<f32>> {
+                let name = find_name(suffix, global)?;
+                Some(load_f32_vec(
+                    mmap_data,
+                    data_offset,
+                    &name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                ))
+            };
+
+            let (eh_name, eh_proj) = load_required_weight("eh_proj.weight")?;
+            validate_global_shape(&eh_name, &eh_proj, config.dim, 2 * config.dim);
+
+            let (q_name, q_gate) = load_required_weight("attn_q.weight")?;
+            validate_global_shape(
+                &q_name,
+                &q_gate,
+                2 * config.n_heads * config.head_dim,
+                config.dim,
+            );
+            let (k_name, k) = load_required_weight("attn_k.weight")?;
+            validate_global_shape(&k_name, &k, config.n_kv_heads * config.head_dim, config.dim);
+            let (v_name, v) = load_required_weight("attn_v.weight")?;
+            validate_global_shape(
+                &v_name,
+                &v,
+                config.n_kv_heads * config.value_dim,
+                config.dim,
+            );
+            let (out_name, attn_out) = load_required_weight("attn_output.weight")?;
+            validate_global_shape(
+                &out_name,
+                &attn_out,
+                config.dim,
+                config.n_heads * config.value_dim,
+            );
+
+            let (gate_name, ffn_gate) = load_required_weight("ffn_gate.weight")?;
+            validate_global_shape(&gate_name, &ffn_gate, config.hidden_dim, config.dim);
+            let (up_name, ffn_up) = load_required_weight("ffn_up.weight")?;
+            validate_global_shape(&up_name, &ffn_up, config.hidden_dim, config.dim);
+            let (down_name, ffn_down) = load_required_weight("ffn_down.weight")?;
+            validate_global_shape(&down_name, &ffn_down, config.dim, config.hidden_dim);
+
+            let optional_weight = |suffix: &str, global: Option<&str>| -> Option<Weight> {
+                let name = find_name(suffix, global)?;
+                Some(load_weight(
+                    mmap_data,
+                    data_offset,
+                    &name,
+                    &tensor_idx,
+                    &inferred_sizes,
+                    false,
+                    borrow_quantized,
+                ))
+            };
+
+            Some(Qwen35MtpWeights {
+                eh_proj,
+                embedding_norm: load_required_vec("enorm.weight", Some("nextn.enorm.weight"))?,
+                hidden_norm: load_required_vec("hnorm.weight", Some("nextn.hnorm.weight"))?,
+                attn_norm: load_required_vec("attn_norm.weight", None)?,
+                post_attn_norm: load_required_vec("ffn_norm.weight", None)
+                    .or_else(|| load_required_vec("post_attention_norm.weight", None))?,
+                attention: Qwen35AttentionWeights {
+                    q_gate,
+                    k,
+                    v,
+                    q_norm: load_required_vec("attn_q_norm.weight", None)?,
+                    k_norm: load_required_vec("attn_k_norm.weight", None)?,
+                    out: attn_out,
+                    kv_slot: 0,
+                },
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                head_norm: load_required_vec(
+                    "shared_head_norm.weight",
+                    Some("nextn.shared_head_norm.weight"),
+                )?,
+                token_embd: optional_weight(
+                    "embed_tokens.weight",
+                    Some("nextn.embed_tokens.weight"),
+                ),
+                output: optional_weight(
+                    "shared_head_head.weight",
+                    Some("nextn.shared_head_head.weight"),
+                ),
+            })
+        })();
+        if loaded.is_none() {
+            eprintln!(
+                "  Embedded Qwen draft head metadata is present, but one or more required tensors are missing; native drafting is disabled."
+            );
+        } else {
+            eprintln!("  Loaded embedded Qwen one-step draft head");
+        }
+        loaded.map(Box::new)
+    } else {
+        None
+    };
+
     let weights = Qwen35Weights {
         token_embd,
         output_norm: load_f32_vec(
@@ -5542,6 +6110,7 @@ pub fn load_qwen35_model(
             rotary_dim,
             config.rope_scaling_factor,
         ),
+        mtp,
     };
     (config, weights)
 }
@@ -7665,6 +8234,22 @@ fn resident_forward_attempt(
     crate::metal::resident_decode_into(&buf.x, pos, config.vocab_size, logits)
 }
 
+fn resident_greedy_attempt(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+) -> Option<u32> {
+    if pos >= cache.storage_len || !resident_ready(config, weights, cache, buf) {
+        return None;
+    }
+    let _guard = resident_lock();
+    crate::metal::resident_decode_greedy(&buf.x, pos, recent, repeat_penalty)
+}
+
 /// Runs one prompt token on the resident decoder for its KV-cache writes only.
 ///
 /// Prefill discards every position's logits except the last, so this skips the
@@ -7902,6 +8487,33 @@ pub fn forward_into(
     weights.output.matvec_into(&buf.xn, logits);
 }
 
+/// Runs a standard decoder step and, when the resident backend is active,
+/// reduces greedy sampling to one token on the device. A `None` result means
+/// the regular logits buffer was populated and should be sampled on the CPU.
+pub fn forward_greedy_into(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+    logits: &mut Vec<f32>,
+) -> Option<u32> {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    if active_sliding_window(config, cache) == 0
+        && let Some(selected) =
+            resident_greedy_attempt(config, weights, cache, buf, pos, recent, repeat_penalty)
+    {
+        return Some(selected);
+    }
+    forward_into(config, weights, cache, buf, token, pos, logits);
+    None
+}
+
 /// Runs one Laguna decoder step. Laguna combines variable-width GQA attention,
 /// a positive per-head attention gate, and sparse routed SwiGLU experts.
 fn forward_laguna_impl(
@@ -8112,7 +8724,7 @@ fn softplus(value: f32) -> f32 {
 
 /// Qwen3.5's Gated DeltaNet uses true L2 normalisation, unlike RMSNorm.
 ///
-/// llama.cpp intentionally clamps the norm itself (`max(sqrt(sum_sq), eps)`),
+/// The model definition clamps the norm itself (`max(sqrt(sum_sq), eps)`),
 /// rather than adding epsilon under the square root. Keeping that distinction
 /// matters for exact replay and for zero-valued test vectors.
 fn qwen35_l2_normalize_heads(x: &mut [f32], head_dim: usize, heads: usize, eps: f32) {
@@ -8160,7 +8772,7 @@ fn qwen35_split_q_gate(
 ///
 /// `state` is laid out as `[value_row][key_column]`, the transpose of the
 /// mathematical `S[key][value]` notation. It makes each value row contiguous
-/// for the two dot products and exactly matches the GGUF reference kernel.
+/// for the two dot products and matches the tensor layout stored in the model.
 fn qwen35_delta_head_step(
     q: &[f32],
     k: &[f32],
@@ -8180,10 +8792,9 @@ fn qwen35_delta_head_step(
     let mut value_row = 0usize;
 
     // Four rows share the same K/Q vectors and recurrence coefficients. The
-    // x4 kernels load those shared vectors once per SIMD block, and the affine
-    // update folds the separate decay and delta passes into one state write.
-    // This cuts the dominant 128x128 state walk from four passes to three for
-    // Qwen3.8's real head width while preserving update-before-read ordering.
+    // x4 kernels load those shared vectors once per SIMD block. Fusing the
+    // update with its following projection cuts the dominant 128x128 state
+    // walk from three reads to two while preserving update-before-read order.
     while value_row + 4 <= width {
         let rows = &mut state[value_row * width..(value_row + 4) * width];
         let (row0, rows) = rows.split_at_mut(width);
@@ -8203,11 +8814,10 @@ fn qwen35_delta_head_step(
             (v[value_row + 2] - predicted[2]) * beta,
             (v[value_row + 3] - predicted[3]) * beta,
         ];
-        simd::affine_add_f32x4(row0, row1, row2, row3, [decay; 4], delta, k);
-
-        // The reference applies the 1/sqrt(d) scale to Q after the state
-        // update, so these projections must read the new memory.
-        let projected = simd::dot_f32x4(row0, row1, row2, row3, q);
+        // The 1/sqrt(d) scale applies after the state update. The fused SIMD
+        // primitive projects the register-resident updated rows before they
+        // would otherwise need to be loaded from memory a third time.
+        let projected = simd::affine_add_dot_f32x4(row0, row1, row2, row3, [decay; 4], delta, k, q);
         for lane in 0..4 {
             out[value_row + lane] = projected[lane] * q_scale;
         }
@@ -8568,6 +9178,370 @@ fn qwen35_attention_step(
     layer.out.matvec_into(&buf.attn_out, &mut buf.proj);
 }
 
+fn qwen35_resident_quant_parts(weight: &Weight) -> Option<(&[u8], u32, u32, u32)> {
+    match weight {
+        Weight::Quantized {
+            data,
+            dtype,
+            rows,
+            cols,
+        } => Some((
+            data.as_slice(),
+            u32::try_from(*rows).ok()?,
+            u32::try_from(*cols).ok()?,
+            resident_dtype_code(*dtype)?,
+        )),
+        Weight::F32(_) => None,
+    }
+}
+
+// The resident backend wraps quantized bytes with `newBufferWithBytesNoCopy`.
+// Only mmap views have a lifetime tied to the Runner independently of the
+// individual Weight values; owned Vec-backed weights from `from_gguf_bytes`
+// deliberately stay on the CPU path.
+fn qwen35_resident_mmap_backed(weights: &Qwen35Weights) -> bool {
+    let borrowed = |weight: &Weight| {
+        matches!(
+            weight,
+            Weight::Quantized {
+                data: RawTensorData::View { .. },
+                dtype: GGMLType::Q4_K | GGMLType::Q6_K,
+                ..
+            }
+        )
+    };
+    if !borrowed(&weights.output) {
+        return false;
+    }
+    weights.layers.iter().all(|layer| {
+        let mixer_ok = match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => [
+                &linear.qkv,
+                &linear.gate,
+                &linear.alpha,
+                &linear.beta,
+                &linear.out,
+            ]
+            .into_iter()
+            .all(&borrowed),
+            Qwen35Mixer::Attention(attention) => [
+                &attention.q_gate,
+                &attention.k,
+                &attention.v,
+                &attention.out,
+            ]
+            .into_iter()
+            .all(&borrowed),
+        };
+        mixer_ok
+            && [&layer.ffn_gate, &layer.ffn_up, &layer.ffn_down]
+                .into_iter()
+                .all(&borrowed)
+    })
+}
+
+/// Reports whether this loaded Qwen can use the no-copy resident Metal graph.
+/// Runtime-dependent cache checks remain in `qwen35_resident_ready`.
+pub(crate) fn qwen35_resident_eligible(config: &Config, weights: &Qwen35Weights) -> bool {
+    crate::metal::resident_enabled()
+        && qwen35_resident_mmap_backed(weights)
+        && config.sliding_window == 0
+        && config.dim != 0
+        && config.dim % 256 == 0
+        && config.hidden_dim != 0
+        && config.hidden_dim % 256 == 0
+        && config.head_dim != 0
+        && config.head_dim <= 256
+        && weights.ssm.d_state == 128
+}
+
+fn qwen35_resident_fingerprint(
+    config: &Config,
+    weights: &Qwen35Weights,
+) -> u64 {
+    let ptr = match &weights.token_embd {
+        Weight::Quantized { data, .. } => data.as_slice().as_ptr() as usize as u64,
+        Weight::F32(data) => data.as_ptr() as usize as u64,
+    };
+    [
+        ptr,
+        config.n_layers as u64,
+        config.dim as u64,
+        config.hidden_dim as u64,
+        config.n_heads as u64,
+        config.n_kv_heads as u64,
+        config.head_dim as u64,
+        weights.rotary_dim as u64,
+        weights.ssm.n_head as u64,
+        weights.ssm.n_group as u64,
+        weights.ssm.d_state as u64,
+    ]
+    .into_iter()
+    .fold(0xcbf29ce484222325u64, |hash, part| {
+        (hash ^ part).wrapping_mul(0x100000001b3)
+    })
+}
+
+fn qwen35_resident_configure_once(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &KVCache,
+) -> bool {
+    if !crate::metal::qwen_resident_configure(
+        weights.layers.len(),
+        config.dim,
+        config.hidden_dim,
+        config.vocab_size,
+        cache.storage_len,
+        config.rms_norm_eps,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        weights.rotary_dim,
+        weights.ssm.n_head,
+        weights.ssm.n_group,
+        weights.ssm.d_state,
+        weights.ssm.d_conv,
+    ) {
+        return false;
+    }
+
+    let empty_bytes: &[u8] = &[];
+    let empty_floats: &[f32] = &[];
+    for (layer_index, layer) in weights.layers.iter().enumerate() {
+        let mut w = [empty_bytes; 8];
+        let mut w_rows = [0u32; 8];
+        let mut w_cols = [0u32; 8];
+        let mut w_dt = [0u32; 8];
+        let (layer_type, slots, conv_w, a, dt_bias, norm, q_norm, k_norm): (
+            u32,
+            Vec<(usize, &Weight)>,
+            &[f32],
+            &[f32],
+            &[f32],
+            &[f32],
+            &[f32],
+            &[f32],
+        ) = match &layer.mixer {
+            Qwen35Mixer::Linear(linear) => (
+                crate::metal::QWEN_RESIDENT_LAYER_LINEAR,
+                vec![
+                    (0, &linear.qkv),
+                    (1, &linear.gate),
+                    (2, &linear.alpha),
+                    (3, &linear.beta),
+                    (4, &linear.out),
+                    (5, &layer.ffn_gate),
+                    (6, &layer.ffn_up),
+                    (7, &layer.ffn_down),
+                ],
+                &linear.conv_w,
+                &linear.a,
+                &linear.dt_bias,
+                &linear.norm,
+                empty_floats,
+                empty_floats,
+            ),
+            Qwen35Mixer::Attention(attention) => (
+                crate::metal::QWEN_RESIDENT_LAYER_ATTENTION,
+                vec![
+                    (0, &attention.q_gate),
+                    (1, &attention.k),
+                    (2, &attention.v),
+                    (3, &attention.out),
+                    (4, &layer.ffn_gate),
+                    (5, &layer.ffn_up),
+                    (6, &layer.ffn_down),
+                ],
+                empty_floats,
+                empty_floats,
+                empty_floats,
+                empty_floats,
+                &attention.q_norm,
+                &attention.k_norm,
+            ),
+        };
+        for (slot, weight) in slots {
+            let Some((bytes, rows, cols, dtype)) = qwen35_resident_quant_parts(weight) else {
+                return false;
+            };
+            w[slot] = bytes;
+            w_rows[slot] = rows;
+            w_cols[slot] = cols;
+            w_dt[slot] = dtype;
+        }
+        let input = crate::metal::QwenResidentLayerInput {
+            layer_type,
+            w,
+            w_rows,
+            w_cols,
+            w_dt,
+            attn_norm: &layer.attn_norm,
+            post_norm: &layer.post_attn_norm,
+            conv_w,
+            a,
+            dt_bias,
+            norm,
+            q_norm,
+            k_norm,
+        };
+        if !crate::metal::qwen_resident_set_layer(layer_index, &input) {
+            return false;
+        }
+    }
+
+    let Some((output, output_rows, output_cols, output_dt)) =
+        qwen35_resident_quant_parts(&weights.output)
+    else {
+        return false;
+    };
+    output_rows as usize == config.vocab_size
+        && output_cols as usize == config.dim
+        && crate::metal::qwen_resident_set_output(
+            &weights.output_norm,
+            output,
+            output_rows as usize,
+            output_dt,
+            &weights.rope_inv_freq,
+        )
+}
+
+fn qwen35_resident_ready(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &KVCache,
+    allow_reconfigure: bool,
+) -> bool {
+    if !qwen35_resident_eligible(config, weights)
+        // Once a cache has entered the resident graph its CPU recurrent/KV
+        // state is intentionally unseeded.  Keep that stream on its resident
+        // state even if a later session turn requests the CPU policy; falling
+        // through at a non-zero position would silently resume from an empty
+        // CPU prefix.  A fresh cache still obeys the current dispatch policy.
+        || (!cache.qwen_resident_active && !crate::metal::dispatch_enabled())
+        || cache.bf16
+        // The resident attention cache uses linear position-indexed slots and
+        // always scans from position zero.  A runtime sliding-window override
+        // turns KVCache storage into a ring, which this graph cannot represent.
+        || cache.sliding_window.is_some()
+    {
+        return false;
+    }
+    #[derive(Clone, Copy)]
+    struct Registration {
+        fingerprint: u64,
+        capacity: usize,
+        ready: bool,
+    }
+    static REGISTRATION: std::sync::Mutex<Option<Registration>> =
+        std::sync::Mutex::new(None);
+    let fingerprint = qwen35_resident_fingerprint(config, weights);
+    let mut registration = REGISTRATION
+        .lock()
+        .expect("Qwen resident registration lock poisoned");
+    if let Some(current) = *registration
+        && current.fingerprint == fingerprint
+        && current.capacity >= cache.storage_len
+        && current.ready
+    {
+        return true;
+    }
+    if !allow_reconfigure {
+        return false;
+    }
+    let ready = qwen35_resident_configure_once(config, weights, cache);
+    *registration = Some(Registration {
+        fingerprint,
+        capacity: cache.storage_len,
+        ready,
+    });
+    ready
+}
+
+fn qwen35_resident_decode_attempt(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+    logits: &mut Vec<f32>,
+) -> bool {
+    let _guard = resident_lock();
+    if pos >= cache.storage_len
+        || (!cache.qwen_resident_active && pos != 0)
+        || !qwen35_resident_ready(config, weights, cache, pos == 0)
+    {
+        assert!(
+            !cache.qwen_resident_active,
+            "Qwen resident Metal backend became unavailable mid-stream"
+        );
+        return false;
+    }
+    let ok = crate::metal::qwen_resident_decode_into(&buf.x, pos, config.vocab_size, logits);
+    assert!(
+        ok || !cache.qwen_resident_active,
+        "Qwen resident Metal decode failed after the stream entered GPU state"
+    );
+    cache.qwen_resident_active = ok;
+    ok
+}
+
+fn qwen35_resident_prefill_attempt(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+) -> bool {
+    let _guard = resident_lock();
+    if pos >= cache.storage_len
+        || (!cache.qwen_resident_active && pos != 0)
+        || !qwen35_resident_ready(config, weights, cache, pos == 0)
+    {
+        assert!(
+            !cache.qwen_resident_active,
+            "Qwen resident Metal backend became unavailable mid-stream"
+        );
+        return false;
+    }
+    let ok = crate::metal::qwen_resident_prefill(&buf.x, pos);
+    assert!(
+        ok || !cache.qwen_resident_active,
+        "Qwen resident Metal prefill failed after the stream entered GPU state"
+    );
+    cache.qwen_resident_active = ok;
+    ok
+}
+
+fn qwen35_resident_greedy_attempt(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &DecodeBuffer,
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+) -> Option<u32> {
+    let _guard = resident_lock();
+    if pos >= cache.storage_len
+        || (!cache.qwen_resident_active && pos != 0)
+        || !qwen35_resident_ready(config, weights, cache, pos == 0)
+    {
+        assert!(
+            !cache.qwen_resident_active,
+            "Qwen resident Metal backend became unavailable mid-stream"
+        );
+        return None;
+    }
+    let token = crate::metal::qwen_resident_greedy(&buf.x, pos, recent, repeat_penalty);
+    assert!(
+        token.is_some() || !cache.qwen_resident_active,
+        "Qwen resident Metal greedy decode failed after the stream entered GPU state"
+    );
+    cache.qwen_resident_active = token.is_some();
+    token
+}
+
 fn forward_qwen35_impl(
     config: &Config,
     weights: &Qwen35Weights,
@@ -8577,6 +9551,8 @@ fn forward_qwen35_impl(
     pos: usize,
     logits: Option<&mut Vec<f32>>,
 ) {
+    let profiling = qwen35_profile_enabled();
+    let mut profile = Qwen35Profile::default();
     weights
         .token_embd
         .row_into(token as usize, config.dim, &mut buf.x);
@@ -8586,6 +9562,7 @@ fn forward_qwen35_impl(
         rms_norm_into(&buf.x, &layer.attn_norm, config.rms_norm_eps, &mut buf.xn);
         match &layer.mixer {
             Qwen35Mixer::Linear(linear) => {
+                let started = profiling.then(Instant::now);
                 let state = cache
                     .ssm
                     .as_mut()
@@ -8599,15 +9576,23 @@ fn forward_qwen35_impl(
                     buf,
                 );
                 recurrent_index += 1;
+                if let Some(started) = started {
+                    profile.recurrent += started.elapsed();
+                }
             }
             Qwen35Mixer::Attention(attn) => {
+                let started = profiling.then(Instant::now);
                 qwen35_attention_step(config, weights, attn, cache, pos, buf);
+                if let Some(started) = started {
+                    profile.attention += started.elapsed();
+                }
             }
         }
         for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
             *residual += projection;
         }
 
+        let ffn_started = profiling.then(Instant::now);
         rms_norm_into(
             &buf.x,
             &layer.post_attn_norm,
@@ -8629,8 +9614,12 @@ fn forward_qwen35_impl(
         for (residual, projection) in buf.x.iter_mut().zip(&buf.proj) {
             *residual += projection;
         }
+        if let Some(started) = ffn_started {
+            profile.ffn += started.elapsed();
+        }
     }
     debug_assert_eq!(recurrent_index, weights.recurrent_layer_count);
+    let output_started = profiling.then(Instant::now);
     rms_norm_into(
         &buf.x,
         &weights.output_norm,
@@ -8639,6 +9628,16 @@ fn forward_qwen35_impl(
     );
     if let Some(logits) = logits {
         weights.output.matvec_into(&buf.xn, logits);
+    }
+    if let Some(started) = output_started {
+        profile.output += started.elapsed();
+    }
+    if profiling && let Ok(mut total) = qwen35_profile_store().lock() {
+        total.tokens += 1;
+        total.recurrent += profile.recurrent;
+        total.attention += profile.attention;
+        total.ffn += profile.ffn;
+        total.output += profile.output;
     }
 }
 
@@ -8652,7 +9651,46 @@ pub fn forward_qwen35_into(
     pos: usize,
     logits: &mut Vec<f32>,
 ) {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    if qwen35_resident_decode_attempt(config, weights, cache, buf, pos, logits) {
+        return;
+    }
     forward_qwen35_impl(config, weights, cache, buf, token, pos, Some(logits));
+}
+
+/// Runs a Qwen3.5/Qwen3.8 decode step with on-device greedy reduction when the
+/// complete resident Metal graph is available. A `None` result leaves logits
+/// populated through the regular CPU/per-operation path.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_greedy_qwen35_into(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut DecodeBuffer,
+    token: u32,
+    pos: usize,
+    recent: &[u32],
+    repeat_penalty: f32,
+    logits: &mut Vec<f32>,
+) -> Option<u32> {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    if let Some(token) = qwen35_resident_greedy_attempt(
+        config,
+        weights,
+        cache,
+        buf,
+        pos,
+        recent,
+        repeat_penalty,
+    ) {
+        return Some(token);
+    }
+    forward_qwen35_impl(config, weights, cache, buf, token, pos, Some(logits));
+    None
 }
 
 /// Runs one Qwen3.5/Qwen3.8 step and returns the final normalised hidden state.
@@ -8677,7 +9715,118 @@ pub fn forward_prefill_qwen35(
     token: u32,
     pos: usize,
 ) {
+    weights
+        .token_embd
+        .row_into(token as usize, config.dim, &mut buf.x);
+    if qwen35_resident_prefill_attempt(config, weights, cache, buf, pos) {
+        return;
+    }
     forward_qwen35_impl(config, weights, cache, buf, token, pos, None);
+}
+
+/// Runs Qwen's embedded one-step draft head. The head receives the raw final
+/// trunk residual for position `t` and the embedding of the already selected
+/// token `t + 1`, then predicts `t + 2`.
+///
+/// A one-step head has a single attention item, so its softmax is exactly one:
+/// each query head receives its grouped value row. Avoiding a synthetic cache
+/// and unused Q/K dot products keeps this path both exact and inexpensive.
+pub fn forward_qwen35_mtp_into(
+    config: &Config,
+    weights: &Qwen35Weights,
+    mtp: &Qwen35MtpWeights,
+    token: u32,
+    trunk_hidden: &[f32],
+    buf: &mut DecodeBuffer,
+    next_hidden: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+) {
+    let dim = config.dim;
+    let token_embd = mtp.token_embd.as_ref().unwrap_or(&weights.token_embd);
+    token_embd.row_into(token as usize, dim, &mut buf.x);
+    rms_norm_into(
+        &buf.x,
+        &mtp.embedding_norm,
+        config.rms_norm_eps,
+        &mut buf.xn,
+    );
+    rms_norm_into(
+        trunk_hidden,
+        &mtp.hidden_norm,
+        config.rms_norm_eps,
+        &mut buf.xn2,
+    );
+
+    buf.ple_inputs.resize(2 * dim, 0.0);
+    buf.ple_inputs[..dim].copy_from_slice(&buf.xn);
+    buf.ple_inputs[dim..].copy_from_slice(&buf.xn2);
+    mtp.eh_proj.matvec_into(&buf.ple_inputs, &mut buf.x);
+
+    rms_norm_into(&buf.x, &mtp.attn_norm, config.rms_norm_eps, &mut buf.xn);
+    if !try_quant_matvec2_into(
+        &mtp.attention.q_gate,
+        &mtp.attention.v,
+        &buf.xn,
+        &mut buf.qwen35_q_gate,
+        &mut buf.v,
+    ) {
+        mtp.attention
+            .q_gate
+            .matvec_into(&buf.xn, &mut buf.qwen35_q_gate);
+        mtp.attention.v.matvec_into(&buf.xn, &mut buf.v);
+    }
+    qwen35_split_q_gate(
+        &buf.qwen35_q_gate,
+        config.head_dim,
+        config.n_heads,
+        &mut buf.q,
+        &mut buf.qwen35_gate,
+    );
+    let query_dim = config.n_heads * config.value_dim;
+    let kv_mul = config.kv_mul;
+    buf.attn_out.resize(query_dim, 0.0);
+    for head in 0..config.n_heads {
+        let kv_head = head / kv_mul;
+        let source = kv_head * config.value_dim;
+        let target = head * config.value_dim;
+        buf.attn_out[target..target + config.value_dim]
+            .copy_from_slice(&buf.v[source..source + config.value_dim]);
+    }
+    simd::sigmoid_mul_in_place(&mut buf.attn_out, &buf.qwen35_gate);
+    mtp.attention.out.matvec_into(&buf.attn_out, &mut buf.proj);
+    for index in 0..dim {
+        buf.x[index] += buf.proj[index];
+    }
+
+    rms_norm_into(
+        &buf.x,
+        &mtp.post_attn_norm,
+        config.rms_norm_eps,
+        &mut buf.xn2,
+    );
+    if !try_quant_matvec2_into(
+        &mtp.ffn_gate,
+        &mtp.ffn_up,
+        &buf.xn2,
+        &mut buf.gate,
+        &mut buf.up,
+    ) {
+        mtp.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+        mtp.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+    }
+    simd::silu_mul_into(&buf.gate, &buf.up, &mut buf.hidden);
+    mtp.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+    for index in 0..dim {
+        buf.x[index] += buf.proj[index];
+    }
+
+    next_hidden.clear();
+    next_hidden.extend_from_slice(&buf.x);
+    rms_norm_into(&buf.x, &mtp.head_norm, config.rms_norm_eps, &mut buf.xn);
+    mtp.output
+        .as_ref()
+        .unwrap_or(&weights.output)
+        .matvec_into(&buf.xn, logits);
 }
 
 fn select_laguna_experts(
@@ -8731,8 +9880,7 @@ fn relu2(value: f32) -> f32 {
 /// Advances one Mamba-2 mixer by a single token, updating its recurrent state
 /// in place and writing the block output to `out`.
 ///
-/// Mirrors llama.cpp's `build_mamba2_layer` plus `ggml_ssm_scan`: the fused
-/// projection splits into gate/x/B/C/dt, a depthwise causal convolution runs
+/// The fused projection splits into gate/x/B/C/dt, a depthwise causal convolution runs
 /// over x, B and C together, the scan applies a per-head scalar decay, and the
 /// result is gated by `silu(z)` *before* a per-group RMSNorm — that ordering is
 /// load-bearing and the reverse produces plausible-looking garbage.
@@ -8746,6 +9894,34 @@ fn nemotron_mamba2_step(
     scratch: &mut Mamba2Scratch,
     out: &mut Vec<f32>,
 ) {
+    layer.in_proj.matvec_into(hidden, &mut scratch.projected);
+    nemotron_mamba2_core(
+        layer,
+        dims,
+        conv_state,
+        ssm_state,
+        &scratch.projected,
+        eps,
+        &mut scratch.convolved,
+        &mut scratch.y,
+    );
+    layer.out_proj.matvec_into(&scratch.y, out);
+}
+
+/// Applies the causal convolution and selective state update to one already
+/// projected activation. Keeping the projection separate lets verification
+/// reuse each quantized weight row across several consecutive tokens.
+#[allow(clippy::too_many_arguments)]
+fn nemotron_mamba2_core(
+    layer: &Mamba2LayerWeights,
+    dims: &SsmDims,
+    conv_state: &mut [f32],
+    ssm_state: &mut [f32],
+    projected: &[f32],
+    eps: f32,
+    convolved: &mut Vec<f32>,
+    y: &mut Vec<f32>,
+) {
     let d_inner = dims.d_inner;
     let d_state = dims.d_state;
     let d_conv = dims.d_conv;
@@ -8754,12 +9930,11 @@ fn nemotron_mamba2_step(
     let head_dim = dims.head_dim();
     let conv_dim = dims.conv_dim();
 
-    layer.in_proj.matvec_into(hidden, &mut scratch.projected);
-    let (z, rest) = scratch.projected.split_at(d_inner);
+    let (z, rest) = projected.split_at(d_inner);
     let (xbc, dt) = rest.split_at(conv_dim);
 
     // ── Depthwise causal convolution over x, B and C ──
-    scratch.convolved.resize(conv_dim, 0.0);
+    convolved.resize(conv_dim, 0.0);
     let window = d_conv.saturating_sub(1);
     for channel in 0..conv_dim {
         let taps = &layer.conv_w[channel * d_conv..channel * d_conv + d_conv];
@@ -8775,14 +9950,14 @@ fn nemotron_mamba2_step(
             history.copy_within(1..window, 0);
             history[window - 1] = xbc[channel];
         }
-        scratch.convolved[channel] = silu(acc);
+        convolved[channel] = silu(acc);
     }
 
-    let (xs, bc) = scratch.convolved.split_at(d_inner);
+    let (xs, bc) = convolved.split_at(d_inner);
     let (b_all, c_all) = bc.split_at(n_group * d_state);
 
     // ── Selective scan, one step ──
-    scratch.y.resize(d_inner, 0.0);
+    y.resize(d_inner, 0.0);
     let heads_per_group = n_head / n_group.max(1);
     for head in 0..n_head {
         let dt_eff = softplus(dt[head] + layer.dt_bias[head]);
@@ -8802,18 +9977,18 @@ fn nemotron_mamba2_step(
                 state[i] = updated;
             }
             // Skip connection, per head and broadcast across its channels.
-            scratch.y[ii] = sum + layer.d[head] * xs[ii];
+            y[ii] = sum + layer.d[head] * xs[ii];
         }
     }
 
     // ── Gate, then grouped RMSNorm ──
-    for (value, gate) in scratch.y.iter_mut().zip(z.iter()) {
+    for (value, gate) in y.iter_mut().zip(z.iter()) {
         *value *= silu(*gate);
     }
     if !layer.norm.is_empty() {
         let group_size = d_inner / n_group.max(1);
         for group in 0..n_group.max(1) {
-            let span = &mut scratch.y[group * group_size..group * group_size + group_size];
+            let span = &mut y[group * group_size..group * group_size + group_size];
             let weights = &layer.norm[group * group_size..group * group_size + group_size];
             let mean_square = span.iter().map(|v| v * v).sum::<f32>() / group_size.max(1) as f32;
             let inv = 1.0 / (mean_square + eps).sqrt();
@@ -8822,8 +9997,6 @@ fn nemotron_mamba2_step(
             }
         }
     }
-
-    layer.out_proj.matvec_into(&scratch.y, out);
 }
 
 /// Reusable scratch buffers for the Mamba-2 mixer.
@@ -8837,8 +10010,8 @@ struct Mamba2Scratch {
 /// Runs a Nemotron-H routed feed-forward block into `out`.
 ///
 /// Routing is sigmoid-scored with an additive bias used only for *selecting*
-/// experts — the blended weights are the unbiased probabilities, matching
-/// llama.cpp's aux-loss-free load balancing. Experts have no gate projection.
+/// experts; blended weights use the unbiased probabilities. Experts have no
+/// gate projection.
 fn nemotron_moe_ffn_into(
     moe: &NemotronMoeWeights,
     weights: &NemotronHWeights,
@@ -10437,6 +11610,9 @@ pub struct PrefillBatchBuffer {
     /// per layer. This removes 26 redundant `sin_cos` passes for Ministral 3.
     rope_sin: Vec<f32>,
     rope_cos: Vec<f32>,
+    /// Token-local routed-expert scratch. Dense and recurrent projections use
+    /// the matrices above; routed experts remain sparse and token-dependent.
+    nemotron_token: Option<Box<DecodeBuffer>>,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -10465,6 +11641,7 @@ impl PrefillBatchBuffer {
             rope_inv_freq: build_rope_inv_freq(config.rope_theta, config.head_dim, 1.0),
             rope_sin: Vec::new(),
             rope_cos: Vec::new(),
+            nemotron_token: None,
         }
     }
 }
@@ -10482,14 +11659,21 @@ pub fn standard_prefill_batchable(weights: &ModelWeights) -> bool {
             // filling the cache with unnormalised keys.
             && layer.attn_q_norm.is_empty()
             && layer.attn_k_norm.is_empty()
-            && kquant_weight_parts(&layer.wq).is_some()
-            && kquant_weight_parts(&layer.wk).is_some()
-            && kquant_weight_parts(&layer.wv).is_some()
-            && kquant_weight_parts(&layer.wo).is_some()
-            && kquant_weight_parts(&layer.w1).is_some()
-            && kquant_weight_parts(&layer.w3).is_some()
-            && kquant_weight_parts(&layer.w2).is_some()
+            && quant_weight_parts(&layer.wq).is_some()
+            && quant_weight_parts(&layer.wk).is_some()
+            && quant_weight_parts(&layer.wv).is_some()
+            && quant_weight_parts(&layer.wo).is_some()
+            && quant_weight_parts(&layer.w1).is_some()
+            && quant_weight_parts(&layer.w3).is_some()
+            && quant_weight_parts(&layer.w2).is_some()
     })
+}
+
+/// Reports whether a standard decoder can verify a complete draft with the
+/// token-major CPU kernels, including the final vocabulary projection.
+#[cfg(not(target_family = "wasm"))]
+pub fn standard_verify_batchable(weights: &ModelWeights) -> bool {
+    standard_prefill_batchable(weights) && quant_weight_parts(&weights.output).is_some()
 }
 
 /// Reports whether all Qwen3.5/Qwen3.8 trunk projections can use the
@@ -10499,24 +11683,55 @@ pub fn qwen35_prefill_batchable(weights: &Qwen35Weights) -> bool {
     weights.layers.iter().all(|layer| {
         let mixer_batchable = match &layer.mixer {
             Qwen35Mixer::Linear(linear) => {
-                kquant_weight_parts(&linear.qkv).is_some()
-                    && kquant_weight_parts(&linear.gate).is_some()
-                    && kquant_weight_parts(&linear.alpha).is_some()
-                    && kquant_weight_parts(&linear.beta).is_some()
-                    && kquant_weight_parts(&linear.out).is_some()
+                quant_weight_parts(&linear.qkv).is_some()
+                    && quant_weight_parts(&linear.gate).is_some()
+                    && quant_weight_parts(&linear.alpha).is_some()
+                    && quant_weight_parts(&linear.beta).is_some()
+                    && quant_weight_parts(&linear.out).is_some()
             }
             Qwen35Mixer::Attention(attn) => {
-                kquant_weight_parts(&attn.q_gate).is_some()
-                    && kquant_weight_parts(&attn.k).is_some()
-                    && kquant_weight_parts(&attn.v).is_some()
-                    && kquant_weight_parts(&attn.out).is_some()
+                quant_weight_parts(&attn.q_gate).is_some()
+                    && quant_weight_parts(&attn.k).is_some()
+                    && quant_weight_parts(&attn.v).is_some()
+                    && quant_weight_parts(&attn.out).is_some()
             }
         };
         mixer_batchable
-            && kquant_weight_parts(&layer.ffn_gate).is_some()
-            && kquant_weight_parts(&layer.ffn_up).is_some()
-            && kquant_weight_parts(&layer.ffn_down).is_some()
+            && quant_weight_parts(&layer.ffn_gate).is_some()
+            && quant_weight_parts(&layer.ffn_up).is_some()
+            && quant_weight_parts(&layer.ffn_down).is_some()
     })
+}
+
+/// Reports whether a Qwen hybrid decoder can verify a complete draft with the
+/// token-major CPU kernels, including the final vocabulary projection.
+#[cfg(not(target_family = "wasm"))]
+pub fn qwen35_verify_batchable(weights: &Qwen35Weights) -> bool {
+    qwen35_prefill_batchable(weights) && quant_weight_parts(&weights.output).is_some()
+}
+
+/// Reports whether every dense projection in a Nemotron-H/Soofi trunk can use
+/// token-major verification. Routed expert matrices remain sparse and are
+/// deliberately evaluated only for the experts selected by each token.
+#[cfg(not(target_family = "wasm"))]
+pub fn nemotron_h_verify_batchable(weights: &NemotronHWeights) -> bool {
+    quant_weight_parts(&weights.output).is_some()
+        && weights.layers.iter().all(|layer| match &layer.mixer {
+            NemotronMixer::Mamba2(mamba) => {
+                quant_weight_parts(&mamba.in_proj).is_some()
+                    && quant_weight_parts(&mamba.out_proj).is_some()
+            }
+            NemotronMixer::Attention(attn) => {
+                quant_weight_parts(&attn.wq).is_some()
+                    && quant_weight_parts(&attn.wk).is_some()
+                    && quant_weight_parts(&attn.wv).is_some()
+                    && quant_weight_parts(&attn.wo).is_some()
+            }
+            NemotronMixer::DenseFfn(ffn) => {
+                quant_weight_parts(&ffn.up).is_some() && quant_weight_parts(&ffn.down).is_some()
+            }
+            NemotronMixer::Moe(_) => true,
+        })
 }
 
 /// Applies RMSNorm from one matrix row into another (slice output variant of
@@ -10740,6 +11955,37 @@ pub fn forward_prefill_batch(
     }
 
     true
+}
+
+/// Evaluates every draft token in one standard-decoder micro-batch and returns
+/// one normalized hidden row and one vocabulary-logit row per token. Row `i`
+/// predicts the token following `tokens[i]`.
+#[cfg(not(target_family = "wasm"))]
+pub fn forward_verify_batch(
+    config: &Config,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    buf: &mut PrefillBatchBuffer,
+    tokens: &[u32],
+    start_pos: usize,
+    hidden: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+) -> bool {
+    if !standard_verify_batchable(weights) {
+        return false;
+    }
+    if !forward_prefill_batch(config, weights, cache, buf, tokens, start_pos) {
+        return false;
+    }
+    finish_verify_batch(
+        config,
+        &weights.output_norm,
+        &weights.output,
+        buf,
+        tokens.len(),
+        hidden,
+        logits,
+    )
 }
 
 /// Batched prompt prefill for Qwen3.5/Qwen3.8 hybrid decoders.
@@ -11059,6 +12305,282 @@ pub fn forward_prefill_batch_qwen35(
 
     debug_assert_eq!(recurrent_index, weights.recurrent_layer_count);
     true
+}
+
+/// Evaluates every draft token in one Qwen hybrid micro-batch and returns one
+/// normalized hidden row and one vocabulary-logit row per token. Recurrent
+/// state is advanced in token order while projections reuse each weight row.
+#[cfg(not(target_family = "wasm"))]
+pub fn forward_verify_batch_qwen35(
+    config: &Config,
+    weights: &Qwen35Weights,
+    cache: &mut KVCache,
+    buf: &mut PrefillBatchBuffer,
+    tokens: &[u32],
+    start_pos: usize,
+    hidden: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+) -> bool {
+    if !qwen35_verify_batchable(weights) {
+        return false;
+    }
+    if !forward_prefill_batch_qwen35(config, weights, cache, buf, tokens, start_pos) {
+        return false;
+    }
+    finish_verify_batch(
+        config,
+        &weights.output_norm,
+        &weights.output,
+        buf,
+        tokens.len(),
+        hidden,
+        logits,
+    )
+}
+
+/// Evaluates a complete draft through a Nemotron-H/Soofi hybrid trunk. Dense
+/// projections are token-major; causal attention and recurrent state updates
+/// stay in strict position order. Sparse expert work remains token-local so no
+/// unselected expert weights are read.
+#[cfg(not(target_family = "wasm"))]
+pub fn forward_verify_batch_nemotron_h(
+    config: &Config,
+    weights: &NemotronHWeights,
+    cache: &mut KVCache,
+    buf: &mut PrefillBatchBuffer,
+    tokens: &[u32],
+    start_pos: usize,
+    hidden: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+) -> bool {
+    if !nemotron_h_verify_batchable(weights) {
+        return false;
+    }
+    if tokens.is_empty() {
+        hidden.clear();
+        logits.clear();
+        return true;
+    }
+
+    let batch = tokens.len();
+    let dim = config.dim;
+    buf.x.resize(batch * dim, 0.0);
+    buf.xn.resize(batch * dim, 0.0);
+    for (row, &token) in tokens.iter().enumerate() {
+        weights
+            .token_embd
+            .row_into(token as usize, dim, &mut buf.embd_row);
+        buf.x[row * dim..(row + 1) * dim].copy_from_slice(&buf.embd_row);
+    }
+
+    let mut recurrent_index = 0usize;
+    for layer in &weights.layers {
+        for row in 0..batch {
+            rms_norm_slice_into(
+                &buf.x[row * dim..(row + 1) * dim],
+                &layer.attn_norm,
+                config.rms_norm_eps,
+                &mut buf.xn[row * dim..(row + 1) * dim],
+            );
+        }
+
+        match &layer.mixer {
+            NemotronMixer::Mamba2(mamba) => {
+                if !try_kquant_matvec_batch_into(
+                    &mamba.in_proj,
+                    &buf.xn[..batch * dim],
+                    &mut buf.qwen35_qkv,
+                ) {
+                    return false;
+                }
+                let projected_width =
+                    weights.ssm.d_inner + weights.ssm.conv_dim() + weights.ssm.n_head;
+                buf.hidden.resize(batch * weights.ssm.d_inner, 0.0);
+                let state = cache
+                    .ssm
+                    .as_mut()
+                    .expect("hybrid model requires recurrent state");
+                let mut convolved = Vec::new();
+                let mut y = Vec::new();
+                for row in 0..batch {
+                    nemotron_mamba2_core(
+                        mamba,
+                        &weights.ssm,
+                        &mut state.conv[recurrent_index],
+                        &mut state.ssm[recurrent_index],
+                        &buf.qwen35_qkv[row * projected_width..(row + 1) * projected_width],
+                        config.rms_norm_eps,
+                        &mut convolved,
+                        &mut y,
+                    );
+                    buf.hidden[row * weights.ssm.d_inner..(row + 1) * weights.ssm.d_inner]
+                        .copy_from_slice(&y);
+                }
+                recurrent_index += 1;
+                if !try_kquant_matvec_batch_into(
+                    &mamba.out_proj,
+                    &buf.hidden[..batch * weights.ssm.d_inner],
+                    &mut buf.proj,
+                ) {
+                    return false;
+                }
+            }
+            NemotronMixer::Attention(attn) => {
+                if !try_kquant_matvec3_batch_into(
+                    &attn.wq,
+                    &attn.wk,
+                    &attn.wv,
+                    &buf.xn[..batch * dim],
+                    &mut buf.q,
+                    &mut buf.k,
+                    &mut buf.v,
+                ) {
+                    return false;
+                }
+                let head_dim = config.head_dim;
+                let q_dim = attn.n_heads * head_dim;
+                let k_dim = attn.n_kv_heads * head_dim;
+                let v_dim = k_dim;
+                let kv_mul = attn.n_heads / attn.n_kv_heads.max(1);
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                buf.attn_out.resize(batch * q_dim, 0.0);
+                for row in 0..batch {
+                    let pos = start_pos + row;
+                    let k_row = &buf.k[row * k_dim..(row + 1) * k_dim];
+                    let v_row = &buf.v[row * v_dim..(row + 1) * v_dim];
+                    cache.write_k(attn.kv_slot, pos, k_row);
+                    cache.write_v(attn.kv_slot, pos, v_row);
+                    attention_over_kv_heads(
+                        &buf.q[row * q_dim..(row + 1) * q_dim],
+                        &cache.k[attn.kv_slot],
+                        &cache.v[attn.kv_slot],
+                        k_dim,
+                        v_dim,
+                        cache.storage_len,
+                        head_dim,
+                        head_dim,
+                        attn.n_kv_heads,
+                        kv_mul,
+                        0,
+                        pos,
+                        scale,
+                        &mut buf.attn_out[row * q_dim..(row + 1) * q_dim],
+                    );
+                }
+                if !try_kquant_matvec_batch_into(
+                    &attn.wo,
+                    &buf.attn_out[..batch * q_dim],
+                    &mut buf.proj,
+                ) {
+                    return false;
+                }
+                if !attn.bo.is_empty() {
+                    for row in 0..batch {
+                        add_bias_if_present(&mut buf.proj[row * dim..(row + 1) * dim], &attn.bo);
+                    }
+                }
+            }
+            NemotronMixer::DenseFfn(ffn) => {
+                if !try_kquant_matvec_batch_into(&ffn.up, &buf.xn[..batch * dim], &mut buf.up) {
+                    return false;
+                }
+                let up_width = quant_weight_parts(&ffn.up)
+                    .map(|parts| parts.2)
+                    .unwrap_or(0);
+                for row in 0..batch {
+                    let values = &mut buf.up[row * up_width..(row + 1) * up_width];
+                    add_bias_if_present(values, &ffn.up_bias);
+                    for value in values {
+                        *value = relu2(*value);
+                    }
+                }
+                if !try_kquant_matvec_batch_into(
+                    &ffn.down,
+                    &buf.up[..batch * up_width],
+                    &mut buf.proj,
+                ) {
+                    return false;
+                }
+                if !ffn.down_bias.is_empty() {
+                    for row in 0..batch {
+                        add_bias_if_present(
+                            &mut buf.proj[row * dim..(row + 1) * dim],
+                            &ffn.down_bias,
+                        );
+                    }
+                }
+            }
+            NemotronMixer::Moe(moe) => {
+                let token_buf = buf.nemotron_token.get_or_insert_with(|| {
+                    Box::new(DecodeBuffer::new(
+                        config,
+                        config.head_dim,
+                        config.n_kv_heads,
+                        config.value_dim,
+                    ))
+                });
+                buf.proj.resize(batch * dim, 0.0);
+                for row in 0..batch {
+                    token_buf
+                        .xn
+                        .copy_from_slice(&buf.xn[row * dim..(row + 1) * dim]);
+                    nemotron_moe_ffn_into(moe, weights, config.expert_used_count, token_buf);
+                    buf.proj[row * dim..(row + 1) * dim].copy_from_slice(&token_buf.proj[..dim]);
+                }
+            }
+        }
+
+        for row in 0..batch {
+            let projection = &buf.proj[row * dim..(row + 1) * dim];
+            let residual = &mut buf.x[row * dim..(row + 1) * dim];
+            for index in 0..dim {
+                residual[index] += projection[index];
+            }
+        }
+    }
+    debug_assert_eq!(
+        recurrent_index,
+        weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.mixer, NemotronMixer::Mamba2(_)))
+            .count()
+    );
+
+    finish_verify_batch(
+        config,
+        &weights.output_norm,
+        &weights.output,
+        buf,
+        batch,
+        hidden,
+        logits,
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn finish_verify_batch(
+    config: &Config,
+    output_norm: &[f32],
+    output: &Weight,
+    buf: &mut PrefillBatchBuffer,
+    batch: usize,
+    hidden: &mut Vec<f32>,
+    logits: &mut Vec<f32>,
+) -> bool {
+    let dim = config.dim;
+    buf.xn.resize(batch * dim, 0.0);
+    for row in 0..batch {
+        rms_norm_slice_into(
+            &buf.x[row * dim..(row + 1) * dim],
+            output_norm,
+            config.rms_norm_eps,
+            &mut buf.xn[row * dim..(row + 1) * dim],
+        );
+    }
+    hidden.clear();
+    hidden.extend_from_slice(&buf.x[..batch * dim]);
+    try_kquant_matvec_batch_into(output, &buf.xn[..batch * dim], logits)
 }
 
 /// Forward for GPT-OSS (MoE) models; returns the normalized hidden state.

@@ -159,6 +159,9 @@ impl Default for SkillConfig {
 pub struct SpeculativeConfig {
     pub enabled: bool,
     pub assistant_path: Option<String>,
+    /// Explicitly allows an embedded one-step draft head. Kept off by
+    /// default so merely loading a model can never add probe overhead.
+    pub native_head: bool,
     pub max_draft_tokens: usize,
     pub adaptive: bool,
     pub min_accept_rate: f32,
@@ -170,6 +173,7 @@ impl Default for SpeculativeConfig {
         Self {
             enabled: true,
             assistant_path: None,
+            native_head: false,
             max_draft_tokens: 4,
             adaptive: true,
             min_accept_rate: 0.5,
@@ -362,7 +366,9 @@ impl GenerationOptions {
         {
             return Err(String::from("min_p must be in the range [0, 1)."));
         }
-        if self.speculative.max_draft_tokens == 0 && self.speculative.assistant_path.is_some() {
+        if self.speculative.max_draft_tokens == 0
+            && (self.speculative.assistant_path.is_some() || self.speculative.native_head)
+        {
             return Err(String::from("--mtp-tokens must be greater than 0."));
         }
         if !self.speculative.min_accept_rate.is_finite()
@@ -393,6 +399,10 @@ impl GenerationOptions {
 pub struct GenerationStats {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    /// Number of token positions evaluated by the target model after prefill.
+    /// Sampling alone does not increment this counter; in ordinary stateless
+    /// generation the first output token therefore remains free.
+    pub decode_steps: usize,
     pub prefill_time: Duration,
     pub decode_time: Duration,
     pub total_time: Duration,
@@ -402,12 +412,44 @@ pub struct GenerationStats {
     pub speculative: Option<SpeculativeStats>,
 }
 
+impl GenerationStats {
+    /// Returns throughput for target-model token evaluations after prefill.
+    pub fn decode_tok_s(&self) -> f64 {
+        decode_steps_per_second(self.decode_steps, self.decode_time)
+    }
+}
+
+/// Computes target-model decode throughput for one run or an aggregate.
+pub fn decode_steps_per_second(decode_steps: usize, decode_time: Duration) -> f64 {
+    if decode_time.is_zero() {
+        0.0
+    } else {
+        decode_steps as f64 / decode_time.as_secs_f64()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SpeculativeStats {
+    /// Tokens predicted by the assistant or embedded draft head. A token
+    /// selected directly from the target logits is deliberately excluded.
     pub drafted_tokens: usize,
+    /// Predicted draft tokens that matched the target model.
     pub accepted_tokens: usize,
+    /// Predicted draft tokens that did not match the target model.
     pub rejected_tokens: usize,
     pub draft_time: Duration,
+    /// Wall time spent evaluating target-model draft batches.
+    pub verification_time: Duration,
+    /// Number of target tokens evaluated by the batched verifier.
+    pub verified_tokens: usize,
+    /// Number of target-model batch evaluations.
+    pub verification_batches: usize,
+    /// Target work needed to repair state after a rejected batch.
+    pub recovery_time: Duration,
+    /// Target steps executed while repairing rejected batches.
+    pub recovered_target_steps: usize,
+    /// Tokens emitted by speculative verification batches.
+    pub output_tokens: usize,
     pub disabled: bool,
 }
 
@@ -633,7 +675,8 @@ enum LoadedWeights {
 }
 
 struct SpeculativeState<'a> {
-    assistant: &'a Runner,
+    assistant: Option<&'a Runner>,
+    native_qwen_mtp: bool,
     cache: KVCache,
     buf: DecodeBuffer,
     logits: Vec<f32>,
@@ -643,6 +686,10 @@ struct SpeculativeState<'a> {
     min_accept_rate: f32,
     stats: SpeculativeStats,
     enabled: bool,
+    #[cfg(not(target_family = "wasm"))]
+    target_batch: model::PrefillBatchBuffer,
+    target_hidden: Vec<f32>,
+    target_logits: Vec<f32>,
 }
 
 enum DecodeFlow {
@@ -2264,6 +2311,12 @@ impl Runner {
         self.speculative_assistant.is_some()
     }
 
+    /// Returns whether the loaded target contains an executable embedded
+    /// one-step draft head.
+    pub fn has_native_mtp(&self) -> bool {
+        matches!(&self.weights, LoadedWeights::Qwen35(weights) if weights.mtp.is_some())
+    }
+
     /// Describes runtime optimizations that can affect generation behavior.
     pub fn optimization_summary(&self, options: &GenerationOptions) -> Vec<String> {
         let mut items = Vec::new();
@@ -2359,6 +2412,16 @@ impl Runner {
                 options.speculative.adaptive,
                 options.speculative.min_accept_rate
             ));
+        } else if options.speculative.enabled
+            && options.speculative.native_head
+            && self.has_native_mtp()
+        {
+            items.push(format!(
+                "mtp=greedy embedded draft_tokens=2 adaptive={} min_accept_rate={:.2}",
+                options.speculative.adaptive, options.speculative.min_accept_rate
+            ));
+        } else if self.has_native_mtp() {
+            items.push(String::from("mtp=off (embedded head available)"));
         } else {
             items.push(String::from("mtp=off"));
         }
@@ -2544,6 +2607,20 @@ impl Runner {
             && std::env::var("RUSTY_LLM_GEMMA_METAL").as_deref() != Ok("1")
         {
             return BackendPolicy::Cpu;
+        }
+        // Qwen3.5/3.8 only wins on Metal when the complete hybrid graph and
+        // recurrent/KV state remain resident. Mmap-backed Q4_K/Q6_K models use
+        // that path automatically; unsupported/in-memory layouts stay on the
+        // faster CPU path instead of falling into per-operation GPU dispatch.
+        if is_qwen35_arch(&self.arch) && crate::metal::enabled() {
+            return match &self.weights {
+                LoadedWeights::Qwen35(weights)
+                    if model::qwen35_resident_eligible(&self.config, weights) =>
+                {
+                    BackendPolicy::Metal
+                }
+                _ => BackendPolicy::Cpu,
+            };
         }
         if self.arch == "mistral3" && crate::metal::enabled() {
             BackendPolicy::Metal
@@ -3216,6 +3293,7 @@ impl Runner {
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
+        model::qwen35_profile_reset();
         let mut on_token = on_token;
         let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
 
@@ -3296,8 +3374,10 @@ impl Runner {
         let t_decode = Instant::now();
         let mut output = String::with_capacity(options.max_tokens.saturating_mul(4));
         let mut generated_tokens = 0usize;
+        let mut decode_steps = 0usize;
         let mut pos = tokens.len();
         let mut recent = recent_token_tail(&tokens);
+        let mut resident_greedy_token = None;
         // Characters split across token boundaries are reassembled here rather
         // than decoded per token, which would emit U+FFFD for every emoji.
         let mut stitcher = Utf8Stitcher::new();
@@ -3330,6 +3410,7 @@ impl Runner {
                         max_stop_len,
                         &mut recent,
                         &mut generated_tokens,
+                        &mut decode_steps,
                         &mut pos,
                         cache_len,
                         options.max_tokens,
@@ -3342,13 +3423,15 @@ impl Runner {
                 }
             }
 
-            let token = sampling::sample_with_scratch(
-                &mut logits,
-                &options.sampler,
-                &mut rng,
-                recent.as_slice(),
-                &mut buf.sampler_candidates,
-            );
+            let token = resident_greedy_token.take().unwrap_or_else(|| {
+                sampling::sample_with_scratch(
+                    &mut logits,
+                    &options.sampler,
+                    &mut rng,
+                    recent.as_slice(),
+                    &mut buf.sampler_candidates,
+                )
+            });
 
             if self.is_stop_token(token) {
                 break;
@@ -3385,7 +3468,24 @@ impl Runner {
                 break;
             }
 
-            self.forward_token_into(&mut cache, &mut buf, token, pos, &mut logits);
+            let speculative_active = speculative
+                .as_ref()
+                .map(|state| state.enabled && options.speculative.enabled)
+                .unwrap_or(false);
+            if options.sampler.temperature < 1e-6 && !speculative_active {
+                resident_greedy_token = self.forward_greedy_token_into(
+                    &mut cache,
+                    &mut buf,
+                    token,
+                    pos,
+                    recent.as_slice(),
+                    options.sampler.repeat_penalty,
+                    &mut logits,
+                );
+            } else {
+                self.forward_token_into(&mut cache, &mut buf, token, pos, &mut logits);
+            }
+            decode_steps += 1;
             pos += 1;
         }
 
@@ -3398,12 +3498,26 @@ impl Runner {
         }
 
         let decode_time = t_decode.elapsed();
+        if model::qwen35_profile_enabled() {
+            let profile = model::qwen35_profile_snapshot();
+            let total = profile.recurrent + profile.attention + profile.ffn + profile.output;
+            eprintln!(
+                "Qwen profile: tokens={} recurrent_ms={:.3} attention_ms={:.3} ffn_ms={:.3} output_ms={:.3} accounted_ms={:.3}",
+                profile.tokens,
+                profile.recurrent.as_secs_f64() * 1000.0,
+                profile.attention.as_secs_f64() * 1000.0,
+                profile.ffn.as_secs_f64() * 1000.0,
+                profile.output.as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+            );
+        }
         let speculative_stats = speculative.map(|state| state.stats);
         Ok(GenerationResult {
             text: output,
             stats: GenerationStats {
                 prompt_tokens: tokens.len(),
                 generated_tokens,
+                decode_steps,
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
@@ -3425,6 +3539,9 @@ impl Runner {
         if tokens.is_empty() {
             return;
         }
+        #[cfg(not(target_family = "wasm"))]
+        let metal_dispatch_active = crate::metal::enabled()
+            && !matches!(self.effective_backend_policy(options), BackendPolicy::Cpu);
         let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Prefill);
         let _thread_guard =
             SimdThreadGuard::set_temporarily(self.effective_prefill_threads(options, tokens.len()));
@@ -3433,14 +3550,14 @@ impl Runner {
 
         // Batched prefill runs every weight matrix once per chunk instead of
         // once per token (standard and Qwen3.5/Qwen3.8 paths). It is gated on
-        // Metal being fully disabled so macOS keeps its per-token fused-Metal
-        // and GPU-resident prefill paths untouched; the batchability check is
-        // hoisted out of the chunk loop so unsupported models skip straight
-        // to the per-token fallback.
+        // Metal dispatch being disabled for this call so macOS keeps its
+        // per-token fused and GPU-resident prefill paths untouched; the
+        // batchability check is hoisted out of the chunk loop so unsupported
+        // models skip straight to the per-token fallback.
         #[cfg(not(target_family = "wasm"))]
         let mut standard_batch_state = match &self.weights {
             LoadedWeights::Standard(weights)
-                if !crate::metal::enabled()
+                if !metal_dispatch_active
                     && tokens.len() > 2
                     && batch_prefill_enabled()
                     && model::standard_prefill_batchable(weights) =>
@@ -3452,7 +3569,7 @@ impl Runner {
         #[cfg(not(target_family = "wasm"))]
         let mut qwen35_batch_state = match &self.weights {
             LoadedWeights::Qwen35(weights)
-                if !crate::metal::enabled()
+                if !metal_dispatch_active
                     && tokens.len() > 2
                     && batch_prefill_enabled()
                     && model::qwen35_prefill_batchable(weights) =>
@@ -3553,54 +3670,101 @@ impl Runner {
         if !options.speculative.enabled || options.speculative.max_draft_tokens == 0 {
             return None;
         }
-        let assistant = self.speculative_assistant.as_deref()?;
         if options.sampler.temperature != 0.0 {
             eprintln!("MTP: disabled for non-greedy sampling; set --temp 0 for Greedy-MTP.");
             return None;
         }
-        let assistant_cache_len = target_cache_len.min(assistant.effective_max_context(options));
-        if tokens.len() >= assistant_cache_len {
+        let assistant = self.speculative_assistant.as_deref();
+        let native_qwen_mtp =
+            assistant.is_none() && options.speculative.native_head && self.has_native_mtp();
+        if assistant.is_none() && !native_qwen_mtp {
+            return None;
+        }
+        if native_qwen_mtp && options.speculative.max_draft_tokens < 2 {
+            eprintln!("MTP: embedded Qwen drafting needs --mtp-tokens 2 or greater.");
+            return None;
+        }
+        if native_qwen_mtp && crate::metal::dispatch_enabled() {
             eprintln!(
-                "MTP: disabled because prompt needs {} tokens but assistant context is {}.",
-                tokens.len(),
-                assistant_cache_len
+                "MTP: embedded Qwen drafting is disabled because this backend has no batched verifier."
             );
             return None;
         }
 
-        let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) = assistant.kv_dims();
-        let sliding_window = assistant.effective_sliding_window(options);
-        let mut cache = KVCache::with_sliding_window(
-            assistant.config.n_layers,
-            kv_k_dim,
-            kv_v_dim,
-            assistant_cache_len,
-            sliding_window,
-        );
-        let mut buf = DecodeBuffer::new(
-            &assistant.config,
-            max_head_dim,
-            max_n_kv_heads,
-            max_value_dim,
-        );
-        let mut logits = Vec::with_capacity(assistant.config.vocab_size);
         let t_draft = Instant::now();
-        assistant.prefill_prompt_tokens(&mut cache, &mut buf, tokens, 0, &mut logits, options);
+        let (cache, buf, logits, max_draft_tokens, draft_limit) = if let Some(assistant) = assistant
+        {
+            let assistant_cache_len =
+                target_cache_len.min(assistant.effective_max_context(options));
+            if tokens.len() >= assistant_cache_len {
+                eprintln!(
+                    "MTP: disabled because prompt needs {} tokens but assistant context is {}.",
+                    tokens.len(),
+                    assistant_cache_len
+                );
+                return None;
+            }
+
+            let (kv_k_dim, kv_v_dim, max_head_dim, max_n_kv_heads, max_value_dim) =
+                assistant.kv_dims();
+            let sliding_window = assistant.effective_sliding_window(options);
+            let mut cache = KVCache::with_sliding_window(
+                assistant.kv_layer_count(),
+                kv_k_dim,
+                kv_v_dim,
+                assistant_cache_len,
+                sliding_window,
+            );
+            assistant.attach_recurrent_state(&mut cache);
+            let mut buf = DecodeBuffer::new(
+                &assistant.config,
+                max_head_dim,
+                max_n_kv_heads,
+                max_value_dim,
+            );
+            let mut logits = Vec::with_capacity(assistant.config.vocab_size);
+            assistant.prefill_prompt_tokens(&mut cache, &mut buf, tokens, 0, &mut logits, options);
+            (
+                cache,
+                buf,
+                logits,
+                options.speculative.max_draft_tokens,
+                options.speculative.max_draft_tokens.clamp(1, 2),
+            )
+        } else {
+            let (_, _, max_head_dim, max_n_kv_heads, max_value_dim) = self.kv_dims();
+            (
+                KVCache::new(1, 1, 1, target_cache_len),
+                DecodeBuffer::new(&self.config, max_head_dim, max_n_kv_heads, max_value_dim),
+                Vec::with_capacity(self.config.vocab_size),
+                2,
+                2,
+            )
+        };
 
         Some(SpeculativeState {
             assistant,
+            native_qwen_mtp,
             cache,
             buf,
             logits,
-            draft_limit: options.speculative.max_draft_tokens.clamp(1, 2),
-            max_draft_tokens: options.speculative.max_draft_tokens,
+            draft_limit,
+            max_draft_tokens,
             adaptive: options.speculative.adaptive,
             min_accept_rate: options.speculative.min_accept_rate,
             stats: SpeculativeStats {
-                draft_time: t_draft.elapsed(),
+                draft_time: if native_qwen_mtp {
+                    Duration::ZERO
+                } else {
+                    t_draft.elapsed()
+                },
                 ..SpeculativeStats::default()
             },
             enabled: true,
+            #[cfg(not(target_family = "wasm"))]
+            target_batch: model::PrefillBatchBuffer::new(&self.config),
+            target_hidden: Vec::new(),
+            target_logits: Vec::new(),
         })
     }
 
@@ -3618,6 +3782,7 @@ impl Runner {
         max_stop_len: usize,
         recent: &mut Vec<u32>,
         generated_tokens: &mut usize,
+        decode_steps: &mut usize,
         pos: &mut usize,
         cache_len: usize,
         max_tokens: usize,
@@ -3633,40 +3798,232 @@ impl Runner {
         if limit == 0 {
             return DecodeFlow::Fallback;
         }
-
-        let mut draft = Vec::with_capacity(limit);
-        let t_draft = Instant::now();
-        for i in 0..limit {
-            let token = argmax_finite_token(&state.logits);
-            draft.push(token);
-            if self.is_stop_token(token) || i + 1 == limit {
-                break;
-            }
-            state.assistant.forward_token_into(
-                &mut state.cache,
-                &mut state.buf,
-                token,
-                *pos + i,
-                &mut state.logits,
-            );
-        }
-        state.stats.draft_time += t_draft.elapsed();
-        state.stats.drafted_tokens += draft.len();
-
-        if draft.is_empty() {
+        // The embedded head only adds value when it can predict the token
+        // after the target model's already-known greedy token.
+        if state.native_qwen_mtp && limit < 2 {
             return DecodeFlow::Fallback;
         }
 
+        // Recurrent assistants cannot be rewound by truncating a position
+        // counter. Keep one transactional snapshot so a rejected suffix can
+        // be discarded without re-prefilling the complete prompt.
+        let assistant_ssm_snapshot = state.assistant.and_then(|_| state.cache.ssm.clone());
+        let mut draft = Vec::with_capacity(limit);
+        let t_draft = Instant::now();
+        if state.native_qwen_mtp {
+            let first = argmax_finite_token(logits);
+            draft.push(first);
+            if limit > 1 && !self.is_stop_token(first) {
+                if let LoadedWeights::Qwen35(weights) = &self.weights
+                    && let Some(mtp) = weights.mtp.as_deref()
+                {
+                    model::forward_qwen35_mtp_into(
+                        &self.config,
+                        weights,
+                        mtp,
+                        first,
+                        &buf.x,
+                        &mut state.buf,
+                        &mut state.target_hidden,
+                        &mut state.logits,
+                    );
+                    draft.push(argmax_finite_token(&state.logits));
+                }
+            }
+        } else if let Some(assistant) = state.assistant {
+            for i in 0..limit {
+                let token = argmax_finite_token(&state.logits);
+                draft.push(token);
+                if self.is_stop_token(token) || i + 1 == limit {
+                    break;
+                }
+                assistant.forward_token_into(
+                    &mut state.cache,
+                    &mut state.buf,
+                    token,
+                    *pos + i,
+                    &mut state.logits,
+                );
+            }
+        }
+        state.stats.draft_time += t_draft.elapsed();
+        let predicted_in_batch = if state.native_qwen_mtp {
+            draft.len().saturating_sub(1)
+        } else {
+            draft.len()
+        };
+        state.stats.drafted_tokens += predicted_in_batch;
+
+        if draft.is_empty() || (state.native_qwen_mtp && predicted_in_batch == 0) {
+            return DecodeFlow::Fallback;
+        }
+
+        let batch_start = *pos;
+        let target_ssm_snapshot = cache.ssm.clone();
+        let t_verify = Instant::now();
+        #[cfg(not(target_family = "wasm"))]
+        let batched = self.forward_verify_draft_batch(state, cache, &draft, batch_start);
+        #[cfg(target_family = "wasm")]
+        let batched = false;
+        if batched {
+            state.stats.verification_time += t_verify.elapsed();
+            state.stats.verified_tokens += draft.len();
+            state.stats.verification_batches += 1;
+            *decode_steps += draft.len();
+
+            let vocab = self.config.vocab_size;
+            let mut accepted_in_batch = 0usize;
+            let mut rejected_at = None;
+
+            for (idx, &draft_token) in draft.iter().enumerate() {
+                let target_row = if idx == 0 {
+                    logits.as_slice()
+                } else {
+                    &state.target_logits[(idx - 1) * vocab..idx * vocab]
+                };
+                let target_token = argmax_finite_token(target_row);
+                let accepted = target_token == draft_token;
+                let speculative_token = !state.native_qwen_mtp || idx > 0;
+                let token = if accepted {
+                    if speculative_token {
+                        state.stats.accepted_tokens += 1;
+                        accepted_in_batch += 1;
+                    }
+                    draft_token
+                } else {
+                    let rejected_predictions = if state.native_qwen_mtp {
+                        draft.len().saturating_sub(idx.max(1))
+                    } else {
+                        draft.len() - idx
+                    };
+                    state.stats.rejected_tokens += rejected_predictions;
+                    rejected_at = Some((idx, target_token));
+                    target_token
+                };
+
+                if self.is_stop_token(token) {
+                    return DecodeFlow::Stop;
+                }
+                if self.emit_token_text(
+                    token,
+                    output,
+                    on_token,
+                    stitcher,
+                    stop_sequences,
+                    max_stop_len,
+                ) {
+                    return DecodeFlow::Stop;
+                }
+
+                *generated_tokens += 1;
+                state.stats.output_tokens += 1;
+                push_recent_token(recent, token);
+
+                if *generated_tokens >= max_tokens || *pos >= cache_len {
+                    return DecodeFlow::Stop;
+                }
+
+                if !accepted {
+                    // Attention-only caches can overwrite the rejected slot in
+                    // place. Recurrent models additionally restore their
+                    // compact state and replay only the accepted prefix.
+                    let recovery_started = Instant::now();
+                    let recovered_target_steps = if target_ssm_snapshot.is_some() {
+                        cache.ssm = target_ssm_snapshot.clone();
+                        for (offset, &accepted_token) in draft[..idx].iter().enumerate() {
+                            self.forward_prefill_token(
+                                cache,
+                                buf,
+                                accepted_token,
+                                batch_start + offset,
+                            );
+                        }
+                        idx + 1
+                    } else {
+                        1
+                    };
+                    self.forward_token_into(cache, buf, token, batch_start + idx, logits);
+                    state.stats.recovery_time += recovery_started.elapsed();
+                    state.stats.recovered_target_steps += recovered_target_steps;
+                    *decode_steps += recovered_target_steps;
+
+                    if let Some(assistant) = state.assistant {
+                        if assistant_ssm_snapshot.is_some() {
+                            state.cache.ssm = assistant_ssm_snapshot.clone();
+                            for (offset, &accepted_token) in draft[..idx].iter().enumerate() {
+                                assistant.forward_prefill_token(
+                                    &mut state.cache,
+                                    &mut state.buf,
+                                    accepted_token,
+                                    batch_start + offset,
+                                );
+                            }
+                        }
+                        if batch_start + idx < state.cache.max_len {
+                            assistant.forward_token_into(
+                                &mut state.cache,
+                                &mut state.buf,
+                                token,
+                                batch_start + idx,
+                                &mut state.logits,
+                            );
+                        }
+                    }
+                    *pos += 1;
+                    break;
+                }
+
+                *pos += 1;
+            }
+
+            if rejected_at.is_none() {
+                let last = draft.len() - 1;
+                logits.clear();
+                logits.extend_from_slice(&state.target_logits[last * vocab..(last + 1) * vocab]);
+                buf.x.copy_from_slice(
+                    &state.target_hidden[last * self.config.dim..(last + 1) * self.config.dim],
+                );
+
+                // Proposal generation deliberately leaves its final token
+                // unevaluated. Advance it now so the next draft starts from
+                // exactly the same accepted prefix as the target.
+                let last_pos = batch_start + last;
+                if let Some(assistant) = state.assistant
+                    && last_pos < state.cache.max_len
+                {
+                    assistant.forward_token_into(
+                        &mut state.cache,
+                        &mut state.buf,
+                        draft[last],
+                        last_pos,
+                        &mut state.logits,
+                    );
+                }
+            }
+
+            self.adapt_speculative_window(state, accepted_in_batch, predicted_in_batch);
+            return DecodeFlow::Continue;
+        }
+
         let mut accepted_in_batch = 0usize;
+        let mut rejected = false;
         for (idx, &draft_token) in draft.iter().enumerate() {
             let target_token = argmax_finite_token(logits);
             let accepted = target_token == draft_token;
+            let speculative_token = !state.native_qwen_mtp || idx > 0;
             let token = if accepted {
-                state.stats.accepted_tokens += 1;
-                accepted_in_batch += 1;
+                if speculative_token {
+                    state.stats.accepted_tokens += 1;
+                    accepted_in_batch += 1;
+                }
                 draft_token
             } else {
-                state.stats.rejected_tokens += draft.len() - idx;
+                let rejected_predictions = if state.native_qwen_mtp {
+                    draft.len().saturating_sub(idx.max(1))
+                } else {
+                    draft.len() - idx
+                };
+                state.stats.rejected_tokens += rejected_predictions;
                 target_token
             };
 
@@ -3686,6 +4043,7 @@ impl Runner {
             }
 
             *generated_tokens += 1;
+            state.stats.output_tokens += 1;
             push_recent_token(recent, token);
 
             if *generated_tokens >= max_tokens || *pos >= cache_len {
@@ -3693,16 +4051,31 @@ impl Runner {
             }
 
             self.forward_token_into(cache, buf, token, *pos, logits);
+            *decode_steps += 1;
 
             if !accepted {
-                if *pos < state.cache.max_len {
-                    state.assistant.forward_token_into(
-                        &mut state.cache,
-                        &mut state.buf,
-                        token,
-                        *pos,
-                        &mut state.logits,
-                    );
+                rejected = true;
+                if let Some(assistant) = state.assistant {
+                    if assistant_ssm_snapshot.is_some() {
+                        state.cache.ssm = assistant_ssm_snapshot.clone();
+                        for (offset, &accepted_token) in draft[..idx].iter().enumerate() {
+                            assistant.forward_prefill_token(
+                                &mut state.cache,
+                                &mut state.buf,
+                                accepted_token,
+                                batch_start + offset,
+                            );
+                        }
+                    }
+                    if *pos < state.cache.max_len {
+                        assistant.forward_token_into(
+                            &mut state.cache,
+                            &mut state.buf,
+                            token,
+                            *pos,
+                            &mut state.logits,
+                        );
+                    }
                 }
                 *pos += 1;
                 break;
@@ -3711,18 +4084,140 @@ impl Runner {
             *pos += 1;
         }
 
-        if state.stats.drafted_tokens >= 16 && state.stats.accept_rate() < state.min_accept_rate {
+        if !rejected && let Some(assistant) = state.assistant {
+            let last = draft.len() - 1;
+            let last_pos = batch_start + last;
+            if last_pos < state.cache.max_len {
+                assistant.forward_token_into(
+                    &mut state.cache,
+                    &mut state.buf,
+                    draft[last],
+                    last_pos,
+                    &mut state.logits,
+                );
+            }
+        }
+
+        self.adapt_speculative_window(state, accepted_in_batch, predicted_in_batch);
+
+        DecodeFlow::Continue
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn forward_verify_draft_batch(
+        &self,
+        state: &mut SpeculativeState<'_>,
+        cache: &mut KVCache,
+        draft: &[u32],
+        start_pos: usize,
+    ) -> bool {
+        // The resident GPU decoder owns a separate cache. Mixing it with a CPU
+        // batch would verify against an unseeded cache, so keep that path on
+        // its native sequential verifier.
+        if crate::metal::dispatch_enabled() {
+            return false;
+        }
+        match &self.weights {
+            LoadedWeights::Standard(weights) => model::forward_verify_batch(
+                &self.config,
+                weights,
+                cache,
+                &mut state.target_batch,
+                draft,
+                start_pos,
+                &mut state.target_hidden,
+                &mut state.target_logits,
+            ),
+            LoadedWeights::Qwen35(weights) => model::forward_verify_batch_qwen35(
+                &self.config,
+                weights,
+                cache,
+                &mut state.target_batch,
+                draft,
+                start_pos,
+                &mut state.target_hidden,
+                &mut state.target_logits,
+            ),
+            LoadedWeights::NemotronH(weights) => model::forward_verify_batch_nemotron_h(
+                &self.config,
+                weights,
+                cache,
+                &mut state.target_batch,
+                draft,
+                start_pos,
+                &mut state.target_hidden,
+                &mut state.target_logits,
+            ),
+            _ => false,
+        }
+    }
+
+    fn adapt_speculative_window(
+        &self,
+        state: &mut SpeculativeState<'_>,
+        accepted_in_batch: usize,
+        drafted_in_batch: usize,
+    ) {
+        let minimum_acceptance_sample = if state.native_qwen_mtp { 4 } else { 16 };
+        let no_native_signal = state.native_qwen_mtp
+            && state.stats.drafted_tokens >= 4
+            && state.stats.accepted_tokens == 0;
+        let low_acceptance = state.stats.drafted_tokens >= minimum_acceptance_sample
+            && state.stats.accept_rate() < state.min_accept_rate;
+
+        // Once enough measurements exist, compare assistant overhead with a
+        // conservative estimate of the target work actually avoided. This
+        // prevents a nominally accurate but slow draft model from reducing
+        // end-to-end throughput indefinitely.
+        let saved_target_steps = if state.native_qwen_mtp {
+            state.stats.accepted_tokens
+        } else {
+            state
+                .stats
+                .accepted_tokens
+                .saturating_sub(state.stats.verification_batches)
+        };
+        let overhead_exceeds_savings =
+            if state.stats.verified_tokens >= 16 && saved_target_steps > 0 {
+                let target_per_token = state.stats.verification_time.as_secs_f64()
+                    / state.stats.verified_tokens.max(1) as f64;
+                state.stats.draft_time.as_secs_f64() > target_per_token * saved_target_steps as f64
+            } else {
+                false
+            };
+
+        // Replaying a rejected recurrent batch provides an in-situ timing of
+        // the ordinary target path. Compare all measured speculative work to
+        // that conservative baseline. The embedded head has no assistant
+        // prefill cost, so it can react after two batches; an external
+        // assistant receives a longer amortisation window.
+        let timing_sample_batches = if state.native_qwen_mtp { 2 } else { 16 };
+        let measured_slowdown = if state.stats.verification_batches >= timing_sample_batches
+            && state.stats.recovered_target_steps > 0
+            && state.stats.output_tokens > 0
+        {
+            let normal_step =
+                state.stats.recovery_time.as_secs_f64() / state.stats.recovered_target_steps as f64;
+            let normal_estimate = normal_step * state.stats.output_tokens as f64;
+            let speculative_work = (state.stats.draft_time
+                + state.stats.verification_time
+                + state.stats.recovery_time)
+                .as_secs_f64();
+            speculative_work > normal_estimate
+        } else {
+            false
+        };
+
+        if no_native_signal || low_acceptance || overhead_exceeds_savings || measured_slowdown {
             state.enabled = false;
             state.stats.disabled = true;
-        } else if state.adaptive {
-            if accepted_in_batch == draft.len() {
+        } else if state.adaptive && !state.native_qwen_mtp {
+            if accepted_in_batch == drafted_in_batch {
                 state.draft_limit = (state.draft_limit + 1).min(state.max_draft_tokens);
             } else {
                 state.draft_limit = state.draft_limit.saturating_sub(1).max(1);
             }
         }
-
-        DecodeFlow::Continue
     }
 
     fn emit_token_text<F>(
@@ -3795,6 +4290,52 @@ impl Runner {
                 unreachable!("nomic-bert is embedding-only; decode is gated before this call")
             }
         }
+    }
+
+    /// Dispatches a decode step with an optional device-side greedy reduction.
+    /// Unsupported architectures/backends populate `logits` normally.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_greedy_token_into(
+        &self,
+        cache: &mut KVCache,
+        buf: &mut DecodeBuffer,
+        token: u32,
+        pos: usize,
+        recent: &[u32],
+        repeat_penalty: f32,
+        logits: &mut Vec<f32>,
+    ) -> Option<u32> {
+        match &self.weights {
+            LoadedWeights::Standard(weights) => {
+                return model::forward_greedy_into(
+                    &self.config,
+                    weights,
+                    cache,
+                    buf,
+                    token,
+                    pos,
+                    recent,
+                    repeat_penalty,
+                    logits,
+                );
+            }
+            LoadedWeights::Qwen35(weights) => {
+                return model::forward_greedy_qwen35_into(
+                    &self.config,
+                    weights,
+                    cache,
+                    buf,
+                    token,
+                    pos,
+                    recent,
+                    repeat_penalty,
+                    logits,
+                );
+            }
+            _ => {}
+        }
+        self.forward_token_into(cache, buf, token, pos, logits);
+        None
     }
 
     /// Like `forward_token` but returns the normalized hidden state (dim-sized)
@@ -4911,8 +5452,10 @@ impl Runner {
     /// Metal keeps a resident GPU cache instead of `cache.k`/`cache.v`, so it
     /// would never see this storage.
     fn kv_cache_wants_bf16(&self, options: &GenerationOptions) -> bool {
+        let cpu_cache_path = !crate::metal::enabled()
+            || matches!(self.effective_backend_policy(options), BackendPolicy::Cpu);
         options.runtime.kv_cache_dtype == KvCacheDType::Bf16
-            && !crate::metal::enabled()
+            && cpu_cache_path
             && matches!(
                 self.weights,
                 LoadedWeights::Standard(_) | LoadedWeights::Qwen35(_)
@@ -5032,6 +5575,10 @@ impl Runner {
             .generation_lock
             .lock()
             .expect("generation lock poisoned");
+        // Hold one backend policy for the complete session turn. In
+        // particular, a Qwen prompt must not prefill its recurrent/KV state
+        // on CPU and then start decoding from an empty resident GPU cache.
+        let _backend_guard = self.scoped_backend_dispatch(options, RuntimePhase::Decode);
         let mut on_token = on_token;
 
         if messages.is_empty() {
@@ -5120,6 +5667,7 @@ impl Runner {
         let t_decode = Instant::now();
         let mut output = String::with_capacity(options.max_tokens.saturating_mul(4));
         let mut generated_tokens = 0usize;
+        let mut decode_steps = 0usize;
         let mut pos = prompt_len;
 
         // Initialise the repeat-penalty window from only the prompt tail.  This
@@ -5195,6 +5743,7 @@ impl Runner {
                 pos,
                 &mut logits,
             );
+            decode_steps += 1;
             pos += 1;
         }
 
@@ -5216,6 +5765,7 @@ impl Runner {
             stats: GenerationStats {
                 prompt_tokens: prompt_len,
                 generated_tokens,
+                decode_steps,
                 prefill_time,
                 decode_time,
                 total_time: total_start.elapsed(),
@@ -5838,15 +6388,54 @@ fn deterministic_bench_vector(n: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendPolicy, ChatMessage, RECENT_TOKEN_LIMIT, RuntimeProfile, SharedPrefixCache,
-        architecture_preparation_note, architecture_supported, clean_thinking_prompt,
-        cosine_similarity, is_nemotron_hybrid_arch, is_qwen35_arch, l2_normalize_in_place,
-        mean_pool_in_place, push_recent_token, recent_token_tail, render_qwen35_chatml_messages,
-        trailing_char_boundary_start,
+        BackendPolicy, ChatMessage, GenerationStats, RECENT_TOKEN_LIMIT, RuntimeProfile,
+        SharedPrefixCache, architecture_preparation_note, architecture_supported,
+        clean_thinking_prompt, cosine_similarity, decode_steps_per_second, is_nemotron_hybrid_arch,
+        is_qwen35_arch, l2_normalize_in_place, mean_pool_in_place, push_recent_token,
+        recent_token_tail, render_qwen35_chatml_messages, trailing_char_boundary_start,
     };
     use crate::gguf::MetaValue;
     use crate::tokenizer::Tokenizer;
     use std::collections::HashMap;
+    use std::time::Duration;
+
+    #[test]
+    /// Verifies that decode throughput uses target forwards rather than output tokens.
+    fn generation_stats_decode_rate_uses_target_steps() {
+        let stats = GenerationStats {
+            prompt_tokens: 12,
+            generated_tokens: 64,
+            decode_steps: 63,
+            prefill_time: Duration::from_millis(100),
+            decode_time: Duration::from_secs(1),
+            total_time: Duration::from_millis(1100),
+            cached_tokens: 0,
+            speculative: None,
+        };
+
+        assert_eq!(stats.decode_tok_s(), 63.0);
+    }
+
+    #[test]
+    /// Verifies zero-work and zero-duration decode-rate edge cases.
+    fn decode_rate_handles_empty_measurements() {
+        assert_eq!(decode_steps_per_second(0, Duration::from_secs(1)), 0.0);
+        assert_eq!(decode_steps_per_second(1, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    /// Verifies aggregate rates sum each run's measured target steps.
+    fn decode_rate_aggregates_explicit_steps() {
+        let runs = [
+            (0usize, Duration::from_millis(10)),
+            (0usize, Duration::from_millis(10)),
+            (63usize, Duration::from_millis(980)),
+        ];
+        let steps = runs.iter().map(|(steps, _)| *steps).sum();
+        let elapsed = runs.iter().map(|(_, elapsed)| *elapsed).sum();
+
+        assert_eq!(decode_steps_per_second(steps, elapsed), 63.0);
+    }
 
     fn qwen35_test_tokenizer() -> Tokenizer {
         let mut vocab = vec![

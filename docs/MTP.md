@@ -1,10 +1,13 @@
 # MTP Usage Guide
 
-RustyLLM currently implements MTP as greedy assistant-based speculative
-decoding. A smaller assistant GGUF drafts tokens, and the target model verifies
-them with exact greedy argmax matching. Accepted draft tokens are emitted
-without changing the output; rejected tokens are replaced by the target token
-and any later draft tokens from that batch are discarded.
+RustyLLM implements greedy speculative decoding with exact target-model
+verification. Qwen hybrid GGUFs can use their embedded one-step draft head;
+Ministral, LLaMA, Qwen, and Soofi can also use a compatible smaller assistant
+GGUF. On the CPU paths for these four architecture families, the target
+evaluates the complete draft as one token-major micro-batch. Accepted tokens
+are emitted unchanged; on the first mismatch, the target token replaces the
+draft and the suffix is discarded. A backend without this batched verifier
+keeps normal decoding instead of paying draft overhead without a batch benefit.
 
 This mode is useful only when the assistant is much faster than the target and
 the two models agree often enough. If the acceptance rate is low, speculative
@@ -18,7 +21,7 @@ decoding can be slower than normal decoding.
 cargo build --release
 ```
 
-- Use a target GGUF and an assistant GGUF with compatible tokenization:
+- When using an external assistant, target and assistant need compatible tokenization:
   - same vocabulary size
   - same BOS token ID
   - same EOS token ID
@@ -29,7 +32,24 @@ cargo build --release
   assistant can be tested against a 14B target, but only keep it if benchmarks
   show a real speedup.
 
+An embedded Qwen draft head needs no `--mtp-assistant`. Set `--mtp-tokens 2`
+or greater; the native head predicts one additional token after the target's
+first greedy token. It is opt-in: without `--mtp-tokens`, loading a model with
+an embedded head does not run a calibration probe.
+
 ## Basic Command
+
+Embedded Qwen head:
+
+```bash
+./target/release/rusty-llm /path/to/qwen.gguf \
+  --mtp-tokens 2 \
+  --temp 0 \
+  --max-tokens 128 \
+  --prompt "Explain speculative decoding in one paragraph."
+```
+
+External assistant:
 
 ```bash
 ./target/release/rusty-llm /path/to/target.gguf \
@@ -52,6 +72,8 @@ If MTP is inactive, the summary prints:
 ```text
 mtp=off
 ```
+
+For an embedded head the summary contains `mtp=greedy embedded`.
 
 ## Benchmark Before Keeping It
 
@@ -95,17 +117,26 @@ RUSTY_LLM_METAL=0 ./target/release/rusty-llm /path/to/target.gguf \
   --prompt "Write a concise explanation of KV cache reuse."
 ```
 
-The benchmark output includes MTP fields when an assistant is active:
+The benchmark output includes MTP fields when a draft path is active:
 
 - `accept_rate`: accepted draft tokens divided by drafted tokens
 - `draft_tok_s`: assistant draft throughput
 - `eff_tok_s`: effective target generation throughput
 - `drafted`, `accepted`, `rejected`: token counts used to judge whether MTP
   helps
+- `verification_ms`, `verification_batches`: target batch cost
+- `recovery_ms`, `recovered_target_steps`: state repair after rejected batches
 
-Keep MTP only if effective throughput improves for normal prompts. Disable it
-with `--no-speculative` when `accept_rate` stays below about `0.5` or when
-decode throughput drops.
+For the embedded head, `drafted` counts only the token predicted by that head.
+The first token comes directly from target logits and is not counted as an
+accepted draft.
+
+RustyLLM disables MTP automatically when acceptance remains below the selected
+threshold or measured draft overhead exceeds the conservative estimate of
+saved target work. Rejected recurrent batches provide an in-situ baseline for
+this timing guard, and a non-productive embedded head is disabled after a very
+small probe. Still compare effective throughput on normal prompts;
+`--no-speculative` remains the explicit off switch.
 
 RustyLLM also prints `recommendation=disable` in the normal generation stats
 when the final acceptance rate is below the configured threshold.
