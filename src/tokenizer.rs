@@ -119,8 +119,8 @@ pub struct Tokenizer {
     pub eos_id: u32,
     /// WordPiece unknown-token id (`tokenizer.ggml.unknown_token_id`).
     pub unk_id: u32,
-    /// WordPiece separator id (`tokenizer.ggml.seperator_token_id`, note the
-    /// llama.cpp misspelling), appended after the encoded pieces.
+    /// WordPiece separator id (`tokenizer.ggml.seperator_token_id`, preserving
+    /// the legacy misspelled metadata key), appended after the encoded pieces.
     pub sep_id: u32,
 }
 
@@ -286,7 +286,7 @@ impl Tokenizer {
     /// BPE encode: start with character/byte tokens, then greedily merge.
     ///
     /// For WordPiece (encoder models) this frames the sequence as
-    /// `[CLS] … [SEP]`, matching llama.cpp's BERT tokenizer.
+    /// `[CLS] … [SEP]`, following the model's BERT framing metadata.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
         if self.add_bos_token {
@@ -551,9 +551,9 @@ impl Tokenizer {
 
     /// Encodes text with BERT-style WordPiece.
     ///
-    /// Mirrors llama.cpp's WPM tokenizer: normalize (lowercase, strip accents,
-    /// drop control chars), split on whitespace, isolate punctuation / ASCII
-    /// symbols / CJK as single-char words, then greedily match the longest
+    /// Normalizes by lowercasing, stripping accents, and dropping control
+    /// characters; then splits whitespace, isolates punctuation, ASCII symbols,
+    /// and CJK as single-character words, and greedily matches the longest
     /// vocab piece at each position. The GGUF vocab is phantom-space form, so
     /// each word is prefixed with `\u{2581}` and word-start pieces are matched
     /// with that prefix while continuation pieces are matched bare. Any word
@@ -914,10 +914,9 @@ impl Utf8Stitcher {
 
 /// Splits text into Mistral Tekken BPE pre-token chunks.
 ///
-/// Mirrors llama.cpp's TEKKEN regex, including its quirk: the upstream pattern
-/// uses `\p{Lu}`/`\p{Ll}`, but llama.cpp collapses every non-ASCII letter into a
-/// single class, so case boundaries only exist for `a-z`/`A-Z`. Reproducing that
-/// keeps token counts identical to the reference rather than "more correct" and
+/// Uses the compatibility TEKKEN regex where every non-ASCII letter belongs to
+/// one class, so case boundaries only exist for `a-z`/`A-Z`. Preserving that
+/// behavior keeps token counts stable across supported GGUF tokenizers and
 /// therefore different.
 ///
 /// Three differences from the GPT-2 splitter change token counts materially:
@@ -1622,8 +1621,8 @@ fn split_gemma4_pieces(text: &str) -> Vec<&str> {
 
 /// Splits text into normalized WordPiece words.
 ///
-/// Applies llama.cpp's WPM preprocessing: lowercase, strip accents, drop
-/// control / replacement characters, split on Unicode whitespace, and emit
+/// Applies WPM preprocessing: lowercase, strip accents, drop control and
+/// replacement characters, split on Unicode whitespace, and emit
 /// each punctuation char, ASCII symbol, or CJK char as its own word.
 ///
 /// All words are appended to `buffer` and reported as byte ranges into it, so
@@ -1675,7 +1674,7 @@ fn is_wordpiece_standalone(ch: char) -> bool {
     }
     let cp = ch as u32;
     // ASCII symbols that are not is_ascii_punctuation (none extra) plus the
-    // Unicode CJK ideograph ranges llama.cpp isolates.
+    // Unicode CJK ideograph ranges isolated as individual tokens.
     matches!(cp,
         0x3000..=0x303F   // CJK symbols and punctuation
         | 0x4E00..=0x9FFF // CJK unified ideographs
@@ -1707,8 +1706,7 @@ fn is_unicode_punct_or_symbol(ch: char) -> bool {
 /// character of the input passes through here, so writing in place instead of
 /// returning a `String` avoids a heap allocation per character. Combining
 /// marks are dropped; other scripts pass through lowercased. Full Unicode NFD
-/// parity is out of scope — rare non-Latin accents may diverge from
-/// llama.cpp.
+/// parity is out of scope, so rare non-Latin accents may remain model-specific.
 fn push_accent_stripped_lower(ch: char, out: &mut String) {
     // ASCII has no combining marks and no decomposition in `latin_deaccent`
     // (whose arms are all non-ASCII), so it reduces to an ASCII lowercase —
@@ -1894,8 +1892,8 @@ mod tests {
         assert_eq!(pretokenize_tekken("a \n b"), vec!["a", " \n", " b"]);
     }
 
-    /// Case boundaries split ASCII words, matching llama.cpp's collapsed
-    /// character classes — including that all-caps runs stay together.
+    /// Case boundaries split ASCII words using collapsed character classes,
+    /// including that all-caps runs stay together.
     #[test]
     fn tekken_splits_on_ascii_case_boundaries() {
         // A boundary appears only where a lowercase run is followed by an
@@ -1910,8 +1908,8 @@ mod tests {
         assert_eq!(pretokenize_tekken("ABC"), vec!["ABC"]);
         // A non-ASCII letter satisfies both classes, so it never *causes* a
         // boundary — the uppercase run runs straight through the Cyrillic and
-        // into the following ASCII capital. This mirrors llama.cpp's collapsed
-        // classes; the stricter upstream regex would split these in two.
+        // into the following ASCII capital. The compatibility classes keep the
+        // run intact; a stricter Unicode case regex would split these in two.
         assert_eq!(
             pretokenize_tekken("\u{041C}\u{043E}\u{0441}\u{043A}\u{0432}\u{0430}Moscow"),
             vec!["\u{041C}\u{043E}\u{0441}\u{043A}\u{0432}\u{0430}Moscow"]

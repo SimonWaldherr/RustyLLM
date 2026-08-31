@@ -51,7 +51,7 @@ _BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(PROMP
 _NATO_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 _KERNEL_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
-.PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report bench-reference synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
+.PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report bench-reference bench-gemma4-reference synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
 
 all: check release ## Run check and release build
 
@@ -116,6 +116,9 @@ benchmark-report: ## Rebuild BENCHMARK.md from existing .bench_raw TSV files
 
 bench-reference: release-max ## Compare Ministral, Llama and Qwen decode against an external GGUF engine
 	RUSTY_BIN=./target/release-max/$(APP) RUNS="$(REFERENCE_RUNS)" ./bench_reference.sh
+
+bench-gemma4-reference: release-max ## Compare Gemma 4 decode against an external GGUF engine
+	RUSTY_BIN=./target/release-max/$(APP) RUNS="$(REFERENCE_RUNS)" ./bench_gemma4_reference.sh
 
 synonym-bench: release ## Run fixed one-word synonym prompt benchmark (BENCH_MODEL=...)
 	$(BIN) --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) \

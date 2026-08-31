@@ -240,8 +240,7 @@ fn physical_cores() -> Option<usize> {
 /// slowest shard, so including E-cores sets the barrier to E-core speed and
 /// makes the projection slower than using the P-cores alone. macOS 12+ exposes
 /// the split through `hw.perflevel0.physicalcpu` (performance level 0 is the
-/// fastest tier), which is the same key llama.cpp selects its default thread
-/// count from. On a homogeneous CPU there is a single performance level, so this
+/// fastest tier). On a homogeneous CPU there is a single performance level, so this
 /// key reports the full physical count and the result is unchanged from
 /// `hw.physicalcpu`; the fallback covers macOS releases predating the key.
 #[cfg(all(target_os = "macos", not(target_family = "wasm")))]
@@ -352,9 +351,8 @@ pub fn pin_current_thread(worker_idx: usize) -> bool {
 /// the supported way to bias placement on that hardware, so `--cpu-affinity`
 /// maps onto QoS on arm64 Macs.
 ///
-/// It stays behind the flag rather than becoming the default because llama.cpp
-/// gets its Apple Silicon placement purely from sizing the pool to the
-/// performance cores and sets no QoS class at all, and this build has no Apple
+/// It stays behind the flag because sizing the pool to the performance cores
+/// already provides stable placement in the default configuration, and this build has no Apple
 /// hardware to measure the difference on.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn pin_current_thread_impl(_worker_idx: usize) -> bool {
@@ -4224,7 +4222,7 @@ pub fn dequant_row_q4_0_into(qrow: &[u8], out: &mut [f32]) {
             let byte = block[2 + i];
             let lo = ((byte & 0x0F) as i32 - 8) as f32;
             let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-            // ggml Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
+            // Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
             out[b * 32 + i] = scale * lo;
             out[b * 32 + i + 16] = scale * hi;
         }
@@ -4243,7 +4241,7 @@ pub fn dequant_row_q4_1_into(qrow: &[u8], out: &mut [f32]) {
         let min = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
         for i in 0..16 {
             let byte = block[4 + i];
-            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            // Split-nibble layout: lo byte nibble -> weight[i], hi -> weight[i+16].
             out[b * 32 + i] = scale * (byte & 0x0F) as f32 + min;
             out[b * 32 + i + 16] = scale * (byte >> 4) as f32 + min;
         }
@@ -4267,7 +4265,7 @@ pub fn dequant_row_q5_0_into(qrow: &[u8], out: &mut [f32]) {
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
             let lo = (((byte & 0x0F) | lo_hi) as i32 - 16) as f32;
             let hi = (((byte >> 4) | hi_hi) as i32 - 16) as f32;
-            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            // Split-nibble layout: lo byte nibble -> weight[i], hi -> weight[i+16].
             out[b * 32 + i] = scale * lo;
             out[b * 32 + i + 16] = scale * hi;
         }
@@ -4292,7 +4290,7 @@ pub fn dequant_row_q5_1_into(qrow: &[u8], out: &mut [f32]) {
             let hi_hi = if ((qh >> (i + 16)) & 1) != 0 { 16 } else { 0 };
             let lo = ((byte & 0x0F) | lo_hi) as f32;
             let hi = ((byte >> 4) | hi_hi) as f32;
-            // ggml split layout: lo nibble of byte i -> weight[i], hi -> weight[i+16].
+            // Split-nibble layout: lo byte nibble -> weight[i], hi -> weight[i+16].
             out[b * 32 + i] = scale * lo + min;
             out[b * 32 + i + 16] = scale * hi + min;
         }
@@ -4588,7 +4586,7 @@ fn dot_q4_0_f32_scalar(qdata: &[u8], x: &[f32], n: usize) -> f32 {
             let byte = block[2 + i];
             let lo = ((byte & 0x0F) as i32 - 8) as f32;
             let hi = (((byte >> 4) & 0x0F) as i32 - 8) as f32;
-            // ggml Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
+            // Q4_0 split layout: lo nibble of byte i → weight[i], hi → weight[i+16].
             block_sum += lo * x[b * 32 + i];
             block_sum += hi * x[b * 32 + i + 16];
         }
@@ -5041,8 +5039,8 @@ unsafe fn dot_q5_k_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 
 // ─── Integer (sdot) K-quant fast path (aarch64 + FEAT_DotProd) ───────────────
 //
-// llama.cpp's decode-critical path quantizes the activation vector to int8 once
-// per matrix-vector product (Q8_K layout) and then evaluates each weight row
+// The decode-critical integer path quantizes the activation vector to int8 once
+// per matrix-vector product (Q8_K layout), then evaluates each weight row
 // with `sdot` integer dot products, applying the product of the weight and
 // activation block scales only at the very end. This avoids widening every
 // 4/6-bit weight to f32 in the inner loop — the dominant cost of the portable
@@ -6441,7 +6439,7 @@ unsafe fn dot_q8_0_block_f32_neon(
 #[inline]
 unsafe fn dot_q4_0_f32_neon(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     // Q4_0 layout per block (18 bytes): [f16 scale | 16 nibble bytes]
-    // ggml split layout: lo nibble of byte i → weight[i], hi nibble → weight[i+16].
+    // Split-nibble layout: low half of byte i → weight[i], high half → weight[i+16].
     use std::arch::aarch64::*;
     let n_blocks = n / 32;
     let mut sum_acc0 = vdupq_n_f32(0.0);
@@ -7024,7 +7022,7 @@ unsafe fn dot_q8_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn dot_q4_0_f32_avx2(qdata: &[u8], x: &[f32], n: usize) -> f32 {
     // Q4_0 per block: [f16 scale | 16 nibble bytes]
-    // ggml split layout: lo nibble of byte i → weight[i], hi nibble → weight[i+16].
+    // Split-nibble layout: low half of byte i → weight[i], high half → weight[i+16].
     use std::arch::x86_64::*;
     let n_blocks = n / 32;
     let mut acc = _mm256_setzero_ps();
@@ -7807,7 +7805,7 @@ mod tests {
 
     #[test]
     fn q4_0_dequant_uses_split_layout() {
-        // ggml Q4_0 split layout: lo nibble of byte i → weight[i],
+        // Q4_0 split layout: low nibble of byte i → weight[i],
         // hi nibble of byte i → weight[i+16]. Scale = 1.0.
         let block = make_q4_0_block_known();
         let got = dequant_row_q4_0(&block, 32);

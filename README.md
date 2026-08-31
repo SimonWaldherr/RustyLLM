@@ -653,13 +653,16 @@ Health and metadata routes:
 - `GET /openapi.json`, `GET /swagger.json`, `GET /docs`
 - `GET /v1/models`
 - `GET /api/v0/models`
-- `GET /api/tags`
+- `GET /api/tags`, `GET /api/ps`
+- `GET /v1beta/models`
+- `GET /props`, `GET /slots`, `GET /info`
 - `GET /api/explorer/model` (loaded model metadata, tensor inventory, and
   discovered model catalog)
 
 Generation and embedding routes:
 
 - `POST /generate`
+- `POST /generate_stream`, `POST /completion`
 - `POST /v1/completions`
 - `POST /v1/chat/completions`
 - `POST /v1/messages`
@@ -673,6 +676,13 @@ Generation and embedding routes:
 - `POST /api/chat`
 - `POST /api/embeddings`
 - `POST /api/embed`
+- `POST /api/show`
+- `POST /v2/chat`, `POST /v1/embed`, `POST /v2/embed`
+- `POST /v1beta/models/{model}:generateContent`
+- `POST /v1beta/models/{model}:streamGenerateContent`
+- `POST /v1beta/models/{model}:embedContent`
+- `POST /v1beta/models/{model}:batchEmbedContents`
+- `POST /tokenize`, `POST /detokenize` (also under `/v1`)
 - `POST /api/explorer/tokenize`
 - `POST /api/explorer/vector`
 - `POST /api/explorer/neighbors`
@@ -680,6 +690,24 @@ Generation and embedding routes:
 All `POST` routes require `Content-Type: application/json`. Requests are bounded
 by header and body limits and a per-connection I/O timeout. CORS headers are
 included on responses.
+
+### Compatibility matrix
+
+| Contract | Main routes | Streaming and compatibility details |
+|---|---|---|
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/models/{id}` | SSE, usage chunks, tool calls, `developer`/legacy `function` roles, null assistant content, structured errors, token-ID embeddings, dimensions, float or Base64 output |
+| Azure OpenAI-style | `/openai/deployments/{deployment}/chat/completions`, `/completions`, `/embeddings` | Accepts `api-version` and other query parameters; the requested deployment maps to the loaded model |
+| Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/ps`, `/api/show` | NDJSON defaults to streaming unless `stream: false`; supports tools, JSON/schema hints, thinking flags, modern and legacy embedding shapes |
+| Anthropic | `/v1/messages`, `/v1/messages/count_tokens` | Message SSE, content blocks, system prompts, `tool_use`/`tool_result`, token accounting |
+| LM Studio-style | `/api/v0/models`, `/api/v0/chat/completions`, `/api/v0/completions`, `/api/v0/embeddings` | Same request and response semantics as the corresponding OpenAI routes |
+| Cohere | `/v1/chat`, `/v2/chat`, `/v1/embed`, `/v2/embed` | v1 and v2 chat streams, v2 tool calls and response formats, token usage, typed float embeddings and the legacy flat embedding shape |
+| Gemini | `/v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:embedContent`, `:batchEmbedContents` | Content parts, system instructions, function calls/responses, SSE, usage metadata, JSON response hints, model list/detail probes |
+| Text generation | `/generate`, `/generate_stream`, `/info` | Accepts `inputs` plus nested `parameters`; emits token SSE and generation details |
+| Local completion | `/completion`, `/tokenize`, `/detokenize`, `/props`, `/slots` | Common local-client fields and timing/token metadata |
+
+Versioned `/api/v1/*`, unversioned OpenAI paths, `/openai/v1/*`, and query
+strings are accepted where their base route is unambiguous. Unknown model names
+map to the single loaded model so clients do not need model-ID rewrites.
 
 ### Native `/generate`
 
@@ -1059,12 +1087,30 @@ the local Ministral 3 3B, Meta Llama 3.1 8B, and Qwen2-family 7B models, run:
 REFERENCE_BIN=/path/to/reference-cli make bench-reference
 ```
 
-The harness alternates engine order, forces greedy sampling and GPU execution,
-writes raw logs below `.bench_raw/reference/`, and produces
+The harness alternates engine order, uses a 10-second cooldown by default,
+captures available thermal-pressure telemetry before and after each process,
+forces greedy sampling and GPU execution, writes raw logs below
+`.bench_raw/reference/`, and produces
 [`BENCHMARK_REFERENCE.md`](BENCHMARK_REFERENCE.md). Override model discovery
 with `MINISTRAL_MODEL`, `LLAMA_MODEL`, or `QWEN_MODEL`; use
 `REFERENCE_RUNS=5 REFERENCE_BIN=/path/to/reference-cli make bench-reference`
-for a longer comparison.
+for a longer comparison. Override `COOLDOWN_SECS` only when the host has had
+enough time to reach a stable thermal state.
+
+For the dense and sparse Gemma 4 variants, run:
+
+```bash
+REFERENCE_BIN=/path/to/reference-cli make bench-gemma4-reference
+```
+
+This writes raw per-run evidence below `.bench_raw/gemma4-reference/` and the
+mean, standard deviation, median robustness check, protocol, and environment to
+[`BENCHMARK_GEMMA4.md`](BENCHMARK_GEMMA4.md). Override discovery with
+`GEMMA4_12B_MODEL`, `GEMMA4_26B_MODEL`, or `GEMMA4_E2B_MODEL`.
+
+Accepted and rejected performance experiments are recorded in
+[`OPTIMIZATION_LOG.md`](OPTIMIZATION_LOG.md), including the measurement basis
+and the condition under which a rejected idea would be worth revisiting.
 
 Ollama and LM Studio are often faster on macOS because they use heavily tuned
 llama.cpp kernels and GPU paths. RustyLLM benchmark numbers are most useful for

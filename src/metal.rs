@@ -264,6 +264,51 @@ mod ffi {
             cols: usize,
             out: *mut f32,
         ) -> i32;
+        /// Runs two Q4_0 projections sharing one activation and synchronization point.
+        pub fn rusty_metal_q4_0_matvec2(
+            weights_a: *const u8,
+            weights_a_len: usize,
+            rows_a: usize,
+            weights_b: *const u8,
+            weights_b_len: usize,
+            rows_b: usize,
+            x: *const f32,
+            cols: usize,
+            out_a: *mut f32,
+            out_b: *mut f32,
+        ) -> i32;
+        /// Runs three Q4_0 projections sharing one activation and synchronization point.
+        pub fn rusty_metal_q4_0_matvec3(
+            weights_a: *const u8,
+            weights_a_len: usize,
+            rows_a: usize,
+            weights_b: *const u8,
+            weights_b_len: usize,
+            rows_b: usize,
+            weights_c: *const u8,
+            weights_c_len: usize,
+            rows_c: usize,
+            x: *const f32,
+            cols: usize,
+            out_a: *mut f32,
+            out_b: *mut f32,
+            out_c: *mut f32,
+        ) -> i32;
+        /// Runs a Q4_0 GELU feed-forward block in one Metal command buffer.
+        pub fn rusty_metal_q4_0_gelu_ffn(
+            gate_weights: *const u8,
+            gate_weights_len: usize,
+            up_weights: *const u8,
+            up_weights_len: usize,
+            down_weights: *const u8,
+            down_weights_len: usize,
+            x: *const f32,
+            input_cols: usize,
+            hidden_rows: usize,
+            down_rows: usize,
+            down_cols: usize,
+            out: *mut f32,
+        ) -> i32;
         /// Runs one Q8_0 matrix-vector multiply on the Metal backend.
         pub fn rusty_metal_q8_0_matvec(
             weights: *const u8,
@@ -2125,6 +2170,112 @@ pub fn q4_0_matvec_into(
     q4_0_matvec_raw(weights, x, rows, cols, out)
 }
 
+#[inline]
+fn q4_0_matrix_bytes(rows: usize, cols: usize) -> Option<usize> {
+    if cols == 0 || (cols % 32) != 0 {
+        return None;
+    }
+    rows.checked_mul(cols / 32)?.checked_mul(18)
+}
+
+/// Attempts two Q4_0 projections in one Metal command buffer.
+pub fn q4_0_matvec2_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+) -> bool {
+    let (a_weights, a_rows, a_cols) = a;
+    let (b_weights, b_rows, b_cols) = b;
+    if !dispatch_enabled()
+        || a_rows < Q4_0_MIN_METAL_ROWS
+        || b_rows < Q4_0_MIN_METAL_ROWS
+        || a_cols != b_cols
+        || a_cols != x.len()
+        || q4_0_matrix_bytes(a_rows, a_cols).is_none_or(|len| a_weights.len() < len)
+        || q4_0_matrix_bytes(b_rows, b_cols).is_none_or(|len| b_weights.len() < len)
+    {
+        return false;
+    }
+    out_a.resize(a_rows, 0.0);
+    out_b.resize(b_rows, 0.0);
+    q4_0_matvec2_raw(a_weights, a_rows, b_weights, b_rows, x, a_cols, out_a, out_b)
+}
+
+/// Attempts three Q4_0 projections in one Metal command buffer.
+pub fn q4_0_matvec3_into(
+    a: (&[u8], usize, usize),
+    b: (&[u8], usize, usize),
+    c: (&[u8], usize, usize),
+    x: &[f32],
+    out_a: &mut Vec<f32>,
+    out_b: &mut Vec<f32>,
+    out_c: &mut Vec<f32>,
+) -> bool {
+    let (a_weights, a_rows, a_cols) = a;
+    let (b_weights, b_rows, b_cols) = b;
+    let (c_weights, c_rows, c_cols) = c;
+    if !dispatch_enabled()
+        || a_rows < Q4_0_MIN_METAL_ROWS
+        || b_rows < Q4_0_MIN_METAL_ROWS
+        || c_rows < Q4_0_MIN_METAL_ROWS
+        || a_cols != b_cols
+        || a_cols != c_cols
+        || a_cols != x.len()
+        || q4_0_matrix_bytes(a_rows, a_cols).is_none_or(|len| a_weights.len() < len)
+        || q4_0_matrix_bytes(b_rows, b_cols).is_none_or(|len| b_weights.len() < len)
+        || q4_0_matrix_bytes(c_rows, c_cols).is_none_or(|len| c_weights.len() < len)
+    {
+        return false;
+    }
+    out_a.resize(a_rows, 0.0);
+    out_b.resize(b_rows, 0.0);
+    out_c.resize(c_rows, 0.0);
+    q4_0_matvec3_raw(
+        a_weights, a_rows, b_weights, b_rows, c_weights, c_rows, x, a_cols, out_a, out_b,
+        out_c,
+    )
+}
+
+/// Attempts a Q4_0 GELU feed-forward block without CPU-visible intermediates.
+pub fn q4_0_gelu_ffn_into(
+    gate: (&[u8], usize, usize),
+    up: (&[u8], usize, usize),
+    down: (&[u8], usize, usize),
+    x: &[f32],
+    out: &mut Vec<f32>,
+) -> bool {
+    let (gate_weights, gate_rows, gate_cols) = gate;
+    let (up_weights, up_rows, up_cols) = up;
+    let (down_weights, down_rows, down_cols) = down;
+    if !dispatch_enabled()
+        || gate_rows < Q4_0_MIN_METAL_ROWS
+        || down_rows < Q4_0_MIN_METAL_ROWS
+        || gate_cols != x.len()
+        || up_cols != gate_cols
+        || up_rows != gate_rows
+        || down_cols != gate_rows
+        || q4_0_matrix_bytes(gate_rows, gate_cols).is_none_or(|len| gate_weights.len() < len)
+        || q4_0_matrix_bytes(up_rows, up_cols).is_none_or(|len| up_weights.len() < len)
+        || q4_0_matrix_bytes(down_rows, down_cols).is_none_or(|len| down_weights.len() < len)
+    {
+        return false;
+    }
+    out.resize(down_rows, 0.0);
+    q4_0_gelu_ffn_raw(
+        gate_weights,
+        up_weights,
+        down_weights,
+        x,
+        gate_cols,
+        gate_rows,
+        down_rows,
+        down_cols,
+        out,
+    )
+}
+
 /// Attempts a Metal Q8_0 matrix-vector multiply into the output buffer.
 pub fn q8_0_matvec_into(
     weights: &[u8],
@@ -2156,6 +2307,70 @@ fn q4_0_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mu
 }
 
 #[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_matvec2_raw(
+    a: &[u8],
+    a_rows: usize,
+    b: &[u8],
+    b_rows: usize,
+    x: &[f32],
+    cols: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_q4_0_matvec2(
+            a.as_ptr(), a.len(), a_rows, b.as_ptr(), b.len(), b_rows, x.as_ptr(), cols,
+            out_a.as_mut_ptr(), out_b.as_mut_ptr(),
+        ) != 0
+    }
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_matvec3_raw(
+    a: &[u8],
+    a_rows: usize,
+    b: &[u8],
+    b_rows: usize,
+    c: &[u8],
+    c_rows: usize,
+    x: &[f32],
+    cols: usize,
+    out_a: &mut [f32],
+    out_b: &mut [f32],
+    out_c: &mut [f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_q4_0_matvec3(
+            a.as_ptr(), a.len(), a_rows, b.as_ptr(), b.len(), b_rows, c.as_ptr(), c.len(),
+            c_rows, x.as_ptr(), cols, out_a.as_mut_ptr(), out_b.as_mut_ptr(), out_c.as_mut_ptr(),
+        ) != 0
+    }
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_gelu_ffn_raw(
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+    x: &[f32],
+    input_cols: usize,
+    hidden_rows: usize,
+    down_rows: usize,
+    down_cols: usize,
+    out: &mut [f32],
+) -> bool {
+    unsafe {
+        ffi::rusty_metal_q4_0_gelu_ffn(
+            gate.as_ptr(), gate.len(), up.as_ptr(), up.len(), down.as_ptr(), down.len(), x.as_ptr(),
+            input_cols, hidden_rows, down_rows, down_cols, out.as_mut_ptr(),
+        ) != 0
+    }
+}
+
+#[cfg(all(target_os = "macos", rusty_metal))]
 /// Calls the raw Metal Q8_0 projection shim.
 fn q8_0_matvec_raw(weights: &[u8], x: &[f32], rows: usize, cols: usize, out: &mut [f32]) -> bool {
     unsafe {
@@ -2176,6 +2391,55 @@ fn q4_0_matvec_raw(
     _x: &[f32],
     _rows: usize,
     _cols: usize,
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_matvec2_raw(
+    _a: &[u8],
+    _a_rows: usize,
+    _b: &[u8],
+    _b_rows: usize,
+    _x: &[f32],
+    _cols: usize,
+    _out_a: &mut [f32],
+    _out_b: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_matvec3_raw(
+    _a: &[u8],
+    _a_rows: usize,
+    _b: &[u8],
+    _b_rows: usize,
+    _c: &[u8],
+    _c_rows: usize,
+    _x: &[f32],
+    _cols: usize,
+    _out_a: &mut [f32],
+    _out_b: &mut [f32],
+    _out_c: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", rusty_metal)))]
+#[allow(clippy::too_many_arguments)]
+fn q4_0_gelu_ffn_raw(
+    _gate: &[u8],
+    _up: &[u8],
+    _down: &[u8],
+    _x: &[f32],
+    _input_cols: usize,
+    _hidden_rows: usize,
+    _down_rows: usize,
+    _down_cols: usize,
     _out: &mut [f32],
 ) -> bool {
     false
@@ -2296,6 +2560,172 @@ mod tests {
             assert!(
                 (cpu - metal).abs() <= tolerance,
                 "paired B row {row}: CPU={cpu}, Metal={metal}, tolerance={tolerance}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    fn q4_0_single_and_grouped_metal_paths_match_scalar() {
+        if !super::available() {
+            return;
+        }
+        let rows = 513;
+        let cols = 3 * 32;
+        let blocks_per_row = cols / 32;
+        let mut weights = vec![0u8; rows * blocks_per_row * 18];
+        for block_index in 0..rows * blocks_per_row {
+            let block = &mut weights[block_index * 18..(block_index + 1) * 18];
+            block[..2].copy_from_slice(&0x3400u16.to_le_bytes());
+            for (i, value) in block[2..].iter_mut().enumerate() {
+                *value = ((block_index * 29 + i * 17 + 3) & 0xff) as u8;
+            }
+        }
+        let x = (0..cols)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0)
+            .collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; rows];
+        for (row, value) in expected.iter_mut().enumerate() {
+            for block_index in 0..blocks_per_row {
+                let start = (row * blocks_per_row + block_index) * 18;
+                let block = &weights[start..start + 18];
+                let d = crate::simd::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                for i in 0..16 {
+                    let packed = block[2 + i];
+                    *value += d * f32::from((packed & 15) as i8 - 8) * x[block_index * 32 + i];
+                    *value += d * f32::from((packed >> 4) as i8 - 8)
+                        * x[block_index * 32 + 16 + i];
+                }
+            }
+        }
+
+        let mut single = vec![0.0; rows];
+        assert!(super::q4_0_matvec_raw(
+            &weights,
+            &x,
+            rows,
+            cols,
+            &mut single
+        ));
+        let mut pair_a = vec![0.0; rows];
+        let mut pair_b = vec![0.0; rows];
+        assert!(super::q4_0_matvec2_raw(
+            &weights,
+            rows,
+            &weights,
+            rows,
+            &x,
+            cols,
+            &mut pair_a,
+            &mut pair_b,
+        ));
+        let mut triple_a = vec![0.0; rows];
+        let mut triple_b = vec![0.0; rows];
+        let mut triple_c = vec![0.0; rows];
+        assert!(super::q4_0_matvec3_raw(
+            &weights,
+            rows,
+            &weights,
+            rows,
+            &weights,
+            rows,
+            &x,
+            cols,
+            &mut triple_a,
+            &mut triple_b,
+            &mut triple_c,
+        ));
+
+        for (row, expected) in expected.into_iter().enumerate() {
+            let tolerance = 8.0e-5 * expected.abs().max(1.0);
+            for (name, actual) in [
+                ("single", single[row]),
+                ("pair-a", pair_a[row]),
+                ("pair-b", pair_b[row]),
+                ("triple-a", triple_a[row]),
+                ("triple-b", triple_b[row]),
+                ("triple-c", triple_c[row]),
+            ] {
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{name} row {row}: scalar={expected}, Metal={actual}, tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", rusty_metal))]
+    #[test]
+    fn q4_0_gelu_ffn_metal_path_matches_scalar() {
+        if !super::available() {
+            return;
+        }
+        fn make_weights(rows: usize, cols: usize, salt: usize) -> Vec<u8> {
+            let blocks = cols / 32;
+            let mut weights = vec![0u8; rows * blocks * 18];
+            for block_index in 0..rows * blocks {
+                let block = &mut weights[block_index * 18..(block_index + 1) * 18];
+                block[..2].copy_from_slice(&0x2c00u16.to_le_bytes());
+                for (i, value) in block[2..].iter_mut().enumerate() {
+                    *value = ((block_index * 11 + i * 23 + salt) & 0xff) as u8;
+                }
+            }
+            weights
+        }
+        fn scalar_matvec(weights: &[u8], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+            let blocks = cols / 32;
+            let mut out = vec![0.0; rows];
+            for (row, value) in out.iter_mut().enumerate() {
+                for block_index in 0..blocks {
+                    let start = (row * blocks + block_index) * 18;
+                    let block = &weights[start..start + 18];
+                    let d = crate::simd::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                    for i in 0..16 {
+                        let packed = block[2 + i];
+                        *value += d * f32::from((packed & 15) as i8 - 8)
+                            * x[block_index * 32 + i];
+                        *value += d * f32::from((packed >> 4) as i8 - 8)
+                            * x[block_index * 32 + 16 + i];
+                    }
+                }
+            }
+            out
+        }
+
+        let input_cols = 32;
+        let hidden_rows = 512;
+        let down_rows = 512;
+        let gate = make_weights(hidden_rows, input_cols, 3);
+        let up = make_weights(hidden_rows, input_cols, 17);
+        let down = make_weights(down_rows, hidden_rows, 41);
+        let x = (0..input_cols)
+            .map(|i| ((i * 19 % 43) as f32 - 21.0) / 17.0)
+            .collect::<Vec<_>>();
+        let gate_values = scalar_matvec(&gate, &x, hidden_rows, input_cols);
+        let up_values = scalar_matvec(&up, &x, hidden_rows, input_cols);
+        let hidden = gate_values
+            .iter()
+            .zip(&up_values)
+            .map(|(&g, &u)| crate::model::gelu(g) * u)
+            .collect::<Vec<_>>();
+        let expected = scalar_matvec(&down, &hidden, down_rows, hidden_rows);
+        let mut actual = vec![0.0; down_rows];
+        assert!(super::q4_0_gelu_ffn_raw(
+            &gate,
+            &up,
+            &down,
+            &x,
+            input_cols,
+            hidden_rows,
+            down_rows,
+            hidden_rows,
+            &mut actual,
+        ));
+        for (row, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+            let tolerance = 2.0e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "row {row}: scalar={expected}, Metal={actual}, tolerance={tolerance}"
             );
         }
     }

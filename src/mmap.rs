@@ -42,7 +42,7 @@ impl MmapFile {
         })
     }
 
-    /// Best-effort lock for mapped model pages, matching llama.cpp's optional mlock path.
+    /// Best-effort lock for mapped model pages.
     pub fn lock_in_memory(&mut self) -> io::Result<()> {
         if self.locked {
             return Ok(());

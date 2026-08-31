@@ -875,8 +875,8 @@ pub struct Runner {
 ///
 /// The format is a property of the tokenizer version, not of the model family:
 /// Magistral-2506 is V7 while Magistral-2509 is V11. It is therefore detected
-/// from the marker set in the GGUF's own chat template, the same way llama.cpp
-/// tells Ministral-3 and Mistral-Small-3.2 apart.
+/// from the marker set in the GGUF's own chat template, which distinguishes
+/// Ministral-3 from Mistral-Small-3.2 without a model-family assumption.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MistralToolFormat {
     /// `[TOOL_CALLS][{"name", "arguments", "id"}]`, results as JSON with
@@ -4496,7 +4496,7 @@ impl Runner {
 
         // nomic-bert / BERT encoders run a dedicated bidirectional forward with
         // no KV cache; mean-pool over all positions (incl. CLS/SEP), then
-        // L2-normalise — matching llama.cpp's pooling_type=MEAN convention.
+        // L2-normalize the mean-pooled embedding.
         if let LoadedWeights::NomicBert(weights) = &self.weights {
             if tokens.len() > self.config.max_seq_len {
                 // Keep the trailing [SEP] when truncating an over-long input.
@@ -5059,8 +5059,8 @@ impl Runner {
     /// Renders classic Mistral v1 / v3 instruction templates.
     ///
     /// These predate the `[SYSTEM_PROMPT]` block of the v7 format handled by
-    /// [`Self::render_mistral3_inst_messages`]. Following llama.cpp's reference
-    /// renderer, the system prompt is folded into the first `[INST]` block
+    /// [`Self::render_mistral3_inst_messages`]. The legacy template folds the
+    /// system prompt into the first `[INST]` block
     /// separated by a blank line, assistant turns are closed with EOS, and a
     /// trailing assistant message is left open so its text can be continued.
     fn render_mistral_inst_messages(

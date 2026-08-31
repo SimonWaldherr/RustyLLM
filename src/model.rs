@@ -376,6 +376,63 @@ fn try_quant_matvec3_into(
         (
             Weight::Quantized {
                 data: q_data,
+                dtype: GGMLType::Q4_0,
+                rows: q_rows,
+                cols: q_cols,
+            },
+            Weight::Quantized {
+                data: k_data,
+                dtype: GGMLType::Q4_0,
+                rows: k_rows,
+                cols: k_cols,
+            },
+            Weight::Quantized {
+                data: v_data,
+                dtype: GGMLType::Q4_0,
+                rows: v_rows,
+                cols: v_cols,
+            },
+        ) if *q_cols == *k_cols && *q_cols == *v_cols && *q_cols == x.len() => {
+            if crate::metal::q4_0_matvec3_into(
+                (q_data.as_slice(), *q_rows, *q_cols),
+                (k_data.as_slice(), *k_rows, *k_cols),
+                (v_data.as_slice(), *v_rows, *v_cols),
+                x,
+                q,
+                k,
+                v,
+            ) {
+                true
+            } else {
+                crate::simd::matvec_quant3_into(
+                    (
+                        crate::simd::QuantMatvecKind::Q4_0,
+                        q_data.as_slice(),
+                        *q_rows,
+                        *q_cols,
+                    ),
+                    (
+                        crate::simd::QuantMatvecKind::Q4_0,
+                        k_data.as_slice(),
+                        *k_rows,
+                        *k_cols,
+                    ),
+                    (
+                        crate::simd::QuantMatvecKind::Q4_0,
+                        v_data.as_slice(),
+                        *v_rows,
+                        *v_cols,
+                    ),
+                    x,
+                    q,
+                    k,
+                    v,
+                )
+            }
+        }
+        (
+            Weight::Quantized {
+                data: q_data,
                 dtype: GGMLType::Q4_K,
                 rows: q_rows,
                 cols: q_cols,
@@ -555,6 +612,48 @@ fn try_quant_matvec2_into(
         return false;
     }
     match (a, b) {
+        (
+            Weight::Quantized {
+                data: a_data,
+                dtype: GGMLType::Q4_0,
+                rows: a_rows,
+                cols: a_cols,
+            },
+            Weight::Quantized {
+                data: b_data,
+                dtype: GGMLType::Q4_0,
+                rows: b_rows,
+                cols: b_cols,
+            },
+        ) if *a_cols == *b_cols && *a_cols == x.len() => {
+            if crate::metal::q4_0_matvec2_into(
+                (a_data.as_slice(), *a_rows, *a_cols),
+                (b_data.as_slice(), *b_rows, *b_cols),
+                x,
+                out_a,
+                out_b,
+            ) {
+                true
+            } else {
+                crate::simd::matvec_quant2_into(
+                    (
+                        crate::simd::QuantMatvecKind::Q4_0,
+                        a_data.as_slice(),
+                        *a_rows,
+                        *a_cols,
+                    ),
+                    (
+                        crate::simd::QuantMatvecKind::Q4_0,
+                        b_data.as_slice(),
+                        *b_rows,
+                        *b_cols,
+                    ),
+                    x,
+                    out_a,
+                    out_b,
+                )
+            }
+        }
         (
             Weight::Quantized {
                 data: a_data,
@@ -793,6 +892,58 @@ fn try_quant_matvec2_into(
     _x: &[f32],
     _out_a: &mut Vec<f32>,
     _out_b: &mut Vec<f32>,
+) -> bool {
+    false
+}
+
+#[cfg(not(target_family = "wasm"))]
+/// Attempts a Gemma-style Q4_0 GELU feed-forward block as one Metal command buffer.
+fn try_metal_gemma4_ffn_into(
+    gate: &Weight,
+    up: &Weight,
+    down: &Weight,
+    x: &[f32],
+    out: &mut Vec<f32>,
+) -> bool {
+    let (
+        Weight::Quantized {
+            data: gate_data,
+            dtype: GGMLType::Q4_0,
+            rows: gate_rows,
+            cols: gate_cols,
+        },
+        Weight::Quantized {
+            data: up_data,
+            dtype: GGMLType::Q4_0,
+            rows: up_rows,
+            cols: up_cols,
+        },
+        Weight::Quantized {
+            data: down_data,
+            dtype: GGMLType::Q4_0,
+            rows: down_rows,
+            cols: down_cols,
+        },
+    ) = (gate, up, down)
+    else {
+        return false;
+    };
+    crate::metal::q4_0_gelu_ffn_into(
+        (gate_data.as_slice(), *gate_rows, *gate_cols),
+        (up_data.as_slice(), *up_rows, *up_cols),
+        (down_data.as_slice(), *down_rows, *down_cols),
+        x,
+        out,
+    )
+}
+
+#[cfg(target_family = "wasm")]
+fn try_metal_gemma4_ffn_into(
+    _gate: &Weight,
+    _up: &Weight,
+    _down: &Weight,
+    _x: &[f32],
+    _out: &mut Vec<f32>,
 ) -> bool {
     false
 }
@@ -2232,7 +2383,7 @@ mod tests {
         let q4_weight = |salt: u8| {
             let mut data = vec![0u8; ROWS * Q4_ROW_BYTES];
             for (row, bytes) in data.chunks_exact_mut(Q4_ROW_BYTES).enumerate() {
-                // GGML block_q4_K: d=1, dmin=0, followed by 12 scale bytes
+                // Q4_K block: d=1, dmin=0, followed by 12 scale bytes.
                 // and 128 packed quants. Values are deterministic but nonzero.
                 bytes[0] = 0;
                 bytes[1] = 0x3c;
@@ -2253,7 +2404,7 @@ mod tests {
         let q6_weight = |salt: u8| {
             let mut data = vec![0u8; ROWS * Q6_ROW_BYTES];
             for (row, bytes) in data.chunks_exact_mut(Q6_ROW_BYTES).enumerate() {
-                // GGML block_q6_K: 128 low bits, 64 high bits, 16 scales, d.
+                // Q6_K block: 128 low bits, 64 high bits, 16 scales, then d.
                 for (i, value) in bytes[..192].iter_mut().enumerate() {
                     *value = salt.wrapping_add((row * 19 + i * 5) as u8);
                 }
@@ -10412,7 +10563,7 @@ pub fn forward_gemma4_into(
                 config.rms_norm_eps,
             );
 
-            // Gemma 4 uses HF/GGML NeoX-style rotate_half layout.
+            // Gemma 4 uses the NeoX-style rotate-half layout.
             apply_rope_qk_neox(
                 &mut buf.q,
                 &mut buf.k,
@@ -10492,27 +10643,33 @@ pub fn forward_gemma4_into(
             buf.x[i] += buf.xn2[i];
         }
 
-        // ── FFN (SwiGLU-like) ──
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
-
-        if !try_quant_matvec2_into(
+        if !try_metal_gemma4_ffn_into(
             &layer.ffn_gate,
             &layer.ffn_up,
+            &layer.ffn_down,
             &buf.xn2,
-            &mut buf.gate,
-            &mut buf.up,
+            &mut buf.proj,
         ) {
-            layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
-            layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
-        }
+            if !try_quant_matvec2_into(
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &buf.xn2,
+                &mut buf.gate,
+                &mut buf.up,
+            ) {
+                layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+                layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+            }
 
-        let ffn_hidden_dim = layer.ffn_hidden_dim;
-        buf.hidden.resize(ffn_hidden_dim, 0.0);
-        for i in 0..ffn_hidden_dim {
-            buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
-        }
+            let ffn_hidden_dim = layer.ffn_hidden_dim;
+            buf.hidden.resize(ffn_hidden_dim, 0.0);
+            for i in 0..ffn_hidden_dim {
+                buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
+            }
 
-        layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+            layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+        }
         rms_norm_into(
             &buf.proj,
             &layer.post_ffw_norm,
@@ -12957,25 +13114,32 @@ fn forward_hidden_gemma4_impl<'a>(
         }
 
         rms_norm_into(&buf.x, &layer.ffn_norm, config.rms_norm_eps, &mut buf.xn2);
-
-        if !try_quant_matvec2_into(
+        if !try_metal_gemma4_ffn_into(
             &layer.ffn_gate,
             &layer.ffn_up,
+            &layer.ffn_down,
             &buf.xn2,
-            &mut buf.gate,
-            &mut buf.up,
+            &mut buf.proj,
         ) {
-            layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
-            layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
-        }
+            if !try_quant_matvec2_into(
+                &layer.ffn_gate,
+                &layer.ffn_up,
+                &buf.xn2,
+                &mut buf.gate,
+                &mut buf.up,
+            ) {
+                layer.ffn_gate.matvec_into(&buf.xn2, &mut buf.gate);
+                layer.ffn_up.matvec_into(&buf.xn2, &mut buf.up);
+            }
 
-        let ffn_hidden_dim = layer.ffn_hidden_dim;
-        buf.hidden.resize(ffn_hidden_dim, 0.0);
-        for i in 0..ffn_hidden_dim {
-            buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
-        }
+            let ffn_hidden_dim = layer.ffn_hidden_dim;
+            buf.hidden.resize(ffn_hidden_dim, 0.0);
+            for i in 0..ffn_hidden_dim {
+                buf.hidden[i] = gelu(buf.gate[i]) * buf.up[i];
+            }
 
-        layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+            layer.ffn_down.matvec_into(&buf.hidden, &mut buf.proj);
+        }
         rms_norm_into(
             &buf.proj,
             &layer.post_ffw_norm,

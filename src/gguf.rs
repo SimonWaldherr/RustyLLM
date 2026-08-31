@@ -30,7 +30,7 @@ pub enum GGMLType {
 }
 
 impl From<u32> for GGMLType {
-    /// converts raw GGUF tensor type IDs into `GGMLType` variants.
+    /// Converts raw GGUF tensor type IDs into internal type variants.
     fn from(v: u32) -> Self {
         match v {
             0 => Self::F32,
