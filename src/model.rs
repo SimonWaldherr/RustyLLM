@@ -1951,6 +1951,194 @@ mod tests {
     }
 
     #[test]
+    /// `attention_over_heads_with_sink` must agree bit-for-bit with a plain
+    /// serial per-head reference loop (the code it replaced at both gpt-oss
+    /// call sites), whichever internal path (worker-pool or serial fallback)
+    /// actually runs for this process's thread count. Shape mirrors
+    /// gpt-oss-20b (64 heads, 8 KV heads, kv_mul 8) with enough scanned
+    /// positions (96 * 64 = 6144 > the 4096 work threshold) to exercise the
+    /// parallel path when more than one worker thread is available.
+    fn attention_over_heads_with_sink_matches_serial_reference() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const N_KV_HEADS: usize = 8;
+        const KV_MUL: usize = 8;
+        const N_HEADS: usize = N_KV_HEADS * KV_MUL;
+        const SLOT_COUNT: usize = 96;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let queries: Vec<f32> = (0..N_HEADS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+        let keys: Vec<f32> = (0..SLOT_COUNT * N_KV_HEADS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.007).cos())
+            .collect();
+        let values: Vec<f32> = (0..SLOT_COUNT * N_KV_HEADS * VALUE_DIM)
+            .map(|i| (i as f32 * 0.011).sin() * 0.5)
+            .collect();
+        let sinks: Vec<f32> = (0..N_HEADS).map(|h| h as f32 * 0.02 - 0.3).collect();
+
+        let key_stride = N_KV_HEADS * HEAD_DIM;
+        let value_stride = N_KV_HEADS * VALUE_DIM;
+        let start_t = 0;
+        let end_t = SLOT_COUNT - 1;
+
+        let mut reference = vec![0.0f32; N_HEADS * VALUE_DIM];
+        for h in 0..N_HEADS {
+            let kv_h = h / KV_MUL;
+            let q_off = h * HEAD_DIM;
+            let out_off = h * VALUE_DIM;
+            super::online_attention_with_sink(
+                &queries[q_off..q_off + HEAD_DIM],
+                &keys[kv_h * HEAD_DIM..],
+                &values[kv_h * VALUE_DIM..],
+                key_stride,
+                value_stride,
+                SLOT_COUNT,
+                HEAD_DIM,
+                VALUE_DIM,
+                start_t,
+                end_t,
+                scale,
+                sinks[h],
+                &mut reference[out_off..out_off + VALUE_DIM],
+            );
+        }
+
+        let mut actual = vec![0.0f32; N_HEADS * VALUE_DIM];
+        super::attention_over_heads_with_sink(
+            &queries,
+            &keys,
+            &values,
+            &sinks,
+            key_stride,
+            value_stride,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            N_HEADS,
+            KV_MUL,
+            start_t,
+            end_t,
+            scale,
+            &mut actual,
+        );
+
+        assert_eq!(reference, actual);
+    }
+
+    #[test]
+    #[ignore = "manual microbenchmark, not a correctness check"]
+    /// Measures the wall-clock win from parallelizing gpt-oss's sink
+    /// attention, at a shape/context length representative of gpt-oss-20b
+    /// (64 heads, 8 KV heads, kv_mul 8, ctx 4096) but with no GGUF involved —
+    /// no gpt-oss model is available on this box (11.5 GB, not locally
+    /// cached), so this isolates just the mechanism this change actually
+    /// touches instead of leaving it completely unverified end-to-end.
+    /// Interleaves both arms across several rounds to average out scheduler
+    /// noise; run manually with `--ignored --nocapture`.
+    fn attention_over_heads_with_sink_parallel_speedup() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const HEAD_DIM: usize = 64;
+        const VALUE_DIM: usize = 64;
+        const N_KV_HEADS: usize = 8;
+        const KV_MUL: usize = 8;
+        const N_HEADS: usize = N_KV_HEADS * KV_MUL;
+        const SLOT_COUNT: usize = 4096;
+        const ROUNDS: usize = 5;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let queries: Vec<f32> = (0..N_HEADS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.013).sin())
+            .collect();
+        let keys: Vec<f32> = (0..SLOT_COUNT * N_KV_HEADS * HEAD_DIM)
+            .map(|i| (i as f32 * 0.007).cos())
+            .collect();
+        let values: Vec<f32> = (0..SLOT_COUNT * N_KV_HEADS * VALUE_DIM)
+            .map(|i| (i as f32 * 0.011).sin() * 0.5)
+            .collect();
+        let sinks: Vec<f32> = (0..N_HEADS).map(|h| h as f32 * 0.02 - 0.3).collect();
+        let key_stride = N_KV_HEADS * HEAD_DIM;
+        let value_stride = N_KV_HEADS * VALUE_DIM;
+        let start_t = 0;
+        let end_t = SLOT_COUNT - 1;
+
+        let mut serial_out = vec![0.0f32; N_HEADS * VALUE_DIM];
+        let mut parallel_out = vec![0.0f32; N_HEADS * VALUE_DIM];
+        let mut serial_times = Vec::with_capacity(ROUNDS);
+        let mut parallel_times = Vec::with_capacity(ROUNDS);
+
+        for _ in 0..ROUNDS {
+            let start = Instant::now();
+            // online_attention_with_sink seeds its running max from the
+            // (finite) sink score rather than NEG_INFINITY, so it can take
+            // the additive branch on the very first real token and must
+            // start from a zeroed buffer each round, same as the production
+            // function does internally for `parallel_out`. Zeroing inside
+            // the timed section keeps this symmetric with the parallel arm,
+            // which times its own internal zero-fill too.
+            for value in serial_out.iter_mut() {
+                *value = 0.0;
+            }
+            for h in 0..N_HEADS {
+                let kv_h = h / KV_MUL;
+                let q_off = h * HEAD_DIM;
+                let out_off = h * VALUE_DIM;
+                super::online_attention_with_sink(
+                    black_box(&queries[q_off..q_off + HEAD_DIM]),
+                    &keys[kv_h * HEAD_DIM..],
+                    &values[kv_h * VALUE_DIM..],
+                    key_stride,
+                    value_stride,
+                    SLOT_COUNT,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    start_t,
+                    end_t,
+                    scale,
+                    sinks[h],
+                    &mut serial_out[out_off..out_off + VALUE_DIM],
+                );
+            }
+            serial_times.push(start.elapsed());
+
+            let start = Instant::now();
+            super::attention_over_heads_with_sink(
+                black_box(&queries),
+                &keys,
+                &values,
+                &sinks,
+                key_stride,
+                value_stride,
+                SLOT_COUNT,
+                HEAD_DIM,
+                VALUE_DIM,
+                N_HEADS,
+                KV_MUL,
+                start_t,
+                end_t,
+                scale,
+                &mut parallel_out,
+            );
+            parallel_times.push(start.elapsed());
+        }
+
+        assert_eq!(serial_out, parallel_out);
+
+        serial_times.sort();
+        parallel_times.sort();
+        let median = |v: &[std::time::Duration]| v[v.len() / 2];
+        let (serial_med, parallel_med) = (median(&serial_times), median(&parallel_times));
+        println!(
+            "serial: {serial_times:?}\nparallel: {parallel_times:?}\nmedian serial={serial_med:?} parallel={parallel_med:?} speedup={:.2}x (threads={})",
+            serial_med.as_secs_f64() / parallel_med.as_secs_f64().max(1e-12),
+            crate::simd::num_threads(),
+        );
+    }
+
+    #[test]
     fn sliding_kv_cache_uses_ring_storage_without_lowering_context_limit() {
         let mut cache = KVCache::with_sliding_window(2, 4, 6, 128, Some(8));
         assert_eq!(cache.max_len, 128);
@@ -7029,6 +7217,161 @@ pub(crate) fn online_attention_with_sink(
     }
 }
 
+/// Raw context for the parallel attention-sink trampoline, one shard per
+/// individual query head (not grouped by KV head like [`AttnHeadsCtx`]):
+/// [`online_attention_with_sink`] takes one sink score per head, and
+/// gpt-oss's head count is large enough (64 for gpt-oss-20b) that plain
+/// contiguous chunking already keeps most `kv_mul`-sized KV-sharing groups
+/// inside one shard without needing the grouped kernel's extra complexity.
+#[cfg(not(target_family = "wasm"))]
+struct AttnHeadsSinkCtx {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    sinks: *const f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn attn_heads_sink_trampoline(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `ctx` is a live &AttnHeadsSinkCtx for the blocking call; each
+    // head index reads its own (possibly KV-shared, but read-only) K/V band
+    // and writes a disjoint `out` slice, and `out` was fully zeroed by the
+    // caller before dispatch.
+    unsafe {
+        let c = &*(ctx as *const AttnHeadsSinkCtx);
+        for h in start..end {
+            let kv_h = h / c.kv_mul;
+            let q_off = h * c.head_dim;
+            let out_off = h * c.value_dim;
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let q = std::slice::from_raw_parts(c.q.add(q_off), c.head_dim);
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+            let out = std::slice::from_raw_parts_mut(c.out.add(out_off), c.value_dim);
+            online_attention_with_sink(
+                q,
+                keys,
+                values,
+                c.key_stride,
+                c.value_stride,
+                c.slot_count,
+                c.head_dim,
+                c.value_dim,
+                c.start_t,
+                c.end_t,
+                c.scale,
+                *c.sinks.add(h),
+                out,
+            );
+        }
+    }
+}
+
+/// Parallel (worker-pool) counterpart of the gpt-oss sink-attention loop.
+/// `out` is zeroed unconditionally before any head runs: unlike
+/// [`online_attention`], [`online_attention_with_sink`] seeds its running max
+/// from the (finite) sink score rather than `NEG_INFINITY`, so its first
+/// real-token branch can take the additive path and would accumulate onto
+/// whatever `out` already held instead of overwriting it.
+pub(crate) fn attention_over_heads_with_sink(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    sinks: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_heads: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    for value in out.iter_mut() {
+        *value = 0.0;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    let scanned = end_t.saturating_sub(start_t) + 1;
+    #[cfg(not(target_family = "wasm"))]
+    let work = scanned.saturating_mul(n_heads);
+    #[cfg(not(target_family = "wasm"))]
+    let threads = crate::simd::num_threads();
+
+    #[cfg(not(target_family = "wasm"))]
+    if n_heads > 1
+        && threads > 1
+        && work >= attention_parallel_min_work(n_heads, kv_mul, head_dim, value_dim, threads)
+    {
+        let ctx = AttnHeadsSinkCtx {
+            q: queries.as_ptr(),
+            k: keys.as_ptr(),
+            v: values.as_ptr(),
+            out: out.as_mut_ptr(),
+            sinks: sinks.as_ptr(),
+            k_len: keys.len(),
+            v_len: values.len(),
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            kv_mul,
+            start_t,
+            end_t,
+            scale,
+        };
+        // SAFETY: `ctx` outlives the blocking call; each head writes a
+        // disjoint `out` band and only reads (never writes) K/V state.
+        unsafe {
+            crate::simd::parallel_range(
+                n_heads,
+                attn_heads_sink_trampoline,
+                &ctx as *const AttnHeadsSinkCtx as *const (),
+            );
+        }
+        return;
+    }
+
+    // Serial fallback (short contexts, single-threaded, or wasm).
+    for h in 0..n_heads {
+        let kv_h = h / kv_mul;
+        let q_off = h * head_dim;
+        let out_off = h * value_dim;
+        online_attention_with_sink(
+            &queries[q_off..q_off + head_dim],
+            &keys[kv_h * head_dim..],
+            &values[kv_h * value_dim..],
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            start_t,
+            end_t,
+            scale,
+            sinks[h],
+            &mut out[out_off..out_off + value_dim],
+        );
+    }
+}
+
 #[inline]
 /// Runs numerically stable online attention over cached keys and values.
 pub(crate) fn online_attention(
@@ -8063,29 +8406,23 @@ pub fn forward_gpt_oss_into(
             pos,
             scale,
         ) {
-            for value in buf.attn_out.iter_mut() {
-                *value = 0.0;
-            }
-            for h in 0..config.n_heads {
-                let kv_h = h / config.kv_mul;
-                let q_off = h * config.head_dim;
-                let out_off = h * config.value_dim;
-                online_attention_with_sink(
-                    &buf.q[q_off..q_off + config.head_dim],
-                    &cache.k[l][kv_h * config.head_dim..],
-                    &cache.v[l][kv_h * config.value_dim..],
-                    kv_k_dim,
-                    kv_v_dim,
-                    cache.storage_len,
-                    config.head_dim,
-                    config.value_dim,
-                    attn_window,
-                    pos,
-                    scale,
-                    layer.sinks[h],
-                    &mut buf.attn_out[out_off..out_off + config.value_dim],
-                );
-            }
+            attention_over_heads_with_sink(
+                &buf.q,
+                &cache.k[l],
+                &cache.v[l],
+                &layer.sinks,
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                config.head_dim,
+                config.value_dim,
+                config.n_heads,
+                config.kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
@@ -12818,29 +13155,23 @@ fn forward_hidden_gpt_oss_impl<'a>(
             pos,
             scale,
         ) {
-            for value in buf.attn_out.iter_mut() {
-                *value = 0.0;
-            }
-            for h in 0..config.n_heads {
-                let kv_h = h / config.kv_mul;
-                let q_off = h * config.head_dim;
-                let out_off = h * config.value_dim;
-                online_attention_with_sink(
-                    &buf.q[q_off..q_off + config.head_dim],
-                    &cache.k[l][kv_h * config.head_dim..],
-                    &cache.v[l][kv_h * config.value_dim..],
-                    kv_k_dim,
-                    kv_v_dim,
-                    cache.storage_len,
-                    config.head_dim,
-                    config.value_dim,
-                    attn_window,
-                    pos,
-                    scale,
-                    layer.sinks[h],
-                    &mut buf.attn_out[out_off..out_off + config.value_dim],
-                );
-            }
+            attention_over_heads_with_sink(
+                &buf.q,
+                &cache.k[l],
+                &cache.v[l],
+                &layer.sinks,
+                kv_k_dim,
+                kv_v_dim,
+                cache.storage_len,
+                config.head_dim,
+                config.value_dim,
+                config.n_heads,
+                config.kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut buf.attn_out,
+            );
         }
 
         layer.wo.matvec_into(&buf.attn_out, &mut buf.proj);
