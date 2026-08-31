@@ -2139,6 +2139,89 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_family = "wasm"))]
+    /// `attention_over_kv_heads_prefill_batch` must agree bit-for-bit with a
+    /// per-token reference built from the exact single-token call it
+    /// replaces (`online_attention_grouped` per (t, kv_h), same as the old
+    /// `forward_prefill_batch` inner loop). Sized so the parallel dispatch
+    /// path actually runs (work = sum_t(pos_t+1) * n_kv_heads = 8320, above
+    /// the 4096 threshold) rather than only exercising the serial fallback —
+    /// the `prefill_batch_parity_case` integration tests use a tiny model
+    /// too small to ever cross that threshold, so they alone wouldn't catch
+    /// a bug specific to the parallel branch.
+    fn attention_over_kv_heads_prefill_batch_matches_per_token_reference() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const N_KV_HEADS: usize = 4;
+        const KV_MUL: usize = 4;
+        const N_HEADS: usize = N_KV_HEADS * KV_MUL;
+        const B: usize = 64;
+        const SLOT_COUNT: usize = B;
+        const START_POS: usize = 0;
+        const SLIDING_WINDOW: usize = 0;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let q_rows = N_HEADS * HEAD_DIM;
+        let attn_dim = N_HEADS * VALUE_DIM;
+        let key_stride = N_KV_HEADS * HEAD_DIM;
+        let value_stride = N_KV_HEADS * VALUE_DIM;
+
+        let queries: Vec<f32> = (0..B * q_rows).map(|i| (i as f32 * 0.0091).sin()).collect();
+        let keys: Vec<f32> = (0..SLOT_COUNT * key_stride)
+            .map(|i| (i as f32 * 0.0037).cos())
+            .collect();
+        let values: Vec<f32> = (0..SLOT_COUNT * value_stride)
+            .map(|i| (i as f32 * 0.0059).sin() * 0.3)
+            .collect();
+
+        let mut reference = vec![0.0f32; B * attn_dim];
+        for t in 0..B {
+            let pos = START_POS + t;
+            let attn_window = super::attention_start_pos(pos, SLIDING_WINDOW);
+            for kv_h in 0..N_KV_HEADS {
+                let q_off = t * q_rows + kv_h * KV_MUL * HEAD_DIM;
+                let out_off = t * attn_dim + kv_h * KV_MUL * VALUE_DIM;
+                super::online_attention_grouped(
+                    &queries[q_off..q_off + KV_MUL * HEAD_DIM],
+                    &keys[kv_h * HEAD_DIM..],
+                    &values[kv_h * VALUE_DIM..],
+                    key_stride,
+                    value_stride,
+                    SLOT_COUNT,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    KV_MUL,
+                    attn_window,
+                    pos,
+                    scale,
+                    &mut reference[out_off..out_off + KV_MUL * VALUE_DIM],
+                );
+            }
+        }
+
+        let mut actual = vec![0.0f32; B * attn_dim];
+        super::attention_over_kv_heads_prefill_batch(
+            &queries,
+            &keys,
+            &values,
+            key_stride,
+            value_stride,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            N_KV_HEADS,
+            KV_MUL,
+            B,
+            START_POS,
+            SLIDING_WINDOW,
+            scale,
+            &mut actual,
+        );
+
+        assert_eq!(reference, actual);
+    }
+
+    #[test]
     fn sliding_kv_cache_uses_ring_storage_without_lowering_context_limit() {
         let mut cache = KVCache::with_sliding_window(2, 4, 6, 128, Some(8));
         assert_eq!(cache.max_len, 128);
@@ -8176,6 +8259,342 @@ pub(crate) fn attention_over_kv_heads_bf16(
     }
 }
 
+/// Raw context for the batched-prefill attention trampoline. Unlike
+/// [`AttnHeadsCtx`] (one shard per KV head, called once per token from the
+/// prefill batch loop), this shards over the flattened `(token, KV head)`
+/// space for the *whole* microbatch in one dispatch: every token's K/V is
+/// already written to `cache` by the time this runs (the prefill batch loop
+/// splits cache-write and attention into two passes precisely so this can
+/// read the whole batch's cache state), so token t's causal window is
+/// enforced purely by `attn_window(t)..=pos(t)`, not by ordering. This is
+/// what lets a narrow-GQA model (e.g. Qwen2's 2 KV heads) actually use more
+/// than `n_kv_heads` worker threads during prefill.
+#[cfg(not(target_family = "wasm"))]
+struct PrefillAttnBatchCtx {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    start_pos: usize,
+    sliding_window: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn prefill_attn_batch_range(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `ctx` is a live &PrefillAttnBatchCtx for the blocking call;
+    // each (t, kv_h) unit writes a disjoint `out` band and only reads
+    // (never writes) K/V state, which the caller guarantees is already
+    // fully populated for the whole microbatch.
+    unsafe {
+        let c = &*(ctx as *const PrefillAttnBatchCtx);
+        let q_rows = c.n_kv_heads * c.kv_mul * c.head_dim;
+        let attn_dim = c.n_kv_heads * c.kv_mul * c.value_dim;
+        for u in start..end {
+            let t = u / c.n_kv_heads;
+            let kv_h = u % c.n_kv_heads;
+            let pos = c.start_pos + t;
+            let attn_window = attention_start_pos(pos, c.sliding_window);
+            let q_off = t * q_rows + kv_h * c.kv_mul * c.head_dim;
+            let out_off = t * attn_dim + kv_h * c.kv_mul * c.value_dim;
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let q = std::slice::from_raw_parts(c.q.add(q_off), c.kv_mul * c.head_dim);
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+            let out = std::slice::from_raw_parts_mut(c.out.add(out_off), c.kv_mul * c.value_dim);
+            online_attention_grouped(
+                q,
+                keys,
+                values,
+                c.key_stride,
+                c.value_stride,
+                c.slot_count,
+                c.head_dim,
+                c.value_dim,
+                c.kv_mul,
+                attn_window,
+                pos,
+                c.scale,
+                out,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+/// Computes attention for every token in a prefill microbatch, parallelizing
+/// over `(token, KV head)` pairs rather than just KV heads. `keys`/`values`
+/// must already hold every token's cache entry for this layer (the caller
+/// writes the whole batch's K/V before calling this). `queries`/`out` are
+/// laid out `[token][kv_head][kv_mul][dim]`, i.e. `b` copies of the same
+/// per-token layout the single-token [`attention_over_kv_heads`] uses.
+/// Only called from `forward_prefill_batch`, which is itself excluded from
+/// wasm (no batch prefill there), hence the matching cfg gate.
+pub(crate) fn attention_over_kv_heads_prefill_batch(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    b: usize,
+    start_pos: usize,
+    sliding_window: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let q_rows = n_kv_heads * kv_mul * head_dim;
+    let attn_dim = n_kv_heads * kv_mul * value_dim;
+
+    #[cfg(not(target_family = "wasm"))]
+    let units = b.saturating_mul(n_kv_heads);
+    #[cfg(not(target_family = "wasm"))]
+    let work: usize = (0..b)
+        .map(|t| {
+            let pos = start_pos + t;
+            (pos - attention_start_pos(pos, sliding_window) + 1) * n_kv_heads
+        })
+        .sum();
+    #[cfg(not(target_family = "wasm"))]
+    let threads = crate::simd::num_threads();
+
+    #[cfg(not(target_family = "wasm"))]
+    if units > 1
+        && threads > 1
+        && work >= attention_parallel_min_work(n_kv_heads, kv_mul, head_dim, value_dim, threads)
+    {
+        let ctx = PrefillAttnBatchCtx {
+            q: queries.as_ptr(),
+            k: keys.as_ptr(),
+            v: values.as_ptr(),
+            out: out.as_mut_ptr(),
+            k_len: keys.len(),
+            v_len: values.len(),
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            n_kv_heads,
+            kv_mul,
+            start_pos,
+            sliding_window,
+            scale,
+        };
+        // SAFETY: `ctx` outlives the blocking call; each (t, kv_h) unit
+        // writes a disjoint `out` band and only reads K/V state.
+        unsafe {
+            crate::simd::parallel_range(
+                units,
+                prefill_attn_batch_range,
+                &ctx as *const PrefillAttnBatchCtx as *const (),
+            );
+        }
+        return;
+    }
+
+    // Serial fallback (short batches/contexts, single-threaded, or wasm).
+    for t in 0..b {
+        let pos = start_pos + t;
+        let attn_window = attention_start_pos(pos, sliding_window);
+        for kv_h in 0..n_kv_heads {
+            let q_off = t * q_rows + kv_h * kv_mul * head_dim;
+            let out_off = t * attn_dim + kv_h * kv_mul * value_dim;
+            online_attention_grouped(
+                &queries[q_off..q_off + kv_mul * head_dim],
+                &keys[kv_h * head_dim..],
+                &values[kv_h * value_dim..],
+                key_stride,
+                value_stride,
+                slot_count,
+                head_dim,
+                value_dim,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut out[out_off..out_off + kv_mul * value_dim],
+            );
+        }
+    }
+}
+
+/// bf16-KV-cache counterpart of [`PrefillAttnBatchCtx`]/
+/// [`attention_over_kv_heads_prefill_batch`]; mirrors it exactly except for
+/// reading bf16-stored keys/values.
+#[cfg(not(target_family = "wasm"))]
+struct PrefillAttnBatchCtxBf16 {
+    q: *const f32,
+    k: *const u16,
+    v: *const u16,
+    out: *mut f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    start_pos: usize,
+    sliding_window: usize,
+    scale: f32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn prefill_attn_batch_range_bf16(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: mirrors prefill_attn_batch_range — `ctx` is a live
+    // &PrefillAttnBatchCtxBf16 for the blocking call; each (t, kv_h) unit
+    // writes a disjoint `out` band and only reads K/V state.
+    unsafe {
+        let c = &*(ctx as *const PrefillAttnBatchCtxBf16);
+        let q_rows = c.n_kv_heads * c.kv_mul * c.head_dim;
+        let attn_dim = c.n_kv_heads * c.kv_mul * c.value_dim;
+        for u in start..end {
+            let t = u / c.n_kv_heads;
+            let kv_h = u % c.n_kv_heads;
+            let pos = c.start_pos + t;
+            let attn_window = attention_start_pos(pos, c.sliding_window);
+            let q_off = t * q_rows + kv_h * c.kv_mul * c.head_dim;
+            let out_off = t * attn_dim + kv_h * c.kv_mul * c.value_dim;
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let q = std::slice::from_raw_parts(c.q.add(q_off), c.kv_mul * c.head_dim);
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+            let out = std::slice::from_raw_parts_mut(c.out.add(out_off), c.kv_mul * c.value_dim);
+            online_attention_grouped_bf16(
+                q,
+                keys,
+                values,
+                c.key_stride,
+                c.value_stride,
+                c.slot_count,
+                c.head_dim,
+                c.value_dim,
+                c.kv_mul,
+                attn_window,
+                pos,
+                c.scale,
+                out,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+/// bf16-KV-cache counterpart of [`attention_over_kv_heads_prefill_batch`].
+/// Only called from `forward_prefill_batch`, hence the matching cfg gate.
+pub(crate) fn attention_over_kv_heads_prefill_batch_bf16(
+    queries: &[f32],
+    keys: &[u16],
+    values: &[u16],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    b: usize,
+    start_pos: usize,
+    sliding_window: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    let q_rows = n_kv_heads * kv_mul * head_dim;
+    let attn_dim = n_kv_heads * kv_mul * value_dim;
+
+    #[cfg(not(target_family = "wasm"))]
+    let units = b.saturating_mul(n_kv_heads);
+    #[cfg(not(target_family = "wasm"))]
+    let work: usize = (0..b)
+        .map(|t| {
+            let pos = start_pos + t;
+            (pos - attention_start_pos(pos, sliding_window) + 1) * n_kv_heads
+        })
+        .sum();
+    #[cfg(not(target_family = "wasm"))]
+    let threads = crate::simd::num_threads();
+
+    #[cfg(not(target_family = "wasm"))]
+    if units > 1
+        && threads > 1
+        && work >= attention_parallel_min_work(n_kv_heads, kv_mul, head_dim, value_dim, threads)
+    {
+        let ctx = PrefillAttnBatchCtxBf16 {
+            q: queries.as_ptr(),
+            k: keys.as_ptr(),
+            v: values.as_ptr(),
+            out: out.as_mut_ptr(),
+            k_len: keys.len(),
+            v_len: values.len(),
+            key_stride,
+            value_stride,
+            slot_count,
+            head_dim,
+            value_dim,
+            n_kv_heads,
+            kv_mul,
+            start_pos,
+            sliding_window,
+            scale,
+        };
+        // SAFETY: `ctx` outlives the blocking call; each (t, kv_h) unit
+        // writes a disjoint `out` band and only reads K/V state.
+        unsafe {
+            crate::simd::parallel_range(
+                units,
+                prefill_attn_batch_range_bf16,
+                &ctx as *const PrefillAttnBatchCtxBf16 as *const (),
+            );
+        }
+        return;
+    }
+
+    // Serial fallback (short batches/contexts, single-threaded, or wasm).
+    for t in 0..b {
+        let pos = start_pos + t;
+        let attn_window = attention_start_pos(pos, sliding_window);
+        for kv_h in 0..n_kv_heads {
+            let q_off = t * q_rows + kv_h * kv_mul * head_dim;
+            let out_off = t * attn_dim + kv_h * kv_mul * value_dim;
+            online_attention_grouped_bf16(
+                &queries[q_off..q_off + kv_mul * head_dim],
+                &keys[kv_h * head_dim..],
+                &values[kv_h * value_dim..],
+                key_stride,
+                value_stride,
+                slot_count,
+                head_dim,
+                value_dim,
+                kv_mul,
+                attn_window,
+                pos,
+                scale,
+                &mut out[out_off..out_off + kv_mul * value_dim],
+            );
+        }
+    }
+}
+
 /// SiLU activation
 #[inline(always)]
 /// Computes the SiLU activation.
@@ -12294,6 +12713,14 @@ pub fn forward_prefill_batch(
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let sliding_window = active_sliding_window(config, cache);
+    // Writing every token's K/V before any attention read (below) is only
+    // safe if the ring can't wrap within this microbatch: `cache.storage_len`
+    // is the physical ring capacity (== the sliding window, or the full
+    // context for a non-sliding cache), and a batch larger than that would
+    // let a later token's write evict an earlier token's still-unread slot.
+    // `batched_prefill_matches_sequential_with_ring_window` pins this with a
+    // window of 8 and 17 tokens.
+    let batch_attention_safe = b <= cache.storage_len;
     let rope_pairs = buf.rope_inv_freq.len();
     buf.rope_sin.resize(b * rope_pairs, 0.0);
     buf.rope_cos.resize(b * rope_pairs, 0.0);
@@ -12337,32 +12764,41 @@ pub fn forward_prefill_batch(
             return false;
         }
 
-        for t in 0..b {
-            let pos = start_pos + t;
-            let q_row = &mut buf.q[t * q_rows..(t + 1) * q_rows];
-            let k_row = &mut buf.k[t * k_rows..(t + 1) * k_rows];
-            let v_row = &mut buf.v[t * v_rows..(t + 1) * v_rows];
-            add_bias_if_present(q_row, &layer.bq);
-            add_bias_if_present(k_row, &layer.bk);
-            add_bias_if_present(v_row, &layer.bv);
+        if batch_attention_safe {
+            // Pass 1: bias, RoPE, and cache writes for every token in the
+            // microbatch. Kept separate from attention (pass 2 below) so
+            // that by the time any token's attention scan runs, the *whole*
+            // batch's K/V is already in cache — each token still only ever
+            // reads up to its own position (attn_window(t)..=pos(t)
+            // enforces that), but this lets attention be parallelized over
+            // (token, KV head) instead of just KV head.
+            for t in 0..b {
+                let pos = start_pos + t;
+                let q_row = &mut buf.q[t * q_rows..(t + 1) * q_rows];
+                let k_row = &mut buf.k[t * k_rows..(t + 1) * k_rows];
+                let v_row = &mut buf.v[t * v_rows..(t + 1) * v_rows];
+                add_bias_if_present(q_row, &layer.bq);
+                add_bias_if_present(k_row, &layer.bk);
+                add_bias_if_present(v_row, &layer.bv);
 
-            let rope_start = t * rope_pairs;
-            apply_model_rope_prepared(
-                config,
-                q_row,
-                k_row,
-                &buf.rope_sin[rope_start..rope_start + rope_pairs],
-                &buf.rope_cos[rope_start..rope_start + rope_pairs],
-            );
+                let rope_start = t * rope_pairs;
+                apply_model_rope_prepared(
+                    config,
+                    q_row,
+                    k_row,
+                    &buf.rope_sin[rope_start..rope_start + rope_pairs],
+                    &buf.rope_cos[rope_start..rope_start + rope_pairs],
+                );
 
-            cache.write_k(l, pos, k_row);
-            cache.write_v(l, pos, v_row);
+                cache.write_k(l, pos, k_row);
+                cache.write_v(l, pos, v_row);
+            }
 
-            let attn_window = attention_start_pos(pos, sliding_window);
-            let out_row = &mut buf.attn_out[t * attn_dim..(t + 1) * attn_dim];
+            // Pass 2: attention for every token, parallelized over (token,
+            // KV head) pairs rather than per-token over just KV heads.
             if cache.bf16 {
-                attention_over_kv_heads_bf16(
-                    &buf.q[t * q_rows..(t + 1) * q_rows],
+                attention_over_kv_heads_prefill_batch_bf16(
+                    &buf.q[..b * q_rows],
                     &cache.k_bf16[l],
                     &cache.v_bf16[l],
                     cache.per_pos_k_dim,
@@ -12372,14 +12808,15 @@ pub fn forward_prefill_batch(
                     config.value_dim,
                     config.n_kv_heads,
                     kv_mul,
-                    attn_window,
-                    pos,
+                    b,
+                    start_pos,
+                    sliding_window,
                     scale,
-                    out_row,
+                    &mut buf.attn_out[..b * attn_dim],
                 );
             } else {
-                attention_over_kv_heads(
-                    &buf.q[t * q_rows..(t + 1) * q_rows],
+                attention_over_kv_heads_prefill_batch(
+                    &buf.q[..b * q_rows],
                     &cache.k[l],
                     &cache.v[l],
                     cache.per_pos_k_dim,
@@ -12389,11 +12826,77 @@ pub fn forward_prefill_batch(
                     config.value_dim,
                     config.n_kv_heads,
                     kv_mul,
-                    attn_window,
-                    pos,
+                    b,
+                    start_pos,
+                    sliding_window,
                     scale,
-                    out_row,
+                    &mut buf.attn_out[..b * attn_dim],
                 );
+            }
+        } else {
+            // Ring-wrap fallback: a batch larger than the cache's physical
+            // ring capacity must interleave each token's write with its own
+            // attention read, exactly like the single-token decode path,
+            // or a later token's write could evict an earlier token's
+            // still-unread slot before pass 2 (above) ever reads it.
+            for t in 0..b {
+                let pos = start_pos + t;
+                let q_row = &mut buf.q[t * q_rows..(t + 1) * q_rows];
+                let k_row = &mut buf.k[t * k_rows..(t + 1) * k_rows];
+                let v_row = &mut buf.v[t * v_rows..(t + 1) * v_rows];
+                add_bias_if_present(q_row, &layer.bq);
+                add_bias_if_present(k_row, &layer.bk);
+                add_bias_if_present(v_row, &layer.bv);
+
+                let rope_start = t * rope_pairs;
+                apply_model_rope_prepared(
+                    config,
+                    q_row,
+                    k_row,
+                    &buf.rope_sin[rope_start..rope_start + rope_pairs],
+                    &buf.rope_cos[rope_start..rope_start + rope_pairs],
+                );
+
+                cache.write_k(l, pos, k_row);
+                cache.write_v(l, pos, v_row);
+
+                let attn_window = attention_start_pos(pos, sliding_window);
+                let out_row = &mut buf.attn_out[t * attn_dim..(t + 1) * attn_dim];
+                if cache.bf16 {
+                    attention_over_kv_heads_bf16(
+                        &buf.q[t * q_rows..(t + 1) * q_rows],
+                        &cache.k_bf16[l],
+                        &cache.v_bf16[l],
+                        cache.per_pos_k_dim,
+                        cache.per_pos_v_dim,
+                        cache.storage_len,
+                        head_dim,
+                        config.value_dim,
+                        config.n_kv_heads,
+                        kv_mul,
+                        attn_window,
+                        pos,
+                        scale,
+                        out_row,
+                    );
+                } else {
+                    attention_over_kv_heads(
+                        &buf.q[t * q_rows..(t + 1) * q_rows],
+                        &cache.k[l],
+                        &cache.v[l],
+                        cache.per_pos_k_dim,
+                        cache.per_pos_v_dim,
+                        cache.storage_len,
+                        head_dim,
+                        config.value_dim,
+                        config.n_kv_heads,
+                        kv_mul,
+                        attn_window,
+                        pos,
+                        scale,
+                        out_row,
+                    );
+                }
             }
         }
 
