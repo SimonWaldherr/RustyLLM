@@ -1080,22 +1080,45 @@ Benchmark output includes prompt tokens, generated tokens, prefill time, decode
 time, wall time, and aggregate throughput. Use the same model, prompt,
 temperature, seed, thread count, and build flags when comparing changes.
 
-For a fresh-process, same-GGUF comparison against an external reference across
-the local Ministral 3 3B, Meta Llama 3.1 8B, and Qwen2-family 7B models, run:
+For a fresh-process, same-GGUF decode comparison across the local Ministral,
+Gemma, Qwen 3.8, and Llama models, use the dedicated fixed-step benchmark
+binary as the reference:
 
 ```bash
-REFERENCE_BIN=/path/to/reference-cli make bench-reference
+REFERENCE_BIN=/path/to/llama-bench make bench-families-reference
 ```
 
-The harness alternates engine order, uses a 10-second cooldown by default,
-captures available thermal-pressure telemetry before and after each process,
-forces greedy sampling and GPU execution, writes raw logs below
-`.bench_raw/reference/`, and produces
-[`BENCHMARK_REFERENCE.md`](BENCHMARK_REFERENCE.md). Override model discovery
-with `MINISTRAL_MODEL`, `LLAMA_MODEL`, or `QWEN_MODEL`; use
-`REFERENCE_RUNS=5 REFERENCE_BIN=/path/to/reference-cli make bench-reference`
-for a longer comparison. Override `COOLDOWN_SECS` only when the host has had
-enough time to reach a stable thermal state.
+The harness alternates fresh processes, measures exactly 64 decode steps, keeps
+model files identical, captures thermal-pressure telemetry, and stores every
+raw result below `.bench_raw/families-reference/`. For large models, run a
+single family in isolation so cooling can be sized to the hardware:
+
+```bash
+FAMILY=qwen INITIAL_COOLDOWN_SECS=180 COOLDOWN_SECS=120 \
+  REFERENCE_BIN=/path/to/llama-bench make bench-one-family-reference
+```
+
+Use `FAMILY=ministral`, `gemma`, `qwen`, or `llama`. A throughput decline can
+indicate thermal or power-state drift even when macOS reports no warning, so a
+final result should not be selected from the fastest run. Increase both cooling
+intervals until the alternating sequence is stable.
+
+Nomic is encoder-only and is therefore measured separately through warm local
+HTTP embedding endpoints:
+
+```bash
+LLAMA_SERVER_BIN=/path/to/llama-server make bench-nomic-reference
+```
+
+This uses the same GGUF, exact request body, CPU backend, pooling,
+normalization, and thread count. It reports end-to-end input tokens/s and HTTP
+latency rather than mixing encoder work with autoregressive decode tokens/s.
+The retained thermally controlled results are in
+[`BENCHMARK_FAMILIES.md`](BENCHMARK_FAMILIES.md) and
+[`BENCHMARK_NOMIC.md`](BENCHMARK_NOMIC.md). The post-optimization Ministral
+rerun is in
+[`BENCHMARK_MINISTRAL_OPTIMIZED.md`](BENCHMARK_MINISTRAL_OPTIMIZED.md); the
+prioritized follow-up work is in [`OPTIMIZATION_PLAN.md`](OPTIMIZATION_PLAN.md).
 
 For the dense and sparse Gemma 4 variants, run:
 
@@ -1251,7 +1274,18 @@ per query head and merges their stable online-softmax states. Set
 or `=1` to force the parallel path even for very short contexts. The older
 shared-KV GQA kernel remains as a fallback when timeline parallelism is
 disabled; set `RUSTY_LLM_METAL_GROUPED_GQA=0` to disable it too or `=1` to
-force it. Metal
+force it. The Ministral resident decoder stores normalized projection inputs,
+the SwiGLU result, and the attention-to-output-projection boundary as FP16 while
+retaining FP32 residual state, KV state, softmax arithmetic, and accumulators.
+This is enabled automatically only for the measured Ministral architectures.
+Set `RUSTY_LLM_METAL_HALF_PROJECTION_INPUT=0`,
+`RUSTY_LLM_METAL_HALF_OUTPUT_INPUT=0`, or
+`RUSTY_LLM_METAL_HALF_ATTENTION_OUTPUT=0` to disable one boundary for an A/B
+test; `=1` explicitly enables it for another compatible resident model.
+Greedy decode writes its vocabulary logits to private GPU storage and uses a
+parallel two-stage reduction by default. Set
+`RUSTY_LLM_METAL_PRIVATE_GREEDY_LOGITS=0` or
+`RUSTY_LLM_METAL_LEGACY_ARGMAX=1` only for regression measurements. Metal
 matvec and attention calls use reusable copy buffers by default, which is faster
 on the current Ministral 3B Q4_K_M benchmark than Shared/NoCopy wrapping. Set
 `RUSTY_LLM_METAL_NOCOPY=1` only when benchmarking the no-copy path on your Mac.

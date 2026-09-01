@@ -51,7 +51,7 @@ _BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(PROMP
 _NATO_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_BENCH_MODEL_ARG) --prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)"
 _KERNEL_BENCH_COMMON = --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
-.PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report bench-reference bench-gemma4-reference synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
+.PHONY: all build release release-max run repl serve serve-metal serve-ultra https find-model-dir list-models inspect list-tensors bench cargo-bench bench-model bench-model-metal bench-model-ultra bench-models benchmark-report bench-reference bench-families-reference bench-one-family-reference bench-nomic-reference bench-gemma4-reference synonym-bench nato-bench nato-bench-metal kernel-bench kernel-bench-metal kernel-bench-ultra fmt test vet check wasm clean help
 
 all: check release ## Run check and release build
 
@@ -116,6 +116,15 @@ benchmark-report: ## Rebuild BENCHMARK.md from existing .bench_raw TSV files
 
 bench-reference: release-max ## Compare Ministral, Llama and Qwen decode against an external GGUF engine
 	RUSTY_BIN=./target/release-max/$(APP) RUNS="$(REFERENCE_RUNS)" ./bench_reference.sh
+
+bench-families-reference: release-max ## Compare Ministral, Gemma, Qwen and Llama with fixed decode windows
+	RUSTY_BIN=./target/release-max/$(APP) REFERENCE_KIND=bench RUNS="$(REFERENCE_RUNS)" ./bench_family_reference.sh
+
+bench-one-family-reference: release-max ## Run one isolated decoder family (FAMILY=ministral|gemma|qwen|llama)
+	RUSTY_BIN=./target/release-max/$(APP) REFERENCE_KIND=bench RUNS="$(REFERENCE_RUNS)" ./bench_one_family_reference.sh
+
+bench-nomic-reference: release-max ## Compare Nomic embedding throughput through warm local HTTP servers
+	RUSTY_BIN=./target/release-max/$(APP) RUNS="$(REFERENCE_RUNS)" ./bench_nomic_reference.sh
 
 bench-gemma4-reference: release-max ## Compare Gemma 4 decode against an external GGUF engine
 	RUSTY_BIN=./target/release-max/$(APP) RUNS="$(REFERENCE_RUNS)" ./bench_gemma4_reference.sh
