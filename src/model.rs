@@ -1951,6 +1951,81 @@ mod tests {
     }
 
     #[test]
+    /// The core invariant KV-block-tiled prefill attention depends on:
+    /// several `online_attention_grouped_scan` calls over consecutive,
+    /// gap-free sub-ranges with carried-over (max_score, denom, out) state
+    /// must be bit-identical to one `online_attention_grouped` call over the
+    /// concatenated range. Uses kv_mul=6 to exercise both the x4-fused fast
+    /// path (first 4 groups) and the scalar tail (groups 4-5) inside the
+    /// scan core, and deliberately uneven block sizes (7 positions per
+    /// block, 50 total, so the last block is a 1-position remainder) to
+    /// catch any off-by-one at a chunk boundary.
+    fn online_attention_grouped_scan_chunks_match_single_call() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const KV_MUL: usize = 6;
+        const N: usize = 50;
+        const BLOCK: usize = 7;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let queries: Vec<f32> = (0..KV_MUL * HEAD_DIM)
+            .map(|i| (i as f32 * 0.031).sin())
+            .collect();
+        let keys: Vec<f32> = (0..N * HEAD_DIM)
+            .map(|i| (i as f32 * 0.017).cos())
+            .collect();
+        let values: Vec<f32> = (0..N * VALUE_DIM)
+            .map(|i| (i as f32 * 0.023).sin() * 0.4)
+            .collect();
+
+        let mut reference = vec![0.0f32; KV_MUL * VALUE_DIM];
+        super::online_attention_grouped(
+            &queries,
+            &keys,
+            &values,
+            HEAD_DIM,
+            VALUE_DIM,
+            N,
+            HEAD_DIM,
+            VALUE_DIM,
+            KV_MUL,
+            0,
+            N - 1,
+            scale,
+            &mut reference,
+        );
+
+        let mut chunked = vec![0.0f32; KV_MUL * VALUE_DIM];
+        let mut max_score = [f32::NEG_INFINITY; KV_MUL];
+        let mut denom = [0.0f32; KV_MUL];
+        let mut start = 0usize;
+        while start < N {
+            let end = (start + BLOCK - 1).min(N - 1);
+            super::online_attention_grouped_scan(
+                &queries,
+                &keys,
+                &values,
+                HEAD_DIM,
+                VALUE_DIM,
+                N,
+                HEAD_DIM,
+                VALUE_DIM,
+                KV_MUL,
+                start,
+                end,
+                scale,
+                &mut max_score,
+                &mut denom,
+                &mut chunked,
+            );
+            start = end + 1;
+        }
+        super::online_attention_grouped_finalize(KV_MUL, VALUE_DIM, &denom, &mut chunked);
+
+        assert_eq!(reference, chunked);
+    }
+
+    #[test]
     /// `attention_over_heads_with_sink` must agree bit-for-bit with a plain
     /// serial per-head reference loop (the code it replaced at both gpt-oss
     /// call sites), whichever internal path (worker-pool or serial fallback)
@@ -2214,6 +2289,86 @@ mod tests {
             B,
             START_POS,
             SLIDING_WINDOW,
+            scale,
+            &mut actual,
+        );
+
+        assert_eq!(reference, actual);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    /// `attention_over_kv_heads_prefill_batch_tiled` must agree bit-for-bit
+    /// with a per-token reference built the same way as the untiled
+    /// dispatcher's test above. B=140 with `KV_TILE_BLOCK`=128 and
+    /// `PREFILL_TOKEN_TILE`=64 means this spans 3 token tiles and, for the
+    /// later tiles, 2 KV blocks — deliberately not a multiple of either
+    /// constant, to catch an off-by-one at a tile or block boundary (the
+    /// kind of bug the chunked-scan invariant test alone wouldn't catch,
+    /// since that test doesn't exercise the tile/suffix bookkeeping this
+    /// dispatcher adds on top of the scan core).
+    fn attention_over_kv_heads_prefill_batch_tiled_matches_per_token_reference() {
+        const HEAD_DIM: usize = 8;
+        const VALUE_DIM: usize = 6;
+        const N_KV_HEADS: usize = 2;
+        const KV_MUL: usize = 4;
+        const N_HEADS: usize = N_KV_HEADS * KV_MUL;
+        const B: usize = 140;
+        const SLOT_COUNT: usize = B;
+        const START_POS: usize = 0;
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+        let q_rows = N_HEADS * HEAD_DIM;
+        let attn_dim = N_HEADS * VALUE_DIM;
+        let key_stride = N_KV_HEADS * HEAD_DIM;
+        let value_stride = N_KV_HEADS * VALUE_DIM;
+
+        let queries: Vec<f32> = (0..B * q_rows).map(|i| (i as f32 * 0.0091).sin()).collect();
+        let keys: Vec<f32> = (0..SLOT_COUNT * key_stride)
+            .map(|i| (i as f32 * 0.0037).cos())
+            .collect();
+        let values: Vec<f32> = (0..SLOT_COUNT * value_stride)
+            .map(|i| (i as f32 * 0.0059).sin() * 0.3)
+            .collect();
+
+        let mut reference = vec![0.0f32; B * attn_dim];
+        for t in 0..B {
+            let pos = START_POS + t;
+            for kv_h in 0..N_KV_HEADS {
+                let q_off = t * q_rows + kv_h * KV_MUL * HEAD_DIM;
+                let out_off = t * attn_dim + kv_h * KV_MUL * VALUE_DIM;
+                super::online_attention_grouped(
+                    &queries[q_off..q_off + KV_MUL * HEAD_DIM],
+                    &keys[kv_h * HEAD_DIM..],
+                    &values[kv_h * VALUE_DIM..],
+                    key_stride,
+                    value_stride,
+                    SLOT_COUNT,
+                    HEAD_DIM,
+                    VALUE_DIM,
+                    KV_MUL,
+                    0,
+                    pos,
+                    scale,
+                    &mut reference[out_off..out_off + KV_MUL * VALUE_DIM],
+                );
+            }
+        }
+
+        let mut actual = vec![0.0f32; B * attn_dim];
+        super::attention_over_kv_heads_prefill_batch_tiled(
+            &queries,
+            &keys,
+            &values,
+            key_stride,
+            value_stride,
+            SLOT_COUNT,
+            HEAD_DIM,
+            VALUE_DIM,
+            N_KV_HEADS,
+            KV_MUL,
+            B,
+            START_POS,
             scale,
             &mut actual,
         );
@@ -4132,6 +4287,72 @@ mod tests {
         // Window 8 with 17 tokens wraps the ring cache more than once, so
         // this covers the store→attend interleaving the ring layout requires.
         prefill_batch_parity_case(8);
+    }
+
+    #[test]
+    #[cfg(not(target_family = "wasm"))]
+    /// `prefill_batch_parity_case` above only compares KV *cache* contents,
+    /// which tiling cannot affect (pass 1, the cache write, is identical
+    /// either way — only pass 2, attention, differs) and which are too
+    /// small (17 tokens) to cross the `attention_parallel_min_work`
+    /// threshold that engages `forward_prefill_batch`'s new KV-block-tiled
+    /// path anyway. This forces that path (n_kv_heads=1 here, so work =
+    /// 140*141/2 = 9870 >= the 4096 threshold) and checks the actual
+    /// per-token *hidden state* output against sequential
+    /// `forward_hidden_impl` calls, at 140 tokens so the run also crosses
+    /// both a `PREFILL_TOKEN_TILE`=64 tile boundary (3 tiles: 64/64/12) and
+    /// a `KV_TILE_BLOCK`=128 KV-block boundary within the later tiles.
+    fn batched_prefill_tiled_path_matches_sequential_hidden_states() {
+        let (mut config, weights) = tiny_standard_model(0);
+        assert!(super::standard_prefill_batchable(&weights));
+        config.max_seq_len = 256;
+        let tokens: Vec<u32> = (0..140u32).map(|i| (i * 7) % 32).collect();
+
+        let mut cache_seq = super::KVCache::new(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+        );
+        let mut seq_buf = super::DecodeBuffer::new(&config, config.head_dim, 1, config.value_dim);
+        let mut expected_hidden = Vec::new();
+        for (pos, &token) in tokens.iter().enumerate() {
+            let _ = super::forward_hidden_impl(
+                &config,
+                &weights,
+                &mut cache_seq,
+                &mut seq_buf,
+                token,
+                pos,
+                false,
+            );
+            expected_hidden.extend_from_slice(&seq_buf.x);
+        }
+
+        let mut cache_batch = super::KVCache::new(
+            config.n_layers,
+            config.kv_dim,
+            config.kv_dim,
+            config.max_seq_len,
+        );
+        let mut batch_buf = super::PrefillBatchBuffer::new(&config);
+        assert!(super::forward_prefill_batch(
+            &config,
+            &weights,
+            &mut cache_batch,
+            &mut batch_buf,
+            &tokens,
+            0,
+        ));
+
+        assert_eq!(expected_hidden.len(), batch_buf.x.len());
+        for (index, (&expected, &actual)) in expected_hidden.iter().zip(&batch_buf.x).enumerate() {
+            let tolerance = 1e-3 * expected.abs().max(1.0);
+            assert!(
+                (expected - actual).abs() <= tolerance,
+                "hidden[{index}] sequential={expected} tiled_batch={actual}"
+            );
+        }
     }
 
     #[test]
@@ -7753,6 +7974,66 @@ pub(crate) fn online_attention_grouped(
     let mut max_score = [f32::NEG_INFINITY; MAX_KV_MUL];
     let mut denom = [0.0f32; MAX_KV_MUL];
     let kv_mul = kv_mul.min(MAX_KV_MUL);
+    online_attention_grouped_scan(
+        queries,
+        keys,
+        values,
+        key_stride,
+        value_stride,
+        slot_count,
+        key_head_dim,
+        value_head_dim,
+        kv_mul,
+        start_t,
+        end_t,
+        scale,
+        &mut max_score[..kv_mul],
+        &mut denom[..kv_mul],
+        out,
+    );
+    online_attention_grouped_finalize(kv_mul, value_head_dim, &denom[..kv_mul], out);
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+/// Core of [`online_attention_grouped`], factored out so KV-block-tiled
+/// prefill (below) can call it repeatedly over consecutive sub-ranges with
+/// state (`max_score`/`denom`/`out`) that persists across calls, instead of
+/// being freshly initialized every time. The online-softmax recurrence only
+/// depends on visiting positions in increasing order — it does not care
+/// whether that happens in one call over `[a, z]` or several calls over
+/// `[a, b], [b+1, c], ..., [y+1, z]` with the running state carried between
+/// them, so this produces bit-identical results either way. Does **not**
+/// normalize `out` (divide by `denom`) — callers finalize once after the
+/// position range for a query group is fully scanned, via
+/// [`online_attention_grouped_finalize`].
+///
+/// `kv_mul` here must already be `<= MAX_KV_MUL` (callers slice their
+/// scratch arrays to it) and `max_score`/`denom` must have exactly `kv_mul`
+/// elements — this only exists to be called from the two trusted call sites
+/// above and below, so it skips the public wrapper's own clamping/dispatch.
+fn online_attention_grouped_scan(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    key_head_dim: usize,
+    value_head_dim: usize,
+    kv_mul: usize,
+    start_t: usize,
+    end_t: usize,
+    scale: f32,
+    max_score: &mut [f32],
+    denom: &mut [f32],
+    out: &mut [f32],
+) {
+    if slot_count == 0 || start_t > end_t {
+        return;
+    }
+    debug_assert_eq!(max_score.len(), kv_mul);
+    debug_assert_eq!(denom.len(), kv_mul);
     let linear_slots = attention_uses_linear_slots(start_t, end_t, slot_count);
     let mut slot = if linear_slots {
         start_t
@@ -7864,7 +8145,19 @@ pub(crate) fn online_attention_grouped(
             slot = 0;
         }
     }
+}
 
+#[inline]
+/// Normalizes each query group's unnormalized weighted-sum accumulator by
+/// its running softmax denominator. Called once after
+/// [`online_attention_grouped_scan`] has processed a query group's entire
+/// position range (whether via one call or several consecutive ones).
+fn online_attention_grouped_finalize(
+    kv_mul: usize,
+    value_head_dim: usize,
+    denom: &[f32],
+    out: &mut [f32],
+) {
     for g in 0..kv_mul {
         if denom[g] > 0.0 {
             let inv = 1.0 / denom[g];
@@ -8592,6 +8885,208 @@ pub(crate) fn attention_over_kv_heads_prefill_batch_bf16(
                 &mut out[out_off..out_off + kv_mul * value_dim],
             );
         }
+    }
+}
+
+/// KV positions per block in the tiled prefill attention path below: large
+/// enough to amortize the online-softmax bookkeeping per block, small
+/// enough that one block's K+V for one KV head stays comfortably
+/// L2-resident while every participating token in a tile scans it.
+#[cfg(not(target_family = "wasm"))]
+const KV_TILE_BLOCK: usize = 128;
+
+/// Tokens per tile in the tiled prefill attention path below, and the
+/// compile-time bound for the per-unit stack scratch (`PREFILL_TOKEN_TILE`
+/// tokens x `MAX_KV_MUL` groups of `max_score`/`denom`). Chosen so
+/// `n_kv_heads * ceil(b / PREFILL_TOKEN_TILE)` gives enough dispatch units
+/// to use every thread even for a narrow-GQA model's short prompts, while
+/// keeping the per-unit scratch (`PREFILL_TOKEN_TILE * MAX_KV_MUL * 4`
+/// bytes x 2 arrays = 8 KiB at these values) a modest stack allocation.
+#[cfg(not(target_family = "wasm"))]
+const PREFILL_TOKEN_TILE: usize = 64;
+
+/// Raw context for the KV-block-tiled prefill attention trampoline. Scoped
+/// to `sliding_window == 0` (plain causal): every token's window starts at
+/// position 0, so a KV block's participating tokens are always a *suffix*
+/// of the tile (later positions keep needing later blocks; earlier
+/// positions stop once the block moves past their own position). A sliding
+/// window would additionally need an upper-exclusion check per token per
+/// block (the window's lower bound also advances with position), which
+/// this does not implement — see `attention_over_kv_heads_prefill_batch`
+/// for the windowed case, still used for `sliding_window > 0`.
+#[cfg(not(target_family = "wasm"))]
+struct PrefillAttnTiledCtx {
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    out: *mut f32,
+    k_len: usize,
+    v_len: usize,
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    b: usize,
+    start_pos: usize,
+    scale: f32,
+    num_tiles: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+unsafe fn prefill_attn_tiled_range(ctx: *const (), start: usize, end: usize) {
+    // SAFETY: `ctx` is a live &PrefillAttnTiledCtx for the blocking call;
+    // each (kv_h, tile) unit writes a disjoint `out` band (every token in
+    // the tile, for this kv_h's kv_mul query heads) and only reads K/V
+    // state, which the caller guarantees is already fully populated for the
+    // whole microbatch.
+    unsafe {
+        let c = &*(ctx as *const PrefillAttnTiledCtx);
+        let kv_mul = c.kv_mul.min(MAX_KV_MUL);
+        let q_rows = c.n_kv_heads * kv_mul * c.head_dim;
+        let attn_dim = c.n_kv_heads * kv_mul * c.value_dim;
+
+        for u in start..end {
+            let kv_h = u / c.num_tiles;
+            let tile_idx = u % c.num_tiles;
+            let tile_start = tile_idx * PREFILL_TOKEN_TILE;
+            let tile_end = (tile_start + PREFILL_TOKEN_TILE).min(c.b);
+            if tile_start >= tile_end {
+                continue;
+            }
+            let tile_len = tile_end - tile_start;
+
+            // Per-token-in-tile running softmax state, indexed
+            // [local_t * kv_mul + g]. Persists across every KV block below
+            // for this tile — this is the whole point of the tiling: each
+            // block's K/V rows are read once and applied to every token
+            // that still needs them, instead of once per token.
+            let mut max_score = [f32::NEG_INFINITY; PREFILL_TOKEN_TILE * MAX_KV_MUL];
+            let mut denom = [0.0f32; PREFILL_TOKEN_TILE * MAX_KV_MUL];
+
+            let pos_first = c.start_pos + tile_start;
+            let pos_last = c.start_pos + tile_end - 1;
+            let k_start = kv_h * c.head_dim;
+            let v_start = kv_h * c.value_dim;
+            let keys = std::slice::from_raw_parts(c.k.add(k_start), c.k_len - k_start);
+            let values = std::slice::from_raw_parts(c.v.add(v_start), c.v_len - v_start);
+
+            let mut block_start = 0usize;
+            while block_start <= pos_last {
+                let block_end = (block_start + KV_TILE_BLOCK - 1).min(pos_last);
+                // Causal: token t needs this block iff pos_t >= block_start.
+                // pos_t is increasing in local_t, so the participating set
+                // is exactly the suffix [first_local_t, tile_len).
+                let first_local_t = block_start.saturating_sub(pos_first);
+                for local_t in first_local_t..tile_len {
+                    let pos_t = pos_first + local_t;
+                    let this_end = block_end.min(pos_t);
+                    let t = tile_start + local_t;
+                    let ms_off = local_t * kv_mul;
+                    let q_off = t * q_rows + kv_h * kv_mul * c.head_dim;
+                    let out_off = t * attn_dim + kv_h * kv_mul * c.value_dim;
+                    let q = std::slice::from_raw_parts(c.q.add(q_off), kv_mul * c.head_dim);
+                    let out =
+                        std::slice::from_raw_parts_mut(c.out.add(out_off), kv_mul * c.value_dim);
+                    online_attention_grouped_scan(
+                        q,
+                        keys,
+                        values,
+                        c.key_stride,
+                        c.value_stride,
+                        c.slot_count,
+                        c.head_dim,
+                        c.value_dim,
+                        kv_mul,
+                        block_start,
+                        this_end,
+                        c.scale,
+                        &mut max_score[ms_off..ms_off + kv_mul],
+                        &mut denom[ms_off..ms_off + kv_mul],
+                        out,
+                    );
+                }
+                block_start = block_end + 1;
+            }
+
+            for local_t in 0..tile_len {
+                let t = tile_start + local_t;
+                let ms_off = local_t * kv_mul;
+                let out_off = t * attn_dim + kv_h * kv_mul * c.value_dim;
+                let out = std::slice::from_raw_parts_mut(c.out.add(out_off), kv_mul * c.value_dim);
+                online_attention_grouped_finalize(
+                    kv_mul,
+                    c.value_dim,
+                    &denom[ms_off..ms_off + kv_mul],
+                    out,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[allow(clippy::too_many_arguments)]
+/// KV-block-tiled counterpart of [`attention_over_kv_heads_prefill_batch`],
+/// used when `sliding_window == 0` (plain causal prefill) and there is
+/// enough work to be worth it (see `forward_prefill_batch`'s dispatch,
+/// which decides that, not this function). Where the untiled version has
+/// each (token, KV head) unit sweep the *whole* KV history from position 0
+/// independently — O(b^2) total KV bytes read per layer across the
+/// microbatch, since every token re-reads every earlier position from
+/// scratch — this tiles the KV axis into `KV_TILE_BLOCK`-sized chunks, read
+/// ONCE per (KV head, token tile) unit and shared across every token in
+/// that tile that still needs them, cutting total KV bytes read to
+/// O(max position) per layer instead of O(b x max position).
+pub(crate) fn attention_over_kv_heads_prefill_batch_tiled(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    key_stride: usize,
+    value_stride: usize,
+    slot_count: usize,
+    head_dim: usize,
+    value_dim: usize,
+    n_kv_heads: usize,
+    kv_mul: usize,
+    b: usize,
+    start_pos: usize,
+    scale: f32,
+    out: &mut [f32],
+) {
+    if b == 0 || n_kv_heads == 0 {
+        return;
+    }
+    let num_tiles = b.div_ceil(PREFILL_TOKEN_TILE).max(1);
+    let ctx = PrefillAttnTiledCtx {
+        q: queries.as_ptr(),
+        k: keys.as_ptr(),
+        v: values.as_ptr(),
+        out: out.as_mut_ptr(),
+        k_len: keys.len(),
+        v_len: values.len(),
+        key_stride,
+        value_stride,
+        slot_count,
+        head_dim,
+        value_dim,
+        n_kv_heads,
+        kv_mul,
+        b,
+        start_pos,
+        scale,
+        num_tiles,
+    };
+    // SAFETY: `ctx` outlives the blocking call; each (kv_h, tile) unit
+    // writes a disjoint `out` band and only reads K/V state.
+    unsafe {
+        crate::simd::parallel_range(
+            n_kv_heads * num_tiles,
+            prefill_attn_tiled_range,
+            &ctx as *const PrefillAttnTiledCtx as *const (),
+        );
     }
 }
 
@@ -12795,9 +13290,42 @@ pub fn forward_prefill_batch(
                 cache.write_v(l, pos, v_row);
             }
 
-            // Pass 2: attention for every token, parallelized over (token,
-            // KV head) pairs rather than per-token over just KV heads.
-            if cache.bf16 {
+            // Pass 2: attention for every token. Prefer the KV-block-tiled
+            // path (reads each KV block once per tile instead of once per
+            // token) whenever it applies — plain causal only (no sliding
+            // window, no bf16 cache yet) and enough work that the tiling
+            // and extra dispatch bookkeeping pay for themselves. Otherwise
+            // fall back to the untiled (token, KV head)-parallel path.
+            let use_tiled = sliding_window == 0 && !cache.bf16 && {
+                let work: usize = (0..b)
+                    .map(|t| (start_pos + t + 1) * config.n_kv_heads)
+                    .sum();
+                work >= attention_parallel_min_work(
+                    config.n_kv_heads,
+                    kv_mul,
+                    head_dim,
+                    config.value_dim,
+                    crate::simd::num_threads(),
+                )
+            };
+            if use_tiled {
+                attention_over_kv_heads_prefill_batch_tiled(
+                    &buf.q[..b * q_rows],
+                    &cache.k[l],
+                    &cache.v[l],
+                    cache.per_pos_k_dim,
+                    cache.per_pos_v_dim,
+                    cache.storage_len,
+                    head_dim,
+                    config.value_dim,
+                    config.n_kv_heads,
+                    kv_mul,
+                    b,
+                    start_pos,
+                    scale,
+                    &mut buf.attn_out[..b * attn_dim],
+                );
+            } else if cache.bf16 {
                 attention_over_kv_heads_prefill_batch_bf16(
                     &buf.q[..b * q_rows],
                     &cache.k_bf16[l],

@@ -927,11 +927,23 @@ fn parallel_matvec(
 
     #[cfg(not(target_family = "wasm"))]
     {
+        // Quantize once here, on the publishing thread, and share the result
+        // with every worker — matching MatvecJob::xq's own doc comment
+        // ("quantized once by the publishing thread; workers only read it").
+        // Before this fix that contract was never honored: this call was
+        // missing and every worker got XQuant::NONE, silently downgrading
+        // every parallel K-quant matvec (i.e. every real matvec above the
+        // rows < threads*8 serial cutoff — the overwhelming majority in any
+        // real model) from the AVX2/NEON int8 kernel to dot_row's plain f32
+        // fallback, which additionally has no x86_64 SIMD implementation at
+        // all for Q6_K (dot_q6_k_f32 is NEON-or-scalar only) and so ran
+        // fully scalar on this platform.
+        let xq = unsafe { prepare_xq(kind, x, cols) };
         worker_pool().run(MatvecJob {
             kind,
             data,
             x,
-            xq: XQuant::NONE,
+            xq,
             out: out.as_mut_ptr(),
             rows,
             cols,
@@ -3266,6 +3278,10 @@ pub fn matvec_q4_k3_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        // See parallel_matvec's fix comment: xq must be prepared once here
+        // (by the publishing thread) and shared with workers, or every row
+        // silently falls back to the much slower f32/scalar dequant kernel.
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: MatvecKind::Q4K,
             kind_b: MatvecKind::Q4K,
@@ -3274,7 +3290,7 @@ pub fn matvec_q4_k3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -3358,6 +3374,7 @@ pub fn matvec_q4_k2_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: MatvecKind::Q4K,
             kind_b: MatvecKind::Q4K,
@@ -3366,7 +3383,7 @@ pub fn matvec_q4_k2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
@@ -3493,6 +3510,10 @@ pub fn matvec_kquant3_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        // cols_a == cols_b == cols_c (checked above), and prepare_xq_kquant
+        // quantizes the shared activation independent of which K-quant kind
+        // consumes it, so one call covers all three sub-matrices.
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: kind_a.matvec_kind(),
             kind_b: kind_b.matvec_kind(),
@@ -3501,7 +3522,7 @@ pub fn matvec_kquant3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -3872,6 +3893,10 @@ pub fn matvec_quant3_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        // cols_a == cols_b == cols_c (checked above), and prepare_xq_kquant
+        // quantizes the shared activation independent of which K-quant kind
+        // consumes it, so one call covers all three sub-matrices.
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: kind_a.matvec_kind(),
             kind_b: kind_b.matvec_kind(),
@@ -3880,7 +3905,7 @@ pub fn matvec_quant3_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_c.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_c.as_mut_ptr(),
@@ -3971,6 +3996,7 @@ pub fn matvec_quant2_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: kind_a.matvec_kind(),
             kind_b: kind_b.matvec_kind(),
@@ -3979,7 +4005,7 @@ pub fn matvec_quant2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
@@ -4082,6 +4108,7 @@ fn matvec_k2_into(
             return true;
         }
         let workers = num_threads().min(total_rows);
+        let xq = unsafe { prepare_xq_kquant(x.as_ptr(), cols_a) };
         worker_pool().run_q4k_matvec3(Q4KMatvec3Job {
             kind_a: kind,
             kind_b: kind,
@@ -4090,7 +4117,7 @@ fn matvec_k2_into(
             b_data: weights_b.as_ptr(),
             c_data: weights_b.as_ptr(),
             x: x.as_ptr(),
-            xq: XQuant::NONE,
+            xq,
             out_a: out_a.as_mut_ptr(),
             out_b: out_b.as_mut_ptr(),
             out_c: out_b.as_mut_ptr(),
