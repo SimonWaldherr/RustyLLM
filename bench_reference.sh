@@ -22,6 +22,8 @@ set -euo pipefail
 
 RUSTY_BIN="${RUSTY_BIN:-./target/release-max/rusty-llm}"
 REFERENCE_BIN="${REFERENCE_BIN:-}"
+REFERENCE_KIND="${REFERENCE_KIND:-cli}"
+REFERENCE_PROMPT_TOKENS="${REFERENCE_PROMPT_TOKENS:-32}"
 MODEL_ROOT="${MODEL_ROOT:-${HOME:-}/.cache/lm-studio/models}"
 MINISTRAL_MODEL="${MINISTRAL_MODEL:-}"
 LLAMA_MODEL="${LLAMA_MODEL:-}"
@@ -77,9 +79,13 @@ slugify() {
 }
 
 cooldown() {
-  if [ "$COOLDOWN_SECS" != "0" ]; then
-    sleep "$COOLDOWN_SECS"
-  fi
+  local remaining="$COOLDOWN_SECS"
+  local chunk
+  while [ "$remaining" -gt 0 ]; do
+    if [ "$remaining" -gt 60 ]; then chunk=60; else chunk="$remaining"; fi
+    sleep "$chunk"
+    remaining=$((remaining - chunk))
+  done
 }
 
 capture_thermal() {
@@ -144,26 +150,45 @@ run_reference() {
   local model="$2"
   local run="$3"
   local order="$4"
-  local slug raw prompt_rate decode_rate
+  local slug raw json prompt_rate decode_rate
   slug=$(slugify "$label")
   raw="$RAW_DIR/${slug}.reference.run${run}.log"
 
   log "[$label][$run/$RUNS][$order/2] Reference"
   capture_thermal "$label" "Reference" "$run" "before"
-  "$REFERENCE_BIN" \
-    -m "$model" \
-    -p "$PROMPT" \
-    -n "$MAX_TOKENS" \
-    --temp 0 --repeat-penalty 1 --seed "$SEED" --ignore-eos \
-    --no-display-prompt --no-warmup --single-turn --simple-io --color off \
-    --reasoning off --flash-attn on -ngl 99 > "$raw" 2>&1
+  if [ "$REFERENCE_KIND" = "bench" ]; then
+    json="$RAW_DIR/${slug}.reference.run${run}.json"
+    "$REFERENCE_BIN" \
+      -m "$model" \
+      -p "$REFERENCE_PROMPT_TOKENS" \
+      -n "$MAX_TOKENS" -r 1 -o json \
+      -t 8 -ngl 99 -fa on > "$raw" 2>&1
+  else
+    "$REFERENCE_BIN" \
+      -m "$model" \
+      -p "$PROMPT" \
+      -n "$MAX_TOKENS" \
+      --temp 0 --repeat-penalty 1 --seed "$SEED" --ignore-eos \
+      --no-display-prompt --no-warmup --single-turn --simple-io --color off \
+      --reasoning off --flash-attn on -ngl 99 > "$raw" 2>&1
+  fi
   capture_thermal "$label" "Reference" "$run" "after"
 
-  prompt_rate=$(sed -nE 's/.*Prompt: *([0-9]+([.][0-9]+)?) t\/s.*/\1/p' "$raw" | tail -n 1)
-  decode_rate=$(sed -nE 's/.*Generation: *([0-9]+([.][0-9]+)?) t\/s.*/\1/p' "$raw" | tail -n 1)
+  if [ "$REFERENCE_KIND" = "bench" ]; then
+    sed -n '/^[[]/,$p' "$raw" > "$json"
+    jq -e 'type == "array"' "$json" >/dev/null \
+      || die "could not parse reference benchmark JSON; see $raw"
+    prompt_rate=$(jq -r '[.[] | select(.n_prompt > 0)] | last | .avg_ts // empty' "$json")
+    decode_rate=$(jq -r --argjson tokens "$MAX_TOKENS" \
+      '[.[] | select(.n_gen == $tokens)] | last | .avg_ts // empty' "$json")
+  else
+    prompt_rate=$(sed -nE 's/.*Prompt: *([0-9]+([.][0-9]+)?) t\/s.*/\1/p' "$raw" | tail -n 1)
+    decode_rate=$(sed -nE 's/.*Generation: *([0-9]+([.][0-9]+)?) t\/s.*/\1/p' "$raw" | tail -n 1)
+  fi
   [ -n "$prompt_rate" ] && [ -n "$decode_rate" ] \
     || die "could not parse reference timing line; see $raw"
-  append_result "$label" "Reference" "$run" "$order" "$prompt_rate" "$decode_rate" "n/a" "n/a" "$raw"
+  append_result "$label" "Reference" "$run" "$order" "$prompt_rate" "$decode_rate" \
+    "$REFERENCE_PROMPT_TOKENS" "$MAX_TOKENS" "$raw"
   log "  decode: $(LC_ALL=C awk -v v="$decode_rate" 'BEGIN { printf "%.2f", v }') tok/s"
 }
 
@@ -210,6 +235,27 @@ environment_value() {
   awk -F '\t' -v key="$1" '$1 == key { sub(/^[^\t]*\t/, ""); print; exit }' "$ENV_TSV"
 }
 
+reference_version_value() {
+  local json version
+  if [ "$REFERENCE_KIND" = "bench" ]; then
+    while IFS= read -r json; do
+      version=$(jq -r '
+        if type == "array" and length > 0
+        then "build " + (.[0].build_number | tostring) + ", commit " + .[0].build_commit
+        else empty
+        end
+      ' "$json" 2>/dev/null || true)
+      if [ -n "$version" ]; then
+        printf '%s\n' "$version"
+        return 0
+      fi
+    done < <(find "$RAW_DIR" -type f -name '*.reference.run*.json' -print 2>/dev/null | sort)
+    printf 'build metadata recorded in per-run JSON\n'
+  else
+    "$REFERENCE_BIN" --version 2>&1 | sed -n '1p'
+  fi
+}
+
 write_environment() {
   local host cpu os memory_bytes rust_revision dirty reference_version
   host=$(hostname 2>/dev/null || printf 'unknown')
@@ -224,7 +270,7 @@ write_environment() {
   if ! git diff --quiet --ignore-submodules -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
     dirty=" + working tree changes"
   fi
-  reference_version=$($REFERENCE_BIN --version 2>&1 | head -n 1)
+  reference_version=$(reference_version_value)
   {
     printf 'generated_at\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     printf 'host\t%s\n' "$host"
@@ -234,6 +280,8 @@ write_environment() {
     printf 'rust_revision\t%s\n' "$rust_revision"
     printf 'dirty\t%s\n' "$dirty"
     printf 'reference_version\t%s\n' "$reference_version"
+    printf 'reference_kind\t%s\n' "$REFERENCE_KIND"
+    printf 'reference_prompt_tokens\t%s\n' "$REFERENCE_PROMPT_TOKENS"
     printf 'runs\t%s\n' "$RUNS"
     printf 'max_tokens\t%s\n' "$MAX_TOKENS"
     printf 'cooldown_secs\t%s\n' "$COOLDOWN_SECS"
@@ -262,7 +310,7 @@ write_report() {
   if ! git diff --quiet --ignore-submodules -- 2>/dev/null || [ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]; then
     dirty=" + working tree changes"
   fi
-  reference_version=$($REFERENCE_BIN --version 2>&1 | head -n 1)
+  reference_version=$(reference_version_value)
   benchmark_runs="$RUNS"
   benchmark_max_tokens="$MAX_TOKENS"
   benchmark_cooldown="$COOLDOWN_SECS"
@@ -289,6 +337,9 @@ write_report() {
     [ -z "$stored_report_title" ] || report_title="$stored_report_title"
     [ -z "$stored_protocol_note" ] || protocol_note="$stored_protocol_note"
     memory_gib=$(LC_ALL=C awk -v bytes="$memory_bytes" 'BEGIN { printf "%.0f", bytes / 1073741824 }')
+  fi
+  if [ "$reference_version" = "build metadata recorded in per-run JSON" ]; then
+    reference_version=$(reference_version_value)
   fi
   model_count=$(awk -F '\t' 'NR > 1 { count++ } END { print count + 0 }' "$MODELS_TSV")
   geomean_delta=$(LC_ALL=C awk -F '\t' '
@@ -400,10 +451,14 @@ write_report() {
     printf -- '- Prompt: `%s`\n' "$benchmark_prompt"
     printf -- '- Greedy sampling: temperature 0, repeat penalty 1, seed %s.\n' "$benchmark_seed"
     printf -- '- Reasoning/thinking mode disabled in both engines.\n'
-    printf -- '- Exactly %s generated tokens per run; %s runs per engine and model. The reference ignores EOS for a fixed measurement window.\n' "$benchmark_max_tokens" "$benchmark_runs"
+    printf -- '- Exactly %s generated tokens per run; %s runs per engine and model.\n' "$benchmark_max_tokens" "$benchmark_runs"
     printf -- '- Fresh process for every run; startup/model-load time excluded from the engine-reported token rate.\n'
     printf -- '- RustyLLM: release-max, native CPU, Metal with automatic attention selection.\n'
-    printf -- '- Reference: all layers on the GPU, fused attention on, built-in warm-up off.\n'
+    if [ "$REFERENCE_KIND" = "bench" ]; then
+      printf -- '- Reference: dedicated decode benchmark, %s prompt tokens, all layers on the GPU, fused attention on, one built-in warm-up, and one measured repetition per fresh process.\n' "$REFERENCE_PROMPT_TOKENS"
+    else
+      printf -- '- Reference: all layers on the GPU, fused attention on, built-in warm-up off, and EOS ignored for a fixed measurement window.\n'
+    fi
     printf -- '- Engine order alternates on every run; cooldown is %s seconds between processes.\n' "$benchmark_cooldown"
     printf -- '- Thermal/performance-pressure telemetry is captured before and after every process when the host exposes it.\n'
     printf -- '- A result inside ±2%% is classified as measurement parity.\n'
@@ -444,6 +499,13 @@ esac
 case "$MAX_TOKENS" in
   ''|*[!0-9]*) die "MAX_TOKENS must be a positive integer" ;;
   0) die "MAX_TOKENS must be greater than zero" ;;
+esac
+case "$REFERENCE_KIND" in
+  cli|bench) ;;
+  *) die "REFERENCE_KIND must be cli or bench" ;;
+esac
+case "$REFERENCE_PROMPT_TOKENS" in
+  ''|*[!0-9]*|0) die "REFERENCE_PROMPT_TOKENS must be a positive integer" ;;
 esac
 
 require_cmd jq

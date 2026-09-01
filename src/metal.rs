@@ -384,6 +384,7 @@ mod ffi {
             storage_len: u32,
             eps: f32,
             neox: u32,
+            prefer_half_inputs: u32,
         ) -> i32;
         /// Registers one transformer layer's weights with the resident decoder.
         pub fn rusty_metal_resident_set_layer(l: u32, desc: *const super::ResidentLayerDesc)
@@ -599,6 +600,7 @@ pub fn resident_configure(
     vocab: usize,
     storage_len: usize,
     eps: f32,
+    prefer_half_inputs: bool,
 ) -> bool {
     unsafe {
         ffi::rusty_metal_resident_configure(
@@ -613,6 +615,7 @@ pub fn resident_configure(
             storage_len as u32,
             eps,
             0,
+            u32::from(prefer_half_inputs),
         ) != 0
     }
 }
@@ -630,6 +633,7 @@ pub fn resident_configure(
     _vocab: usize,
     _storage_len: usize,
     _eps: f32,
+    _prefer_half_inputs: bool,
 ) -> bool {
     false
 }

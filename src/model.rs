@@ -8256,6 +8256,7 @@ fn resident_configure_once(
         config.vocab_size,
         cache.storage_len,
         config.rms_norm_eps,
+        matches!(config.arch.as_str(), "mistral3" | "ministral"),
     ) {
         return false;
     }

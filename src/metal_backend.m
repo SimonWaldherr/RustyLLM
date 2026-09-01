@@ -101,16 +101,23 @@ static id<MTLDevice> gDevice;
 static id<MTLCommandQueue> gQueue;
 static id<MTLComputePipelineState> gQ4KPipeline;
 static id<MTLComputePipelineState> gQ4KPairPipeline;
+static id<MTLComputePipelineState> gQ4KHalfPipeline;
+static id<MTLComputePipelineState> gQ4KPairHalfPipeline;
 static id<MTLComputePipelineState> gQ6KPipeline;
+static id<MTLComputePipelineState> gQ6KHalfPipeline;
 static id<MTLComputePipelineState> gQ4_0Pipeline;
 static id<MTLComputePipelineState> gQ8_0Pipeline;
 static id<MTLComputePipelineState> gAttentionPipeline;
 static id<MTLComputePipelineState> gResidentAttentionPipeline;
 static id<MTLComputePipelineState> gResidentParallelAttentionPipeline;
+static id<MTLComputePipelineState> gResidentAttentionHalfPipeline;
+static id<MTLComputePipelineState> gResidentParallelAttentionHalfPipeline;
 static id<MTLComputePipelineState> gResidentGroupedAttentionPipeline;
 static id<MTLComputePipelineState> gSiluMulPipeline;
+static id<MTLComputePipelineState> gSiluMulHalfPipeline;
 static id<MTLComputePipelineState> gGeluMulPipeline;
 static id<MTLComputePipelineState> gResidualRmsPipeline;
+static id<MTLComputePipelineState> gResidualRmsHalfPipeline;
 static id<MTLComputePipelineState> gResidualAddPipeline;
 static id<MTLComputePipelineState> gRopeStorePipeline;
 static id<MTLComputePipelineState> gGreedyArgmaxPipeline;
@@ -303,6 +310,148 @@ static NSString *const kQ4KSource =
 "    }\n"
 "}\n";
 
+static NSString *const kQ4KHalfSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void q4k_matvec_half(device const uchar* weights [[buffer(0)]],\n"
+"                       device const half* x [[buffer(1)]],\n"
+"                       device float* out [[buffer(2)]],\n"
+"                       constant Q4KParams& p [[buffer(3)]],\n"
+"                       uint group [[threadgroup_position_in_grid]],\n"
+"                       uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                       uint lane [[thread_index_in_simdgroup]]) {\n"
+"    constexpr uint rows_per_simdgroup = 8;\n"
+"    uint first_row = group * p.rows_per_group + sg * rows_per_simdgroup;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float lane_sum[rows_per_simdgroup] = { 0.0f, 0.0f, 0.0f, 0.0f,\n"
+"                                                0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = block_team; b < p.n_blocks; b += 4) {\n"
+"        float4 inputs_lo[4];\n"
+"        float4 inputs_hi[4];\n"
+"        #pragma unroll\n"
+"        for (uint segment = 0; segment < 4; ++segment) {\n"
+"            uint input_base = b * 256 + segment * 64 + value_base;\n"
+"            inputs_lo[segment] = float4(*reinterpret_cast<const device half4*>(x + input_base));\n"
+"            inputs_hi[segment] = float4(*reinterpret_cast<const device half4*>(x + input_base + 32));\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= p.rows) continue;\n"
+"            const device uchar* block = weights + row * p.row_bytes + b * 144;\n"
+"            const device half* multipliers = reinterpret_cast<const device half*>(block);\n"
+"            const device uchar* packed_scales = block + 4;\n"
+"            const device uchar* quants = block + 16;\n"
+"            float weighted = 0.0f;\n"
+"            float offsets = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint segment = 0; segment < 4; ++segment) {\n"
+"                uint low_group = segment * 2;\n"
+"                uint quant_base = segment * 32 + value_base;\n"
+"                ushort2 packed = *reinterpret_cast<const device ushort2*>(quants + quant_base);\n"
+"                uchar2 sm_lo = scale_min_k4(low_group, packed_scales);\n"
+"                uchar2 sm_hi = scale_min_k4(low_group + 1, packed_scales);\n"
+"                float4 lo = inputs_lo[segment];\n"
+"                float4 hi = inputs_hi[segment];\n"
+"                float dot_lo = lo.x * float(packed.x & 0x000f) +\n"
+"                               lo.y * float(packed.x & 0x0f00) * (1.0f / 256.0f) +\n"
+"                               lo.z * float(packed.y & 0x000f) +\n"
+"                               lo.w * float(packed.y & 0x0f00) * (1.0f / 256.0f);\n"
+"                float dot_hi = hi.x * float(packed.x & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.y * float(packed.x & 0xf000) * (1.0f / 4096.0f) +\n"
+"                               hi.z * float(packed.y & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.w * float(packed.y & 0xf000) * (1.0f / 4096.0f);\n"
+"                weighted += float(sm_lo.x) * dot_lo + float(sm_hi.x) * dot_hi;\n"
+"                offsets += float(sm_lo.y) * (lo.x + lo.y + lo.z + lo.w) +\n"
+"                           float(sm_hi.y) * (hi.x + hi.y + hi.z + hi.w);\n"
+"            }\n"
+"            lane_sum[row_slot] += float(multipliers[0]) * weighted -\n"
+"                                  float(multipliers[1]) * offsets;\n"
+"        }\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < p.rows) out[row] = total;\n"
+"    }\n"
+"}\n"
+"// A single grid covers two matrices that share one activation vector.\n"
+"kernel void q4k_matvec_pair_half(device const uchar* weights_a [[buffer(0)]],\n"
+"                            device const uchar* weights_b [[buffer(1)]],\n"
+"                            device const half* x [[buffer(2)]],\n"
+"                            device float* out_a [[buffer(3)]],\n"
+"                            device float* out_b [[buffer(4)]],\n"
+"                            constant PairParams& pp [[buffer(5)]],\n"
+"                            uint group [[threadgroup_position_in_grid]],\n"
+"                            uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                            uint lane [[thread_index_in_simdgroup]]) {\n"
+"    uint groups_a = (pp.rows_a + pp.rows_per_group - 1) / pp.rows_per_group;\n"
+"    bool second = group >= groups_a;\n"
+"    uint local_group = second ? group - groups_a : group;\n"
+"    uint rows = second ? pp.rows_b : pp.rows_a;\n"
+"    const device uchar* weights = second ? weights_b : weights_a;\n"
+"    device float* out = second ? out_b : out_a;\n"
+"    constexpr uint rows_per_simdgroup = 8;\n"
+"    uint first_row = local_group * pp.rows_per_group + sg * rows_per_simdgroup;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float lane_sum[rows_per_simdgroup] = { 0.0f, 0.0f, 0.0f, 0.0f,\n"
+"                                                0.0f, 0.0f, 0.0f, 0.0f };\n"
+"    for (uint b = block_team; b < pp.n_blocks; b += 4) {\n"
+"        float4 inputs_lo[4];\n"
+"        float4 inputs_hi[4];\n"
+"        #pragma unroll\n"
+"        for (uint segment = 0; segment < 4; ++segment) {\n"
+"            uint input_base = b * 256 + segment * 64 + value_base;\n"
+"            inputs_lo[segment] = float4(*reinterpret_cast<const device half4*>(x + input_base));\n"
+"            inputs_hi[segment] = float4(*reinterpret_cast<const device half4*>(x + input_base + 32));\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= rows) continue;\n"
+"            const device uchar* block = weights + row * pp.row_bytes + b * 144;\n"
+"            const device half* multipliers = reinterpret_cast<const device half*>(block);\n"
+"            const device uchar* packed_scales = block + 4;\n"
+"            const device uchar* quants = block + 16;\n"
+"            float weighted = 0.0f;\n"
+"            float offsets = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint segment = 0; segment < 4; ++segment) {\n"
+"                uint low_group = segment * 2;\n"
+"                uint quant_base = segment * 32 + value_base;\n"
+"                ushort2 packed = *reinterpret_cast<const device ushort2*>(quants + quant_base);\n"
+"                uchar2 sm_lo = scale_min_k4(low_group, packed_scales);\n"
+"                uchar2 sm_hi = scale_min_k4(low_group + 1, packed_scales);\n"
+"                float4 lo = inputs_lo[segment];\n"
+"                float4 hi = inputs_hi[segment];\n"
+"                float dot_lo = lo.x * float(packed.x & 0x000f) +\n"
+"                               lo.y * float(packed.x & 0x0f00) * (1.0f / 256.0f) +\n"
+"                               lo.z * float(packed.y & 0x000f) +\n"
+"                               lo.w * float(packed.y & 0x0f00) * (1.0f / 256.0f);\n"
+"                float dot_hi = hi.x * float(packed.x & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.y * float(packed.x & 0xf000) * (1.0f / 4096.0f) +\n"
+"                               hi.z * float(packed.y & 0x00f0) * (1.0f / 16.0f) +\n"
+"                               hi.w * float(packed.y & 0xf000) * (1.0f / 4096.0f);\n"
+"                weighted += float(sm_lo.x) * dot_lo + float(sm_hi.x) * dot_hi;\n"
+"                offsets += float(sm_lo.y) * (lo.x + lo.y + lo.z + lo.w) +\n"
+"                           float(sm_hi.y) * (hi.x + hi.y + hi.z + hi.w);\n"
+"            }\n"
+"            lane_sum[row_slot] += float(multipliers[0]) * weighted -\n"
+"                                  float(multipliers[1]) * offsets;\n"
+"        }\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < rows_per_simdgroup; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < rows) out[row] = total;\n"
+"    }\n"
+"}\n";
+
+
 static NSString *const kQ6KSource =
 @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
@@ -326,6 +475,70 @@ static NSString *const kQ6KSource =
 "        for (uint quant_group = 0; quant_group < 8; ++quant_group) {\n"
 "            uint input_base = b * 256 + quant_group * 32 + value_base;\n"
 "            inputs[quant_group] = *reinterpret_cast<const device float4*>(x + input_base);\n"
+"        }\n"
+"        #pragma unroll\n"
+"        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"            uint row = first_row + row_slot;\n"
+"            if (row >= p.rows) continue;\n"
+"            const device uchar* block = weights + row * p.row_bytes + b * 210;\n"
+"            const device uchar* low_bits = block;\n"
+"            const device uchar* high_bits = block + 128;\n"
+"            const device char* scales = reinterpret_cast<const device char*>(block + 192);\n"
+"            float multiplier = float(*reinterpret_cast<const device half*>(block + 208));\n"
+"            float weighted = 0.0f;\n"
+"            #pragma unroll\n"
+"            for (uint half_block = 0; half_block < 2; ++half_block) {\n"
+"                uint low_base = half_block * 64 + value_base;\n"
+"                uint high_base = half_block * 32 + value_base;\n"
+"                uint scale_base = half_block * 8 + uint(value_base >= 16);\n"
+"                uint input_group = half_block * 4;\n"
+"                float4 x0 = inputs[input_group];\n"
+"                float4 x1 = inputs[input_group + 1];\n"
+"                float4 x2 = inputs[input_group + 2];\n"
+"                float4 x3 = inputs[input_group + 3];\n"
+"                uchar4 low_a = *reinterpret_cast<const device uchar4*>(low_bits + low_base);\n"
+"                uchar4 low_b = *reinterpret_cast<const device uchar4*>(low_bits + low_base + 32);\n"
+"                uchar4 high = *reinterpret_cast<const device uchar4*>(high_bits + high_base);\n"
+"                int4 q0 = int4((low_a & 15) | ((high & 3) << 4)) - 32;\n"
+"                int4 q1 = int4((low_b & 15) | (((high >> 2) & 3) << 4)) - 32;\n"
+"                int4 q2 = int4((low_a >> 4) | (((high >> 4) & 3) << 4)) - 32;\n"
+"                int4 q3 = int4((low_b >> 4) | ((high >> 6) << 4)) - 32;\n"
+"                float dot0 = dot(float4(q0), x0);\n"
+"                float dot1 = dot(float4(q1), x1);\n"
+"                float dot2 = dot(float4(q2), x2);\n"
+"                float dot3 = dot(float4(q3), x3);\n"
+"                weighted += float(scales[scale_base]) * dot0 +\n"
+"                            float(scales[scale_base + 2]) * dot1 +\n"
+"                            float(scales[scale_base + 4]) * dot2 +\n"
+"                            float(scales[scale_base + 6]) * dot3;\n"
+"            }\n"
+"            lane_sum[row_slot] += multiplier * weighted;\n"
+"        }\n"
+"    }\n"
+"    #pragma unroll\n"
+"    for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
+"        float total = simd_sum(lane_sum[row_slot]);\n"
+"        uint row = first_row + row_slot;\n"
+"        if (lane == 0 && row < p.rows) out[row] = total;\n"
+"    }\n"
+"}\n"
+"kernel void q6k_matvec_half(device const uchar* weights [[buffer(0)]],\n"
+"                            device const half* x [[buffer(1)]],\n"
+"                            device float* out [[buffer(2)]],\n"
+"                            constant Q6KParams& p [[buffer(3)]],\n"
+"                            uint group [[threadgroup_position_in_grid]],\n"
+"                            uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                            uint lane [[thread_index_in_simdgroup]]) {\n"
+"    uint first_row = group * p.rows_per_group + sg * 2;\n"
+"    uint block_team = lane >> 3;\n"
+"    uint value_base = (lane & 7) * 4;\n"
+"    float2 lane_sum = float2(0.0f);\n"
+"    for (uint b = block_team; b < p.n_blocks; b += 4) {\n"
+"        float4 inputs[8];\n"
+"        #pragma unroll\n"
+"        for (uint quant_group = 0; quant_group < 8; ++quant_group) {\n"
+"            uint input_base = b * 256 + quant_group * 32 + value_base;\n"
+"            inputs[quant_group] = float4(*reinterpret_cast<const device half4*>(x + input_base));\n"
 "        }\n"
 "        #pragma unroll\n"
 "        for (uint row_slot = 0; row_slot < 2; ++row_slot) {\n"
@@ -528,6 +741,15 @@ static NSString *const kSiluMulSource =
 "    float g = gate[gid];\n"
 "    out[gid] = (g / (1.0f + exp(-g))) * up[gid];\n"
 "}\n"
+"kernel void silu_mul_half(device const float* gate [[buffer(0)]],\n"
+"                          device const float* up [[buffer(1)]],\n"
+"                          device half* out [[buffer(2)]],\n"
+"                          constant ActivationParams& p [[buffer(3)]],\n"
+"                          uint gid [[thread_position_in_grid]]) {\n"
+"    if (gid >= p.len) return;\n"
+"    float g = gate[gid];\n"
+"    out[gid] = half((g / (1.0f + exp(-g))) * up[gid]);\n"
+"}\n"
 "kernel void gelu_mul(device const float* gate [[buffer(0)]],\n"
 "                     device const float* up [[buffer(1)]],\n"
 "                     device float* out [[buffer(2)]],\n"
@@ -571,6 +793,33 @@ static NSString *const kResidualSource =
 "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 "    float scale = rsqrt(partial[0] / float(p.len) + p.eps);\n"
 "    for (uint i = tid; i < p.len; i += 256) out[i] = x[i] * weight[i] * scale;\n"
+"}\n"
+"kernel void residual_rms_half(device float* x [[buffer(0)]],\n"
+"                              device const float* residual [[buffer(1)]],\n"
+"                              device const float* weight [[buffer(2)]],\n"
+"                              device half* out [[buffer(3)]],\n"
+"                              constant NormParams& p [[buffer(4)]],\n"
+"                              uint tid [[thread_index_in_threadgroup]]) {\n"
+"    threadgroup float partial[8];\n"
+"    uint lane = tid & 31;\n"
+"    uint sg = tid >> 5;\n"
+"    float sum = 0.0f;\n"
+"    for (uint i = tid; i < p.len; i += 256) {\n"
+"        float v = x[i] + residual[i];\n"
+"        x[i] = v;\n"
+"        sum += v * v;\n"
+"    }\n"
+"    sum = simd_sum(sum);\n"
+"    if (lane == 0) partial[sg] = sum;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        float total = lane < 8 ? partial[lane] : 0.0f;\n"
+"        total = simd_sum(total);\n"
+"        if (lane == 0) partial[0] = total;\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float scale = rsqrt(partial[0] / float(p.len) + p.eps);\n"
+"    for (uint i = tid; i < p.len; i += 256) out[i] = half(x[i] * weight[i] * scale);\n"
 "}\n"
 "kernel void residual_add(device float* x [[buffer(0)]],\n"
 "                         device const float* residual [[buffer(1)]],\n"
@@ -765,6 +1014,118 @@ static NSString *const kResidentParallelAttnSource =
 "            float value = total * inv;\n"
 "            if (p.apply_gate != 0) { float z = gate[head * p.value_dim + i]; value *= 1.0f / (1.0f + exp(-z)); }\n"
 "            orow[i] = value;\n"
+"        }\n"
+"    }\n"
+"}\n";
+
+static NSString *const kResidentHalfAttnSource =
+@"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void resident_attention_half(device const float* q [[buffer(0)]],\n"
+"                               device const float* k_cache [[buffer(1)]],\n"
+"                               device const float* v_cache [[buffer(2)]],\n"
+"                               device half* out [[buffer(3)]],\n"
+"                               constant ResidentAttnParams& p [[buffer(4)]],\n"
+"                               device const float* gate [[buffer(5)]],\n"
+"                               uint head [[threadgroup_position_in_grid]],\n"
+"                               uint lane [[thread_index_in_simdgroup]]) {\n"
+"    if (head >= p.n_heads) return;\n"
+"    threadgroup float qsh[256];\n"
+"    threadgroup float osh[256];\n"
+"    const device float* qrow = q + head * p.head_dim;\n"
+"    uint kv_head = head / p.kv_mul;\n"
+"    for (uint i = lane; i < p.head_dim; i += 32) qsh[i] = qrow[i];\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) osh[i] = 0.0f;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float maxs = -INFINITY;\n"
+"    float denom = 0.0f;\n"
+"    for (uint t = p.start_t; t <= p.end_t; ++t) {\n"
+"        const device float* krow = k_cache + t * p.kv_k_dim + kv_head * p.head_dim;\n"
+"        float partial = 0.0f;\n"
+"        for (uint i = lane; i < p.head_dim; i += 32) partial += qsh[i] * krow[i];\n"
+"        for (ushort o = 16; o > 0; o >>= 1) partial += simd_shuffle_xor(partial, o);\n"
+"        float score = simd_broadcast_first(partial) * p.scale;\n"
+"        const device float* vrow = v_cache + t * p.kv_v_dim + kv_head * p.value_dim;\n"
+"        if (score > maxs) {\n"
+"            float r = isfinite(maxs) ? exp(maxs - score) : 0.0f;\n"
+"            denom = denom * r + 1.0f;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[i] = osh[i] * r + vrow[i];\n"
+"            maxs = score;\n"
+"        } else {\n"
+"            float w = exp(score - maxs);\n"
+"            denom += w;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[i] += w * vrow[i];\n"
+"        }\n"
+"    }\n"
+"    float inv = denom > 0.0f ? 1.0f / denom : 0.0f;\n"
+"    device half* orow = out + head * p.value_dim;\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"        float value = osh[i] * inv;\n"
+"        if (p.apply_gate != 0) { float z = gate[head * p.value_dim + i]; value *= 1.0f / (1.0f + exp(-z)); }\n"
+"        orow[i] = half(value);\n"
+"    }\n"
+"}\n"
+"kernel void resident_parallel_attention_half(device const float* q [[buffer(0)]],\n"
+"                                        device const float* k_cache [[buffer(1)]],\n"
+"                                        device const float* v_cache [[buffer(2)]],\n"
+"                                        device half* out [[buffer(3)]],\n"
+"                                        constant ParallelAttnParams& p [[buffer(4)]],\n"
+"                                        device const float* gate [[buffer(5)]],\n"
+"                                        uint head [[threadgroup_position_in_grid]],\n"
+"                                        uint sg [[simdgroup_index_in_threadgroup]],\n"
+"                                        uint lane [[thread_index_in_simdgroup]]) {\n"
+"    constexpr uint nsg = 4;\n"
+"    if (head >= p.n_heads) return;\n"
+"    threadgroup float qsh[256];\n"
+"    threadgroup float osh[nsg][256];\n"
+"    threadgroup float maxsh[nsg];\n"
+"    threadgroup float densh[nsg];\n"
+"    threadgroup float merged_max;\n"
+"    threadgroup float merged_den;\n"
+"    uint local = sg * 32 + lane;\n"
+"    const device float* qrow = q + head * p.head_dim;\n"
+"    uint kv_head = head / p.kv_mul;\n"
+"    for (uint i = local; i < p.head_dim; i += 128) qsh[i] = qrow[i];\n"
+"    for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = 0.0f;\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float maxs = -INFINITY;\n"
+"    float denom = 0.0f;\n"
+"    for (uint t = p.start_t + sg; t <= p.end_t; t += nsg) {\n"
+"        const device float* krow = k_cache + t * p.kv_k_dim + kv_head * p.head_dim;\n"
+"        float partial = 0.0f;\n"
+"        for (uint i = lane; i < p.head_dim; i += 32) partial += qsh[i] * krow[i];\n"
+"        float score = simd_sum(partial) * p.scale;\n"
+"        const device float* vrow = v_cache + t * p.kv_v_dim + kv_head * p.value_dim;\n"
+"        if (score > maxs) {\n"
+"            float r = isfinite(maxs) ? exp(maxs - score) : 0.0f;\n"
+"            denom = denom * r + 1.0f;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] = osh[sg][i] * r + vrow[i];\n"
+"            maxs = score;\n"
+"        } else {\n"
+"            float w = exp(score - maxs);\n"
+"            denom += w;\n"
+"            for (uint i = lane; i < p.value_dim; i += 32) osh[sg][i] += w * vrow[i];\n"
+"        }\n"
+"    }\n"
+"    if (lane == 0) { maxsh[sg] = maxs; densh[sg] = denom; }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (local == 0) {\n"
+"        float m = max(max(maxsh[0], maxsh[1]), max(maxsh[2], maxsh[3]));\n"
+"        float d = 0.0f;\n"
+"        for (uint j = 0; j < nsg; ++j) d += densh[j] * exp(maxsh[j] - m);\n"
+"        merged_max = m;\n"
+"        merged_den = d;\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (sg == 0) {\n"
+"        device half* orow = out + head * p.value_dim;\n"
+"        float inv = merged_den > 0.0f ? 1.0f / merged_den : 0.0f;\n"
+"        for (uint i = lane; i < p.value_dim; i += 32) {\n"
+"            float total = 0.0f;\n"
+"            for (uint j = 0; j < nsg; ++j) total += osh[j][i] * exp(maxsh[j] - merged_max);\n"
+"            float value = total * inv;\n"
+"            if (p.apply_gate != 0) { float z = gate[head * p.value_dim + i]; value *= 1.0f / (1.0f + exp(-z)); }\n"
+"            orow[i] = half(value);\n"
 "        }\n"
 "    }\n"
 "}\n";
@@ -1121,6 +1482,7 @@ static BOOL rusty_metal_init(void) {
         options.fastMathEnabled = YES;
         NSArray<NSString *> *sources = @[
             kQ4KSource,
+            kQ4KHalfSource,
             kQ6KSource,
             kQ4_0Source,
             kQ8_0Source,
@@ -1130,6 +1492,7 @@ static BOOL rusty_metal_init(void) {
             kRopeStoreSource,
             kResidentAttnSource,
             kResidentParallelAttnSource,
+            kResidentHalfAttnSource,
             kResidentGroupedAttnSource,
             kGreedyArgmaxSource,
             kQwenResidentSource,
@@ -1180,6 +1543,22 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create q4k pair pipeline", error);
             return;
         }
+        id<MTLFunction> q4_half_function = [library newFunctionWithName:@"q4k_matvec_half"];
+        id<MTLFunction> q4_pair_half_function = [library newFunctionWithName:@"q4k_matvec_pair_half"];
+        if (!q4_half_function || !q4_pair_half_function) {
+            rusty_metal_log_error("load q4k half functions", nil);
+            return;
+        }
+        gQ4KHalfPipeline = [gDevice newComputePipelineStateWithFunction:q4_half_function error:&error];
+        if (!gQ4KHalfPipeline) {
+            rusty_metal_log_error("create q4k half pipeline", error);
+            return;
+        }
+        gQ4KPairHalfPipeline = [gDevice newComputePipelineStateWithFunction:q4_pair_half_function error:&error];
+        if (!gQ4KPairHalfPipeline) {
+            rusty_metal_log_error("create q4k pair half pipeline", error);
+            return;
+        }
         id<MTLFunction> q6_function = [library newFunctionWithName:@"q6k_matvec"];
         if (!q6_function) {
             rusty_metal_log_error("load q6k function", nil);
@@ -1188,6 +1567,16 @@ static BOOL rusty_metal_init(void) {
         gQ6KPipeline = [gDevice newComputePipelineStateWithFunction:q6_function error:&error];
         if (!gQ6KPipeline) {
             rusty_metal_log_error("create q6k pipeline", error);
+            return;
+        }
+        id<MTLFunction> q6_half_function = [library newFunctionWithName:@"q6k_matvec_half"];
+        if (!q6_half_function) {
+            rusty_metal_log_error("load q6k half function", nil);
+            return;
+        }
+        gQ6KHalfPipeline = [gDevice newComputePipelineStateWithFunction:q6_half_function error:&error];
+        if (!gQ6KHalfPipeline) {
+            rusty_metal_log_error("create q6k half pipeline", error);
             return;
         }
         id<MTLFunction> q4_0_function = [library newFunctionWithName:@"q4_0_matvec"];
@@ -1240,6 +1629,26 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create resident parallel attention pipeline", error);
             return;
         }
+        id<MTLFunction> resident_attention_half_function =
+            [library newFunctionWithName:@"resident_attention_half"];
+        id<MTLFunction> parallel_attention_half_function =
+            [library newFunctionWithName:@"resident_parallel_attention_half"];
+        if (!resident_attention_half_function || !parallel_attention_half_function) {
+            rusty_metal_log_error("load resident half attention functions", nil);
+            return;
+        }
+        gResidentAttentionHalfPipeline = [gDevice
+            newComputePipelineStateWithFunction:resident_attention_half_function error:&error];
+        if (!gResidentAttentionHalfPipeline) {
+            rusty_metal_log_error("create resident half attention pipeline", error);
+            return;
+        }
+        gResidentParallelAttentionHalfPipeline = [gDevice
+            newComputePipelineStateWithFunction:parallel_attention_half_function error:&error];
+        if (!gResidentParallelAttentionHalfPipeline) {
+            rusty_metal_log_error("create resident parallel half attention pipeline", error);
+            return;
+        }
         id<MTLFunction> grouped_attention_function = [library newFunctionWithName:@"resident_gqa4_attention"];
         if (!grouped_attention_function) {
             rusty_metal_log_error("load resident grouped attention function", nil);
@@ -1260,6 +1669,16 @@ static BOOL rusty_metal_init(void) {
             rusty_metal_log_error("create silu_mul pipeline", error);
             return;
         }
+        id<MTLFunction> silu_half_function = [library newFunctionWithName:@"silu_mul_half"];
+        if (!silu_half_function) {
+            rusty_metal_log_error("load silu_mul_half function", nil);
+            return;
+        }
+        gSiluMulHalfPipeline = [gDevice newComputePipelineStateWithFunction:silu_half_function error:&error];
+        if (!gSiluMulHalfPipeline) {
+            rusty_metal_log_error("create silu_mul_half pipeline", error);
+            return;
+        }
         id<MTLFunction> residual_rms_function = [library newFunctionWithName:@"residual_rms"];
         if (!residual_rms_function) {
             rusty_metal_log_error("load residual_rms function", nil);
@@ -1268,6 +1687,16 @@ static BOOL rusty_metal_init(void) {
         gResidualRmsPipeline = [gDevice newComputePipelineStateWithFunction:residual_rms_function error:&error];
         if (!gResidualRmsPipeline) {
             rusty_metal_log_error("create residual_rms pipeline", error);
+            return;
+        }
+        id<MTLFunction> residual_rms_half_function = [library newFunctionWithName:@"residual_rms_half"];
+        if (!residual_rms_half_function) {
+            rusty_metal_log_error("load residual_rms_half function", nil);
+            return;
+        }
+        gResidualRmsHalfPipeline = [gDevice newComputePipelineStateWithFunction:residual_rms_half_function error:&error];
+        if (!gResidualRmsHalfPipeline) {
+            rusty_metal_log_error("create residual_rms_half pipeline", error);
             return;
         }
         id<MTLFunction> residual_add_function = [library newFunctionWithName:@"residual_add"];
@@ -1675,6 +2104,68 @@ static void rusty_metal_encode_q4k_pair(id<MTLComputeCommandEncoder> encoder,
             threadsPerThreadgroup:threads];
 }
 
+static void rusty_metal_encode_q4k_half(id<MTLComputeCommandEncoder> encoder,
+                                        id<MTLBuffer> weight_buffer,
+                                        id<MTLBuffer> x_buffer,
+                                        id<MTLBuffer> out_buffer,
+                                        uintptr_t rows,
+                                        uintptr_t cols) {
+    const NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group((NSUInteger)rows);
+    RustyQ4KParams params = {
+        .rows = (uint32_t)rows,
+        .cols = (uint32_t)cols,
+        .row_bytes = (uint32_t)((cols / 256) * 144),
+        .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [encoder setComputePipelineState:gQ4KHalfPipeline];
+    [encoder setBuffer:weight_buffer offset:0 atIndex:0];
+    [encoder setBuffer:x_buffer offset:0 atIndex:1];
+    [encoder setBuffer:out_buffer offset:0 atIndex:2];
+    [encoder setBytes:&params length:sizeof(params) atIndex:3];
+    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 8), 1, 1);
+    MTLSize groups = MTLSizeMake(
+        ((NSUInteger)rows + rows_per_group - 1) / rows_per_group, 1, 1
+    );
+    gMetalDispatches += 1;
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void rusty_metal_encode_q4k_pair_half(id<MTLComputeCommandEncoder> encoder,
+                                             id<MTLBuffer> weight_a,
+                                             id<MTLBuffer> weight_b,
+                                             id<MTLBuffer> x_buffer,
+                                             id<MTLBuffer> out_a,
+                                             id<MTLBuffer> out_b,
+                                             uintptr_t rows_a,
+                                             uintptr_t rows_b,
+                                             uintptr_t cols) {
+    const NSUInteger rows_per_group = rusty_metal_q4k_rows_per_group(
+        (NSUInteger)(rows_a + rows_b)
+    );
+    RustyQ4KPairParams params = {
+        .rows_a = (uint32_t)rows_a,
+        .rows_b = (uint32_t)rows_b,
+        .cols = (uint32_t)cols,
+        .row_bytes = (uint32_t)((cols / 256) * 144),
+        .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [encoder setComputePipelineState:gQ4KPairHalfPipeline];
+    [encoder setBuffer:weight_a offset:0 atIndex:0];
+    [encoder setBuffer:weight_b offset:0 atIndex:1];
+    [encoder setBuffer:x_buffer offset:0 atIndex:2];
+    [encoder setBuffer:out_a offset:0 atIndex:3];
+    [encoder setBuffer:out_b offset:0 atIndex:4];
+    [encoder setBytes:&params length:sizeof(params) atIndex:5];
+    NSUInteger groups_a = ((NSUInteger)rows_a + rows_per_group - 1) / rows_per_group;
+    NSUInteger groups_b = ((NSUInteger)rows_b + rows_per_group - 1) / rows_per_group;
+    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 8), 1, 1);
+    gMetalDispatches += 1;
+    [encoder dispatchThreadgroups:MTLSizeMake(groups_a + groups_b, 1, 1)
+            threadsPerThreadgroup:threads];
+}
+
 static void rusty_metal_encode_q6k(id<MTLComputeCommandEncoder> encoder,
                                    id<MTLBuffer> weight_buffer,
                                    id<MTLBuffer> x_buffer,
@@ -1704,6 +2195,33 @@ static void rusty_metal_encode_q6k(id<MTLComputeCommandEncoder> encoder,
     );
     gMetalDispatches += 1;
     [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+}
+
+static void rusty_metal_encode_q6k_half(id<MTLComputeCommandEncoder> encoder,
+                                        id<MTLBuffer> weight_buffer,
+                                        id<MTLBuffer> x_buffer,
+                                        id<MTLBuffer> out_buffer,
+                                        uintptr_t rows,
+                                        uintptr_t cols) {
+    NSUInteger rows_per_group = rusty_metal_q6k_rows_per_group((NSUInteger)rows);
+    RustyQ4KParams params = {
+        .rows = (uint32_t)rows,
+        .cols = (uint32_t)cols,
+        .row_bytes = (uint32_t)((cols / 256) * 210),
+        .n_blocks = (uint32_t)(cols / 256),
+        .rows_per_group = (uint32_t)rows_per_group,
+    };
+    [encoder setComputePipelineState:gQ6KHalfPipeline];
+    [encoder setBuffer:weight_buffer offset:0 atIndex:0];
+    [encoder setBuffer:x_buffer offset:0 atIndex:1];
+    [encoder setBuffer:out_buffer offset:0 atIndex:2];
+    [encoder setBytes:&params length:sizeof(params) atIndex:3];
+    MTLSize threads = MTLSizeMake(32 * (rows_per_group / 2), 1, 1);
+    MTLSize groups = MTLSizeMake(
+        ((NSUInteger)rows + rows_per_group - 1) / rows_per_group, 1, 1
+    );
+    gMetalDispatches += 1;
+    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
 static void rusty_metal_encode_q4_0(id<MTLComputeCommandEncoder> encoder,
@@ -2921,11 +3439,20 @@ static uint32_t gR_hidden, gR_vocab, gR_storage;
 static uint32_t gR_qdim, gR_kdim, gR_vdim, gR_attndim, gR_half;
 static float gR_eps;
 static uint32_t gR_neox, gR_outrows, gR_outdt;
+static BOOL gR_private_greedy_logits;
+static BOOL gR_half_output_input;
+static BOOL gR_half_projection_input;
+static BOOL gR_half_attention_output;
 static ResidentLayer gRLayers[RUSTY_MAX_RESIDENT_LAYERS];
 static __strong id<MTLBuffer> gR_x, gR_xn, gR_q, gR_k, gR_v, gR_attn;
 static __strong id<MTLBuffer> gR_gate, gR_up, gR_hiddenbuf, gR_proj, gR_logits;
+static __strong id<MTLBuffer> gR_greedy_logits;
+static __strong id<MTLBuffer> gR_out_xn_half;
+static __strong id<MTLBuffer> gR_hidden_half;
+static __strong id<MTLBuffer> gR_attn_half;
 static __strong id<MTLBuffer> gR_zero, gR_invfreq, gR_outnorm, gR_outw;
 static __strong id<MTLBuffer> gR_recent, gR_selected;
+static __strong id<MTLBuffer> gR_argmax_value, gR_argmax_id;
 
 static id<MTLBuffer> resident_alloc_shared(NSUInteger bytes) {
     return [gDevice newBufferWithLength:bytes options:MTLResourceStorageModeShared];
@@ -2951,11 +3478,30 @@ static void resident_matvec(id<MTLComputeCommandEncoder> enc, uint32_t dt,
     }
 }
 
+static void resident_matvec_half(id<MTLComputeCommandEncoder> enc, uint32_t dt,
+                                 id<MTLBuffer> w, id<MTLBuffer> x, id<MTLBuffer> out,
+                                 uint32_t rows, uint32_t cols) {
+    if (dt == 1) {
+        rusty_metal_encode_q6k_half(enc, w, x, out, rows, cols);
+    } else {
+        rusty_metal_encode_q4k_half(enc, w, x, out, rows, cols);
+    }
+}
+
 static void resident_q4_pair(id<MTLComputeCommandEncoder> enc,
                              id<MTLBuffer> weight_a, id<MTLBuffer> weight_b,
                              id<MTLBuffer> x, id<MTLBuffer> out_a, id<MTLBuffer> out_b,
                              uint32_t rows_a, uint32_t rows_b, uint32_t cols) {
     rusty_metal_encode_q4k_pair(
+        enc, weight_a, weight_b, x, out_a, out_b, rows_a, rows_b, cols
+    );
+}
+
+static void resident_q4_pair_half(id<MTLComputeCommandEncoder> enc,
+                                  id<MTLBuffer> weight_a, id<MTLBuffer> weight_b,
+                                  id<MTLBuffer> x, id<MTLBuffer> out_a, id<MTLBuffer> out_b,
+                                  uint32_t rows_a, uint32_t rows_b, uint32_t cols) {
+    rusty_metal_encode_q4k_pair_half(
         enc, weight_a, weight_b, x, out_a, out_b, rows_a, rows_b, cols
     );
 }
@@ -2971,6 +3517,20 @@ static void resident_rms(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
     [enc setBuffer:out offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void resident_rms_half(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
+                              id<MTLBuffer> residual, id<MTLBuffer> weight,
+                              id<MTLBuffer> out, uint32_t len, float eps) {
+    RustyResidualNormParams p = { .len = len, .eps = eps };
+    [enc setComputePipelineState:gResidualRmsHalfPipeline];
+    [enc setBuffer:x offset:0 atIndex:0];
+    [enc setBuffer:residual offset:0 atIndex:1];
+    [enc setBuffer:weight offset:0 atIndex:2];
+    [enc setBuffer:out offset:0 atIndex:3];
+    [enc setBytes:&p length:sizeof(p) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
 static void resident_add(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x,
@@ -2996,8 +3556,47 @@ static void resident_silu(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate,
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
+static void resident_silu_half(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> gate,
+                               id<MTLBuffer> up, id<MTLBuffer> out, uint32_t len) {
+    RustyUnaryParams p = { .len = len };
+    [enc setComputePipelineState:gSiluMulHalfPipeline];
+    [enc setBuffer:gate offset:0 atIndex:0];
+    [enc setBuffer:up offset:0 atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    [enc setBytes:&p length:sizeof(p) atIndex:3];
+    NSUInteger groups = ((NSUInteger)len + 255) / 256;
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 static void resident_greedy_argmax(id<MTLComputeCommandEncoder> enc,
+                                   id<MTLBuffer> logits,
                                    uint32_t recent_len, float repeat_penalty) {
+    if (!rusty_metal_env_enabled("RUSTY_LLM_METAL_LEGACY_ARGMAX")) {
+        uint32_t groups = MIN((gR_vocab + 255) / 256, RUSTY_ARGMAX_GROUPS);
+        RustyArgmaxParams p = {
+            .vocab = gR_vocab,
+            .recent_len = recent_len,
+            .groups = groups,
+            .repeat_penalty = repeat_penalty,
+        };
+        [enc setComputePipelineState:gGreedyArgmaxStage1Pipeline];
+        [enc setBuffer:logits offset:0 atIndex:0];
+        [enc setBuffer:gR_recent offset:0 atIndex:1];
+        [enc setBuffer:gR_argmax_value offset:0 atIndex:2];
+        [enc setBuffer:gR_argmax_id offset:0 atIndex:3];
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc setComputePipelineState:gGreedyArgmaxStage2Pipeline];
+        [enc setBuffer:gR_argmax_value offset:0 atIndex:0];
+        [enc setBuffer:gR_argmax_id offset:0 atIndex:1];
+        [enc setBuffer:gR_selected offset:0 atIndex:2];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+    }
     RustyArgmaxParams p = {
         .vocab = gR_vocab,
         .recent_len = recent_len,
@@ -3005,7 +3604,7 @@ static void resident_greedy_argmax(id<MTLComputeCommandEncoder> enc,
         .repeat_penalty = repeat_penalty,
     };
     [enc setComputePipelineState:gGreedyArgmaxPipeline];
-    [enc setBuffer:gR_logits offset:0 atIndex:0];
+    [enc setBuffer:logits offset:0 atIndex:0];
     [enc setBuffer:gR_recent offset:0 atIndex:1];
     [enc setBuffer:gR_selected offset:0 atIndex:2];
     [enc setBytes:&p length:sizeof(p) atIndex:3];
@@ -3034,8 +3633,9 @@ static void resident_rope(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
     [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
-static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
-                          uint32_t start_t, uint32_t end_t, float scale) {
+static BOOL resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
+                          uint32_t start_t, uint32_t end_t, float scale,
+                          BOOL prefer_half) {
     uint32_t kv_mul = gR_nheads / gR_nkv;
     RustyResidentAttentionParams p = {
         .heads = gR_nheads, .kv_mul = kv_mul, .head_dim = gR_headdim,
@@ -3058,12 +3658,19 @@ static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
                          (!parallel_override_off && context_tokens >= 16));
     BOOL use_grouped_gqa = !use_parallel && kv_mul == 4 && gResidentGroupedAttentionPipeline != nil &&
                            (grouped_override_on || (!grouped_override_off && context_tokens >= 128));
-    [enc setComputePipelineState:use_parallel ? gResidentParallelAttentionPipeline :
-                                 (use_grouped_gqa ? gResidentGroupedAttentionPipeline : gResidentAttentionPipeline)];
+    BOOL output_half = prefer_half && !use_grouped_gqa &&
+                       gResidentAttentionHalfPipeline != nil &&
+                       (!use_parallel || gResidentParallelAttentionHalfPipeline != nil);
+    id<MTLComputePipelineState> pipeline = use_parallel
+        ? (output_half ? gResidentParallelAttentionHalfPipeline : gResidentParallelAttentionPipeline)
+        : (use_grouped_gqa ? gResidentGroupedAttentionPipeline
+                           : (output_half ? gResidentAttentionHalfPipeline
+                                          : gResidentAttentionPipeline));
+    [enc setComputePipelineState:pipeline];
     [enc setBuffer:gR_q offset:0 atIndex:0];
     [enc setBuffer:L->k_cache offset:0 atIndex:1];
     [enc setBuffer:L->v_cache offset:0 atIndex:2];
-    [enc setBuffer:gR_attn offset:0 atIndex:3];
+    [enc setBuffer:output_half ? gR_attn_half : gR_attn offset:0 atIndex:3];
     [enc setBytes:&p length:sizeof(p) atIndex:4];
     [enc setBuffer:gAttentionZeroBuffer offset:0 atIndex:5];
     if (use_parallel) {
@@ -3073,12 +3680,13 @@ static void resident_attn(id<MTLComputeCommandEncoder> enc, ResidentLayer *L,
     } else {
         [enc dispatchThreadgroups:MTLSizeMake(gR_nheads, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     }
+    return output_half;
 }
 
 int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_heads,
                                    uint32_t n_kv_heads, uint32_t head_dim, uint32_t value_dim,
                                    uint32_t hidden_dim, uint32_t vocab, uint32_t storage_len,
-                                   float eps, uint32_t neox) {
+                                   float eps, uint32_t neox, uint32_t prefer_half_inputs) {
     if (!rusty_metal_init()) return 0;
     if (n_layers == 0 || n_layers > RUSTY_MAX_RESIDENT_LAYERS) return 0;
     if (n_kv_heads == 0 || (n_heads % n_kv_heads) != 0) return 0;
@@ -3088,6 +3696,17 @@ int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_h
     gR_nlayers = n_layers; gR_dim = dim; gR_nheads = n_heads; gR_nkv = n_kv_heads;
     gR_headdim = head_dim; gR_valuedim = value_dim; gR_hidden = hidden_dim;
     gR_vocab = vocab; gR_storage = storage_len; gR_eps = eps; gR_neox = neox;
+    gR_private_greedy_logits = !rusty_metal_env_disabled("RUSTY_LLM_METAL_PRIVATE_GREEDY_LOGITS");
+    BOOL half_default = prefer_half_inputs != 0;
+    gR_half_output_input = rusty_metal_env_enabled("RUSTY_LLM_METAL_HALF_OUTPUT_INPUT") ||
+                           (half_default &&
+                            !rusty_metal_env_disabled("RUSTY_LLM_METAL_HALF_OUTPUT_INPUT"));
+    gR_half_projection_input = rusty_metal_env_enabled("RUSTY_LLM_METAL_HALF_PROJECTION_INPUT") ||
+                               (half_default &&
+                                !rusty_metal_env_disabled("RUSTY_LLM_METAL_HALF_PROJECTION_INPUT"));
+    gR_half_attention_output = rusty_metal_env_enabled("RUSTY_LLM_METAL_HALF_ATTENTION_OUTPUT") ||
+                               (half_default &&
+                                !rusty_metal_env_disabled("RUSTY_LLM_METAL_HALF_ATTENTION_OUTPUT"));
     gR_qdim = n_heads * head_dim; gR_kdim = n_kv_heads * head_dim;
     gR_vdim = n_kv_heads * value_dim; gR_attndim = n_heads * value_dim;
     gR_half = head_dim / 2;
@@ -3102,11 +3721,19 @@ int rusty_metal_resident_configure(uint32_t n_layers, uint32_t dim, uint32_t n_h
     gR_hiddenbuf = resident_alloc_private((NSUInteger)hidden_dim * sizeof(float));
     gR_proj = resident_alloc_private((NSUInteger)dim * sizeof(float));
     gR_logits = resident_alloc_shared((NSUInteger)vocab * sizeof(float));
+    gR_greedy_logits = resident_alloc_private((NSUInteger)vocab * sizeof(float));
+    gR_out_xn_half = resident_alloc_private((NSUInteger)dim * sizeof(uint16_t));
+    gR_hidden_half = resident_alloc_private((NSUInteger)hidden_dim * sizeof(uint16_t));
+    gR_attn_half = resident_alloc_private((NSUInteger)gR_attndim * sizeof(uint16_t));
     gR_zero = resident_alloc_shared((NSUInteger)dim * sizeof(float));
     gR_recent = resident_alloc_shared(64 * sizeof(uint32_t));
     gR_selected = resident_alloc_shared(sizeof(uint32_t));
+    gR_argmax_value = resident_alloc_private(RUSTY_ARGMAX_GROUPS * sizeof(float));
+    gR_argmax_id = resident_alloc_private(RUSTY_ARGMAX_GROUPS * sizeof(uint32_t));
     if (!gR_x || !gR_xn || !gR_q || !gR_k || !gR_v || !gR_attn || !gR_gate || !gR_up ||
-        !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_zero || !gR_recent || !gR_selected) {
+        !gR_hiddenbuf || !gR_proj || !gR_logits || !gR_greedy_logits || !gR_out_xn_half ||
+        !gR_hidden_half || !gR_attn_half || !gR_zero ||
+        !gR_recent || !gR_selected || !gR_argmax_value || !gR_argmax_id) {
         return 0;
     }
     memset([gR_zero contents], 0, (NSUInteger)dim * sizeof(float));
@@ -3187,41 +3814,151 @@ int rusty_metal_resident_decode(const float *x_embed, uint32_t pos, uint32_t sta
         for (uint32_t l = 0; l < gR_nlayers; ++l) {
             ResidentLayer *L = &gRLayers[l];
             id<MTLBuffer> resid = (l == 0) ? gR_zero : gR_proj;
-            resident_rms(enc, gR_x, resid, L->attn_norm, gR_xn, gR_dim, gR_eps);
+            id<MTLBuffer> projection_input;
+            if (gR_half_projection_input) {
+                resident_rms_half(
+                    enc, gR_x, resid, L->attn_norm, gR_out_xn_half, gR_dim, gR_eps
+                );
+                projection_input = gR_out_xn_half;
+            } else {
+                resident_rms(enc, gR_x, resid, L->attn_norm, gR_xn, gR_dim, gR_eps);
+                projection_input = gR_xn;
+            }
             if (L->dt[0] == 0 && L->dt[1] == 0) {
-                resident_q4_pair(
-                    enc, L->w[0], L->w[1], gR_xn, gR_q, gR_k,
-                    L->rows[0], L->rows[1], L->cols[0]
+                if (gR_half_projection_input) {
+                    resident_q4_pair_half(
+                        enc, L->w[0], L->w[1], projection_input, gR_q, gR_k,
+                        L->rows[0], L->rows[1], L->cols[0]
+                    );
+                } else {
+                    resident_q4_pair(
+                        enc, L->w[0], L->w[1], projection_input, gR_q, gR_k,
+                        L->rows[0], L->rows[1], L->cols[0]
+                    );
+                }
+            } else {
+                if (gR_half_projection_input) {
+                    resident_matvec_half(
+                        enc, L->dt[0], L->w[0], projection_input, gR_q,
+                        L->rows[0], L->cols[0]
+                    );
+                    resident_matvec_half(
+                        enc, L->dt[1], L->w[1], projection_input, gR_k,
+                        L->rows[1], L->cols[1]
+                    );
+                } else {
+                    resident_matvec(
+                        enc, L->dt[0], L->w[0], projection_input, gR_q,
+                        L->rows[0], L->cols[0]
+                    );
+                    resident_matvec(
+                        enc, L->dt[1], L->w[1], projection_input, gR_k,
+                        L->rows[1], L->cols[1]
+                    );
+                }
+            }
+            if (gR_half_projection_input) {
+                resident_matvec_half(
+                    enc, L->dt[2], L->w[2], projection_input, gR_v,
+                    L->rows[2], L->cols[2]
                 );
             } else {
-                resident_matvec(enc, L->dt[0], L->w[0], gR_xn, gR_q, L->rows[0], L->cols[0]);
-                resident_matvec(enc, L->dt[1], L->w[1], gR_xn, gR_k, L->rows[1], L->cols[1]);
+                resident_matvec(
+                    enc, L->dt[2], L->w[2], projection_input, gR_v,
+                    L->rows[2], L->cols[2]
+                );
             }
-            resident_matvec(enc, L->dt[2], L->w[2], gR_xn, gR_v, L->rows[2], L->cols[2]);
             if (L->bias_len[0]) resident_add(enc, gR_q, L->bias[0], L->bias_len[0]);
             if (L->bias_len[1]) resident_add(enc, gR_k, L->bias[1], L->bias_len[1]);
             if (L->bias_len[2]) resident_add(enc, gR_v, L->bias[2], L->bias_len[2]);
             resident_rope(enc, L, pos, slot);
-            resident_attn(enc, L, start_t, pos, scale);
-            resident_matvec(enc, L->dt[3], L->w[3], gR_attn, gR_proj, L->rows[3], L->cols[3]);
-            resident_rms(enc, gR_x, gR_proj, L->ffn_norm, gR_xn, gR_dim, gR_eps);
-            if (L->dt[4] == 0 && L->dt[5] == 0) {
-                resident_q4_pair(
-                    enc, L->w[4], L->w[5], gR_xn, gR_gate, gR_up,
-                    L->rows[4], L->rows[5], L->cols[4]
+            BOOL attention_is_half = resident_attn(
+                enc, L, start_t, pos, scale, gR_half_attention_output
+            );
+            if (attention_is_half) {
+                resident_matvec_half(
+                    enc, L->dt[3], L->w[3], gR_attn_half, gR_proj,
+                    L->rows[3], L->cols[3]
                 );
             } else {
-                resident_matvec(enc, L->dt[4], L->w[4], gR_xn, gR_gate, L->rows[4], L->cols[4]);
-                resident_matvec(enc, L->dt[5], L->w[5], gR_xn, gR_up, L->rows[5], L->cols[5]);
+                resident_matvec(
+                    enc, L->dt[3], L->w[3], gR_attn, gR_proj,
+                    L->rows[3], L->cols[3]
+                );
             }
-            resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
-            resident_matvec(enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj, L->rows[6], L->cols[6]);
+            if (gR_half_projection_input) {
+                resident_rms_half(
+                    enc, gR_x, gR_proj, L->ffn_norm, gR_out_xn_half, gR_dim, gR_eps
+                );
+                projection_input = gR_out_xn_half;
+            } else {
+                resident_rms(enc, gR_x, gR_proj, L->ffn_norm, gR_xn, gR_dim, gR_eps);
+                projection_input = gR_xn;
+            }
+            if (L->dt[4] == 0 && L->dt[5] == 0) {
+                if (gR_half_projection_input) {
+                    resident_q4_pair_half(
+                        enc, L->w[4], L->w[5], projection_input, gR_gate, gR_up,
+                        L->rows[4], L->rows[5], L->cols[4]
+                    );
+                } else {
+                    resident_q4_pair(
+                        enc, L->w[4], L->w[5], projection_input, gR_gate, gR_up,
+                        L->rows[4], L->rows[5], L->cols[4]
+                    );
+                }
+            } else {
+                if (gR_half_projection_input) {
+                    resident_matvec_half(
+                        enc, L->dt[4], L->w[4], projection_input, gR_gate,
+                        L->rows[4], L->cols[4]
+                    );
+                    resident_matvec_half(
+                        enc, L->dt[5], L->w[5], projection_input, gR_up,
+                        L->rows[5], L->cols[5]
+                    );
+                } else {
+                    resident_matvec(
+                        enc, L->dt[4], L->w[4], projection_input, gR_gate,
+                        L->rows[4], L->cols[4]
+                    );
+                    resident_matvec(
+                        enc, L->dt[5], L->w[5], projection_input, gR_up,
+                        L->rows[5], L->cols[5]
+                    );
+                }
+            }
+            if (gR_half_projection_input) {
+                resident_silu_half(enc, gR_gate, gR_up, gR_hidden_half, gR_hidden);
+                resident_matvec_half(
+                    enc, L->dt[6], L->w[6], gR_hidden_half, gR_proj,
+                    L->rows[6], L->cols[6]
+                );
+            } else {
+                resident_silu(enc, gR_gate, gR_up, gR_hiddenbuf, gR_hidden);
+                resident_matvec(
+                    enc, L->dt[6], L->w[6], gR_hiddenbuf, gR_proj,
+                    L->rows[6], L->cols[6]
+                );
+            }
         }
         if (output_mode != 0) {
-            resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
-            resident_matvec(enc, gR_outdt, gR_outw, gR_xn, gR_logits, gR_outrows, gR_dim);
+            id<MTLBuffer> logits = output_mode == 2 && gR_private_greedy_logits
+                                      ? gR_greedy_logits
+                                      : gR_logits;
+            if (gR_half_output_input && gR_outdt == 1) {
+                resident_rms_half(
+                    enc, gR_x, gR_proj, gR_outnorm, gR_out_xn_half, gR_dim, gR_eps
+                );
+                rusty_metal_encode_q6k_half(
+                    enc, gR_outw, gR_out_xn_half, logits, gR_outrows, gR_dim
+                );
+            } else {
+                resident_rms(enc, gR_x, gR_proj, gR_outnorm, gR_xn, gR_dim, gR_eps);
+                resident_matvec(enc, gR_outdt, gR_outw, gR_xn, logits, gR_outrows, gR_dim);
+            }
             if (output_mode == 2) {
-                resident_greedy_argmax(enc, recent_len, repeat_penalty);
+                resident_greedy_argmax(enc, logits, recent_len, repeat_penalty);
             }
         }
         [enc endEncoding];
