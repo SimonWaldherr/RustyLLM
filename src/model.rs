@@ -10658,10 +10658,7 @@ pub(crate) fn qwen35_resident_eligible(config: &Config, weights: &Qwen35Weights)
         && weights.ssm.d_state == 128
 }
 
-fn qwen35_resident_fingerprint(
-    config: &Config,
-    weights: &Qwen35Weights,
-) -> u64 {
+fn qwen35_resident_fingerprint(config: &Config, weights: &Qwen35Weights) -> u64 {
     let ptr = match &weights.token_embd {
         Weight::Quantized { data, .. } => data.as_slice().as_ptr() as usize as u64,
         Weight::F32(data) => data.as_ptr() as usize as u64,
@@ -10836,8 +10833,7 @@ fn qwen35_resident_ready(
         capacity: usize,
         ready: bool,
     }
-    static REGISTRATION: std::sync::Mutex<Option<Registration>> =
-        std::sync::Mutex::new(None);
+    static REGISTRATION: std::sync::Mutex<Option<Registration>> = std::sync::Mutex::new(None);
     let fingerprint = qwen35_resident_fingerprint(config, weights);
     let mut registration = REGISTRATION
         .lock()
@@ -11081,15 +11077,9 @@ pub fn forward_greedy_qwen35_into(
     weights
         .token_embd
         .row_into(token as usize, config.dim, &mut buf.x);
-    if let Some(token) = qwen35_resident_greedy_attempt(
-        config,
-        weights,
-        cache,
-        buf,
-        pos,
-        recent,
-        repeat_penalty,
-    ) {
+    if let Some(token) =
+        qwen35_resident_greedy_attempt(config, weights, cache, buf, pos, recent, repeat_penalty)
+    {
         return Some(token);
     }
     forward_qwen35_impl(config, weights, cache, buf, token, pos, Some(logits));
