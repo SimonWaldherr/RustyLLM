@@ -570,6 +570,7 @@ pub struct ResidentLayerInput<'a> {
 /// Borrowed inputs used to register one Qwen hybrid layer with the resident
 /// decoder. Empty slices represent fields that do not apply to the selected
 /// `layer_type` and are passed to the Objective-C backend as null pointers.
+#[cfg_attr(not(all(target_os = "macos", rusty_metal)), allow(dead_code))]
 pub(crate) struct QwenResidentLayerInput<'a> {
     pub layer_type: u32,
     pub w: [&'a [u8]; 8],
@@ -1004,10 +1005,9 @@ pub(crate) fn qwen_resident_set_output(
     if output_norm.is_empty() || output_w.is_empty() || inv_freq.is_empty() || output_dt > 1 {
         return false;
     }
-    let (Ok(output_rows), Ok(inv_freq_len)) = (
-        u32::try_from(output_rows),
-        u32::try_from(inv_freq.len()),
-    ) else {
+    let (Ok(output_rows), Ok(inv_freq_len)) =
+        (u32::try_from(output_rows), u32::try_from(inv_freq.len()))
+    else {
         return false;
     };
     unsafe {
@@ -2204,7 +2204,9 @@ pub fn q4_0_matvec2_into(
     }
     out_a.resize(a_rows, 0.0);
     out_b.resize(b_rows, 0.0);
-    q4_0_matvec2_raw(a_weights, a_rows, b_weights, b_rows, x, a_cols, out_a, out_b)
+    q4_0_matvec2_raw(
+        a_weights, a_rows, b_weights, b_rows, x, a_cols, out_a, out_b,
+    )
 }
 
 /// Attempts three Q4_0 projections in one Metal command buffer.
@@ -2237,8 +2239,7 @@ pub fn q4_0_matvec3_into(
     out_b.resize(b_rows, 0.0);
     out_c.resize(c_rows, 0.0);
     q4_0_matvec3_raw(
-        a_weights, a_rows, b_weights, b_rows, c_weights, c_rows, x, a_cols, out_a, out_b,
-        out_c,
+        a_weights, a_rows, b_weights, b_rows, c_weights, c_rows, x, a_cols, out_a, out_b, out_c,
     )
 }
 
@@ -2324,8 +2325,16 @@ fn q4_0_matvec2_raw(
 ) -> bool {
     unsafe {
         ffi::rusty_metal_q4_0_matvec2(
-            a.as_ptr(), a.len(), a_rows, b.as_ptr(), b.len(), b_rows, x.as_ptr(), cols,
-            out_a.as_mut_ptr(), out_b.as_mut_ptr(),
+            a.as_ptr(),
+            a.len(),
+            a_rows,
+            b.as_ptr(),
+            b.len(),
+            b_rows,
+            x.as_ptr(),
+            cols,
+            out_a.as_mut_ptr(),
+            out_b.as_mut_ptr(),
         ) != 0
     }
 }
@@ -2347,8 +2356,20 @@ fn q4_0_matvec3_raw(
 ) -> bool {
     unsafe {
         ffi::rusty_metal_q4_0_matvec3(
-            a.as_ptr(), a.len(), a_rows, b.as_ptr(), b.len(), b_rows, c.as_ptr(), c.len(),
-            c_rows, x.as_ptr(), cols, out_a.as_mut_ptr(), out_b.as_mut_ptr(), out_c.as_mut_ptr(),
+            a.as_ptr(),
+            a.len(),
+            a_rows,
+            b.as_ptr(),
+            b.len(),
+            b_rows,
+            c.as_ptr(),
+            c.len(),
+            c_rows,
+            x.as_ptr(),
+            cols,
+            out_a.as_mut_ptr(),
+            out_b.as_mut_ptr(),
+            out_c.as_mut_ptr(),
         ) != 0
     }
 }
@@ -2368,8 +2389,18 @@ fn q4_0_gelu_ffn_raw(
 ) -> bool {
     unsafe {
         ffi::rusty_metal_q4_0_gelu_ffn(
-            gate.as_ptr(), gate.len(), up.as_ptr(), up.len(), down.as_ptr(), down.len(), x.as_ptr(),
-            input_cols, hidden_rows, down_rows, down_cols, out.as_mut_ptr(),
+            gate.as_ptr(),
+            gate.len(),
+            up.as_ptr(),
+            up.len(),
+            down.as_ptr(),
+            down.len(),
+            x.as_ptr(),
+            input_cols,
+            hidden_rows,
+            down_rows,
+            down_cols,
+            out.as_mut_ptr(),
         ) != 0
     }
 }
@@ -2597,8 +2628,7 @@ mod tests {
                 for i in 0..16 {
                     let packed = block[2 + i];
                     *value += d * f32::from((packed & 15) as i8 - 8) * x[block_index * 32 + i];
-                    *value += d * f32::from((packed >> 4) as i8 - 8)
-                        * x[block_index * 32 + 16 + i];
+                    *value += d * f32::from((packed >> 4) as i8 - 8) * x[block_index * 32 + 16 + i];
                 }
             }
         }
@@ -2686,10 +2716,9 @@ mod tests {
                     let d = crate::simd::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
                     for i in 0..16 {
                         let packed = block[2 + i];
-                        *value += d * f32::from((packed & 15) as i8 - 8)
-                            * x[block_index * 32 + i];
-                        *value += d * f32::from((packed >> 4) as i8 - 8)
-                            * x[block_index * 32 + 16 + i];
+                        *value += d * f32::from((packed & 15) as i8 - 8) * x[block_index * 32 + i];
+                        *value +=
+                            d * f32::from((packed >> 4) as i8 - 8) * x[block_index * 32 + 16 + i];
                     }
                 }
             }
