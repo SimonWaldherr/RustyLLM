@@ -10682,6 +10682,7 @@ fn qwen35_resident_fingerprint(config: &Config, weights: &Qwen35Weights) -> u64 
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn qwen35_resident_configure_once(
     config: &Config,
     weights: &Qwen35Weights,

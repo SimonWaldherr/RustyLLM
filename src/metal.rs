@@ -570,6 +570,7 @@ pub struct ResidentLayerInput<'a> {
 /// Borrowed inputs used to register one Qwen hybrid layer with the resident
 /// decoder. Empty slices represent fields that do not apply to the selected
 /// `layer_type` and are passed to the Objective-C backend as null pointers.
+#[cfg_attr(not(all(target_os = "macos", rusty_metal)), allow(dead_code))]
 pub(crate) struct QwenResidentLayerInput<'a> {
     pub layer_type: u32,
     pub w: [&'a [u8]; 8],
